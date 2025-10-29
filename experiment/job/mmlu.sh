@@ -33,7 +33,7 @@ module list  # job documentation and metadata
 DATA_DIR=data
 MODEL_PATH=meta-llama/Llama-3.2-1B-Instruct
 DATA_SEED=3
-JOB_NAME=llama3-1b-p${PERCENTAGE}-lora-seed${DATA_SEED}-hooks
+JOB_NAME=llama3-1b-p${PERCENTAGE}-lora-seed${DATA_SEED}
 
 method=$1
 batch_size=$2

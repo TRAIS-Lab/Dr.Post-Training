@@ -1,23 +1,12 @@
 #!/usr/bin/env python
 # coding=utf-8
 """
-Modified training script that uses hook-based gradient computation instead of custom layers.
-
-This is a drop-in replacement for core/train/train.py that uses the existing
-_GradComp.core.hook.HookManager instead of replacing layers with GCLinear/GCLoRALinear.
-
-This follows the GPT2_wikitext pattern where we:
-1. Do normal loss.backward() calls
-2. Use hook_manager.get_compressed_grads() to retrieve gradients
-3. Compute simple inner products on compressed gradients
+Training script that uses hook-based gradient computation.
 """
 
 import logging
 import os
-import random
 import sys
-sys.path.append('/u/phu1/Project/Efficient-Fine-Tuning')
-
 import time
 
 import datasets
@@ -30,14 +19,13 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           DataCollatorForSeq2Seq, HfArgumentParser, Trainer,
                           set_seed)
 
-from core.data_selection.get_training_dataset import get_training_dataset
-from core.train.data_arguments import DataArguments, get_data_statistics
-from core.train.model_arguments import ModelArguments, add_padding_to_tokenizer
-from core.train.training_arguments import TrainingArguments
+from ..data_selection.get_training_dataset import get_training_dataset
+from .data_arguments import DataArguments, get_data_statistics
+from .model_arguments import ModelArguments, add_padding_to_tokenizer
+from .training_arguments import TrainingArguments
 
-# Import hook-based components - use the existing _GradComp HookManager
-from _GradComp.core.hook import HookManager
-from core.train.hook_trainer import HookTrainer
+from ..GradComp.core.hook import HookManager
+from .hook_trainer import HookTrainer
 
 logger = logging.getLogger(__name__)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -158,14 +146,6 @@ def main():
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    ##### ***************************************** #####
-    ##### Hook-based approach - NO LAYER REPLACEMENT! #####
-    ##### ***************************************** #####
-
-    logger.info("="*60)
-    logger.info("Using HOOK-BASED gradient computation (GPT2_wikitext style)")
-    logger.info("="*60)
-
     # Find trainable layers (LoRA layers or all Linear layers)
     layer_names = find_trainable_layers(model, lora_only=model_args.lora)
     logger.info(f"Found {len(layer_names)} trainable layers for hook attachment")
@@ -180,18 +160,18 @@ def main():
     else:
         logger.warning("WARNING: No trainable layers found! Check model and lora_only setting.")
 
-    # Create hook manager using _GradComp.core.hook.HookManager
+    # Create hook manager using GradComp.core.hook.HookManager
     hook_manager = HookManager(
         model=model,
         layer_names=layer_names,
         profile=False,
         device=str(training_args.device)
     )
-    logger.info("Hook manager created successfully (using _GradComp.core.hook.HookManager)")
+    logger.info("Hook manager created successfully (using GradComp.core.hook.HookManager)")
 
     # Optional: Set up gradient compression
     if training_args.sparsification is not None or training_args.projection is not None:
-        from _GradComp.projection.projector import setup_model_compressors
+        from ..GradComp.projection.projector import setup_model_compressors
 
         logger.info("=== Gradient Compression Setup ===")
 
@@ -272,7 +252,8 @@ def main():
 
         class DummyDataset:
             def __init__(self, inputs):
-                self.inputs = inputs
+                # Remove batch dimension from inputs
+                self.inputs = {k: v.squeeze(0) for k, v in inputs.items()}
             def __getitem__(self, idx):
                 return self.inputs
             def __len__(self):
@@ -305,10 +286,8 @@ def main():
     else:
         logger.info("Gradient compression disabled (sparsification and projection both None)")
 
-    ##### ***************************************** #####
-
     # Prepare eval dataset
-    from core.data_selection.get_validation_dataset import get_dataset
+    from ..data_selection.get_validation_dataset import get_dataset
     eval_dataset = get_dataset(
         task=training_args.analysis_dataset,
         data_dir='data',
@@ -342,11 +321,11 @@ def main():
         test_dataset=test_dataset,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        hook_manager=hook_manager,  # Pass hook manager (using _GradComp.core.hook.HookManager)
+        hook_manager=hook_manager,
     )
 
     # Train
-    logger.info("*** Starting training with hook-based gradient computation (GPT2_wikitext style) ***")
+    logger.info("*** Starting training with hook-based gradient computation ***")
     train_result = trainer.train()
 
     # Save model

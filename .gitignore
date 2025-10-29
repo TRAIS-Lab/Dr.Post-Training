@@ -41,6 +41,7 @@ dist
 
 */log
 */data/*
+*/out
 
 # debug
 *debug*

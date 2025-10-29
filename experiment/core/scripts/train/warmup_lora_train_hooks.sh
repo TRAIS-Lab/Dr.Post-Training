@@ -27,9 +27,8 @@ sparsification=${16}  # Optional: e.g., "Rademacher-512"
 projection=${17}      # Optional: e.g., "Gaussian-256"
 
 echo "Training with combined modules: $combined_modules"
-echo "Using HOOK-BASED gradient computation (no custom layers)"
 
-output_dir=../out/${job_name}
+output_dir=./out/${job_name}
 if [[ ! -d $output_dir ]]; then
     mkdir -p $output_dir
 fi
