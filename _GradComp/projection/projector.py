@@ -104,15 +104,22 @@ def setup_model_compressors(
     else:
         projector_kwargs_copy = {}
 
-    # Run a forward pass to initialize model
+    # Ensure model is on the correct device before running forward pass
     logger.info("Running forward pass to initialize model for compressor setup")
+    original_device = next(model.parameters()).device
+    if str(original_device) != device:
+        logger.info(f"Moving model from {original_device} to {device} for compressor setup")
+        model.to(device)
+
     train_batch = next(iter(train_dataloader))
-    if isinstance(train_batch, dict):
-        inputs = {k: v.to(device) for k, v in train_batch.items()}
-        model(**inputs)
-    else:
-        inputs = train_batch[0].to(device)
-        model(inputs)
+    # Use no_grad to avoid autograd issues during setup
+    with torch.no_grad():
+        if isinstance(train_batch, dict):
+            inputs = {k: v.to(device) for k, v in train_batch.items()}
+            model(**inputs)
+        else:
+            inputs = train_batch[0].to(device)
+            model(inputs)
 
     # First, capture inputs and outputs for each layer
     layer_inputs = {}
@@ -130,10 +137,11 @@ def setup_model_compressors(
             hooks.append(hook)
 
     # Run another forward pass to capture inputs/outputs
-    if isinstance(train_batch, dict):
-        model(**inputs)
-    else:
-        model(inputs)
+    with torch.no_grad():
+        if isinstance(train_batch, dict):
+            model(**inputs)
+        else:
+            model(inputs)
 
     # Remove temporary hooks
     for hook in hooks:

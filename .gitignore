@@ -40,7 +40,7 @@ dist
 *.arrow
 
 */log
-# */data/*
+*/data/*
 
 # debug
 *debug*

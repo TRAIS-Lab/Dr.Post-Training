@@ -1,31 +1,67 @@
-# Efficient Fine-Tuning
+# GREATS: Online Selection of High-Quality Data for LLM Training in Every Iteration
 
-## Setup
+[![OpenReview](https://img.shields.io/badge/OpenReview-b31b1b.svg)](https://openreview.net/pdf?id=232VcN8tSx)
 
-Our code is guaranteed to run on Python 3.10 and CUDA 12.6. With miniconda, you can create a new environment with the following command:
+<p align="center">
+    <img src="./abstract.png" alt="abs" width="500px">
+</p>
+
+
+
+
+## Quick Start
 
 ```bash
-conda env create -f environment.yml --name IF
+pip install -r requirement.txt
 ```
 
-> (Optional) In some special projection setting, please also install the [`sjlt` library](https://github.com/TRAIS-Lab/sjlt/tree/main) following the installation guide.
+Download data at this [link](https://drive.google.com/file/d/1L8IE7_9R-8zamRrR-69PRIB9WoEHF5XY/view?usp=sharing), and put it in the folder of codebase. 
 
-## Running Jobs
-
-To run the jobs, you can use the following command:
+Run experiments using:
 ```bash
-nohup bash script.sh > output.log 2>&1 &
+sh online_batch_select_mmlu.sh Regular 4 0.05 5 mmlu llama2 1 2e-05 11 1 sociology
+sh online_batch_select_mmlu.sh GREATS 2 0.05 5 mmlu llama2 1 2e-05 11 1 sociology
 ```
 
-The `job` directory contains all the jobs we have implemented. You can run them by executing the corresponding script files. The main experiment is controlled by `experiment/job/master.sh`
+The result from the trial run:
+![TrialRun](./trialrun.png)
+
+**Note:** to make it compatible with gradient accumulation, in the current implementation of ghost inner product we still use 2 forward-backward passes. 
 
 
-## Supervised fine-tuning of GPT-2 on Self-Instruct
+### Parameters
 
-### Setup
+```bash
+sh online_batch_select_mmlu.sh \
+    <selection_method>  # Batch selection strategy. Options: Regular, GREATS, GradNorm, MaxLoss, RHO-Loss, SBERT.
+    <batch_size>        # Batch size for training. 
+    <data_percentage>   # Percentage of the full dataset used for training (for faster test). 
+    <validation_size>   # Size of the validation set. 
+    <task>              # Task name for the model (e.g., a classification or QA task).
+    <model>             # Model name or path to the pretrained model.
+    <lora_alpha>        # LoRA hyperparameter (if applicable).
+    <learning_rate>     # Learning rate for the optimizer.
+    [seed]              # Random seed for reproducibility.
+    [gradient_accumulation_steps]  # Number of gradient accumulation steps.
+    [subject]           # Dataset subject.
+```
 
-For the credential: we can simply use the temporary credentials obtained in Isengard:
+## Citation
 
-![Temporary Credentials from Isengard](else/credentials.png)
+```bibtex
+@inproceedings{
+    wang2024greats,
+    title={{GREATS}: Online Selection of High-Quality Data for {LLM} Training in Every Iteration},
+    author={Jiachen T. Wang and Tong Wu and Dawn Song and Prateek Mittal and Ruoxi Jia},
+    booktitle={The Thirty-eighth Annual Conference on Neural Information Processing Systems},
+    year={2024},
+    url={https://openreview.net/forum?id=232VcN8tSx}
+}
+```
 
-Then the credentials will be automatically handled in `sdgen.py`.
+## Contact
+If you have any issues running the codebase, feel free to contact us at tianhaowang@princeton.edu. 
+
+## Acknowledgments
+
+The codebase builds upon [LESS](https://github.com/princeton-nlp/LESS). 

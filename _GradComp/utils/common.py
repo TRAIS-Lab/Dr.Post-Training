@@ -3,7 +3,6 @@ Common utility functions for gradient computation and influence attribution.
 """
 
 import torch
-import numpy as np
 import logging
 from typing import Dict, List, Optional
 
@@ -108,17 +107,16 @@ def get_parameter_chunk_sizes(
     param_shape_list: List,
     batch_size: int,
 ) -> tuple[int, List[int]]:
-    """
-    Compute chunk size information from feature to be projected.
+    """Compute chunk size information from feature to be projected.
 
     Get a tuple containing max chunk size and a list of the number of
     parameters in each chunk.
 
     Args:
-        param_shape_list: A list of numbers indicating the total number of
+        param_shape_list (List): A list of numbers indicating the total number of
             features to be projected. A typical example is a list of parameter
             size of each module in a torch.nn.Module model.
-        batch_size: The batch size. Each term (or module) in feature
+        batch_size (int): The batch size. Each term (or module) in feature
             will have the same batch size.
 
     Returns:
@@ -126,14 +124,40 @@ def get_parameter_chunk_sizes(
             - Maximum number of parameters per chunk
             - A list of the number of parameters in each chunk
     """
-    # get the number of total params
-    param_num = param_shape_list[0]
+    param_shapes = torch.tensor(param_shape_list, dtype=torch.int64)
 
-    max_chunk_size = np.iinfo(np.uint32).max // batch_size
+    max_chunk_size = torch.iinfo(torch.int32).max // (batch_size * 8)
 
-    num_chunk = param_num // max_chunk_size
-    remaining = param_num % max_chunk_size
-    params_per_chunk = [max_chunk_size] * num_chunk + [remaining] if remaining > 0 else [max_chunk_size] * num_chunk
+    params_per_chunk = []
+    chunk_sum = 0
+
+    for ps in param_shapes:
+        # If adding the current param exceeds the max size,
+        # finalize the current chunk (if not empty) and start a new one.
+
+        current_ps = ps
+
+        if chunk_sum + current_ps >= max_chunk_size:
+            if chunk_sum > 0:
+                params_per_chunk.append(chunk_sum)
+            chunk_sum = 0  # Reset for new chunk
+
+        # Handle the case where a single param layer is
+        # larger than the max_chunk_size by splitting it.
+        while current_ps >= max_chunk_size:
+            params_per_chunk.append(max_chunk_size)
+            current_ps -= max_chunk_size
+
+        # Add the (remainder of) the current param to the chunk
+        chunk_sum += current_ps
+
+    # Add the final chunk if it has any params
+    if chunk_sum > 0:
+        params_per_chunk.append(chunk_sum)
+
+    # Handle edge case of no params
+    if not params_per_chunk:
+        params_per_chunk = [0]
 
     return max_chunk_size, params_per_chunk
 

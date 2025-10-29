@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from typing import Dict, List, Union, Optional
 
-import numpy as np
 import torch
 from torch import Tensor
 
@@ -263,6 +262,7 @@ class CudaProjector(AbstractProjector):
         max_batch_size: int,
         method: str,
         active_indices: Optional[Tensor] = None,
+        dtype: torch.dtype = torch.float32,
         pre_compute: bool = False,
     ) -> None:
         """Initializes hyperparameters for CudaProjector.
@@ -290,6 +290,7 @@ class CudaProjector(AbstractProjector):
         """
         super().__init__(feature_dim, proj_dim, seed, proj_type, device)
         self.max_batch_size = max_batch_size
+        self.dtype = dtype
 
         if active_indices is None:
             active_indices = torch.arange(feature_dim, device=device)
@@ -352,6 +353,7 @@ class CudaProjector(AbstractProjector):
                     active_dim,
                     proj_dim,
                     device=device,
+                    dtype=self.dtype,
                 )
                 torch.manual_seed(self.seed)
                 self.proj_matrix.bernoulli_(p=0.5)
@@ -365,7 +367,7 @@ class CudaProjector(AbstractProjector):
                     active_dim,
                     proj_dim,
                     device=device,
-                    # dtype=torch.bfloat16 #Add
+                    dtype=self.dtype
                 )
         elif self.method == "RandomMask":
             if self.active_indices.numel() > proj_dim:
@@ -401,6 +403,8 @@ class CudaProjector(AbstractProjector):
             features = vectorize(features, device=self.device)
         elif features.device.type != self.device:
             features = features.to(self.device)
+        if features.dtype != self.dtype:
+            features = features.to(self.dtype)
         batch_size = features.shape[0]
 
         effective_batch_size = 32
@@ -468,6 +472,7 @@ class CudaProjector(AbstractProjector):
                     active_dim,
                     self.proj_dim,
                     device=self.device,
+                    dtype=self.dtype,
                 )
                 torch.manual_seed(self.seed)
                 proj_matrix.bernoulli_(p=0.5)
@@ -486,7 +491,7 @@ class CudaProjector(AbstractProjector):
                     active_dim,
                     self.proj_dim,
                     device=self.device,
-                    # dtype=torch.bfloat16 #Add
+                    dtype=self.dtype,
                 )
 
             features = features[:, self.active_indices]
@@ -727,8 +732,28 @@ def make_random_projector(
         RuntimeError: Too many resources requested for launch CUDA. Try reduce
             proj_max_batch_size.
     """
+    if use_half_precision:
+        if device.type == "cpu":
+            if torch.cuda.is_bf16_supported():
+                dtype = torch.bfloat16
+            else:
+                msg = "BFloat16 is not supported on CPU.\
+                    Please set `use_half_precision=False`."
+                raise RuntimeError(msg)
+        elif torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        elif proj_type == ProjectionType.sjlt:
+            msg = f"BFloat16 is not supported on CUDA device {device}. \
+                SJLT projection requires BFloat16. Please switch to a \
+                CUDA device that supports BFloat16 or set \
+                `proj_type` to 'rademacher' or 'normal'."
+            raise RuntimeError(msg)
+        else:
+            dtype = torch.float16
+    else:
+        dtype = torch.float32
+
     using_cuda_projector = False
-    dtype = torch.float16 if use_half_precision else torch.float32
     # the total feature dim
     feature_dim = sum(param_shape_list)
     if device == "cpu":
@@ -777,13 +802,19 @@ def make_random_projector(
             proj_max_batch_size,
         )
         if len(param_chunk_sizes) > 1:  # we have to use the ChunkedCudaProjector
-            rng = np.random.default_rng(proj_seed)
-            # different seeds for each chunk
-            seeds = rng.integers(
+            # different seeds for each chunk using PyTorch
+            generator = torch.Generator(device=device)
+            generator.manual_seed(proj_seed)
+
+            # Generate seeds using torch.randint
+            seeds = torch.randint(
                 low=0,
                 high=500,
-                size=len(param_chunk_sizes),
-            )
+                size=(len(param_chunk_sizes),),
+                generator=generator,
+                dtype=torch.int64,
+                device=device,
+            ).tolist()  # Convert to list for indexing
             projector_per_chunk = [
                 projector(
                     feature_dim=chunk_size,
@@ -819,6 +850,7 @@ def make_random_projector(
             method=method,
             active_indices=active_indices,
             pre_compute=pre_compute,
+            dtype=dtype,
         )
     elif projector == BasicProjector:
         assigned_projector = projector(
@@ -874,6 +906,10 @@ def random_project(
     Returns:
         A function that takes projects feature to a smaller dimension.
     """
+    # convert device to torch.device if needed
+    if isinstance(device, str):
+        device = torch.device(device)
+
     # check the type of feature
     if isinstance(feature, dict):
         param_shape_list = [

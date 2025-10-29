@@ -86,12 +86,18 @@ class HookManager:
         # Create mapping from layer name to index for O(1) lookups
         self.layer_name_to_idx = {name: idx for idx, name in enumerate(layer_names)}
 
+        # Create mapping from layer name to module for O(1) lookups
+        self.layer_name_to_module = {}
+
         self.forward_hooks = [None] * len(layer_names)
         self.backward_hooks = [None] * len(layer_names)
         self.compressed_grads = [None] * len(layer_names)
         self.inputs = [None] * len(layer_names)
         self.pre_activations = [None] * len(layer_names)
         self.normalized = [None] * len(layer_names)
+
+        # Initialize sparsifiers and projectors (to avoid AttributeError when not set)
+        self.sparsifiers = [None] * len(layer_names)
         self.projectors = [None] * len(layer_names)
 
         # Profiling stats
@@ -103,20 +109,22 @@ class HookManager:
         logger.info(f"Initialized HookManager with {len(layer_names)} layer hooks")
 
     def _register_hooks(self):
-        """Register forward and backward hooks to target layers"""
+        """Register forward hooks to target layers (backward hooks are registered dynamically via tensors)"""
         for name, module in self.model.named_modules():
             if name in self.layer_names:
                 idx = self.layer_name_to_idx[name]
 
+                # Cache the module for efficient lookup later
+                self.layer_name_to_module[name] = module
+
                 # Use functools.partial to correctly bind parameters to avoid late binding issues
                 forward_hook = functools.partial(self._forward_hook_fn, name)
-                backward_hook = functools.partial(self._backward_hook_fn, name)
 
-                # Register hooks with properly bound parameters
+                # Register only forward hook - backward hooks are registered dynamically on tensors
+                # to avoid BackwardHookFunction wrapper issues with in-place operations
                 self.forward_hooks[idx] = module.register_forward_hook(forward_hook)
-                self.backward_hooks[idx] = module.register_full_backward_hook(backward_hook)
 
-                logger.debug(f"Registered hooks for layer: {name}")
+                logger.debug(f"Registered forward hook for layer: {name} (module type: {type(module).__name__})")
 
     def set_sparsifiers(self, sparsifiers: List[Any]) -> None:
         """
@@ -156,7 +164,7 @@ class HookManager:
         """
         return self.compression_time
 
-    def _forward_hook_fn(self, name: str, mod: nn.Module, inp: Any, out: Any) -> None:
+    def _forward_hook_fn(self, name: str, mod: nn.Module, inp: Any, out: Any) -> Any:
         """
         Forward hook function that captures inputs and pre-activations
 
@@ -165,6 +173,9 @@ class HookManager:
             mod: Module instance
             inp: Input tensors
             out: Output tensors
+
+        Returns:
+            The output (potentially cloned to avoid in-place modification issues)
         """
         # Get the index for this layer
         idx = self.layer_name_to_idx[name]
@@ -175,8 +186,17 @@ class HookManager:
         else:
             self.inputs[idx] = inp.detach()
 
-        # Store pre-activation (output)
-        self.pre_activations[idx] = out.detach()
+        # Store pre-activation (output) - clone to avoid view issues
+        if isinstance(out, tuple):
+            self.pre_activations[idx] = tuple(o.detach() if isinstance(o, torch.Tensor) else o for o in out)
+            # Register tensor hook on the first tensor output to avoid BackwardHookFunction issues
+            if len(out) > 0 and isinstance(out[0], torch.Tensor) and out[0].requires_grad:
+                out[0].register_hook(lambda grad, n=name: self._tensor_backward_hook(n, grad))
+        else:
+            self.pre_activations[idx] = out.detach()
+            # Register tensor hook to avoid BackwardHookFunction issues with in-place ops
+            if isinstance(out, torch.Tensor) and out.requires_grad:
+                out.register_hook(lambda grad, n=name: self._tensor_backward_hook(n, grad))
 
         # For LayerNorm, also capture the normalized tensor
         if isinstance(mod, nn.LayerNorm):
@@ -185,6 +205,46 @@ class HookManager:
             var = x.var(dim=-1, keepdim=True, unbiased=False)
             normalized = (x - mean) / torch.sqrt(var + mod.eps)
             self.normalized[idx] = normalized.detach()
+
+        # Return None to not modify the output
+        return None
+
+    def _tensor_backward_hook(self, name: str, grad_output: Tensor) -> None:
+        """
+        Tensor-level backward hook that computes projected gradients.
+        This is called during backward pass on the output tensor of a layer.
+
+        Args:
+            name: Layer name
+            grad_output: Gradient w.r.t the output tensor
+        """
+        # Get the module and index for this layer
+        idx = self.layer_name_to_idx[name]
+        mod = self.layer_name_to_module.get(name)
+
+        if mod is None:
+            return
+
+        # Calculate the projected gradient based on layer type
+        with torch.no_grad():
+            if isinstance(mod, nn.Linear):
+                grad = self._linear_grad(
+                    mod, idx, grad_output, per_sample=True
+                )
+            elif isinstance(mod, nn.LayerNorm):
+                grad = self._layernorm_grad(
+                    mod, idx, grad_output, per_sample=True
+                )
+            elif isinstance(mod, nn.Embedding):
+                # Embeddings would need their own implementation
+                grad = None
+            else:
+                # Fallback for other layer types
+                grad = None
+
+            if grad is not None:
+                # Store the projected gradient
+                self.compressed_grads[idx] = grad.detach()
 
     def _backward_hook_fn(self, name: str, mod: nn.Module, grad_input: Any, grad_output: Any) -> None:
         """
