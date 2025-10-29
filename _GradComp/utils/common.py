@@ -10,47 +10,39 @@ from typing import Dict, List, Optional
 # Configure logger
 logger = logging.getLogger(__name__)
 
-
 def stable_inverse(matrix: torch.Tensor, damping: float = None) -> torch.Tensor:
     """
-    Fast stable inverse using progressive Cholesky decomposition.
+    Compute a numerically stable inverse of a matrix using eigendecomposition.
+
+    Args:
+        matrix: Input matrix to invert
+        damping: (Adaptive) Damping factor for numerical stability
+
+    Returns:
+        Stable inverse of the input matrix with the same dtype as input
     """
     orig_dtype = matrix.dtype
-    matrix = matrix.to(dtype=torch.float64)
+    matrix = matrix.to(dtype=torch.float32)
 
-    # Quick heuristic for initial damping based on diagonal
+    assert matrix.dim() == 2, "Input must be a 2D matrix"
+
+    # Add damping to the diagonal
     if damping is None:
-        diag_mean = torch.diag(matrix).mean()
-        diag_max = torch.diag(matrix).max()
-        # Start with conservative damping
-        initial_damping = max(1e-6 * diag_max, 1e-8)
+        damping = 1e-5 * torch.trace(matrix) / matrix.size(0)
     else:
-        initial_damping = damping
+        damping = damping * torch.trace(matrix) / matrix.size(0)
 
-    # Progressive Cholesky with increasing regularization
-    damping_factors = [initial_damping, initial_damping * 10, initial_damping * 100,
-                      initial_damping * 1000, initial_damping * 10000]
+    damped_matrix = matrix + damping * torch.eye(matrix.size(0), device=matrix.device)
 
-    for i, current_damping in enumerate(damping_factors):
-        damped_matrix = matrix + current_damping * torch.eye(matrix.size(0), device=matrix.device)
+    try:
+        L = torch.linalg.cholesky(damped_matrix)
+        inverse = torch.cholesky_inverse(L)
+    except RuntimeError:
+        logger.warning(f"Falling back to direct inverse due to Cholesky failure")
+        inverse = torch.inverse(damped_matrix)
 
-        try:
-            L = torch.linalg.cholesky(damped_matrix)
-            inverse = torch.cholesky_inverse(L)
-            return inverse.to(dtype=orig_dtype)
+    return inverse.to(dtype=orig_dtype)
 
-        except RuntimeError:
-            if i == len(damping_factors) - 1:
-                # Last resort: SVD, but only if all Cholesky attempts failed
-                logger.warning("All Cholesky attempts failed, falling back to SVD")
-                U, S, Vh = torch.linalg.svd(damped_matrix)
-                S_thresh = torch.clamp(S, min=current_damping)
-                inverse = torch.matmul(Vh.t(), torch.matmul(torch.diag(1.0 / S_thresh), U.t()))
-                return inverse.to(dtype=orig_dtype)
-            continue
-
-    # Should never reach here
-    raise RuntimeError("All inversion methods failed")
 
 def vectorize(
     g: Dict[str, torch.Tensor],

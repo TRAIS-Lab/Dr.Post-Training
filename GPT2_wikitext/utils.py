@@ -134,6 +134,6 @@ def result_filename(args):
         projection_name = "NA"
 
     training_setting = args.output_dir.split("/")[-1]
-    result_filename = f"./results/{training_setting}/{args.baseline}/{args.tda}/{args.layer}/{sparsification_name}->{projection_name}.pt"
+    result_filename = f"./results/{training_setting}/{args.baseline}/{args.tda}/{args.layer_type}/{sparsification_name}->{projection_name}.pt"
 
     return result_filename

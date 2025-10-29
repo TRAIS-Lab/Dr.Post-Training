@@ -56,7 +56,11 @@ from transformers import (
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
-from utils import SubsetSampler, replace_conv1d_modules
+from utils import SubsetSampler, replace_conv1d_modules, setup_compression_kwargs
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from _GradComp.core.hook import HookManager
+from _GradComp.projection.projector import setup_model_compressors
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -246,6 +250,41 @@ def parse_args():
         default=1.0,
         help="The ratio used for model training.",
     )
+    parser.add_argument(
+        "--enable_data_selection",
+        action="store_true",
+        help="Enable online data selection using gradient-dot product.",
+    )
+    parser.add_argument(
+        "--selection_top_k",
+        type=int,
+        default=None,
+        help="Number of top samples to select based on gradient similarity. If not specified, uses half of batch size.",
+    )
+    parser.add_argument(
+        "--layer_type",
+        type=str,
+        default="Linear",
+        help="Type of layers to hook for gradient computation (e.g., 'Linear', 'LayerNorm'). Default: 'Linear'",
+    )
+    parser.add_argument(
+        "--projection",
+        type=str,
+        default=None,
+        help="The projection method for gradient compression. Format: 'method-dim' (e.g., 'SJLT-4096') or 'method-dim*dim' for factorized (e.g., 'Random-64*64').",
+    )
+    parser.add_argument(
+        "--sparsification",
+        type=str,
+        default=None,
+        help="The sparsification method for gradient compression. Format: 'method-dim' (e.g., 'Random-128') or 'method-dim*dim' for factorized (e.g., 'SelectiveMask-128*128').",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Device to be used for training (e.g., 'cuda', 'cuda:0', 'cpu'). Default: 'cuda'",
+    )
     args = parser.parse_args()
 
     # Sanity checks
@@ -270,6 +309,22 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.device.startswith("cuda"):
+        # Check if GPU is available
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA is not available. Please check your CUDA installation.")
+        device = torch.device(args.device)
+        # Set the default CUDA device
+        if ":" in args.device:
+            device_id = int(args.device.split(":")[1])
+            torch.cuda.set_device(device_id)
+        else:
+            torch.cuda.set_device(0)  # Default to GPU 0
+    else:
+        assert args.device == "cpu", "Invalid device. Choose from 'cuda', 'cuda:X', or 'cpu'."
+        device = torch.device("cpu")
+
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
@@ -427,7 +482,7 @@ def main():
         model = AutoModelForCausalLM.from_config(config, trust_remote_code=args.trust_remote_code)
 
     # Replace Conv1D modules for GPT2 specifically when online training is enabled (for influence function calculation)
-    if args.track_influence and args.model_name_or_path == "openai-community/gpt2":
+    if args.model_name_or_path == "openai-community/gpt2":
         model = replace_conv1d_modules(model)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
@@ -435,6 +490,39 @@ def main():
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
+
+    # Set up gradient hooks for online data selection
+    hook_manager = None
+    layer_names = []  # Initialize outside the if block for later use
+    if args.enable_data_selection:
+        from torch import nn
+        # Find all layers of the specified type
+        layer_type_map = {
+            "Linear": nn.Linear,
+            "LayerNorm": nn.LayerNorm,
+            "Embedding": nn.Embedding,
+        }
+        target_layer_type = layer_type_map.get(args.layer_type, nn.Linear)
+
+        for name, module in model.named_modules():
+            if isinstance(module, target_layer_type):
+                layer_names.append(name)
+
+        logger.info(f"Found {len(layer_names)} layers of type {args.layer_type} for gradient hooks")
+        if len(layer_names) == 0:
+            raise ValueError(f"No layers of type {args.layer_type} found in the model")
+
+        hook_manager = HookManager(
+            model=model,
+            layer_names=layer_names,
+            profile=False,
+            device=device
+        )
+
+        # Set default top_k if not specified
+        if args.selection_top_k is None:
+            args.selection_top_k = args.per_device_train_batch_size // 2
+            logger.info(f"Using default top_k = {args.selection_top_k} (half of batch size)")
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -503,12 +591,27 @@ def main():
         )
 
     train_dataset = lm_datasets["train"]
-    eval_dataset = lm_datasets["validation"]
+    full_eval_dataset = lm_datasets["validation"]
+
+    # Split the validation set into validation (for data selection) and test (for evaluation)
+    # Use 50% for validation and 50% for test to prevent data leakage
+    val_test_split = int(len(full_eval_dataset) * 0.5)
+    val_dataset = full_eval_dataset.select(range(val_test_split))
+    eval_dataset = full_eval_dataset.select(range(val_test_split, len(full_eval_dataset)))
+
+    # train_dataset = lm_datasets["train"]
+    # val_dataset = lm_datasets["validation"]
+    # eval_dataset = lm_datasets["evaluation"]
+
 
     # crop the data to subset
     if args.subset_ratio < 1:
         train_index = random.sample(range(len(train_dataset)), int(args.subset_ratio * len(train_dataset)))
         train_sampler = SubsetSampler(train_index)
+    else:
+        train_index = list(range(len(train_dataset)))
+        train_sampler = None
+
 
     # Log a few random samples from the training set:
     # for index in random.sample(range(len(train_dataset)), 3):
@@ -516,11 +619,15 @@ def main():
 
     # Dataset length
     logger.info(f"The training dataset length: {len(train_dataset)}.")
-    logger.info(f"The eval dataset length: {len(eval_dataset)}.")
+    logger.info(f"The validation dataset length: {len(val_dataset)}.")
+    logger.info(f"The eval (test) dataset length: {len(eval_dataset)}.")
 
     # DataLoaders creation:
     train_dataloader = DataLoader(
         train_dataset, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size, sampler=train_sampler
+    )
+    val_dataloader = DataLoader(
+        val_dataset, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size
     )
     eval_dataloader = DataLoader(
         eval_dataset, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size
@@ -558,9 +665,35 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, val_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader, eval_dataloader, lr_scheduler
     )
+
+    # Update hook manager device and setup compression after accelerator preparation
+    if hook_manager is not None:
+        # Setup compression kwargs using the specified device
+        sparsifier_kwargs, projector_kwargs = setup_compression_kwargs(args, device)
+
+        logger.info(f"Setting up compressors on device {device}: sparsifier={sparsifier_kwargs}, projector={projector_kwargs}")
+
+        # Setup projectors and sparsifiers
+        sparsifiers, projectors = setup_model_compressors(
+            model=accelerator.unwrap_model(model),  # Use unwrapped model
+            layer_names=layer_names,
+            sparsifier_kwargs=sparsifier_kwargs,
+            projector_kwargs=projector_kwargs,
+            train_dataloader=train_dataloader,
+            setting="GPT2_wikitext",
+            device=device
+        )
+
+        # Set projectors and sparsifiers on hook manager
+        if sparsifiers:
+            hook_manager.set_sparsifiers(sparsifiers)
+            logger.info(f"Set {len(sparsifiers)} sparsifiers on hook manager")
+        if projectors:
+            hook_manager.set_projectors(projectors)
+            logger.info(f"Set {len(projectors)} projectors on hook manager")
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
     # if accelerator.distributed_type == DistributedType.TPU: # Error due to accelerator version
@@ -642,17 +775,80 @@ def main():
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
+
+        # Create iterator for validation dataloader for online data selection
+        if args.enable_data_selection:
+            val_iter = iter(val_dataloader)
+
         for step, batch in enumerate(active_dataloader):
-            with accelerator.accumulate(model):
-                outputs = model(**batch)
-                loss = outputs.loss
-                # We keep track of the loss at each epoch
-                if args.with_tracking:
-                    total_loss += loss.detach().float()
-                accelerator.backward(loss)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+            if args.enable_data_selection:
+                # Step 1: Get validation batch
+                try:
+                    val_batch = next(val_iter)
+                except StopIteration:
+                    # Reset validation iterator if we run out of batches
+                    val_iter = iter(val_dataloader)
+                    val_batch = next(val_iter)
+
+                # Step 2: Compute validation gradients
+                model.zero_grad()
+                val_outputs = model(**val_batch)
+                val_loss = val_outputs.loss
+                accelerator.backward(val_loss)
+
+                # Get validation gradients
+                val_grads = hook_manager.get_compressed_grads()
+                # Concatenate gradients from all layers: each is [batch_size, grad_dim_per_layer]
+                val_grads_concat = torch.cat([g for g in val_grads if g is not None], dim=1)  # [val_batch_size, total_grad_dim]
+                # Average over validation batch
+                val_grad_avg = val_grads_concat.mean(dim=0, keepdim=True)  # [1, total_grad_dim]
+
+                # Step 3: Compute training gradients for current batch
+                model.zero_grad()
+                train_outputs = model(**batch)
+                train_loss = train_outputs.loss
+                accelerator.backward(train_loss)
+
+                # Get training gradients
+                train_grads = hook_manager.get_compressed_grads()
+                # Concatenate gradients from all layers
+                train_grads_concat = torch.cat([g for g in train_grads if g is not None], dim=1)  # [train_batch_size, total_grad_dim]
+
+                # Step 4: Compute inner product (gradient similarity)
+                # Shape: [train_batch_size, total_grad_dim] x [total_grad_dim, 1] -> [train_batch_size]
+                similarity_scores = torch.matmul(train_grads_concat, val_grad_avg.t()).squeeze(-1)
+
+                # Step 5: Select top-k training samples
+                top_k = min(args.selection_top_k, similarity_scores.shape[0])
+                _, top_indices = torch.topk(similarity_scores, top_k, largest=True)
+
+                # Step 6: Create selected batch
+                selected_batch = {k: v[top_indices] for k, v in batch.items()}
+
+                # Step 7: Train on selected samples
+                with accelerator.accumulate(model):
+                    model.zero_grad()
+                    outputs = model(**selected_batch)
+                    loss = outputs.loss
+                    # We keep track of the loss at each epoch
+                    if args.with_tracking:
+                        total_loss += loss.detach().float()
+                    accelerator.backward(loss)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+            else:
+                # Original training loop without data selection
+                with accelerator.accumulate(model):
+                    outputs = model(**batch)
+                    loss = outputs.loss
+                    # We keep track of the loss at each epoch
+                    if args.with_tracking:
+                        total_loss += loss.detach().float()
+                    accelerator.backward(loss)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:

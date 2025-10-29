@@ -17,7 +17,7 @@ class MetadataManager:
     Manager for batch metadata with master worker coordination.
     """
 
-    def __init__(self, cache_dir: str, layer_names: List[str], resume: bool = False):
+    def __init__(self, cache_dir: str, layer_names: List[str]):
         """
         Initialize the metadata manager.
 
@@ -38,8 +38,7 @@ class MetadataManager:
 
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
-            if resume:
-                self._load_metadata_if_exists()
+            self._load_metadata_if_exists()
 
         logger.debug(f"Initialized MetadataManager with {len(layer_names)} layers")
 
@@ -78,31 +77,18 @@ class MetadataManager:
             logger.info("Dataset metadata already complete, skipping initialization")
             return
 
-        # Determine effective dataset size (accounting for samplers)
-        if train_dataloader.sampler is not None:
-            # Use sampler length if available
-            if hasattr(train_dataloader.sampler, '__len__'):
-                effective_dataset_size = len(train_dataloader.sampler)
-                logger.info(f"Using sampler-based dataset size: {effective_dataset_size}")
-            else:
-                # Fallback to dataset length
-                effective_dataset_size = len(train_dataloader.dataset) if hasattr(train_dataloader.dataset, '__len__') else None
-                logger.warning("Sampler doesn't support __len__, falling back to dataset length")
-        else:
-            # No sampler, use dataset length
-            effective_dataset_size = len(train_dataloader.dataset) if hasattr(train_dataloader.dataset, '__len__') else None
-
         # Compute complete batch structure
-        if effective_dataset_size is not None:
+        if hasattr(train_dataloader.dataset, '__len__'):
+            dataset_size = len(train_dataloader.dataset)
             current_sample_idx = 0
 
             for batch_idx in range(total_batches):
                 start_idx = batch_idx * batch_size
                 # Handle last batch which might be smaller
                 if batch_idx == total_batches - 1 and not getattr(train_dataloader, 'drop_last', False):
-                    actual_batch_size = effective_dataset_size - start_idx
+                    actual_batch_size = dataset_size - start_idx
                 else:
-                    actual_batch_size = min(batch_size, effective_dataset_size - start_idx)
+                    actual_batch_size = min(batch_size, dataset_size - start_idx)
 
                 self.batch_info[batch_idx] = {
                     "sample_count": actual_batch_size,
@@ -111,7 +97,7 @@ class MetadataManager:
                 current_sample_idx += actual_batch_size
         else:
             # Fallback: assume uniform batch sizes
-            logger.warning("Cannot determine dataset size, using uniform batch size assumption")
+            logger.warning("Dataset doesn't support __len__, using uniform batch size assumption")
             current_sample_idx = 0
             for batch_idx in range(total_batches):
                 self.batch_info[batch_idx] = {

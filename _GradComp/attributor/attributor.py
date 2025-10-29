@@ -361,23 +361,100 @@ class IFAttributor(BaseAttributor):
         else:
             return processing_info
 
+    @torch.no_grad()
+    def compute_self_attribution(self, worker: str = "0/1") -> Union[torch.Tensor, Tuple[torch.Tensor, ProfilingStats]]:
+        """Compute self-influence scores using tensor-based processing."""
+        logger.info(f"Worker {worker}: Computing self-influence scores")
+
+        if not self.metadata.batch_info:
+            logger.info("Loading batch information from metadata...")
+            self.metadata._load_metadata_if_exists()
+
+        if not self.metadata.batch_info:
+            raise ValueError("No batch information found.")
+
+        # Synchronize layer dimensions
+        self._sync_layer_dims()
+
+        if self.layer_dims is None:
+            raise ValueError("Layer dimensions not found. Ensure gradients have been computed and stored.")
+
+        # Make sure IFVP is computed
+        if not self.offload_manager.has_ifvp():
+            logger.info("IFVP not found, computing it now...")
+            self.compute_ifvp(worker=worker)
+
+        # Get batch mapping and worker range
+        batch_to_sample_mapping = self.metadata.get_batch_to_sample_mapping()
+        total_samples = self.metadata.get_total_samples()
+        self_influence = torch.zeros(total_samples, device="cpu")
+
+        # Get worker batch range
+        total_batches = len(self.full_train_dataloader)
+        start_batch, end_batch = get_worker_batch_range(total_batches, self.chunk_size, worker)
+
+        # Use tensor dataloaders for both gradients and IFVP
+        grad_dataloader = self.offload_manager.create_gradient_dataloader(
+            data_type="gradients",
+            batch_size=4,
+            pin_memory=True,
+            batch_range=(start_batch, end_batch)
+        )
+
+        ifvp_dataloader = self.offload_manager.create_gradient_dataloader(
+            data_type="ifvp",
+            batch_size=4,
+            pin_memory=True,
+            batch_range=(start_batch, end_batch)
+        )
+
+        if grad_dataloader and ifvp_dataloader:
+            # Process in parallel
+            for (grad_tensor, grad_mapping), (ifvp_tensor, ifvp_mapping) in tqdm(
+                zip(grad_dataloader, ifvp_dataloader),
+                desc="Computing self-influence",
+                total=len(grad_dataloader)
+            ):
+                # Move to device
+                grad_tensor = self.offload_manager.move_to_device(grad_tensor)
+                ifvp_tensor = self.offload_manager.move_to_device(ifvp_tensor)
+
+                # Process each batch
+                for batch_idx in grad_mapping:
+                    if batch_idx not in batch_to_sample_mapping or batch_idx not in ifvp_mapping:
+                        continue
+
+                    sample_start, sample_end = batch_to_sample_mapping[batch_idx]
+
+                    # Extract batch slices
+                    grad_start, grad_end = grad_mapping[batch_idx]
+                    ifvp_start, ifvp_end = ifvp_mapping[batch_idx]
+
+                    batch_grad = grad_tensor[grad_start:grad_end]
+                    batch_ifvp = ifvp_tensor[ifvp_start:ifvp_end]
+
+                    # Compute dot product
+                    batch_influence = torch.sum(batch_grad * batch_ifvp, dim=1).cpu()
+                    self_influence[sample_start:sample_end] = batch_influence
+
+                # del grad_tensor, ifvp_tensor
+                torch.cuda.empty_cache()
+
+        if self.profile and self.profiling_stats:
+            return (self_influence, self.profiling_stats)
+        else:
+            return self_influence
+
     def attribute(
         self,
         test_dataloader: 'DataLoader',
         train_dataloader: Optional['DataLoader'] = None,
-        use_cached_ifvp: bool = True,
-        cosine: bool = False
+        use_cached_ifvp: bool = True
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ProfilingStats]]:
         """
         Attribute influence using efficient single-pass tensor-based processing.
-
-        Args:
-            test_dataloader: DataLoader for test data
-            train_dataloader: Optional DataLoader for training data
-            use_cached_ifvp: Whether to use cached IFVP
-            cosine: If True, use cosine similarity instead of dot product
         """
-        logger.info(f"Computing influence attribution (cosine similarity: {cosine})")
+        logger.info("Computing influence attribution")
 
         # Load batch information if needed
         if not self.metadata.batch_info:
@@ -470,20 +547,9 @@ class IFAttributor(BaseAttributor):
                 # Move test batch to device
                 test_batch_device = self.offload_manager.move_to_device(test_batch)
 
-                if cosine:
-                    # Normalize both tensors for cosine similarity
-                    # Add small epsilon to avoid division by zero
-                    eps = 1e-8
-                    chunk_tensor_normalized = torch.nn.functional.normalize(chunk_tensor_device, p=2, dim=-1, eps=eps)
-                    test_batch_normalized = torch.nn.functional.normalize(test_batch_device, p=2, dim=-1, eps=eps)
-
-                    # Cosine similarity computation
-                    # Shape: (chunk_samples, proj_dim) @ (proj_dim, test_batch_samples) -> (chunk_samples, test_batch_samples)
-                    chunk_scores = torch.matmul(chunk_tensor_normalized, test_batch_normalized.t())
-                else:
-                    # Standard dot product computation
-                    # Shape: (chunk_samples, proj_dim) @ (proj_dim, test_batch_samples) -> (chunk_samples, test_batch_samples)
-                    chunk_scores = torch.matmul(chunk_tensor_device, test_batch_device.t())
+                # Efficient batched matrix multiplication for this (train_chunk, test_batch) pair
+                # Shape: (chunk_samples, proj_dim) @ (proj_dim, test_batch_samples) -> (chunk_samples, test_batch_samples)
+                chunk_scores = torch.matmul(chunk_tensor_device, test_batch_device.t())
 
                 # Map chunk results back to global sample indices
                 for batch_idx, (start_row, end_row) in batch_mapping.items():

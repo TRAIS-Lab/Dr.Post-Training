@@ -24,8 +24,6 @@ from ..utils.worker import get_worker_batch_range, create_worker_dataloader
 import logging
 logger = logging.getLogger(__name__)
 
-torch.set_float32_matmul_precision('high')
-
 HessianOptions = Literal["none", "raw", "kfac", "ekfac"]
 
 @dataclass
@@ -63,8 +61,6 @@ class BaseAttributor(ABC):
         offload: OffloadOptions = "none",
         cache_dir: Optional[str] = None,
         chunk_size: int = 16,
-        resume: bool = False,
-        use_sft_loss: bool = False,  # NEW: Flag for SFT loss computation
     ) -> None:
         self.setting = setting
         self.model = model
@@ -82,7 +78,6 @@ class BaseAttributor(ABC):
         self.projector_kwargs = projector_kwargs or {}
         self.offload = offload
         self.chunk_size = chunk_size
-        self.use_sft_loss = use_sft_loss
 
         # Create appropriate offload strategy
         self.offload_manager = create_offload_manager(
@@ -94,7 +89,7 @@ class BaseAttributor(ABC):
         )
 
         # Initialize metadata manager
-        self.metadata = MetadataManager(cache_dir or ".", self.layer_names, resume=resume)
+        self.metadata = MetadataManager(cache_dir or ".", self.layer_names)
 
         self.full_train_dataloader: Optional['DataLoader'] = None
         self.hook_manager: Optional[HookManager] = None
@@ -222,29 +217,19 @@ class BaseAttributor(ABC):
             self.model.zero_grad()
 
             # Prepare inputs
-            if isinstance(batch, torch.Tensor):
-                inputs = batch.to(self.device)
-                batch_size = batch.shape[0]
-            else:
+            if isinstance(batch, dict):
                 inputs = {k: v.to(self.device) for k, v in batch.items()}
                 batch_size = next(iter(batch.values())).shape[0]
-            # if isinstance(batch, torch.Tensor):
-            #     inputs = batch[0].to(self.device)
-            #     batch_size = batch[0].shape[0]
-            # else:
-            #     inputs = {k: v.to(self.device) for k, v in batch.items()}
-            #     batch_size = next(iter(batch.values())).shape[0]
+            else:
+                inputs = batch[0].to(self.device)
+                batch_size = batch[0].shape[0]
 
             batch_sample_counts.append(batch_size)
 
             # Forward and backward
-            outputs = self.model(inputs) if isinstance(inputs, torch.Tensor) else self.model(**inputs)
-            if self.use_sft_loss:
-                loss = outputs.loss
-            else:
-                logp = -outputs.loss
-                loss = logp - torch.log(1 - torch.exp(logp))
-
+            outputs = self.model(**inputs) if isinstance(inputs, dict) else self.model(inputs)
+            logp = -outputs.loss
+            loss = logp - torch.log(1 - torch.exp(logp))
             loss.backward()
 
             # Get compressed gradients
@@ -382,154 +367,6 @@ class BaseAttributor(ABC):
         else:
             return processing_info
 
-    @torch.no_grad()
-    def compute_self_attribution(self) -> Union[torch.Tensor, Tuple[torch.Tensor, ProfilingStats]]:
-        """
-        Compute self-influence scores using tensor-based processing.
-
-        Returns:
-            Tensor of shape (n_train, 1) containing self-influence scores
-        """
-        logger.info("Computing self-influence scores")
-
-        # Load batch information if needed
-        if not self.metadata.batch_info:
-            logger.info("Loading batch information from metadata...")
-            self.metadata._load_metadata_if_exists()
-
-        if not self.metadata.batch_info:
-            raise ValueError("No batch information found. Call cache_gradients first.")
-
-        # Synchronize layer dimensions
-        self._sync_layer_dims()
-
-        if self.layer_dims is None:
-            raise ValueError("Layer dimensions not found. Ensure gradients have been computed and stored.")
-
-        # Ensure iFVP is computed
-        if not self.offload_manager.has_ifvp():
-            logger.info("iFVP not found, computing it now...")
-            self.compute_ifvp()
-
-        # Get batch mapping and total samples
-        batch_to_sample_mapping = self.metadata.get_batch_to_sample_mapping()
-        total_samples = self.metadata.get_total_samples()
-
-        # Initialize result tensor
-        self_influence = torch.zeros(total_samples, 1, device="cpu")
-
-        # Start profiling
-        if self.profile and self.profiling_stats:
-            torch.cuda.synchronize(self.device)
-            start_time = time.time()
-
-        # Create dataloaders for both gradients and iFVP
-        grad_dataloader = self.offload_manager.create_gradient_dataloader(
-            data_type="gradients",
-            batch_size=4,
-            pin_memory=True
-        )
-
-        ifvp_dataloader = self.offload_manager.create_gradient_dataloader(
-            data_type="ifvp",
-            batch_size=4,
-            pin_memory=True
-        )
-
-        if grad_dataloader and ifvp_dataloader:
-            logger.info("Processing gradients and iFVP simultaneously")
-
-            # Process both dataloaders in parallel
-            for (grad_tensor, grad_mapping), (ifvp_tensor, ifvp_mapping) in tqdm(
-                zip(grad_dataloader, ifvp_dataloader),
-                desc="Computing self-influence",
-                total=len(grad_dataloader)
-            ):
-                # Move tensors to device
-                grad_tensor = self.offload_manager.move_to_device(grad_tensor)
-                ifvp_tensor = self.offload_manager.move_to_device(ifvp_tensor)
-
-                # Process each batch in the chunk
-                for batch_idx in grad_mapping:
-                    if batch_idx not in batch_to_sample_mapping or batch_idx not in ifvp_mapping:
-                        continue
-
-                    # Get sample range for this batch
-                    sample_start, sample_end = batch_to_sample_mapping[batch_idx]
-
-                    # Extract batch slices
-                    grad_start, grad_end = grad_mapping[batch_idx]
-                    ifvp_start, ifvp_end = ifvp_mapping[batch_idx]
-
-                    batch_grad = grad_tensor[grad_start:grad_end]
-                    batch_ifvp = ifvp_tensor[ifvp_start:ifvp_end]
-
-                    # Compute element-wise dot products (self-influence scores)
-                    # Shape: (batch_size,) -> (batch_size, 1)
-                    batch_self_influence = torch.sum(batch_grad * batch_ifvp, dim=1, keepdim=True).cpu()
-
-                    # Store results
-                    self_influence[sample_start:sample_end] = batch_self_influence
-
-                # Clean up GPU memory
-                torch.cuda.empty_cache()
-
-        else:
-            logger.warning("Could not create tensor dataloaders, falling back to individual batch processing")
-
-            # Fallback: process each batch individually
-            for batch_idx in tqdm(batch_to_sample_mapping.keys(), desc="Computing self-influence (fallback)"):
-                # Load gradients and iFVP for this batch
-                batch_grads = self.offload_manager.retrieve_gradients(batch_idx)
-                batch_ifvp = self.offload_manager.retrieve_ifvp(batch_idx)
-
-                if batch_grads is None or batch_ifvp is None:
-                    continue
-
-                # Concatenate layer data
-                grad_features = []
-                ifvp_features = []
-
-                for layer_idx in range(len(self.layer_names)):
-                    if (layer_idx < len(batch_grads) and batch_grads[layer_idx] is not None and
-                        layer_idx < len(batch_ifvp) and batch_ifvp[layer_idx] is not None):
-                        grad_features.append(batch_grads[layer_idx])
-                        ifvp_features.append(batch_ifvp[layer_idx])
-                    else:
-                        # Handle missing data
-                        batch_size = batch_grads[0].shape[0] if batch_grads and batch_grads[0] is not None else 1
-                        layer_dim = self.layer_dims[layer_idx] if layer_idx < len(self.layer_dims) else 0
-                        grad_features.append(torch.zeros(batch_size, layer_dim))
-                        ifvp_features.append(torch.zeros(batch_size, layer_dim))
-
-                if grad_features and ifvp_features:
-                    batch_grad_tensor = torch.cat(grad_features, dim=1)
-                    batch_ifvp_tensor = torch.cat(ifvp_features, dim=1)
-
-                    # Move to device for computation
-                    batch_grad_tensor = self.offload_manager.move_to_device(batch_grad_tensor)
-                    batch_ifvp_tensor = self.offload_manager.move_to_device(batch_ifvp_tensor)
-
-                    # Compute self-influence scores
-                    batch_self_influence = torch.sum(batch_grad_tensor * batch_ifvp_tensor, dim=1, keepdim=True).cpu()
-
-                    # Store results
-                    sample_start, sample_end = batch_to_sample_mapping[batch_idx]
-                    self_influence[sample_start:sample_end] = batch_self_influence
-
-                    torch.cuda.empty_cache()
-
-        if self.profile and self.profiling_stats:
-            torch.cuda.synchronize(self.device)
-            self.profiling_stats.precondition += time.time() - start_time
-
-        logger.info(f"Self-influence computation completed. Result shape: {self_influence.shape}")
-
-        if self.profile and self.profiling_stats:
-            return (self_influence, self.profiling_stats)
-        else:
-            return self_influence
-
     @abstractmethod
     def compute_preconditioners(self, damping: Optional[float] = None) -> Union[ProcessingInfo, Tuple[ProcessingInfo, ProfilingStats]]:
         """Compute and store preconditioners from gradients."""
@@ -538,6 +375,11 @@ class BaseAttributor(ABC):
     @abstractmethod
     def compute_ifvp(self, worker: str = "0/1") -> Union[ProcessingInfo, Tuple[ProcessingInfo, ProfilingStats]]:
         """Compute and store IFVP."""
+        pass
+
+    @abstractmethod
+    def compute_self_attribution(self, worker: str = "0/1") -> Union[torch.Tensor, Tuple[torch.Tensor, ProfilingStats]]:
+        """Compute self-influence scores."""
         pass
 
     @abstractmethod

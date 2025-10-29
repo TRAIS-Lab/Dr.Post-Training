@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple
 import logging
 
 if TYPE_CHECKING:
@@ -367,7 +367,7 @@ class CudaProjector(AbstractProjector):
                     device=device,
                     # dtype=torch.bfloat16 #Add
                 )
-        elif self.method == "Random":
+        elif self.method == "RandomMask":
             if self.active_indices.numel() > proj_dim:
                 torch.manual_seed(self.seed)
                 indices = torch.randperm(self.active_indices.numel())[:proj_dim]
@@ -491,8 +491,13 @@ class CudaProjector(AbstractProjector):
 
             features = features[:, self.active_indices]
             result = features @ proj_matrix / (self.proj_dim ** 0.5)
-        elif self.method == "Random":
+        elif self.method == "RandomMask":
             features = features[:, self.active_indices]
+            result = features
+        elif self.method == "SelectiveMask":
+            features = features[:, self.active_indices]
+            result = features
+        elif self.method == "Identity":
             result = features
 
         return result
@@ -758,6 +763,8 @@ def make_random_projector(
             proj_type = ProjectionType.rademacher
         elif method == "Gaussian":
             proj_type = ProjectionType.normal
+        elif method == "RandomMask" or method == "SelectiveMask" or method == "Identity":
+            proj_type = ProjectionType.identity
 
         projector = CudaProjector
         using_cuda_projector = True

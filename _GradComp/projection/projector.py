@@ -107,13 +107,12 @@ def setup_model_compressors(
     # Run a forward pass to initialize model
     logger.info("Running forward pass to initialize model for compressor setup")
     train_batch = next(iter(train_dataloader))
-
-    if isinstance(train_batch, torch.Tensor):
-        inputs = train_batch.to(device)
-        model(inputs)
-    else:
+    if isinstance(train_batch, dict):
         inputs = {k: v.to(device) for k, v in train_batch.items()}
         model(**inputs)
+    else:
+        inputs = train_batch[0].to(device)
+        model(inputs)
 
     # First, capture inputs and outputs for each layer
     layer_inputs = {}
@@ -131,7 +130,10 @@ def setup_model_compressors(
             hooks.append(hook)
 
     # Run another forward pass to capture inputs/outputs
-    model(inputs) if isinstance(inputs, torch.Tensor) else model(**inputs)
+    if isinstance(train_batch, dict):
+        model(**inputs)
+    else:
+        model(inputs)
 
     # Remove temporary hooks
     for hook in hooks:
@@ -148,8 +150,22 @@ def setup_model_compressors(
                 sparsifier = SparsifierContainer(module_name, idx)
                 base_seed = sparsifier_seed + int(1e4) * module_id
 
-                sparse_kwargs = sparsifier_kwargs_copy.copy()
-                sparse_kwargs["active_indices"] = None
+                # Handle special case for Selective Mask
+                if sparsifier_kwargs_copy.get("method") == "SelectiveMask":
+                    active_indices = _get_active_indices(
+                        module_name,
+                        sparsifier_kwargs_copy.get("proj_dim"),
+                        layer_inputs.get(module_name),
+                        layer_outputs.get(module_name),
+                        setting,
+                        device,
+                        "Sparsifier"
+                    )
+                    sparse_kwargs = sparsifier_kwargs_copy.copy()
+                    sparse_kwargs["active_indices"] = active_indices
+                else:
+                    sparse_kwargs = sparsifier_kwargs_copy.copy()
+                    sparse_kwargs["active_indices"] = None
 
                 # Create appropriate sparsifiers based on layer type
                 if isinstance(module, nn.Linear):
@@ -201,8 +217,22 @@ def setup_model_compressors(
                         f"Invalid configuration for layer {module_name}: Cannot use component projector with full sparsifier."
                     )
 
-                proj_kwargs = projector_kwargs_copy.copy()
-                proj_kwargs["active_indices"] = None
+                # Handle special case for Selective Mask
+                if projector_kwargs_copy.get("method") == "SelectiveMask":
+                    active_indices = _get_active_indices(
+                        module_name,
+                        projector_kwargs_copy.get("proj_dim"),
+                        layer_inputs.get(module_name),
+                        layer_outputs.get(module_name),
+                        setting,
+                        device,
+                        "Projector"
+                    )
+                    proj_kwargs = projector_kwargs_copy.copy()
+                    proj_kwargs["active_indices"] = active_indices
+                else:
+                    proj_kwargs = projector_kwargs_copy.copy()
+                    proj_kwargs["active_indices"] = None
 
                 # Set up projectors based on sparsifier configuration
                 if using_sparsifier_component:
@@ -257,6 +287,31 @@ def setup_model_compressors(
     logger.info(f"Set up compressors for {len(layer_names)} layers")
 
     return sparsifiers, projectors
+
+def _get_active_indices(
+    module_name: str,
+    dim: int,
+    input_tensor: Tensor,
+    output_tensor: Tensor,
+    setting: str,
+    device: str,
+    compressor_type: str
+) -> Dict[str, Tensor]:
+    """
+    Helper function to get active indices for Selective Mask
+    """
+    active_indices = None
+    try:
+        mask_path = f"../{setting}/SelectiveMask/mask_{dim}*{dim}/{module_name}.pt"
+        active_indices = torch.load(mask_path, weights_only=False)
+        logger.debug(f"Loaded active indices for {module_name} from {mask_path}")
+    except FileNotFoundError:
+        logger.warning(f"Mask file not found for {module_name} {compressor_type}. Random indices are used.")
+        active_indices = {
+            "pre_activation": torch.randperm(output_tensor.shape[1])[:dim].to(device),
+            "input_features": torch.randperm(input_tensor.shape[1])[:dim].to(device)
+        }
+    return active_indices
 
 
 def _setup_linear_compressor(

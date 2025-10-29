@@ -97,8 +97,6 @@ class HookManager:
         # Profiling stats
         self.compression_time = 0.0
 
-        self.hooks_enabled = True
-
         # Register hooks
         self._register_hooks()
 
@@ -119,21 +117,6 @@ class HookManager:
                 self.backward_hooks[idx] = module.register_full_backward_hook(backward_hook)
 
                 logger.debug(f"Registered hooks for layer: {name}")
-
-
-    def enable_hooks(self):
-        """Enable all hooks"""
-        self.hooks_enabled = True
-        logger.debug("Enabled gradient computation hooks")
-
-
-    def disable_hooks(self):
-        """Disable all hooks to save computation"""
-        self.hooks_enabled = False
-        # Clear any stored gradients to free memory
-        self.compressed_grads = [None] * len(self.layer_names)
-        logger.debug("Disabled gradient computation hooks")
-
 
     def set_sparsifiers(self, sparsifiers: List[Any]) -> None:
         """
@@ -183,8 +166,6 @@ class HookManager:
             inp: Input tensors
             out: Output tensors
         """
-        if not self.hooks_enabled:
-            return
         # Get the index for this layer
         idx = self.layer_name_to_idx[name]
 
@@ -215,8 +196,6 @@ class HookManager:
             grad_input: Gradient w.r.t inputs
             grad_output: Gradient w.r.t outputs
         """
-        if not self.hooks_enabled:
-            return
         # Get the index for this layer
         idx = self.layer_name_to_idx[name]
 
