@@ -14,7 +14,7 @@ export base_training_args="--do_train=True \
 --weight_decay=0.0 \
 --logging_steps=1 \
 --n_eval=500 \
---eval_steps=50 \
+--eval_steps=100 \
 --eval_strategy=steps \
 --save_strategy=epoch \
 --num_train_epochs=1 \
@@ -27,6 +27,6 @@ export base_training_args="--do_train=True \
 --seed=0 \
 --percentage=1.0 \
 --lora=True \
---lora_r=128 \
+--lora_r=64 \
 --lora_dropout=0.1 \
 --fracinv=2.0"
