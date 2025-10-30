@@ -38,6 +38,7 @@ dist
 *.pt
 *.slurm
 *.arrow
+*.png
 
 */log
 */job
