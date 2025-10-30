@@ -19,12 +19,13 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           DataCollatorForSeq2Seq, HfArgumentParser, set_seed)
 
 from ..data_selection.get_training_dataset import get_training_dataset
+from ..GradComp.core.hook import HookManager
+
+from .hook_trainer import HookTrainer
 from .data_arguments import DataArguments, get_data_statistics
 from .model_arguments import ModelArguments, add_padding_to_tokenizer
 from .training_arguments import TrainingArguments
 
-from ..GradComp.core.hook import HookManager
-from .hook_trainer import HookTrainer
 
 logger = logging.getLogger(__name__)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"

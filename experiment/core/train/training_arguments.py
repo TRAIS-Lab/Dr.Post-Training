@@ -84,7 +84,7 @@ class TrainingArguments(TA):
     fracinv: float = field(default=1.0, metadata={"help": "training method"})
     subject: str = field(default='abstract_algebra', metadata={"help": "subject for evaluation"})
     n_val: int = field(default=5, metadata={"help": "number of validation data (for data selection)"})
-    n_eval: int = field(default=20, metadata={"help": "number of evaluation data (for generalization testing)"})
+    n_eval: int = field(default=500, metadata={"help": "number of evaluation data (for generalization testing)"})
 
     ### Gradient compression arguments ###
     sparsification: str = field(
