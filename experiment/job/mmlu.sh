@@ -1,12 +1,15 @@
 #!/bin/bash
+sbatch <<EOT
+#!/bin/bash
+
 #SBATCH --job-name=MMLU
 #SBATCH --mem=128g
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16    # <- match to OMP_NUM_THREADS
-#SBATCH --partition=gpuA40x4 # <- or one of: gpuA100x4 gpuA40x4 gpuA100x8 gpuMI100x8
+#SBATCH --partition=gpuA100x4 # <- or one of: gpuA100x4 gpuA40x4 gpuA100x8 gpuMI100x8
 #SBATCH --account=bdzy-delta-gpu
-#SBATCH --time=2:00:00      # hh:mm:ss for the job
+#SBATCH --time=24:00:00      # hh:mm:ss for the job
 #SBATCH --constraint="scratch"
 #SBATCH --output=/u/%u/Project/Efficient-Fine-Tuning/experiment/log/%x-%j.log
 
@@ -24,7 +27,7 @@ module reset # drop modules and explicitly load the ones needed
 module load cuda/12.4.0
 module list  # job documentation and metadata
 
-#¬ This script runs GREATS with the hook-based gradient compression
+# This script runs GREATS with the hook-based gradient compression
 #
 # Usage:
 #   sh online_batch_select_mmlu.sh GREATS 2 0.05 5 mmlu llama2 1 2e-05 11 1 sociology "" "Gaussian-64*64"
@@ -58,3 +61,5 @@ fi
 
 # Call the hook-based training script
 ./core/scripts/train/warmup_lora_train.sh "$DATA_DIR" "$MODEL_PATH" "$percentage" "$DATA_SEED" "$JOB_NAME" "$method" "$batch_size" "$subject" "$n_val" "$task" "$combined_modules" "$lora_alpha" "$lr" "$gradient_accumulation_steps" "$seed" "$sparsification" "$projection"
+
+EOT
