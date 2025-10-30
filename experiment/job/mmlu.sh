@@ -30,15 +30,10 @@ module list  # job documentation and metadata
 #   sh online_batch_select_mmlu.sh GREATS 2 0.05 5 mmlu llama2 1 2e-05 11 1 sociology "" "Gaussian-64*64"
 #
 
-DATA_DIR=data
-MODEL_PATH=meta-llama/Llama-3.2-1B-Instruct
-DATA_SEED=3
-JOB_NAME=llama3-1b-p${PERCENTAGE}-lora-seed${DATA_SEED}
-
 method=$1
 batch_size=$2
-PERCENTAGE=$3
-NVAL=$4
+percentage=$3
+n_val=$4
 task=$5
 model=$6
 lora_alpha=$7
@@ -49,6 +44,11 @@ subject=${11:-"world_religions"}
 sparsification=${12:-""}
 projection=${13:-""}
 
+DATA_DIR=data
+MODEL_PATH=meta-llama/Llama-3.2-1B-Instruct
+DATA_SEED=3
+JOB_NAME=${method}-${model}-p${percentage}-lora-seed${DATA_SEED}
+
 # Set combined_modules based on the task
 if [ "$task" = "mmlu" ]; then
     combined_modules="q_proj k_proj v_proj o_proj"
@@ -57,4 +57,4 @@ else
 fi
 
 # Call the hook-based training script
-./core/scripts/train/warmup_lora_train_hooks.sh "$DATA_DIR" "$MODEL_PATH" "$PERCENTAGE" "$DATA_SEED" "$JOB_NAME" "$method" "$batch_size" "$subject" "$NVAL" "$task" "$combined_modules" "$lora_alpha" "$lr" "$gradient_accumulation_steps" "$seed" "$sparsification" "$projection"
+./core/scripts/train/warmup_lora_train.sh "$DATA_DIR" "$MODEL_PATH" "$percentage" "$DATA_SEED" "$JOB_NAME" "$method" "$batch_size" "$subject" "$n_val" "$task" "$combined_modules" "$lora_alpha" "$lr" "$gradient_accumulation_steps" "$seed" "$sparsification" "$projection"

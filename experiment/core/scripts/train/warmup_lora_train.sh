@@ -2,7 +2,7 @@
 #
 # Hook-based version of warmup_lora_train.sh
 #
-# This version uses train_with_hooks.py instead of train.py
+# This version uses train.py instead of train.py
 #
 
 source core/scripts/train/base_training_args.sh
@@ -23,8 +23,8 @@ lora_alpha=${12}
 lr=${13}
 gradient_accumulation_steps=${14}
 seed=${15}
-sparsification=${16}  # Optional: e.g., "Rademacher-512"
-projection=${17}      # Optional: e.g., "Gaussian-256"
+sparsification=${16}  # Optional
+projection=${17}      # Optional
 
 echo "Training with combined modules: $combined_modules"
 
@@ -47,11 +47,10 @@ if [[ $model_path == "meta-llama/Llama-2-13b-hf" ]]; then
     base_training_args="$base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config mistral_7b_finetune"
 fi
 
-# Modify header to use train_with_hooks.py instead of train.py
 ID=$RANDOM
 export header="torchrun --nproc_per_node 1 --nnodes 1 \
 --rdzv-id=$ID --rdzv_backend c10d \
--m core.train.train_with_hooks"
+-m core.train.train"
 
 training_args="$base_training_args \
 --model_name_or_path $model_path \

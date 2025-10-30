@@ -103,12 +103,12 @@ def compute_accuracy(args, model, tokenizer, answer_choice_ids, batch_size=1):
                                  k = args.n_val,
                                  subject = args.subject)
 
-    test_df = get_mmlu_dataset_df(data_dir='./data',
+    eval_df = get_mmlu_dataset_df(data_dir='./data',
                                  validation=False,
-                                 k = args.n_test,
+                                 k = args.n_eval,
                                  subject = args.subject)
 
-    prompts = eval_hf_model_generate_ICL_prompts(args, model, tokenizer, dev_df, test_df, batch_size=1)
+    prompts = eval_hf_model_generate_ICL_prompts(args, model, tokenizer, dev_df, eval_df, batch_size=1)
 
     # for prompt in prompts:
     #     print('')
@@ -128,7 +128,7 @@ def compute_accuracy(args, model, tokenizer, answer_choice_ids, batch_size=1):
 
     # get the metrics
     cors = []
-    groud_truths = test_df.iloc[:, -1].values
+    groud_truths = eval_df.iloc[:, -1].values
     for i in range(len(pred_indices)):
         prediction = choices[pred_indices[i]]
         ground_truth = groud_truths[i]

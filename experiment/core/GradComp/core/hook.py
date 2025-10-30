@@ -67,7 +67,8 @@ class HookManager:
             model: nn.Module,
             layer_names: List[str],
             profile: bool = False,
-            device: str = 'cpu'
+            device: str = 'cpu',
+            register_hooks: bool = True
         ) -> None:
         """
         Initialize the hook manager
@@ -77,6 +78,7 @@ class HookManager:
             layer_names: Names of layers to hook
             profile: Whether to profile execution time
             device: Device to use for profiling synchronization
+            register_hooks: Whether to register hooks immediately (default: True)
         """
         self.model = model
         self.layer_names = layer_names
@@ -103,13 +105,21 @@ class HookManager:
         # Profiling stats
         self.compression_time = 0.0
 
-        # Register hooks
-        self._register_hooks()
+        # Flag to track if hooks are currently registered
+        self.hooks_registered = False
 
-        logger.info(f"Initialized HookManager with {len(layer_names)} layer hooks")
+        # Register hooks if requested
+        if register_hooks:
+            self._register_hooks()
+
+        logger.info(f"Initialized HookManager with {len(layer_names)} layers (hooks {'registered' if register_hooks else 'NOT registered'})")
 
     def _register_hooks(self):
         """Register forward hooks to target layers (backward hooks are registered dynamically via tensors)"""
+        if self.hooks_registered:
+            logger.warning("Hooks already registered, skipping registration")
+            return
+
         for name, module in self.model.named_modules():
             if name in self.layer_names:
                 idx = self.layer_name_to_idx[name]
@@ -125,6 +135,9 @@ class HookManager:
                 self.forward_hooks[idx] = module.register_forward_hook(forward_hook)
 
                 logger.debug(f"Registered forward hook for layer: {name} (module type: {type(module).__name__})")
+
+        self.hooks_registered = True
+        logger.info(f"Successfully registered hooks for {len(self.layer_names)} layers")
 
     def set_sparsifiers(self, sparsifiers: List[Any]) -> None:
         """
@@ -843,4 +856,5 @@ class HookManager:
                 hook.remove()
         self.forward_hooks = [None] * len(self.layer_names)
         self.backward_hooks = [None] * len(self.layer_names)
+        self.hooks_registered = False
         logger.debug("Removed all hooks from HookManager")

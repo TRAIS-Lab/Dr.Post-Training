@@ -37,3 +37,11 @@ sh mmlu.sh \
 	[sparsify]          # Sparsification method.
 	[projection]        # Projection method.
 ```
+
+```bash
+python evaluate_mmlu.py \
+    --model_path ./out/GREATS-llama3-1b-p-lora-seed3 \
+    --subject sociology \
+    --n_val 5 \
+    --n_eval 500
+```

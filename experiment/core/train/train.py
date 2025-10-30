@@ -16,8 +16,7 @@ import transformers
 
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
-                          DataCollatorForSeq2Seq, HfArgumentParser, Trainer,
-                          set_seed)
+                          DataCollatorForSeq2Seq, HfArgumentParser, set_seed)
 
 from ..data_selection.get_training_dataset import get_training_dataset
 from .data_arguments import DataArguments, get_data_statistics
@@ -160,12 +159,18 @@ def main():
     else:
         logger.warning("WARNING: No trainable layers found! Check model and lora_only setting.")
 
+    # Determine if hooks should be registered based on training method
+    # Only register hooks for methods that require gradient computation (GREATS, GradNorm)
+    should_register_hooks = training_args.method in ['GREATS', 'GradNorm']
+    logger.info(f"Training method: {training_args.method} - Hooks will be {'registered' if should_register_hooks else 'NOT registered'}")
+
     # Create hook manager using GradComp.core.hook.HookManager
     hook_manager = HookManager(
         model=model,
         layer_names=layer_names,
         profile=False,
-        device=str(training_args.device)
+        device=str(training_args.device),
+        register_hooks=should_register_hooks
     )
     logger.info("Hook manager created successfully (using GradComp.core.hook.HookManager)")
 
@@ -200,7 +205,7 @@ def main():
                 "method": sparsification_method,
                 "use_half_precision": True,
             }
-            logger.info(f"  Sparsification: {sparsification_method} -> {sparsification_dim}D "
+            logger.info(f"  Sparsification: {sparsification_method} -> {sparsification_dim} dimension "
                        f"(factorized: {sparsification_factorize})")
 
         # Parse projection argument
@@ -236,7 +241,7 @@ def main():
                 "method": proj_method,
                 "use_half_precision": True,
             }
-            logger.info(f"  Projection: {proj_method} -> {proj_dim}D (factorized: {proj_factorize})")
+            logger.info(f"  Projection: {proj_method} -> {proj_dim} dimension (factorized: {proj_factorize})")
 
         # Create a small dummy batch for compression initialization
         dummy_text = ["This is a test sentence for compression initialization."]
@@ -286,9 +291,9 @@ def main():
     else:
         logger.info("Gradient compression disabled (sparsification and projection both None)")
 
-    # Prepare eval dataset
+    # Prepare validation dataset (used for data selection in GREATS)
     from ..data_selection.get_validation_dataset import get_dataset
-    eval_dataset = get_dataset(
+    val_dataset = get_dataset(
         task=training_args.analysis_dataset,
         data_dir='data',
         tokenizer=tokenizer,
@@ -298,14 +303,14 @@ def main():
         subject=training_args.subject
     )
 
-    # Prepare test dataset
-    test_dataset = get_dataset(
+    # Prepare evaluation dataset (held-out test set for measuring generalization)
+    eval_dataset = get_dataset(
         task=training_args.analysis_dataset,
         data_dir='data',
         tokenizer=tokenizer,
         max_length=data_args.max_seq_length,
         validation=False,
-        k=training_args.n_test,
+        k=training_args.n_eval,
         subject=training_args.subject
     )
 
@@ -317,8 +322,8 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        val_dataset=val_dataset,
         eval_dataset=eval_dataset,
-        test_dataset=test_dataset,
         tokenizer=tokenizer,
         data_collator=data_collator,
         hook_manager=hook_manager,
@@ -328,12 +333,18 @@ def main():
     logger.info("*** Starting training with hook-based gradient computation ***")
     train_result = trainer.train()
 
+    # Save final evaluation results
+    trainer.on_train_end()
+
     # Save model
     trainer.save_model()
 
-    # Clean up hooks
-    hook_manager.remove_hooks()
-    logger.info("Removed all hooks after training")
+    # Clean up hooks (only if they were registered)
+    if hook_manager.hooks_registered:
+        hook_manager.remove_hooks()
+        logger.info("Removed all hooks after training")
+    else:
+        logger.info("No hooks to remove (hooks were not registered)")
 
     return train_result
 

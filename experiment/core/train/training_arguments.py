@@ -82,9 +82,9 @@ class TrainingArguments(TA):
     ### added ###
     method: str = field(default='Regular', metadata={"help": "training method"})
     fracinv: float = field(default=1.0, metadata={"help": "training method"})
-    subject: str = field(default='abstract_algebra', metadata={"help": "subject of validation"})
-    n_val: int = field(default=5, metadata={"help": "number of validation data"})
-    n_test: int = field(default=20, metadata={"help": "number of test data"})
+    subject: str = field(default='abstract_algebra', metadata={"help": "subject for evaluation"})
+    n_val: int = field(default=5, metadata={"help": "number of validation data (for data selection)"})
+    n_eval: int = field(default=20, metadata={"help": "number of evaluation data (for generalization testing)"})
 
     ### Gradient compression arguments ###
     sparsification: str = field(

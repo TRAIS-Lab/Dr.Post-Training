@@ -6,12 +6,16 @@ export header="torchrun --nproc_per_node 1 --nnodes 1 \
 -m core.train.train"
 
 export base_training_args="--do_train=True \
+--do_eval=True \
 --max_seq_length=512 \
 --use_fast_tokenizer=True \
 --lr_scheduler_type=linear \
 --warmup_ratio=0.03 \
 --weight_decay=0.0 \
 --logging_steps=1 \
+--n_eval=500 \
+--eval_steps=50 \
+--eval_strategy=steps \
 --save_strategy=epoch \
 --num_train_epochs=1 \
 --bf16=True \
@@ -25,6 +29,4 @@ export base_training_args="--do_train=True \
 --lora=True \
 --lora_r=128 \
 --lora_dropout=0.1 \
---fracinv=2.0 \
---n_test=500" \
-# --evaluation_strategy=no \
+--fracinv=2.0"
