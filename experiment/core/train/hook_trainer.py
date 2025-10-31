@@ -182,7 +182,6 @@ class HookTrainer(Trainer):
         model.train()
         args = self.args
 
-        # Get next validation batch from cached iterator
         try:
             val_batch = next(self.val_dataloader_iter)
         except StopIteration:
@@ -192,11 +191,8 @@ class HookTrainer(Trainer):
 
         # Perform selection based on method
         if args.method == 'GREATS':
-            torch.cuda.synchronize()
-            start_time = time.time()
-
             # Compute gradients and scores using simple backward
-            tracin_scores, similarity_matrix = compute_grad_dotprod(
+            scores, similarity_matrix = compute_grad_dotprod(
                 model=model,
                 hook_manager=self.hook_manager,
                 batch_train=inputs,
@@ -204,29 +200,13 @@ class HookTrainer(Trainer):
                 return_similarity=True
             )
 
-            torch.cuda.synchronize()
-            print(f'\nExtra Time for Attribution: {time.time() - start_time:.2f} (s)')
-
-            torch.cuda.synchronize()
-            start_time = time.time()
-
             # Select samples
             lr = self.optimizer.param_groups[0]["lr"]
             selected_ind = greedy_selection(
-                tracin_scores * lr,
+                scores * lr,
                 similarity_matrix * (lr ** 2),
-                int(len(tracin_scores) / args.fracinv)
+                int(len(scores) / args.fracinv)
             )
-
-            # Filter to selected samples
-            inputs = {
-                'input_ids': inputs['input_ids'][selected_ind],
-                'attention_mask': inputs['attention_mask'][selected_ind],
-                'labels': inputs['labels'][selected_ind]
-            }
-
-            torch.cuda.synchronize()
-            print(f'Extra Time for Selection: {time.time() - start_time:.2f} seconds')
 
         elif args.method == "GradNorm":
             # Use diagonal of similarity matrix as gradient norm
@@ -239,18 +219,12 @@ class HookTrainer(Trainer):
                 return_similarity=True
             )
 
-            tracin_scores = torch.diag(similarity_matrix)
+            scores = torch.diag(similarity_matrix)
             selected_ind = greedy_selection(
-                tracin_scores,
+                scores,
                 similarity_matrix * 0,
-                int(len(tracin_scores) / 2)
+                int(len(scores) / 2)
             )
-
-            inputs = {
-                'input_ids': inputs['input_ids'][selected_ind],
-                'attention_mask': inputs['attention_mask'][selected_ind],
-                'labels': inputs['labels'][selected_ind]
-            }
 
         elif args.method == "MaxLoss":
             # Select highest loss samples
@@ -266,7 +240,10 @@ class HookTrainer(Trainer):
                 torch.zeros((len(losses), len(losses))),
                 int(len(losses) / 2)
             )
+        else:
+            selected_ind = None
 
+        if selected_ind is not None:
             inputs = {
                 'input_ids': inputs['input_ids'][selected_ind],
                 'attention_mask': inputs['attention_mask'][selected_ind],

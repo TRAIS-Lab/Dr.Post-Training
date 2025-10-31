@@ -7,9 +7,6 @@ import os
 from importlib import import_module
 from transformers import StoppingCriteria
 
-# from open_instruct.finetune import encode_with_prompt_completion_format
-# from eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
-
 
 class KeyWordsCriteria(StoppingCriteria):
     def __init__(self, stop_id_sequences):
@@ -26,8 +23,8 @@ class KeyWordsCriteria(StoppingCriteria):
                     break
             sequences_should_be_stopped.append(sequence_should_be_stopped)
         return all(sequences_should_be_stopped)
-    
-    
+
+
 @torch.no_grad()
 def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequences=None, add_special_tokens=True, disable_tqdm=False, **generation_kwargs):
     generations = []
@@ -49,10 +46,10 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
                 input_ids=batch_input_ids,
                 attention_mask=attention_mask,
                 stopping_criteria=[KeyWordsCriteria(stop_id_sequences)] if stop_id_sequences else None,
-                max_new_tokens = 20, 
+                max_new_tokens = 20,
                 **generation_kwargs
             )
-        
+
             # the stopping criteria is applied at batch level, so if other examples are not stopped, the entire batch will continue to generate.
             # so some outputs still have the stop sequence, which we need to remove.
             if stop_id_sequences:
@@ -97,13 +94,13 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
 
 
 @torch.no_grad()
-def get_next_word_predictions(model, tokenizer, prompts, 
-                              candidate_token_ids=None, 
-                              batch_size=1, 
-                              return_token_predictions=False, 
-                              add_special_tokens=True, 
+def get_next_word_predictions(model, tokenizer, prompts,
+                              candidate_token_ids=None,
+                              batch_size=1,
+                              return_token_predictions=False,
+                              add_special_tokens=True,
                               disable_tqdm=True):
-    
+
     predictions, probs = [], []
     if not disable_tqdm:
         progress = tqdm.tqdm(total=len(prompts), desc="Getting Predictions")
@@ -151,7 +148,7 @@ def score_completions(model, tokenizer, scoring_examples, disable_tqdm=False):
     - prompt: the prompt to score
     - completions: a list of completions to score
     '''
-    
+
     if not disable_tqdm:
         progress = tqdm.tqdm(total=len(scoring_examples), desc="Scoring Completions")
 
@@ -195,38 +192,38 @@ def score_completions(model, tokenizer, scoring_examples, disable_tqdm=False):
 
 # edit the function to support lora loading
 def load_hf_lm_and_tokenizer(
-        model_name_or_path, 
-        tokenizer_name_or_path=None, 
-        device_map="auto", 
+        model_name_or_path,
+        tokenizer_name_or_path=None,
+        device_map="auto",
         torch_dtype="auto",
-        load_in_8bit=False, 
+        load_in_8bit=False,
         convert_to_half=False,
         convert_to_bf16=True,
         gptq_model=False,
         use_fast_tokenizer=True,
         padding_side="left",
     ):
-    
+
     from transformers import AutoModelForCausalLM, AutoTokenizer, OPTForCausalLM, GPTNeoXForCausalLM
-    
-    is_peft = "lora" in model_name_or_path 
+
+    is_peft = "lora" in model_name_or_path
     from peft import PeftConfig, PeftModel
-    
+
     if is_peft:
         peft_config = PeftConfig.from_pretrained(model_name_or_path)
         peft_dir = model_name_or_path
         model_name_or_path = peft_config.base_model_name_or_path
-        
+
     if gptq_model:
         from auto_gptq import AutoGPTQForCausalLM
         model_wrapper = AutoGPTQForCausalLM.from_quantized(
             model_name_or_path, device="cuda:0", use_triton=True
         )
-        model = model_wrapper.model  
+        model = model_wrapper.model
     elif load_in_8bit:
         model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path, 
-            device_map=device_map, 
+            model_name_or_path,
+            device_map=device_map,
             load_in_8bit=True
         )
     else:
@@ -236,11 +233,11 @@ def load_hf_lm_and_tokenizer(
             model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch_dtype)
             if torch.cuda.is_available():
                 model = model.cuda()
-        
+
         if is_peft:
             model = PeftModel.from_pretrained(model, peft_dir, device_map="auto").merge_and_unload()
-            print(f"loaded the peft model") 
-         
+            print(f"loaded the peft model")
+
         if convert_to_half:
             model = model.half()
             print("Convert model to half precision.")
@@ -273,15 +270,15 @@ def load_hf_lm_and_tokenizer(
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # replace with new embeddings 
+    # replace with new embeddings
     if len(tokenizer) > model.get_input_embeddings().weight.shape[0]:
         model.resize_token_embeddings(len(tokenizer))
-    # for OPT and Pythia models, we need to set tokenizer.model_max_length to model.config.max_position_embeddings 
-    # to avoid wrong embedding index.    
+    # for OPT and Pythia models, we need to set tokenizer.model_max_length to model.config.max_position_embeddings
+    # to avoid wrong embedding index.
     if isinstance(model, GPTNeoXForCausalLM) or isinstance(model, OPTForCausalLM):
         tokenizer.model_max_length = model.config.max_position_embeddings
         print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
-        
+
     return model, tokenizer
 
 
@@ -351,7 +348,7 @@ def query_openai_chat_model(engine, instances, output_path=None, batch_size=10, 
                 fout.flush()
         progress_bar.update(batch_size)
     return results
- 
+
 
 def query_openai_model(engine, instances, output_path=None, batch_size=10, retry_limit=5, reuse_existing_outputs=True, **completion_kwargs):
     '''
@@ -428,4 +425,52 @@ def dynamic_import_function(function_path):
     module = import_module(module_path)
     function = getattr(module, function_name)
     return function
- 
+
+
+def create_prompt_with_tulu_chat_format(messages, bos="<s>", eos="</s>", add_bos=True):
+    formatted_text = ""
+    for message in messages:
+        if message["role"] == "system":
+            formatted_text += "<|system|>\n" + message["content"] + "\n"
+        elif message["role"] == "user":
+            formatted_text += "<|user|>\n" + message["content"] + "\n"
+        elif message["role"] == "assistant":
+            formatted_text += "<|assistant|>\n" + message["content"].strip() + eos + "\n"
+        else:
+            raise ValueError(
+                "Tulu chat template only supports 'system', 'user' and 'assistant' roles. Invalid role: {}.".format(message["role"])
+                )
+    formatted_text += "<|assistant|>\n"
+    formatted_text = bos + formatted_text if add_bos else formatted_text
+    return formatted_text
+
+
+def create_prompt_with_llama2_chat_format(messages, bos="<s>", eos="</s>", add_bos=True):
+    '''
+    This function is adapted from the official llama2 chat completion script:
+    https://github.com/facebookresearch/llama/blob/7565eb6fee2175b2d4fe2cfb45067a61b35d7f5e/llama/generation.py#L274
+    '''
+    B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
+    B_INST, E_INST = "[INST]", "[/INST]"
+    formatted_text = ""
+    # If you want to include system prompt, see this discussion for the template: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGML/discussions/4
+    # However, see here that removing the system prompt actually reduce the false refusal rates: https://github.com/facebookresearch/llama/blob/main/UPDATES.md?utm_source=twitter&utm_medium=organic_social&utm_campaign=llama2&utm_content=text#observed-issue
+    if messages[0]["role"] == "system":
+        assert len(messages) >= 2 and messages[1]["role"] == "user", "LLaMa2 chat cannot start with a single system message."
+        messages = [{
+            "role": "user",
+            "content": B_SYS + messages[0]["content"] + E_SYS + messages[1]["content"]
+        }] + messages[2:]
+    for message in messages:
+        if message["role"] == "user":
+            formatted_text += bos + f"{B_INST} {(message['content']).strip()} {E_INST}"
+        elif message["role"] == "assistant":
+            formatted_text += f" {(message['content'])} " + eos
+        else:
+            raise ValueError(
+                "Llama2 chat template only supports 'system', 'user' and 'assistant' roles. Invalid role: {}.".format(message["role"])
+                )
+    # The llama2 chat template by default has a bos token at the start of each user message.
+    # The next line removes the bos token if add_bos is False.
+    formatted_text = formatted_text[len(bos):] if not add_bos else formatted_text
+    return formatted_text

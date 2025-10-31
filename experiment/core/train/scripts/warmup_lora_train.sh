@@ -5,7 +5,7 @@
 # This version uses train.py instead of train.py
 #
 
-source core/scripts/train/base_training_args.sh
+source core/train/scripts/base_args.sh
 
 data_dir=$1
 model_path=$2

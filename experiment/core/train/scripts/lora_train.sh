@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source core/scripts/train/base_training_args.sh
+source core/train/scripts/base_args.sh
 
 train_files=$1
 model_path=$2

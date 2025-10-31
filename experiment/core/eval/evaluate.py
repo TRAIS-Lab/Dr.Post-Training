@@ -1,14 +1,21 @@
 #!/usr/bin/env python
 """
-Standalone script to evaluate a trained model on MMLU dataset.
+Unified evaluation script for MMLU and TyDiQA datasets.
 
 Usage:
-    python evaluate_mmlu.py \
-        --model_path ./out/GREATS-llama3-1b-p-lora-seed3 \
+    # MMLU evaluation
+    python evaluate.py \
+        --task mmlu \
+        --model_path ./out/model \
         --subject sociology \
         --n_val 5 \
-        --n_test 500 \
-        --output_file ./out/GREATS-llama3-1b-p-lora-seed3/mmlu_results.json
+        --n_eval 500
+
+    # TyDiQA evaluation
+    python evaluate.py \
+        --task tydiqa \
+        --model_path ./out/model \
+        --n_test 100
 """
 
 import argparse
@@ -24,7 +31,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core.train.mmlu_eval import compute_accuracy
+from experiment.core.eval.mmlu import compute_accuracy as compute_mmlu_accuracy
+from experiment.core.eval.tydiqa import compute_accuracy as compute_tydiqa_accuracy
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -91,9 +99,80 @@ def load_model_and_tokenizer(model_path, base_model=None):
     return model, tokenizer
 
 
+def evaluate_mmlu(args, model, tokenizer):
+    """Run MMLU evaluation."""
+    # Get answer choice token IDs
+    choices = ["A", "B", "C", "D"]
+    answer_choice_ids = [
+        tokenizer.encode(" " + answer_choice, add_special_tokens=False)[-1]
+        for answer_choice in choices
+    ]
+
+    logger.info(f"Evaluating on MMLU subject: {args.subject}")
+    logger.info(f"Number of validation examples: {args.n_val}")
+    logger.info(f"Number of evaluation examples: {args.n_eval}")
+
+    # Run evaluation
+    cors, accuracy, all_probs = compute_mmlu_accuracy(
+        args=args,
+        model=model,
+        tokenizer=tokenizer,
+        answer_choice_ids=answer_choice_ids,
+        batch_size=args.batch_size,
+    )
+
+    # Prepare results
+    results = {
+        "task": "mmlu",
+        "subject": args.subject,
+        "n_val": args.n_val,
+        "n_eval": args.n_eval,
+        "accuracy": accuracy,
+        "num_correct": cors.sum().item(),
+        "num_total": len(cors),
+    }
+
+    logger.info(f"Accuracy: {accuracy:.4f} ({cors.sum().item()}/{len(cors)})")
+
+    return results
+
+
+def evaluate_tydiqa(args, model, tokenizer):
+    """Run TyDiQA evaluation."""
+    logger.info(f"Evaluating on TyDiQA")
+    logger.info(f"Number of test examples: {args.n_test}")
+
+    # Run evaluation
+    f1_score = compute_tydiqa_accuracy(
+        args=args,
+        model=model,
+        tokenizer=tokenizer,
+    )
+
+    # Prepare results
+    results = {
+        "task": "tydiqa",
+        "n_test": args.n_test,
+        "f1_score": f1_score,
+    }
+
+    logger.info(f"F1 Score: {f1_score:.4f}")
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained model on MMLU dataset"
+        description="Unified evaluation script for MMLU and TyDiQA"
+    )
+
+    # Common arguments
+    parser.add_argument(
+        "--task",
+        type=str,
+        required=True,
+        choices=["mmlu", "tydiqa"],
+        help="Evaluation task to run",
     )
     parser.add_argument(
         "--model_path",
@@ -108,24 +187,6 @@ def main():
         help="Base model name/path (required if model_path is a LoRA adapter and base model cannot be inferred)",
     )
     parser.add_argument(
-        "--subject",
-        type=str,
-        default="sociology",
-        help="MMLU subject to evaluate on",
-    )
-    parser.add_argument(
-        "--n_val",
-        type=int,
-        default=5,
-        help="Number of validation examples for in-context learning",
-    )
-    parser.add_argument(
-        "--n_eval",
-        type=int,
-        default=500,
-        help="Number of evaluation examples to evaluate",
-    )
-    parser.add_argument(
         "--batch_size",
         type=int,
         default=1,
@@ -135,57 +196,61 @@ def main():
         "--output_file",
         type=str,
         default=None,
-        help="Path to save results JSON file (default: model_path/mmlu_results.json)",
+        help="Path to save results JSON file (default: model_path/{task}_results.json)",
     )
     parser.add_argument(
         "--data_dir",
         type=str,
         default="./data",
-        help="Directory containing MMLU data",
+        help="Directory containing evaluation data",
+    )
+
+    # MMLU-specific arguments
+    parser.add_argument(
+        "--subject",
+        type=str,
+        default="sociology",
+        help="MMLU subject to evaluate on (only for --task mmlu)",
+    )
+    parser.add_argument(
+        "--n_val",
+        type=int,
+        default=5,
+        help="Number of validation examples for in-context learning (only for --task mmlu)",
+    )
+    parser.add_argument(
+        "--n_eval",
+        type=int,
+        default=500,
+        help="Number of evaluation examples to evaluate (only for --task mmlu)",
+    )
+
+    # TyDiQA-specific arguments
+    parser.add_argument(
+        "--n_test",
+        type=int,
+        default=100,
+        help="Number of test examples to evaluate (only for --task tydiqa)",
     )
 
     args = parser.parse_args()
 
     # Set output file path
     if args.output_file is None:
-        args.output_file = os.path.join(args.model_path, "mmlu_results.json")
+        args.output_file = os.path.join(args.model_path, f"{args.task}_results.json")
 
     # Load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(args.model_path, args.base_model)
 
-    # Get answer choice token IDs
-    choices = ["A", "B", "C", "D"]
-    answer_choice_ids = [
-        tokenizer.encode(" " + answer_choice, add_special_tokens=False)[-1]
-        for answer_choice in choices
-    ]
-
-    logger.info(f"Evaluating on MMLU subject: {args.subject}")
-    logger.info(f"Number of validation examples: {args.n_val}")
-    logger.info(f"Number of evaluation examples: {args.n_eval}")
-
-    # Run evaluation
-    cors, accuracy, all_probs = compute_accuracy(
-        args=args,
-        model=model,
-        tokenizer=tokenizer,
-        answer_choice_ids=answer_choice_ids,
-        batch_size=args.batch_size,
-    )
+    # Run appropriate evaluation
+    if args.task == "mmlu":
+        results = evaluate_mmlu(args, model, tokenizer)
+    elif args.task == "tydiqa":
+        results = evaluate_tydiqa(args, model, tokenizer)
+    else:
+        raise ValueError(f"Unknown task: {args.task}")
 
     # Save results
-    results = {
-        "subject": args.subject,
-        "n_val": args.n_val,
-        "n_eval": args.n_eval,
-        "accuracy": accuracy,
-        "num_correct": cors.sum().item(),
-        "num_total": len(cors),
-    }
-
-    logger.info(f"Accuracy: {accuracy:.4f} ({cors.sum().item()}/{len(cors)})")
-
-    # Save to file
     os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
     with open(args.output_file, "w") as f:
         json.dump(results, f, indent=2)

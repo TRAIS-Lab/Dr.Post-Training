@@ -18,8 +18,8 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           DataCollatorForSeq2Seq, HfArgumentParser, set_seed)
 
-from ..data_selection.get_training_dataset import get_training_dataset
-from ..data_selection.get_validation_dataset import get_dataset
+from ..data.get_training_dataset import get_training_dataset
+from ..data.get_validation_dataset import get_dataset
 from ..GradComp.core.hook import HookManager
 
 from .hook_trainer import HookTrainer
