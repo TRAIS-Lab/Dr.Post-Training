@@ -27,6 +27,6 @@ export base_training_args="--do_train=True \
 --seed=0 \
 --percentage=1.0 \
 --lora=True \
---lora_r=64 \
+--lora_r=256 \
 --lora_dropout=0.1 \
 --fracinv=2.0"

@@ -101,7 +101,7 @@ def encode_with_prompt_completion_format(example, tokenizer, max_seq_length):
     Original implementation of the function: https://github.com/allenai/open-instruct/blob/9ebcb582cfc243a6dab75b4302fa432784db26c2/open_instruct/finetune.py#L238
 
     Here we assume each example has 'prompt' and 'completion' fields.
-    We concatenate prompt and completion and tokenize them together because otherwise prompt will be padded/trancated 
+    We concatenate prompt and completion and tokenize them together because otherwise prompt will be padded/truncated
     and it doesn't make sense to follow directly with the completion.
     '''
     # if prompt doesn't end with space and completion doesn't start with space, add space

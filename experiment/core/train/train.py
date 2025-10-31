@@ -19,6 +19,7 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           DataCollatorForSeq2Seq, HfArgumentParser, set_seed)
 
 from ..data_selection.get_training_dataset import get_training_dataset
+from ..data_selection.get_validation_dataset import get_dataset
 from ..GradComp.core.hook import HookManager
 
 from .hook_trainer import HookTrainer
@@ -293,7 +294,6 @@ def main():
         logger.info("Gradient compression disabled (sparsification and projection both None)")
 
     # Prepare validation dataset (used for data selection in GREATS)
-    from ..data_selection.get_validation_dataset import get_dataset
     val_dataset = get_dataset(
         task=training_args.analysis_dataset,
         data_dir='data',
