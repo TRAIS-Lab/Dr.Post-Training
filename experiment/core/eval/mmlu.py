@@ -1,7 +1,8 @@
 import torch
 
 from core.data.get_validation_dataset import get_mmlu_dataset_df
-from experiment.core.eval.utils import get_next_word_predictions, create_prompt_with_tulu_chat_format
+
+from utils import get_next_word_predictions, create_prompt_with_tulu_chat_format
 
 choices = ["A", "B", "C", "D"]
 

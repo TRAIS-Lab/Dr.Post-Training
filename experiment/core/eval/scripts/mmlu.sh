@@ -36,7 +36,7 @@ echo "Batch Size:    $batch_size"
 echo "======================================"
 
 # Build the command
-cmd="python -m experiment.core.eval.evaluate \
+cmd="python -m core.eval.eval \
     --task mmlu \
     --model_path $model_path \
     --subject $subject \

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Hook-based version of warmup_lora_train.sh
+# Hook-based version of warmup_lora.sh
 #
 # This version uses train.py instead of train.py
 #

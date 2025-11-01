@@ -31,8 +31,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from experiment.core.eval.mmlu import compute_accuracy as compute_mmlu_accuracy
-from experiment.core.eval.tydiqa import compute_accuracy as compute_tydiqa_accuracy
+from mmlu import compute_accuracy as compute_mmlu_accuracy
+from tydiqa import compute_accuracy as compute_tydiqa_accuracy
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -81,6 +81,15 @@ def load_model_and_tokenizer(model_path, base_model=None):
         model = AutoModelForCausalLM.from_pretrained(
             base_model, torch_dtype=torch.bfloat16, device_map="auto"
         )
+
+        # Resize embeddings if tokenizer has additional tokens
+        embedding_size = model.get_input_embeddings().weight.shape[0]
+        if len(tokenizer) > embedding_size:
+            logger.info(
+                f"Resizing model embeddings from {embedding_size} to {len(tokenizer)} "
+                f"to match tokenizer vocabulary size"
+            )
+            model.resize_token_embeddings(len(tokenizer))
 
         logger.info(f"Loading LoRA adapter from {model_path}")
         model = PeftModel.from_pretrained(model, model_path)

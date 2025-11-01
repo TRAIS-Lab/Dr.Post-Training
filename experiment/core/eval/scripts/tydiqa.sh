@@ -30,7 +30,7 @@ echo "Batch Size:    $batch_size"
 echo "======================================"
 
 # Build the command
-cmd="python -m experiment.core.eval.evaluate \
+cmd="python -m core.eval.eval \
     --task tydiqa \
     --model_path $model_path \
     --n_test $n_test \

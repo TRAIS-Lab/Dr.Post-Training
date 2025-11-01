@@ -2,8 +2,8 @@ import evaluate
 metric = evaluate.load("squad")
 
 from core.data.get_validation_dataset import get_tydiqa_dataset_df
-from experiment.core.eval.utils import generate_completions
 
+from utils import generate_completions
 
 def compute_accuracy(args, model, tokenizer):
     """
@@ -56,24 +56,19 @@ def compute_accuracy(args, model, tokenizer):
         else:
             output = outputs[i]
 
-        # Strip leading/trailing whitespace from answer
-        answer = answer.strip()
-        output = output.strip()
-
-        print(f"Example {i} ({lang}):")
-        print(f"  Output: {output}")
-        print(f"  Answer: {answer}")
-
         try:
-            lang_predictions = [{"id": str(i), "prediction_text": output}]
-            lang_references = [{"id": str(i), "answers": [{"text": answer, "answer_start": 0}]}]
+            # Strip whitespace from both answer and output for fair comparison
+            clean_answer = answer.strip()
+            clean_output = output.strip()
+            lang_predictions = [{"id": str(i), "prediction_text": clean_output}]
+            # SQuAD metric expects answers in format: {'text': [list], 'answer_start': [list]}
+            lang_references = [{"id": str(i), "answers": {"text": [clean_answer], "answer_start": [0]}}]
             res = metric.compute(predictions=lang_predictions, references=lang_references)
             if isinstance(res["f1"], float):
                 acc += res["f1"]
                 length += 1
-                print(f"  F1: {res['f1']:.4f}")
         except Exception as e:
-            print(f'  Error in f1 computation: {e}')
+            # Skip examples where F1 computation fails
             continue
 
     if length == 0:
