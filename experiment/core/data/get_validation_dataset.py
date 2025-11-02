@@ -457,6 +457,68 @@ def get_mmlu_dataset(data_dir: str,
     return dataset
 
 
+def get_samsum_dataset(data_dir: str,
+                       tokenizer: PreTrainedTokenizerBase,
+                       max_length: int,
+                       validation=False,
+                       k=5,
+                       **kwargs):
+    """
+    Get the SAMSUM dataset for dialogue summarization evaluation.
+
+    The dataset is formatted with user/assistant messages:
+    User: "Summarize the following dialogue:\n\n<dialogue>"
+    Assistant: "<summary>"
+
+    Args:
+        data_dir (str): The main data directory.
+        tokenizer (PreTrainedTokenizerBase): The tokenizer used to tokenize the input text.
+        max_length (int): The maximum length of the input sequence.
+        validation (bool, optional): Whether to use validation set or test set. Defaults to False (test).
+        k (int, optional): Number of examples to use. Defaults to 5.
+
+    Returns:
+        Dataset: The SAMSUM dataset containing input_ids, attention_mask, and labels.
+    """
+    # Determine which split to use
+    if validation:
+        file_path = f"{data_dir}/eval/samsum/samsum_validation_data.jsonl"
+    else:
+        file_path = f"{data_dir}/eval/samsum/samsum_test_data.jsonl"
+
+    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+
+    # Read the JSONL file
+    with open(file_path, 'r', encoding='utf-8') as f:
+        examples = [json.loads(line) for line in f]
+
+    # Limit to k examples
+    examples = examples[:k]
+
+    for i, example in enumerate(examples):
+        # Extract user prompt and assistant response from messages
+        messages = example['messages']
+        user_content = messages[0]['content']  # "Summarize the following dialogue:\n\n..."
+        assistant_content = messages[1]['content']  # The summary
+
+        # Format as chat with <|user|> and <|assistant|> tags
+        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+        answer = assistant_content + tokenizer.eos_token
+
+        # Tokenize
+        full_input_ids, labels, attention_mask = tokenize(
+            tokenizer, prompt, answer, max_length,
+            print_ex=True if i == 0 else False
+        )
+
+        dataset["input_ids"].append(full_input_ids)
+        dataset["labels"].append(labels)
+        dataset["attention_mask"].append(attention_mask)
+
+    dataset = Dataset.from_dict(dataset)
+    return dataset
+
+
 def get_dataset(task, **kwargs):
     """
     Get the dataset for the given task.
@@ -476,6 +538,8 @@ def get_dataset(task, **kwargs):
         return get_tydiqa_dataset(**kwargs)
     elif task == "mmlu":
         return get_mmlu_dataset(**kwargs)
+    elif task == "samsum":
+        return get_samsum_dataset(**kwargs)
     else:
         raise ValueError("Invalid task name")
 

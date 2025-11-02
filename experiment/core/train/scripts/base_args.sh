@@ -1,8 +1,10 @@
 #!/bin/bash
 
 ID=$RANDOM
+# Generate a unique port for this job to avoid conflicts with other jobs
+PORT=$((29400 + RANDOM % 10000))
 export header="torchrun --nproc_per_node 1 --nnodes 1 \
---rdzv-id=$ID --rdzv_backend c10d \
+--rdzv-id=$ID --rdzv_backend c10d --rdzv-endpoint=localhost:$PORT \
 -m core.train.train"
 
 export base_training_args="--do_train=True \
@@ -13,7 +15,6 @@ export base_training_args="--do_train=True \
 --warmup_ratio=0.03 \
 --weight_decay=0.0 \
 --logging_steps=1 \
---n_eval=500 \
 --eval_steps=100 \
 --eval_strategy=steps \
 --save_strategy=epoch \

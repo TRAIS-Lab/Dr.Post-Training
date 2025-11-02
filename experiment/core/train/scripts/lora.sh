@@ -5,8 +5,9 @@ source core/train/scripts/base_args.sh
 train_files=$1
 model_path=$2
 job_name=$3
+n_eval=${4:-"500"}  # Optional - number of evaluation examples (default: 500)
 
-output_dir=./out/${job_name}
+output_dir=/scratch/pbb/Project/Efficient-Fine-Tuning/${job_name}
 if [[ ! -d $output_dir ]]; then
     mkdir -p $output_dir
 fi
@@ -21,6 +22,7 @@ fi
 training_args="$base_training_args \
 --model_name_or_path $model_path \
 --output_dir $output_dir \
+--n_eval $n_eval \
 --train_files ${train_files[@]} 2>&1 | tee $output_dir/train.log"
 
 echo "$header $training_args"

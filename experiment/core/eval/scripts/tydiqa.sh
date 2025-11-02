@@ -6,18 +6,18 @@
 #
 
 model_path=$1
-n_test=$2
-output_file=$3
-batch_size=${4:-1}
+batch_size=$2
+n_test=$3
+output_file=$4
 
 if [[ -z "$model_path" || -z "$n_test" ]]; then
     echo "Usage: $0 <model_path> <n_test> [output_file] [batch_size]"
     echo ""
     echo "Arguments:"
     echo "  model_path   : Path to the trained model checkpoint"
+    echo "  batch_size   : Optional batch size (default: 1)"
     echo "  n_test       : Number of test examples to evaluate"
     echo "  output_file  : Optional output file path (default: model_path/tydiqa_results.json)"
-    echo "  batch_size   : Optional batch size (default: 1)"
     exit 1
 fi
 
