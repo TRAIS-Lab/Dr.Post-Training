@@ -20,9 +20,9 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
 
 from ..data.get_training_dataset import get_training_dataset
 from ..data.get_validation_dataset import get_dataset
-from ..GradComp.core.hook import HookManager
+from ..compress_gradient.hook import GradHook
 
-from .hook_trainer import HookTrainer
+from .trainer import CompGradTrainer
 from .data_arguments import DataArguments, get_data_statistics
 from .model_arguments import ModelArguments, add_padding_to_tokenizer
 from .training_arguments import TrainingArguments
@@ -166,19 +166,19 @@ def main():
     should_register_hooks = training_args.method in ['GREATS', 'GradNorm']
     logger.info(f"Training method: {training_args.method} - Hooks will be {'registered' if should_register_hooks else 'NOT registered'}")
 
-    # Create hook manager using GradComp.core.hook.HookManager
-    hook_manager = HookManager(
+    # Create gradient hook
+    grad_hook = GradHook(
         model=model,
         layer_names=layer_names,
         profile=False,
         device=str(training_args.device),
         register_hooks=should_register_hooks
     )
-    logger.info("Hook manager created successfully (using GradComp.core.hook.HookManager)")
+    logger.info("Gradient Hook created successfully.")
 
     # Optional: Set up gradient compression
     if training_args.sparsification is not None or training_args.projection is not None:
-        from ..GradComp.projection.projector import setup_model_compressors
+        from ..compress_gradient.projector import setup_model_compressors
 
         logger.info("=== Gradient Compression Setup ===")
 
@@ -282,11 +282,11 @@ def main():
         )
 
         if sparsifiers:
-            hook_manager.set_sparsifiers(sparsifiers)
+            grad_hook.set_sparsifiers(sparsifiers)
             logger.info(f"  ✓ Set {len(sparsifiers)} sparsifiers")
 
         if projectors:
-            hook_manager.set_projectors(projectors)
+            grad_hook.set_projectors(projectors)
             logger.info(f"  ✓ Set {len(projectors)} projectors")
 
         logger.info("Gradient compression setup completed!")
@@ -318,8 +318,8 @@ def main():
     # Data collator
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True)
 
-    # Initialize trainer with hook manager
-    trainer = HookTrainer(
+    # Initialize trainer with compressed gradient capabilities
+    trainer = CompGradTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -327,7 +327,7 @@ def main():
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        hook_manager=hook_manager,
+        grad_hook=grad_hook,
     )
 
     # Train
@@ -341,8 +341,8 @@ def main():
     trainer.save_model()
 
     # Clean up hooks (only if they were registered)
-    if hook_manager.hooks_registered:
-        hook_manager.remove_hooks()
+    if grad_hook.hooks_registered:
+        grad_hook.remove_hooks()
         logger.info("Removed all hooks after training")
     else:
         logger.info("No hooks to remove (hooks were not registered)")

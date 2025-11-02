@@ -57,7 +57,7 @@ def compute_linear_gradients_3d(grad_pre_activation: Tensor, input_features: Ten
     grad_tensor = torch.einsum('bsi,bsj->bij', grad_pre_activation, input_features)
     return grad_tensor.reshape(batch_size, output_dim * input_dim)
 
-class HookManager:
+class GradHook:
     """
     Manages hooks for efficient gradient component capturing and projection
     without requiring custom layer implementations.
@@ -112,7 +112,7 @@ class HookManager:
         if register_hooks:
             self._register_hooks()
 
-        logger.info(f"Initialized HookManager with {len(layer_names)} layers (hooks {'registered' if register_hooks else 'NOT registered'})")
+        logger.info(f"Initialized GradHook with {len(layer_names)} layers (hooks {'registered' if register_hooks else 'NOT registered'})")
 
     def _register_hooks(self):
         """Register forward hooks to target layers (backward hooks are registered dynamically via tensors)"""
@@ -147,7 +147,7 @@ class HookManager:
             sparsifiers: List of projector objects, ordered by layer_names
         """
         self.sparsifiers = sparsifiers
-        logger.debug(f"Set {len(sparsifiers)} sparsifiers for HookManager")
+        logger.debug(f"Set {len(sparsifiers)} sparsifiers for GradHook")
 
     def set_projectors(self, projectors: List[Any]) -> None:
         """
@@ -157,7 +157,7 @@ class HookManager:
             projectors: List of projector objects, ordered by layer_names
         """
         self.projectors = projectors
-        logger.debug(f"Set {len(projectors)} projectors for HookManager")
+        logger.debug(f"Set {len(projectors)} projectors for GradHook")
 
     def get_compressed_grads(self) -> List[Tensor]:
         """
@@ -857,4 +857,4 @@ class HookManager:
         self.forward_hooks = [None] * len(self.layer_names)
         self.backward_hooks = [None] * len(self.layer_names)
         self.hooks_registered = False
-        logger.debug("Removed all hooks from HookManager")
+        logger.debug("Removed all hooks from GradHook")

@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 import torch
 from torch import Tensor
 
-from ..utils.common import vectorize, get_parameter_chunk_sizes
+from .utils import vectorize, get_parameter_chunk_sizes
 
 # Configure logger
 logger = logging.getLogger(__name__)

@@ -1,7 +1,3 @@
-"""
-Common utility functions for gradient computation and influence attribution.
-"""
-
 import torch
 import logging
 from typing import Dict, List, Optional
@@ -160,56 +156,3 @@ def get_parameter_chunk_sizes(
         params_per_chunk = [0]
 
     return max_chunk_size, params_per_chunk
-
-
-def find_layers(model, layer_type="Linear", return_type="instance"):
-    """
-    Find layers of specified type in a model.
-
-    Args:
-        model: PyTorch model to search
-        layer_type: Type of layer to find ('Linear', 'LayerNorm', or 'Linear_LayerNorm')
-        return_type: What to return ('instance', 'name', or 'name_instance')
-
-    Returns:
-        List of layers, layer names, or (name, layer) tuples
-    """
-    layers = []
-    return_module_name = not (return_type == "instance")
-
-    if return_module_name:
-        for module_name, module in model.named_modules():
-            if isinstance(module, torch.nn.Linear) or isinstance(module, torch.nn.LayerNorm) or isinstance(module, torch.nn.Embedding):
-                layers.append((module_name, module))
-    else:
-        for module in model.modules():
-            if isinstance(module, torch.nn.Linear) or isinstance(module, torch.nn.LayerNorm) or isinstance(module, torch.nn.Embedding):
-                layers.append(module)
-
-    if return_module_name:
-        if layer_type == "Linear":
-            layers = [(name, layer) for name, layer in layers if isinstance(layer, torch.nn.Linear)]
-        elif layer_type == "Linear_LayerNorm":
-            layers = [(name, layer) for name, layer in layers if isinstance(layer, (torch.nn.Linear, torch.nn.LayerNorm))]
-        elif layer_type == "LayerNorm":
-            layers = [(name, layer) for name, layer in layers if isinstance(layer, torch.nn.LayerNorm)]
-        else:
-            raise ValueError("Invalid setting now. Choose from 'Linear', 'LayerNorm', and 'Linear_LayerNorm'.")
-    else:
-        if layer_type == "Linear":
-            layers = [layer for layer in layers if isinstance(layer, torch.nn.Linear)]
-        elif layer_type == "Linear_LayerNorm":
-            layers = [layer for layer in layers if isinstance(layer, torch.nn.Linear) or isinstance(layer, torch.nn.LayerNorm)]
-        elif layer_type == "LayerNorm":
-            layers = [layer for layer in layers if isinstance(layer, torch.nn.LayerNorm)]
-        else:
-            raise ValueError("Invalid setting now. Choose from 'Linear', 'LayerNorm', and 'Linear_LayerNorm'.")
-
-    if return_type == "instance":
-        return layers
-    elif return_type == "name":
-        return [name for name, layer in layers]
-    elif return_type == "name_instance":
-        return [(name, layer) for name, layer in layers]
-    else:
-        raise ValueError("Invalid return_type. Choose from 'instance', 'name', and 'name_instance'.")

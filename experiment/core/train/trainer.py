@@ -17,13 +17,13 @@ from torch.utils.data import DataLoader
 
 from transformers import Trainer
 
-from ..GradComp.core.hook import HookManager
+from ..compress_gradient.hook import GradHook
 
 logger = logging.getLogger(__name__)
 
 def compute_grad_dotprod(
     model: nn.Module,
-    hook_manager: HookManager,
+    grad_hook: GradHook,
     batch_train: Dict[str, Tensor],
     batch_val: Dict[str, Tensor],
     return_similarity: bool = True
@@ -33,7 +33,7 @@ def compute_grad_dotprod(
 
     Args:
         model: The model
-        hook_manager: HookManager with hooks attached
+        grad_hook: GradHook with hooks attached
         batch_train: Training batch
         batch_val: Validation batch (single batch)
         return_similarity: Whether to return similarity matrix
@@ -53,7 +53,7 @@ def compute_grad_dotprod(
     val_loss.backward()
 
     # Get validation gradients from hooks
-    val_grads = hook_manager.get_compressed_grads()
+    val_grads = grad_hook.get_compressed_grads()
     # Concatenate all layers: each is [batch_size, grad_dim]
     val_grads_concat = torch.cat([g for g in val_grads if g is not None], dim=1)  # [val_bs, total_dim]
     # Average over validation batch
@@ -66,7 +66,7 @@ def compute_grad_dotprod(
     train_loss.backward()
 
     # Get training gradients from hooks
-    train_grads = hook_manager.get_compressed_grads()
+    train_grads = grad_hook.get_compressed_grads()
     # Concatenate all layers
     train_grads_concat = torch.cat([g for g in train_grads if g is not None], dim=1)  # [train_bs, total_dim]
 
@@ -110,17 +110,17 @@ def greedy_selection(scores, interaction_matrix, k):
 
     return selected_indices
 
-class HookTrainer(Trainer):
+class CompGradTrainer(Trainer):
     """
-    Simplified trainer using GradComp.core.hook.HookManager.
+    Trainer with gradient hook manager for per-sample gradient computations.
     """
 
-    def __init__(self, hook_manager, val_dataset, *args, **kwargs):
+    def __init__(self, grad_hook, val_dataset, *args, **kwargs):
         """
         Initialize the hook-based trainer.
 
         Args:
-            hook_manager: GradComp.core.hook.HookManager instance
+            grad_hook: compress_gradient.hook.GradHook instance
             val_dataset: Validation dataset (for data selection, small)
             *args, **kwargs: Same as transformers.Trainer
                 - Must include eval_dataset: Evaluation dataset (for generalization testing, large)
@@ -135,9 +135,9 @@ class HookTrainer(Trainer):
         super().__init__(*args, **kwargs)
 
         # Store our custom datasets
-        self.hook_manager = hook_manager
+        self.grad_hook = grad_hook
         self.val_dataset = val_dataset
-        self.eval_dataset_custom = eval_dataset  # The large evaluation set
+        self.eval_dataset_custom = eval_dataset
 
         # Note: self.eval_dataset (from parent) will also point to eval_dataset
         # but we override the evaluate() method anyway
@@ -194,7 +194,7 @@ class HookTrainer(Trainer):
             # Compute gradients and scores using simple backward
             scores, similarity_matrix = compute_grad_dotprod(
                 model=model,
-                hook_manager=self.hook_manager,
+                grad_hook=self.grad_hook,
                 batch_train=inputs,
                 batch_val=val_batch,
                 return_similarity=True
@@ -212,7 +212,7 @@ class HookTrainer(Trainer):
             # Use diagonal of similarity matrix as gradient norm
             _, similarity_matrix = compute_grad_dotprod(
                 model=model,
-                hook_manager=self.hook_manager,
+                grad_hook=self.grad_hook,
                 batch_train=inputs,
                 batch_val=val_batch,
                 optimizer=self.optimizer,
