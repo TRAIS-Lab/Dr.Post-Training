@@ -18,6 +18,54 @@ from .projection import random_project
 # Configure logger
 logger = logging.getLogger(__name__)
 
+
+def create_sample_inputs(
+    tokenizer,
+    max_seq_length: int = 512,
+    device: str = 'cpu',
+    sample_text: Optional[str] = None
+) -> Dict[str, Tensor]:
+    """
+    Create sample inputs for initializing gradient compressors.
+
+    This helper function creates a minimal batch of tokenized inputs that can be used
+    to run a forward pass through the model to determine layer dimensions.
+
+    Args:
+        tokenizer: HuggingFace tokenizer instance
+        max_seq_length: Maximum sequence length for tokenization
+        device: Device to place the tensors on
+        sample_text: Optional sample text to tokenize. If None, uses a default message.
+
+    Returns:
+        Dictionary containing tokenized inputs ready for model forward pass
+
+    Example:
+        >>> sample_inputs = create_sample_inputs(tokenizer, max_seq_length=512, device='cuda')
+        >>> sparsifiers, projectors = setup_model_compressors(
+        ...     model=model,
+        ...     layer_names=layer_names,
+        ...     sample_inputs=sample_inputs,
+        ...     device='cuda'
+        ... )
+    """
+    if sample_text is None:
+        sample_text = "This is a sample text for compression initialization."
+
+    sample_inputs = tokenizer(
+        [sample_text],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_seq_length
+    )
+
+    # Move to device and add labels for language modeling
+    sample_inputs = {k: v.to(device) for k, v in sample_inputs.items()}
+    sample_inputs['labels'] = sample_inputs['input_ids'].clone()
+
+    return sample_inputs
+
 class BaseContainer:
     """
     Base container for projection functions associated with a layer.
@@ -47,7 +95,7 @@ def setup_model_compressors(
     layer_names: List[str],
     sparsifier_kwargs: Optional[Dict[str, Any]] = None,
     projector_kwargs: Optional[Dict[str, Any]] = None,
-    train_dataloader: torch.utils.data.DataLoader = None,
+    sample_inputs: Optional[Dict[str, Tensor]] = None,
     setting: str = None,
     device: str = 'cpu'
 ) -> Tuple[List[SparsifierContainer], List[ProjectorContainer]]:
@@ -59,14 +107,14 @@ def setup_model_compressors(
         layer_names: Names of layers to set projectors for
         sparsifier_kwargs: Keyword arguments for sparsifier configuration (optional)
         projector_kwargs: Keyword arguments for projector configuration (optional)
-        train_dataloader: DataLoader for training data (used to get input shapes)
+        sample_inputs: Input batch to run a forward pass (optional)
         setting: Setting name for projectors/sparsifiers
         device: Device to run the model on
 
     Returns:
         Tuple of (sparsifiers, projectors) lists, ordered by layer_names
     """
-    if not train_dataloader:
+    if sample_inputs is None:
         return [], []
 
     # Initialize containers lists
@@ -105,20 +153,19 @@ def setup_model_compressors(
         projector_kwargs_copy = {}
 
     # Ensure model is on the correct device before running forward pass
-    logger.info("Running forward pass to initialize model for compressor setup")
+    logger.info("Running forward pass to initialize compressors")
     original_device = next(model.parameters()).device
     if str(original_device) != device:
         logger.info(f"Moving model from {original_device} to {device} for compressor setup")
         model.to(device)
 
-    train_batch = next(iter(train_dataloader))
     # Use no_grad to avoid autograd issues during setup
     with torch.no_grad():
-        if isinstance(train_batch, dict):
-            inputs = {k: v.to(device) for k, v in train_batch.items()}
+        if isinstance(sample_inputs, dict):
+            inputs = {k: v.to(device) for k, v in sample_inputs.items()}
             model(**inputs)
         else:
-            inputs = train_batch[0].to(device)
+            inputs = sample_inputs[0].to(device)
             model(inputs)
 
     # First, capture inputs and outputs for each layer
@@ -138,7 +185,7 @@ def setup_model_compressors(
 
     # Run another forward pass to capture inputs/outputs
     with torch.no_grad():
-        if isinstance(train_batch, dict):
+        if isinstance(sample_inputs, dict):
             model(**inputs)
         else:
             model(inputs)

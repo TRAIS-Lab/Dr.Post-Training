@@ -1,9 +1,4 @@
 #!/bin/bash
-#
-# Hook-based version of warmup_lora.sh
-#
-# This version uses train.py instead of train.py
-#
 
 source core/train/scripts/base_args.sh
 
@@ -16,15 +11,15 @@ job_name=$5
 method=$6
 batch_size=$7
 subject=$8
-nval=$9
-n_eval=${10}          # Number of evaluation examples
+n_val=$9
+n_eval=${10}
 task=${11}
 combined_modules=${12}
 lora_alpha=${13}
 lr=${14}
 gradient_accumulation_steps=${15}
 seed=${16}
-compression=${17}     # Optional: GraSS, LoGra, or Vanilla (default)
+compression=${17}
 
 echo "Training with combined modules: $combined_modules"
 
@@ -71,7 +66,7 @@ training_args="$base_training_args \
 --per_device_train_batch_size $batch_size \
 --method $method \
 --subject $subject \
---n_val $nval \
+--n_val $n_val \
 --n_eval $n_eval \
 --analysis_dataset $task \
 --lora_target_modules $combined_modules \

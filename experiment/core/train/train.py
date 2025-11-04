@@ -170,7 +170,6 @@ def main():
     grad_hook = GradHook(
         model=model,
         layer_names=layer_names,
-        profile=False,
         device=str(training_args.device),
         register_hooks=should_register_hooks
     )
@@ -178,7 +177,7 @@ def main():
 
     # Optional: Set up gradient compression
     if training_args.sparsification is not None or training_args.projection is not None:
-        from ..compress_gradient.projector import setup_model_compressors
+        from ..compress_gradient.projector import setup_model_compressors, create_sample_inputs
 
         logger.info("=== Gradient Compression Setup ===")
 
@@ -245,39 +244,21 @@ def main():
             }
             logger.info(f"  Projection: {proj_method} -> {proj_dim} dimension (factorized: {proj_factorize})")
 
-        # Create a small dummy batch for compression initialization
-        dummy_text = ["This is a test sentence for compression initialization."]
-        dummy_inputs = tokenizer(
-            dummy_text,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=data_args.max_seq_length
-        )
-        dummy_inputs = {k: v.to(training_args.device) for k, v in dummy_inputs.items()}
-        dummy_inputs['labels'] = dummy_inputs['input_ids'].clone()
-
-        class DummyDataset:
-            def __init__(self, inputs):
-                # Remove batch dimension from inputs
-                self.inputs = {k: v.squeeze(0) for k, v in inputs.items()}
-            def __getitem__(self, idx):
-                return self.inputs
-            def __len__(self):
-                return 1
-
-        dummy_loader = torch.utils.data.DataLoader(
-            DummyDataset(dummy_inputs),
-            batch_size=1
+        # Create sample inputs for compression initialization
+        # This runs a forward pass to determine the dimensions needed for each layer's projector
+        sample_inputs = create_sample_inputs(
+            tokenizer=tokenizer,
+            max_seq_length=data_args.max_seq_length,
+            device=str(training_args.device)
         )
 
-        # Set up compressors
+        # Set up compressors using sample inputs
         sparsifiers, projectors = setup_model_compressors(
             model=model,
             layer_names=layer_names,
             sparsifier_kwargs=sparsifier_kwargs,
             projector_kwargs=projector_kwargs,
-            train_dataloader=dummy_loader,
+            sample_inputs=sample_inputs,
             device=str(training_args.device)
         )
 

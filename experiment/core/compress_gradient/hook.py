@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 import functools
-import time
 import logging
 
 import torch.jit as jit
@@ -66,7 +65,6 @@ class GradHook:
             self,
             model: nn.Module,
             layer_names: List[str],
-            profile: bool = False,
             device: str = 'cpu',
             register_hooks: bool = True
         ) -> None:
@@ -76,13 +74,11 @@ class GradHook:
         Args:
             model: The model to hook
             layer_names: Names of layers to hook
-            profile: Whether to profile execution time
             device: Device to use for profiling synchronization
             register_hooks: Whether to register hooks immediately (default: True)
         """
         self.model = model
         self.layer_names = layer_names
-        self.profile = profile
         self.device = device
 
         # Create mapping from layer name to index for O(1) lookups
@@ -101,9 +97,6 @@ class GradHook:
         # Initialize sparsifiers and projectors (to avoid AttributeError when not set)
         self.sparsifiers = [None] * len(layer_names)
         self.projectors = [None] * len(layer_names)
-
-        # Profiling stats
-        self.compression_time = 0.0
 
         # Flag to track if hooks are currently registered
         self.hooks_registered = False
@@ -167,15 +160,6 @@ class GradHook:
             List of projected gradient tensors, ordered by layer_names
         """
         return self.compressed_grads
-
-    def get_compression_time(self) -> float:
-        """
-        Get the accumulated projection time
-
-        Returns:
-            Total time spent in projection operations
-        """
-        return self.compression_time
 
     def _forward_hook_fn(self, name: str, mod: nn.Module, inp: Any, out: Any) -> Any:
         """
@@ -429,10 +413,6 @@ class GradHook:
         # Case: Only use sparsification in component mode
         if using_sparsifier_component and not using_projector_component and not using_projector_full:
             # Apply sparsification to gradient components
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                start_time = time.time()
-
             sparsifier_grad_comp_1, sparsifier_grad_comp_2 = sparsifier.projector_grad_comp
 
             if is_3d:
@@ -452,19 +432,11 @@ class GradHook:
                 # Compute gradient with sparsified components
                 grad_tensor = compute_linear_gradients_2d(grad_pre_activation_sparse, input_features_sparse)
 
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                self.compression_time += time.time() - start_time
-
             return grad_tensor.reshape(batch_size, -1)
 
         # Case: Only use projection in component mode
         if not using_sparsifier_component and not using_sparsifier_full and using_projector_component:
             # Apply projection to gradient components
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                start_time = time.time()
-
             projector_grad_comp_1, projector_grad_comp_2 = projector.projector_grad_comp
 
             if is_3d:
@@ -484,10 +456,6 @@ class GradHook:
                 # Compute gradient with projected components
                 grad_tensor = compute_linear_gradients_2d(grad_pre_activation_proj, input_features_proj)
 
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                self.compression_time += time.time() - start_time
-
             return grad_tensor.reshape(batch_size, -1)
 
         # Case: Only use full sparsification
@@ -500,25 +468,13 @@ class GradHook:
             grad = grad_tensor.reshape(batch_size, -1)
 
             # Apply full sparsifier
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                start_time = time.time()
-
             grad = sparsifier.projector_grad(grad)
-
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                self.compression_time += time.time() - start_time
 
             return grad
 
         # Stage 1: Apply sparsification in component mode if available
         if using_sparsifier_component:
             # Start timing for sparsification if profiling is enabled
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                start_time = time.time()
-
             sparsifier_grad_comp_1, sparsifier_grad_comp_2 = sparsifier.projector_grad_comp
 
             # Apply sparsification to gradient components
@@ -533,18 +489,9 @@ class GradHook:
                 grad_pre_activation_sparse = sparsifier_grad_comp_1(grad_pre_activation_flat)
                 input_features_sparse = sparsifier_grad_comp_2(input_features_flat)
 
-            # End timing for sparsification
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                self.compression_time += time.time() - start_time
-
             # Stage 2: Apply projection in component mode if available
             if using_projector_component:
                 # Start timing for projection if profiling is enabled
-                if self.profile:
-                    torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                    start_time = time.time()
-
                 projector_grad_comp_1, projector_grad_comp_2 = projector.projector_grad_comp
 
                 # Apply projection to sparsified components
@@ -561,11 +508,6 @@ class GradHook:
                 else:
                     grad_pre_activation_final = projector_grad_comp_1(grad_pre_activation_sparse)
                     input_features_final = projector_grad_comp_2(input_features_sparse)
-
-                # End timing for projection
-                if self.profile:
-                    torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                    self.compression_time += time.time() - start_time
 
                 # Compute the final gradient using the processed components
                 if is_3d:
@@ -586,17 +528,7 @@ class GradHook:
 
                 # Apply full projector if available
                 if using_projector_full:
-                    # Start timing for projection if profiling is enabled
-                    if self.profile:
-                        torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                        start_time = time.time()
-
                     grad = projector.projector_grad(grad)
-
-                    # End timing for projection
-                    if self.profile:
-                        torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                        self.compression_time += time.time() - start_time
 
         else:  # Not using sparsifier component mode
             # Compute the outer product to get the gradient
@@ -609,31 +541,11 @@ class GradHook:
 
             # Apply full sparsifier if available
             if using_sparsifier_full:
-                # Start timing for sparsification if profiling is enabled
-                if self.profile:
-                    torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                    start_time = time.time()
-
                 grad = sparsifier.projector_grad(grad)
-
-                # End timing for sparsification
-                if self.profile:
-                    torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                    self.compression_time += time.time() - start_time
 
             # Apply full projector if available
             if using_projector_full:
-                # Start timing for projection if profiling is enabled
-                if self.profile:
-                    torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                    start_time = time.time()
-
                 grad = projector.projector_grad(grad)
-
-                # End timing for projection
-                if self.profile:
-                    torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                    self.compression_time += time.time() - start_time
 
         return grad
 
@@ -663,11 +575,6 @@ class GradHook:
         """
         projector = self.projectors[idx]
         batch_size = input_features.shape[0]
-
-        # Start timing for the whole operation if profiling is enabled
-        if self.profile:
-            torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-            start_time = time.time()
 
         with torch.no_grad():
             # Handle different input dimensions
@@ -759,11 +666,6 @@ class GradHook:
             if projector and hasattr(projector, 'projector_grad') and projector.projector_grad is not None:
                 per_sample_grads = projector.projector_grad(per_sample_grads)
 
-        # End timing for the whole operation
-        if self.profile:
-            torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-            self.compression_time += time.time() - start_time
-
         return per_sample_grads
 
     def _layernorm_grad(
@@ -813,36 +715,16 @@ class GradHook:
         # Apply projectors if they exist - only measure this part for profiling
         projector = self.projectors[idx]
         if projector and hasattr(projector, 'projector_grad_comp') and projector.projector_grad_comp != (None, None):
-            # Start timing for projection if profiling is enabled
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                start_time = time.time()
-
             projector_grad_comp_1, projector_grad_comp_2 = projector.projector_grad_comp
             grad_weight = projector_grad_comp_1(grad_weight)
             grad_bias = projector_grad_comp_2(grad_bias)
-
-            # End timing for projection
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                self.compression_time += time.time() - start_time
 
         # Concatenate weight and bias gradients
         grad = torch.cat((grad_weight, grad_bias), dim=1)
 
         # Apply final projector if available - also measure this as part of projection
         if projector and hasattr(projector, 'projector_grad') and projector.projector_grad is not None:
-            # Start timing for projection if profiling is enabled
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                start_time = time.time()
-
             grad = projector.projector_grad(grad)
-
-            # End timing for projection
-            if self.profile:
-                torch.cuda.synchronize(self.device) if torch.cuda.is_available() and self.device != 'cpu' else None
-                self.compression_time += time.time() - start_time
 
         return grad
 

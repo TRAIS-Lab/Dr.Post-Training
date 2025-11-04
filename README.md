@@ -8,6 +8,20 @@ pip install -r requirements.txt
 
 Download data at this [link](https://drive.google.com/file/d/1oJw_3V-ALHHJMFQq8c3QJ4GNTGC8vw6s/view?usp=sharing), and put it in the `experiment/data` folder.
 
+### Recommended Environment Setup
+
+It's **not** required to follow the exact same steps in this section. But this is a verified environment setup flow that may help users to avoid most of the issues during the installation.
+
+```bash
+conda create -n IF python=3.10
+conda activate IF
+
+conda install -c "nvidia/label/cuda-11.8.0" cudatoolkit
+pip3 install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu118
+
+pip install -r requirements.txt
+```
+
 ## Running Experiments
 
 Navigate to the experiment directory:
