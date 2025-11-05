@@ -4,6 +4,7 @@ from typing import List, Tuple
 
 import pandas as pd
 import torch
+from torch import Tensor
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from transformers import DataCollatorForSeq2Seq, PreTrainedTokenizerBase
@@ -12,11 +13,13 @@ from transformers import DataCollatorForSeq2Seq, PreTrainedTokenizerBase
 B_INST, E_INST = "[INST]", "[/INST]"
 
 
-def tokenize(tokenizer: PreTrainedTokenizerBase,
-             query: str,
-             completion: str,
-             max_length: int,
-             print_ex: bool = False) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+def tokenize(
+        tokenizer: PreTrainedTokenizerBase,
+        query: str,
+        completion: str,
+        max_length: int,
+        print_ex: bool = False
+    ) -> Tuple[Tensor, Tensor, List[int]]:
     """
     Formats a chat conversation into input tensors for a transformer model.
 
@@ -48,14 +51,16 @@ def tokenize(tokenizer: PreTrainedTokenizerBase,
     return full_input_ids, labels, attention_mask
 
 
-def get_bbh_dataset(data_dir: str,
-                    tokenizer: PreTrainedTokenizerBase,
-                    max_length: int,
-                    use_chat_format: bool = True,
-                    chat_format: str = "tulu",
-                    validation=False,
-                    k = 5,
-                    **kwargs):
+def get_bbh_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        use_chat_format: bool = True,
+        chat_format: str = "tulu",
+        validation=False,
+        k = 5,
+        **kwargs
+    ) -> Dataset:
     """
     Get the bbh dataset in the instruction tuning format. Each example is formatted as follows:
 
@@ -128,12 +133,14 @@ def get_bbh_dataset(data_dir: str,
     dataset = Dataset.from_dict(dataset)
     return dataset
 
-def get_tydiqa_dataset_df(data_dir: str,
-                       use_chat_format: bool = True,
-                       chat_format: str = "tulu",
-                       zh: bool = False,
-                       validation=False,
-                       k = 5):
+def get_tydiqa_dataset_df(
+        data_dir: str,
+        use_chat_format: bool = True,
+        chat_format: str = "tulu",
+        zh: bool = False,
+        validation=False,
+        k = 5
+    ) -> List[Tuple[str, str, str]]:
     encoding_templates_with_context = {
         "english": ("Answer the following question based on the information in the given passage.", "Passage:", "Question:", "Answer:"),
         "arabic": ("أجب على السؤال التالي بناءً على المعلومات في المقطع المعطى.", "المقطع:", "السؤال:", "الإجابة:"),
@@ -201,15 +208,17 @@ def get_tydiqa_dataset_df(data_dir: str,
     return dataset
 
 
-def get_tydiqa_dataset(data_dir: str,
-                       tokenizer: PreTrainedTokenizerBase,
-                       max_length: int,
-                       use_chat_format: bool = True,
-                       chat_format: str = "tulu",
-                       zh: bool = False,
-                       validation=False,
-                       k = 5,
-                       **kwargs) -> Dataset:
+def get_tydiqa_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        use_chat_format: bool = True,
+        chat_format: str = "tulu",
+        zh: bool = False,
+        validation=False,
+        k = 5,
+        **kwargs
+    ) -> Dataset:
     """
     Get the tydiqa dataset in the instruction tuning format. Each example is formatted as follows:
 
@@ -319,10 +328,12 @@ def get_tydiqa_dataset(data_dir: str,
 
 
 
-def get_mmlu_dataset_df(data_dir: str,
-                        validation=False,
-                        k = 5,
-                        subject = 'abstract_algebra'):
+def get_mmlu_dataset_df(
+        data_dir: str,
+        validation=False,
+        k = 5,
+        subject = 'abstract_algebra'
+    ) -> pd.DataFrame:
     """
     Get the MMLU dataset in the instruction tuning format. Each example is formatted as follows:
 
@@ -358,18 +369,17 @@ def get_mmlu_dataset_df(data_dir: str,
     return df
 
 
-
-
-
-def get_mmlu_dataset(data_dir: str,
-                     tokenizer: PreTrainedTokenizerBase,
-                     max_length: int,
-                     use_chat_format=True,
-                     chat_format="tulu",
-                     validation=False,
-                     k = 5,
-                     subject = 'abstract_algebra',
-                     **kwargs):
+def get_mmlu_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        use_chat_format=True,
+        chat_format="tulu",
+        validation=False,
+        k = 5,
+        subject = 'abstract_algebra',
+        **kwargs
+    ) -> Dataset:
     """
     Get the MMLU dataset in the instruction tuning format. Each example is formatted as follows:
 
@@ -457,12 +467,14 @@ def get_mmlu_dataset(data_dir: str,
     return dataset
 
 
-def get_samsum_dataset(data_dir: str,
-                       tokenizer: PreTrainedTokenizerBase,
-                       max_length: int,
-                       validation=False,
-                       k=5,
-                       **kwargs):
+def get_samsum_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        validation=False,
+        k=5,
+        **kwargs
+    ) -> Dataset:
     """
     Get the SAMSUM dataset for dialogue summarization evaluation.
 

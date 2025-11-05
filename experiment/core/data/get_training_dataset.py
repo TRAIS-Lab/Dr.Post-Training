@@ -21,8 +21,37 @@ def temp_seed(seed):
             torch.cuda.set_rng_state_all(cuda_state)
 
 
-def get_training_dataset(train_files: List[str], tokenizer, max_seq_length, sample_percentage=1.0, seed=0):
-    """ get training dataset with a specified seed """
+def get_training_dataset(data_dir: str, task: str, tokenizer, max_seq_length, sample_percentage=1.0, seed=0, train_files: List[str] = None):
+    """
+    Get training dataset with a specified seed.
+
+    Args:
+        data_dir: Base directory containing training data
+        task: Task name (samsum, mmlu, tydiqa, bbh, etc.)
+        tokenizer: Tokenizer to use for encoding
+        max_seq_length: Maximum sequence length
+        sample_percentage: Percentage of data to sample
+        seed: Random seed for sampling
+        train_files: Optional explicit list of training files (overrides task-based selection)
+
+    Returns:
+        Encoded training dataset
+    """
+    # If train_files not provided, construct them based on task
+    if train_files is None:
+        if task == "samsum":
+            # ALPACA training data for SAMSUM evaluation
+            train_files = [
+                f"{data_dir}/train/alpaca/alpaca_data.jsonl"
+            ]
+        else:
+            # LESS (FLAN-v2+CoT+Dolly+OASST1) for testing with MMLU/TydiQA/BBH
+            train_files = [
+                f"{data_dir}/train/flan_v2/flan_v2_data.jsonl",
+                f"{data_dir}/train/cot/cot_data.jsonl",
+                f"{data_dir}/train/dolly/dolly_data.jsonl",
+                f"{data_dir}/train/oasst1/oasst1_data.jsonl"
+            ]
 
     raw_datasets = load_raw_dataset(
         train_files, sample_percentage=sample_percentage, seed=seed)

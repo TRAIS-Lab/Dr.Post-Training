@@ -1,5 +1,16 @@
 # Efficient Fine-Tuning
 
+This repository implements memory-efficient fine-tuning with **compressed optimizer** support, enabling full model fine-tuning on limited GPU memory.
+
+## Key Features
+
+- **Compressed Optimizer (AdamWMeSO)**: 10-20× reduction in optimizer state memory
+- **Full Model Fine-Tuning**: Train full models with memory comparable to LoRA
+- **Gradient Compression**: GraSS and LoGra compression methods
+  - **GaLore-style Projector Refresh**: Periodically resamples random projections for improved training stability
+- **Data Selection**: GREATS and GradNorm for efficient sample selection
+- **Multiple Training Modes**: LoRA fine-tuning and full model fine-tuning
+
 ## Quick Start
 
 ```bash
@@ -29,98 +40,120 @@ Navigate to the experiment directory:
 cd experiment
 ```
 
-### MMLU Task
+### Unified Training Script
 
-Run MMLU experiments with different configurations:
-
-```bash
-# Regular training (no compression)
-sh job/mmlu.sh Regular 2 0.05 5 500 llama3-1b 1 5e-05 42 1 sociology
-
-# Training with GraSS/LoGra compression
-sh job/mmlu.sh GREATS 2 0.05 5 500 llama3-1b 1 5e-05 42 1 sociology <GraSS/LoGra>
-```
-
-### SAMSUM Task
+**Single script for all tasks and training modes with named arguments:**
 
 ```bash
-# Regular training
-sh job/samsum.sh Regular 2 0.05 5 500 llama3-1b 1 5e-05 42 1
-
-# Training with GraSS/LoGra compression
-sh job/samsum.sh GREATS 2 0.05 5 500 llama3-1b 1 5e-05 42 1 <GraSS/LoGra>
+sbatch experiment/job/train.sh [options]
 ```
 
-### TyDiQA Task
+**Examples:**
 
 ```bash
-# Regular training
-sh job/tydiqa.sh Regular 2 0.05 5 500 llama3-1b 1 5e-05 42 1
+# Full fine-tuning with MeSO (compressed optimizer)
+sbatch experiment/job/train.sh --task mmlu --subject sociology --model llama3-1b \
+                                --optimizer MeSO --lr 1e-05
 
-# Training with GraSS/LoGra compression
-sh job/tydiqa.sh GREATS 2 0.05 5 500 llama3-1b 1 5e-05 42 1 <GraSS/LoGra>
+# Full fine-tuning with GREATS data selection
+sbatch experiment/job/train.sh --task mmlu --subject sociology --model llama3-1b \
+                                --data_selection GREATS --optimizer Regular --lr 1e-05
+
+# Full fine-tuning with both GREATS and MeSO
+sbatch experiment/job/train.sh --task mmlu --subject sociology --model llama3-1b \
+                                --data_selection GREATS --optimizer MeSO --lr 1e-05
+
+# LoRA with MeSO
+sbatch experiment/job/train.sh --task mmlu --subject sociology --model llama3-1b \
+                                --optimizer MeSO --lora --lr 5e-05
+
+# Baseline (no compression, no data selection)
+sbatch experiment/job/train.sh --task mmlu --subject sociology --model llama3-1b \
+                                --optimizer Regular --data_selection NA --lr 1e-05
 ```
 
-> [!Note]
-> To make it compatible with gradient accumulation, the current implementation still uses 2 forward-backward passes.
-
+```bash
+./train.sh --task mmlu --subject sociology --model llama3-1b --data_selection GREATS --MeSO --lr 5e-05 --batch_size 8 --n_val 8 --percentage 0.1 --seed 42
+```
 ## Parameters
 
-### MMLU
+The unified training script accepts the following arguments:
 
+### Required Arguments
+- `--task <task>` - Task name: `mmlu`, `samsum`, `tydiqa`, `bbh`
+
+### Core Training Arguments
+- `--data_selection <method>` - Data selection: `NA`, `GREATS`, `GradNorm` (default: `NA`)
+- `--optimizer <type>` - Optimizer: `Regular`, `MeSO` (compressed optimizer) (default: `Regular`)
+- `--model <model>` - Model: `llama3-1b`, `llama2-7b`, `mistral-7b` (default: `llama3-1b`)
+- `--lr <lr>` - Learning rate (default: `5e-05`)
+- `--batch_size <size>` - Batch size (default: `2`)
+- `--seed <seed>` - Random seed (default: `42`)
+- `--gradient_accumulation_steps <steps>` - Gradient accumulation (default: `1`)
+
+### Data Arguments
+- `--percentage <pct>` - Data sampling, e.g., `0.05` for 5% (default: `0.05`)
+- `--n_val <n>` - Validation examples (default: `5`)
+- `--n_eval <n>` - Evaluation examples (default: `500`)
+- `--data_dir <dir>` - Data directory (default: `data`)
+
+### Task-Specific Arguments
+- `--subject <subject>` - Subject for MMLU/BBH (default: `world_religions`)
+
+### Compression Arguments
+- `--compression <method>` - Gradient compression method (auto-enabled when needed)
+  - `GraSS` - Gradient Sparsification with Sketching (RandomMask-128×128 + SJLT-4096) [default]
+  - `LoGra` - Low-rank Gradient compression (Gaussian-64×64)
+  - Auto-enabled when `--data_selection` is not `NA` or `--optimizer` is `MeSO`
+- `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
+  - Resamples random projections every N steps (similar to GaLore's update_compressor_freq)
+  - Helps maintain compression quality throughout training
+  - Set to large value (e.g., `1000000`) to disable refresh
+
+### LoRA Arguments
+- `--lora` - Enable LoRA fine-tuning (flag, omit for full fine-tuning)
+- `--lora_alpha <alpha>` - LoRA alpha (default: `1`)
+- `--lora_r <r>` - LoRA rank (default: `256`)
+
+### Example Commands
+
+**Full fine-tuning with MeSO on MMLU:**
 ```bash
-sh job/mmlu.sh \
-    <method>                        # Batch selection strategy. Options: Regular, GREATS, GradNorm, etc.
-    <batch_size>                    # Batch size for training (e.g., 2, 4, 8)
-    <percentage>                    # Percentage of dataset to use (e.g., 0.05 for 5%)
-    <n_val>                         # Number of validation examples for in-context learning
-    <n_eval>                        # Number of evaluation examples
-    <model>                         # Model identifier (e.g., llama3-1b)
-    <lora_alpha>                    # LoRA alpha parameter (e.g., 1)
-    <lr>                            # Learning rate (e.g., 5e-05)
-    [seed]                          # Random seed for reproducibility (default: 42)
-    [gradient_accumulation_steps]  # Gradient accumulation steps (default: 1)
-    [subject]                       # MMLU subject (default: world_religions)
-    [compression]                   # Compression method: Vanilla, GraSS, or LoGra (default: Vanilla)
+sbatch experiment/job/train.sh \
+    --task mmlu \
+    --subject sociology \
+    --optimizer MeSO \
+    --lr 1e-05
 ```
 
-**Compression Methods:**
-- **Vanilla**: No gradient compression
-- **GraSS**: Gradient Sparsification with Sketching (RandomMask-128*128 + SJLT-4096)
-- **LoGra**: Low-rank Gradient compression (Gaussian-64*64 projection)
-
-### SAMSUM
-
+**Full fine-tuning with GREATS data selection:**
 ```bash
-sh job/samsum.sh \
-    <method>                        # Batch selection strategy
-    <batch_size>                    # Batch size for training
-    <percentage>                    # Percentage of dataset to use
-    <n_val>                         # Number of validation examples
-    <n_eval>                        # Number of evaluation examples (default: 500)
-    <model>                         # Model identifier
-    <lora_alpha>                    # LoRA alpha parameter
-    <lr>                            # Learning rate
-    [seed]                          # Random seed (default: 42)
-    [gradient_accumulation_steps]  # Gradient accumulation steps (default: 1)
-    [compression]                   # Compression method (default: Vanilla)
+sbatch experiment/job/train.sh \
+    --task mmlu \
+    --subject sociology \
+    --data_selection GREATS \
+    --optimizer Regular \
+    --lr 1e-05
 ```
 
-### TyDiQA
-
+**LoRA with MeSO:**
 ```bash
-sh job/tydiqa.sh \
-    <method>                        # Batch selection strategy
-    <batch_size>                    # Batch size for training
-    <percentage>                    # Percentage of dataset to use
-    <n_val>                         # Number of validation examples
-    <n_eval>                        # Number of evaluation examples (default: 500)
-    <model>                         # Model identifier
-    <lora_alpha>                    # LoRA alpha parameter
-    <lr>                            # Learning rate
-    [seed]                          # Random seed (default: 42)
-    [gradient_accumulation_steps]  # Gradient accumulation steps (default: 1)
-    [compression]                   # Compression method (default: Vanilla)
+sbatch experiment/job/train.sh \
+    --task mmlu \
+    --subject sociology \
+    --optimizer MeSO \
+    --lora \
+    --lr 5e-05
+```
+
+**Custom projector refresh interval:**
+```bash
+sbatch experiment/job/train.sh \
+    --task mmlu \
+    --subject sociology \
+    --optimizer MeSO \
+    --update_compressor_freq 100 \
+    --lr 1e-05
 ```
 
 ## Evaluation

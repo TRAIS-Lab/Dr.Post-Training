@@ -17,6 +17,10 @@ def none_or_str(value):
 
 @dataclass
 class DataArguments:
+    data_dir: str = field(
+        default="data",
+        metadata={"help": "The directory containing training and evaluation data."}
+    )
     train_files: List[str] = field(default_factory=list, metadata={
                                    "help": "The input training data files (multiple files in glob format)."})
     overwrite_cache: bool = field(

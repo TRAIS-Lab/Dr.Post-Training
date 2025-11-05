@@ -20,9 +20,11 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
 
 from ..data.get_training_dataset import get_training_dataset
 from ..data.get_validation_dataset import get_dataset
-from ..compress_gradient.hook import GradHook
 
-from .trainer import CompGradTrainer
+from .compress_gradient.hook import GradientHook
+from .compress_gradient.trainer import CompGradTrainer
+from .compress_gradient.compressor import setup_model_compressors, create_sample_inputs
+
 from .data_arguments import DataArguments, get_data_statistics
 from .model_arguments import ModelArguments, add_padding_to_tokenizer
 from .training_arguments import TrainingArguments
@@ -62,7 +64,6 @@ def find_trainable_layers(model, lora_only=True):
 
 
 def main():
-
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
 
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -102,12 +103,14 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
 
     # Load training dataset
-    train_dataset = get_training_dataset(data_args.train_files,
+    train_dataset = get_training_dataset(data_dir=data_args.data_dir,
+                                         task=training_args.analysis_dataset,
                                          tokenizer=tokenizer,
                                          max_seq_length=data_args.max_seq_length,
                                          sample_percentage=data_args.percentage,
-                                         seed=data_args.sample_data_seed)
-    print('Training Set')
+                                         seed=data_args.sample_data_seed,
+                                         train_files=data_args.train_files if data_args.train_files else None)
+
     get_data_statistics(train_dataset)
 
     # Load model - NO CUSTOM LAYER REPLACEMENT!
@@ -125,7 +128,6 @@ def main():
 
     # Apply LoRA using standard PEFT (no custom layers!)
     if not isinstance(model, PeftModel) and model_args.lora:
-
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -167,7 +169,7 @@ def main():
     logger.info(f"Training method: {training_args.method} - Hooks will be {'registered' if should_register_hooks else 'NOT registered'}")
 
     # Create gradient hook
-    grad_hook = GradHook(
+    grad_hook = GradientHook(
         model=model,
         layer_names=layer_names,
         device=str(training_args.device),
@@ -177,8 +179,6 @@ def main():
 
     # Optional: Set up gradient compression
     if training_args.sparsification is not None or training_args.projection is not None:
-        from ..compress_gradient.projector import setup_model_compressors, create_sample_inputs
-
         logger.info("=== Gradient Compression Setup ===")
 
         # Parse sparsification argument
@@ -187,65 +187,50 @@ def main():
             logger.info("  Sparsification: Disabled")
         else:
             sparsification_method, sparsification_dim = training_args.sparsification.split("-")
-            if "*" in sparsification_dim:
-                sparsification_factorize = True
-                sparsification_dim_parts = sparsification_dim.split("*")
-                assert sparsification_dim_parts[0] == sparsification_dim_parts[1], \
-                    "Sparsification dimension must be the same for factorized projection."
-                sparsification_dim = int(sparsification_dim_parts[0])
-            else:
-                sparsification_factorize = False
-                sparsification_dim = int(sparsification_dim)
+            assert "*" in sparsification_dim, "Sparsification dimension must be factorized (e.g., '64*64')."
+
+            sparsification_dim_parts = sparsification_dim.split("*")
+            assert sparsification_dim_parts[0] == sparsification_dim_parts[1], \
+                "Sparsification dimension must be the same for factorized projection."
+            sparsification_dim = int(sparsification_dim_parts[0])
 
             sparsifier_kwargs = {
                 "proj_dim": sparsification_dim,
                 "proj_max_batch_size": 64,
                 "proj_seed": training_args.seed,
-                "proj_factorize": sparsification_factorize,
                 "device": str(training_args.device),
-                "method": sparsification_method,
-                "use_half_precision": True,
+                "proj_type": sparsification_method,
             }
-            logger.info(f"  Sparsification: {sparsification_method} -> {sparsification_dim} dimension "
-                       f"(factorized: {sparsification_factorize})")
+            logger.info(f"  Sparsification: {sparsification_method} -> {sparsification_dim}*{sparsification_dim} dimension ")
 
         # Parse projection argument
         if training_args.projection is None:
             projector_kwargs = {
                 "proj_dim": -1,
-                "proj_max_batch_size": -1,
+                "proj_max_batch_size": 1,
                 "proj_seed": training_args.seed,
-                "proj_factorize": False,
                 "device": str(training_args.device),
-                "method": "Identity",
-                "use_half_precision": True,
+                "proj_type": "identity",
             }
             logger.info("  Projection: Identity (no projection)")
         else:
             proj_method, proj_dim = training_args.projection.split("-")
-            if "*" in proj_dim:
-                proj_factorize = True
-                proj_dim_parts = proj_dim.split("*")
-                assert proj_dim_parts[0] == proj_dim_parts[1], \
-                    "Projection dimension must be the same for factorized projection."
-                proj_dim = int(proj_dim_parts[0])
-            else:
-                proj_factorize = False
-                proj_dim = int(proj_dim)
+            assert "*" not in proj_dim, "Projection dimension must not be factorized."
+
+            proj_dim = int(proj_dim)
 
             projector_kwargs = {
                 "proj_dim": proj_dim,
                 "proj_max_batch_size": 64,
                 "proj_seed": training_args.seed,
-                "proj_factorize": proj_factorize,
                 "device": str(training_args.device),
-                "method": proj_method,
-                "use_half_precision": True,
+                "proj_type": proj_method,
             }
-            logger.info(f"  Projection: {proj_method} -> {proj_dim} dimension (factorized: {proj_factorize})")
+            logger.info(f"  Projection: {proj_method} -> {proj_dim} dimension.")
 
         # Create sample inputs for compression initialization
         # This runs a forward pass to determine the dimensions needed for each layer's projector
+        logger.info("Creating sample inputs for compressor initialization...")
         sample_inputs = create_sample_inputs(
             tokenizer=tokenizer,
             max_seq_length=data_args.max_seq_length,
@@ -253,22 +238,20 @@ def main():
         )
 
         # Set up compressors using sample inputs
+        logger.info("Setting up model compressors...")
         sparsifiers, projectors = setup_model_compressors(
             model=model,
             layer_names=layer_names,
             sparsifier_kwargs=sparsifier_kwargs,
             projector_kwargs=projector_kwargs,
             sample_inputs=sample_inputs,
-            device=str(training_args.device)
+            device=str(training_args.device),
+            update_compressor_freq=training_args.update_compressor_freq
         )
 
-        if sparsifiers:
-            grad_hook.set_sparsifiers(sparsifiers)
-            logger.info(f"  ✓ Set {len(sparsifiers)} sparsifiers")
-
-        if projectors:
-            grad_hook.set_projectors(projectors)
-            logger.info(f"  ✓ Set {len(projectors)} projectors")
+        grad_hook.set_sparsifiers(sparsifiers)
+        grad_hook.set_projectors(projectors)
+        logger.info(f"  Set {len(sparsifiers)} sparsifiers and {len(projectors)} projectors (refreshed every {training_args.update_compressor_freq} steps)")
 
         logger.info("Gradient compression setup completed!")
     else:
@@ -277,7 +260,7 @@ def main():
     # Prepare validation dataset (used for data selection in GREATS)
     val_dataset = get_dataset(
         task=training_args.analysis_dataset,
-        data_dir='data',
+        data_dir=data_args.data_dir,
         tokenizer=tokenizer,
         max_length=data_args.max_seq_length,
         validation=True,
@@ -288,7 +271,7 @@ def main():
     # Prepare evaluation dataset (held-out test set for measuring generalization)
     eval_dataset = get_dataset(
         task=training_args.analysis_dataset,
-        data_dir='data',
+        data_dir=data_args.data_dir,
         tokenizer=tokenizer,
         max_length=data_args.max_seq_length,
         validation=False,

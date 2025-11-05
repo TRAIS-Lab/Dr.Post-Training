@@ -81,7 +81,7 @@ class TrainingArguments(TA):
 
     ### added ###
     method: str = field(default='Regular', metadata={"help": "training method"})
-    fracinv: float = field(default=1.0, metadata={"help": "training method"})
+    selection_frac: float = field(default=1.0, metadata={"help": "training method"})
     subject: str = field(default='abstract_algebra', metadata={"help": "subject for evaluation"})
     n_val: int = field(default=5, metadata={"help": "number of validation data (for data selection)"})
     n_eval: int = field(default=500, metadata={"help": "number of evaluation data (for generalization testing)"})
@@ -102,6 +102,25 @@ class TrainingArguments(TA):
             "help": (
                 "Projection method and dimension in format 'METHOD-DIM' or 'METHOD-DIM*DIM' for factorized. "
                 "Examples: 'Gaussian-256', 'Rademacher-128*128'. Set to None to use identity (no projection)."
+            )
+        },
+    )
+    update_compressor_freq: int = field(
+        default=200,
+        metadata={
+            "help": (
+                "Number of steps between projector refreshes (similar to GaLore's update_compressor_freq). "
+                "Set to a large value (e.g., 1000000) to effectively disable refresh. Default: 200"
+            )
+        },
+    )
+    use_compressed_optimizer: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to use the compressed optimizer (AdamWMeSO). "
+                "When True, uses compressed optimizer states for memory efficiency. "
+                "Requires gradient compression to be enabled (sparsification or projection)."
             )
         },
     )

@@ -1,50 +1,18 @@
 import torch
 import logging
 from typing import Dict, List, Optional
+from torch import Tensor
 
 # Configure logger
 logger = logging.getLogger(__name__)
 
-def stable_inverse(matrix: torch.Tensor, damping: float = None) -> torch.Tensor:
-    """
-    Compute a numerically stable inverse of a matrix using eigendecomposition.
-
-    Args:
-        matrix: Input matrix to invert
-        damping: (Adaptive) Damping factor for numerical stability
-
-    Returns:
-        Stable inverse of the input matrix with the same dtype as input
-    """
-    orig_dtype = matrix.dtype
-    matrix = matrix.to(dtype=torch.float32)
-
-    assert matrix.dim() == 2, "Input must be a 2D matrix"
-
-    # Add damping to the diagonal
-    if damping is None:
-        damping = 1e-5 * torch.trace(matrix) / matrix.size(0)
-    else:
-        damping = damping * torch.trace(matrix) / matrix.size(0)
-
-    damped_matrix = matrix + damping * torch.eye(matrix.size(0), device=matrix.device)
-
-    try:
-        L = torch.linalg.cholesky(damped_matrix)
-        inverse = torch.cholesky_inverse(L)
-    except RuntimeError:
-        logger.warning(f"Falling back to direct inverse due to Cholesky failure")
-        inverse = torch.inverse(damped_matrix)
-
-    return inverse.to(dtype=orig_dtype)
-
 
 def vectorize(
-    g: Dict[str, torch.Tensor],
+    g: Dict[str, Tensor],
     batch_dim: Optional[bool] = True,
-    arr: Optional[torch.Tensor] = None,
+    arr: Optional[Tensor] = None,
     device: Optional[str] = "cuda",
-) -> torch.Tensor:
+) -> Tensor:
     """
     Vectorize gradients into a flattened tensor.
 
@@ -156,3 +124,77 @@ def get_parameter_chunk_sizes(
         params_per_chunk = [0]
 
     return max_chunk_size, params_per_chunk
+
+def create_sample_inputs(
+    tokenizer,
+    max_seq_length: int = 512,
+    device: str = 'cpu',
+    sample_text: Optional[str] = None
+) -> Dict[str, Tensor]:
+    """
+    Create sample inputs for initializing gradient compressors.
+
+    This helper function creates a minimal batch of tokenized inputs that can be used
+    to run a forward pass through the model to determine layer dimensions.
+
+    Args:
+        tokenizer: HuggingFace tokenizer instance
+        max_seq_length: Maximum sequence length for tokenization
+        device: Device to place the tensors on
+        sample_text: Optional sample text to tokenize. If None, uses a default message.
+
+    Returns:
+        Dictionary containing tokenized inputs ready for model forward pass
+
+    Example:
+        >>> sample_inputs = create_sample_inputs(tokenizer, max_seq_length=512, device='cuda')
+        >>> sparsifiers, projectors = setup_model_compressors(
+        ...     model=model,
+        ...     layer_names=layer_names,
+        ...     sample_inputs=sample_inputs,
+        ...     device='cuda'
+        ... )
+    """
+    if sample_text is None:
+        sample_text = "This is a sample text for compression initialization."
+
+    sample_inputs = tokenizer(
+        [sample_text],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_seq_length
+    )
+
+    # Move to device and add labels for language modeling
+    sample_inputs = {k: v.to(device) for k, v in sample_inputs.items()}
+    sample_inputs['labels'] = sample_inputs['input_ids'].clone()
+
+    return sample_inputs
+
+
+def greedy_selection(scores, interaction_matrix, k: int):
+    """
+    Select k data points based on the highest scores, dynamically updating scores
+    by subtracting interactions with previously selected data points.
+
+    Parameters:
+    - scores: A numpy array of initial scores for each data point.
+    - interaction_matrix: A numpy matrix of pairwise interactions between data points.
+    - k: The number of data points to select.
+
+    Returns:
+    - selected_indices: Indices of the selected data points.
+    """
+    # Ensure scores is a mutable numpy array to update it in-place
+    selected_indices = []
+
+    for _ in range(k):
+        idx_max = torch.argmax(scores).item()
+        selected_indices.append(idx_max)
+
+        # Update scores by subtracting interactions with the selected data point
+        scores -= interaction_matrix[idx_max, :]
+        scores[idx_max] = -float('inf')
+
+    return selected_indices

@@ -39,6 +39,9 @@ dist
 *.slurm
 *.arrow
 *.png
+*.pdf
+*.tex
+*.nfs*
 
 */log
 */job
@@ -58,3 +61,4 @@ dist
 
 /test/
 /Figures/
+/GaLore/

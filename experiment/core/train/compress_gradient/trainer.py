@@ -10,20 +10,23 @@ import logging
 from pathlib import Path
 
 import torch
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 import torch.nn as nn
-from typing import Dict, Optional
+from typing import Dict
 from torch import Tensor
-from torch.utils.data import DataLoader
 
 from transformers import Trainer
 
-from ..compress_gradient.hook import GradHook
+from .optimizer import AdamWMeSO
+from .hook import GradientHook
+from .utils import greedy_selection
 
 logger = logging.getLogger(__name__)
 
+
 def compute_grad_dotprod(
     model: nn.Module,
-    grad_hook: GradHook,
+    grad_hook: GradientHook,
     batch_train: Dict[str, Tensor],
     batch_val: Dict[str, Tensor],
     return_similarity: bool = True
@@ -33,14 +36,14 @@ def compute_grad_dotprod(
 
     Args:
         model: The model
-        grad_hook: GradHook with hooks attached
-        batch_train: Training batch
-        batch_val: Validation batch (single batch)
+        grad_hook: GradientHook with hooks attached
+        batch_train: Training batch of size [batch_size]
+        batch_val: Validation batch of size [batch_size]
         return_similarity: Whether to return similarity matrix
 
     Returns:
-        - grad_dot_scores: [train_bs] gradient similarity with validation
-        - similarity_matrix: [train_bs, train_bs] if return_similarity else None
+        - grad_dot_scores: [batch_size] gradient similarity with validation
+        - similarity_matrix: [batch_size, batch_size] if return_similarity else None
     """
     # Move validation batch to same device as training
     device = batch_train['input_ids'].device
@@ -54,8 +57,8 @@ def compute_grad_dotprod(
 
     # Get validation gradients from hooks
     val_grads = grad_hook.get_compressed_grads()
-    # Concatenate all layers: each is [batch_size, grad_dim]
-    val_grads_concat = torch.cat([g for g in val_grads if g is not None], dim=1)  # [val_bs, total_dim]
+    # Concatenate all layers: each is [batch_size, compressed_grad_dim]
+    val_grads_concat = torch.cat([g for g in val_grads if g is not None], dim=1)  # [batch_size, total_dim]
     # Average over validation batch
     val_grad_avg = val_grads_concat.mean(dim=0, keepdim=True)  # [1, total_dim]
 
@@ -67,60 +70,35 @@ def compute_grad_dotprod(
 
     # Get training gradients from hooks
     train_grads = grad_hook.get_compressed_grads()
-    # Concatenate all layers
-    train_grads_concat = torch.cat([g for g in train_grads if g is not None], dim=1)  # [train_bs, total_dim]
+    # Concatenate all layers: each is [batch_size, compressed_grad_dim]
+    train_grads_concat = torch.cat([g for g in train_grads if g is not None], dim=1)  # [batch_size, total_dim]
 
     # Step 3: Compute GradDot scores
-    # [train_bs, total_dim] x [total_dim, 1] -> [train_bs]
+    # [batch_size, total_dim] x [total_dim, 1] -> [batch_size]
     grad_dot_scores = torch.matmul(train_grads_concat, val_grad_avg.t()).squeeze(-1)
     grad_dot_scores = grad_dot_scores.cpu().detach()
 
     # Step 4: Compute similarity matrix if requested
     similarity_matrix = None
     if return_similarity:
-        # [train_bs, total_dim] x [total_dim, train_bs] -> [train_bs, train_bs]
+        # [batch_size, total_dim] x [total_dim, batch_size] -> [batch_size, batch_size]
         similarity_matrix = torch.matmul(train_grads_concat, train_grads_concat.t())
         similarity_matrix = similarity_matrix.cpu().detach()
 
     return grad_dot_scores, similarity_matrix
 
-def greedy_selection(scores, interaction_matrix, k):
-    """
-    Select k data points based on the highest scores, dynamically updating scores
-    by subtracting interactions with previously selected data points.
-
-    Parameters:
-    - scores: A numpy array of initial scores for each data point.
-    - interaction_matrix: A numpy matrix of pairwise interactions between data points.
-    - k: The number of data points to select.
-
-    Returns:
-    - selected_indices: Indices of the selected data points.
-    """
-    # Ensure scores is a mutable numpy array to update it in-place
-    selected_indices = []
-
-    for _ in range(k):
-        idx_max = torch.argmax(scores).item()
-        selected_indices.append(idx_max)
-
-        # Update scores by subtracting interactions with the selected data point
-        scores -= interaction_matrix[idx_max, :]
-        scores[idx_max] = -float('inf')
-
-    return selected_indices
 
 class CompGradTrainer(Trainer):
     """
     Trainer with gradient hook manager for per-sample gradient computations.
     """
 
-    def __init__(self, grad_hook, val_dataset, *args, **kwargs):
+    def __init__(self, grad_hook: GradientHook, val_dataset, *args, **kwargs):
         """
         Initialize the hook-based trainer.
 
         Args:
-            grad_hook: compress_gradient.hook.GradHook instance
+            grad_hook: hook.GradientHook instance
             val_dataset: Validation dataset (for data selection, small)
             *args, **kwargs: Same as transformers.Trainer
                 - Must include eval_dataset: Evaluation dataset (for generalization testing, large)
@@ -146,20 +124,83 @@ class CompGradTrainer(Trainer):
         self.evaluation_results = []
 
         # Create validation dataloader iterator for efficient batch sampling during training
-        self.val_dataloader_iter = iter(self.get_val_dataloader(self.val_dataset, batch_size=4, shuffle=True))
+        self.val_dataloader_iter = iter(self.get_val_dataloader(self.val_dataset, batch_size=self.args.per_device_train_batch_size, shuffle=True))
+
+        # Track selected indices for compressed optimizer
+        self.current_selected_indices = None
 
         logger.info("="*60)
         logger.info("Initialized HookTrainer")
-        logger.info(f"  Selection method: {self.args.method}")
-        logger.info(f"  Fracinv: {self.args.fracinv}")
+        logger.info(f"  Selection method: {self.args.method} (fraction: {self.args.selection_frac})")
         logger.info(f"  Validation set size: {len(val_dataset)}")
         logger.info(f"  Evaluation set size: {len(eval_dataset)}")
+        logger.info(f"  Compressed optimizer: {self.args.use_compressed_optimizer}")
         logger.info("="*60)
+
+    def create_optimizer(self):
+        """
+        Setup the optimizer with optional compressed state storage.
+
+        If use_compressed_optimizer is True and gradient compression is enabled,
+        uses AdamWMeSO which maintains optimizer states in compressed space.
+        """
+        # Check if we should use compressed optimizer
+        use_compressed = (
+            self.args.use_compressed_optimizer and
+            self.grad_hook is not None and
+            len(self.grad_hook.projectors) > 0
+        )
+
+        if use_compressed:
+            # Check that projectors are actually set up
+            has_projectors = any(p is not None for p in self.grad_hook.projectors)
+
+            if not has_projectors:
+                logger.warning(
+                    "use_compressed_optimizer=True but no projectors found! "
+                    "Falling back to standard optimizer. "
+                    "Make sure to set sparsification and/or projection arguments."
+                )
+                use_compressed = False
+
+        if use_compressed:
+            logger.info("Using AdamWMeSO optimizer with compressed state storage")
+
+            # Create compressed optimizer
+            self.optimizer = AdamWMeSO(
+                params=self.model.parameters(),
+                grad_hook=self.grad_hook,
+                lr=self.args.learning_rate,
+                betas=(self.args.adam_beta1, self.args.adam_beta2),
+                eps=self.args.adam_epsilon,
+                weight_decay=self.args.weight_decay,
+            )
+
+            logger.info("Compressed optimizer initialized successfully")
+
+        else:
+            # Use standard Hugging Face optimizer creation
+            logger.info("Using standard AdamW optimizer")
+            super().create_optimizer()
+
+        return self.optimizer
+
+    def optimizer_step(self, *args, **kwargs):
+        """
+        Override optimizer step to pass selected indices to compressed optimizer.
+        """
+        # Check if using compressed optimizer and have selected indices
+        if isinstance(self.optimizer, AdamWMeSO) and self.current_selected_indices is not None:
+            # Call optimizer with selected_indices
+            self.optimizer.step(selected_indices=list(self.current_selected_indices))
+            # Reset selected indices after use
+            self.current_selected_indices = None
+        else:
+            # Standard optimizer step
+            super().optimizer_step(*args, **kwargs)
 
     def get_val_dataloader(self, val_dataset, batch_size=4, shuffle=True):
         """Create validation dataloader for data selection."""
-        from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
-
         if shuffle:
             sampler = RandomSampler(val_dataset)
         else:
@@ -205,7 +246,7 @@ class CompGradTrainer(Trainer):
             selected_ind = greedy_selection(
                 scores * lr,
                 similarity_matrix * (lr ** 2),
-                int(len(scores) / args.fracinv)
+                int(len(scores) * args.selection_frac)
             )
 
         elif args.method == "GradNorm":
@@ -223,7 +264,7 @@ class CompGradTrainer(Trainer):
             selected_ind = greedy_selection(
                 scores,
                 similarity_matrix * 0,
-                int(len(scores) / 2)
+                int(len(scores) * args.selection_frac)
             )
 
         elif args.method == "MaxLoss":
@@ -238,10 +279,13 @@ class CompGradTrainer(Trainer):
             selected_ind = greedy_selection(
                 torch.tensor(losses),
                 torch.zeros((len(losses), len(losses))),
-                int(len(losses) / 2)
+                int(len(losses) * args.selection_frac)
             )
         else:
             selected_ind = None
+
+        # Store selected indices for compressed optimizer
+        self.current_selected_indices = selected_ind
 
         if selected_ind is not None:
             inputs = {
