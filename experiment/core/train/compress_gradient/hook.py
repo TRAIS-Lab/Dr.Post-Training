@@ -1,198 +1,345 @@
 """
-Hook manager for efficient gradient component capture and projection.
+Hook manager for efficient gradient compression with prevented materialization.
+
+This implementation uses monkey-patching with custom autograd Functions to prevent
+full gradient materialization. Key technique:
+
+1. **Monkey-Patching**: Replace module.forward with custom function
+2. **Custom Autograd Function**: Control backward pass to compute ONLY compressed gradients
+3. **Return None for weight.grad**: Tells PyTorch to skip full gradient computation
+4. **Centralized Storage**: All data stored in hook manager (memory efficient)
+5. **Global Registry**: Prevents memory leaks in autograd graph
+
+This prevents PyTorch from computing full gradients that we don't need.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, List
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.autograd import Function
 import functools
 import logging
 
-import torch.jit as jit
 from .compressor import SparsifierContainer, ProjectorContainer
 
-# Configure logger
 logger = logging.getLogger(__name__)
 
-@jit.script
-def linear_grad_2d(grad_pre_activation: Tensor, input_features: Tensor) -> Tensor:
+# Global registry: maps a unique ID to hook manager
+# CRITICAL: Used to avoid storing hook_manager in autograd context, which would cause memory leaks
+_HOOK_MANAGER_REGISTRY = {}
+
+
+class CompressedLinearBackward(Function):
     """
-    Compute weight gradients using outer products for 2D tensors.
+    Custom autograd Function that prevents full gradient materialization.
 
-    Args:
-        grad_pre_activation: Gradient of pre-activation with shape [batch_size, output_dim]
-        input_features: Input features with shape [batch_size, input_dim]
-
-    Returns:
-        Tensor of shape [batch_size, output_dim * input_dim] containing per-sample gradients
+    Key mechanism: When backward() returns None for a parameter, PyTorch skips
+    computing that parameter's gradient entirely. This is how we avoid materializing
+    the full weight gradient.
     """
-    batch_size = input_features.shape[0]
-    output_dim = grad_pre_activation.shape[1]
-    input_dim = input_features.shape[1]
 
-    grad_tensor = torch.einsum('bi,bj->bij', grad_pre_activation, input_features)
-    return grad_tensor.reshape(batch_size, output_dim * input_dim)
+    @staticmethod
+    def forward(ctx, input: Tensor, weight: Tensor, bias: Tensor | None,
+                hook_manager_id: int, layer_idx: int) -> Tensor:
+        """
+        Forward pass: standard linear transformation.
 
-@jit.script
-def linear_grad_3d(grad_pre_activation: Tensor, input_features: Tensor) -> Tensor:
+        CRITICAL: We store hook_manager_id (an int) instead of the hook_manager object.
+        Storing the object would keep it in the autograd graph, causing memory leaks.
+        """
+        ctx.save_for_backward(weight, bias)
+        ctx.hook_manager_id = hook_manager_id
+        ctx.layer_idx = layer_idx
+
+        # Lookup hook manager from global registry
+        hook_manager = _HOOK_MANAGER_REGISTRY.get(hook_manager_id)
+        if hook_manager is None:
+            raise RuntimeError(f"Hook manager {hook_manager_id} not found in registry")
+
+        # Store input for backward pass (centralized storage)
+        hook_manager.inputs[layer_idx] = input.detach()
+
+        # Standard forward pass (same as nn.Linear)
+        output = F.linear(input, weight, bias)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        """
+        Backward pass: compute ONLY compressed gradient, not the full gradient.
+
+        By returning None for weight and bias, we tell PyTorch: "don't compute
+        param.grad for these, I handled it myself". This is the key mechanism
+        that prevents full gradient materialization.
+        """
+        weight, bias = ctx.saved_tensors
+        hook_manager_id = ctx.hook_manager_id
+        layer_idx = ctx.layer_idx
+
+        # Lookup hook manager from registry
+        hook_manager = _HOOK_MANAGER_REGISTRY.get(hook_manager_id)
+        if hook_manager is None:
+            raise RuntimeError(f"Hook manager {hook_manager_id} not found in registry")
+
+        # Retrieve stored input
+        input = hook_manager.inputs[layer_idx]
+
+        # Compute grad_input (needed for backprop to previous layers)
+        grad_input = grad_output @ weight
+
+        # Compute compressed gradient directly (without full gradient)
+        with torch.no_grad():
+            compressed_grad = _compute_compressed_grad(
+                grad_output=grad_output,
+                input=input,
+                has_bias=(bias is not None),
+                sparsifier=hook_manager.sparsifiers[layer_idx],
+                projector=hook_manager.projectors[layer_idx],
+            )
+
+            # Store compressed gradient in hook manager
+            hook_manager.compressed_grads[layer_idx] = compressed_grad
+
+            # Free input immediately
+            hook_manager.inputs[layer_idx] = None
+
+        # Return gradients:
+        # - grad_input: needed for backprop
+        # - None for weight: tells PyTorch NOT to compute weight.grad
+        # - None for bias: tells PyTorch NOT to compute bias.grad
+        # - None for hook_manager_id, layer_idx: not tensors
+        return grad_input, None, None, None, None
+
+
+def _compute_compressed_grad(
+    grad_output: Tensor,
+    input: Tensor,
+    has_bias: bool,
+    sparsifier: Any,
+    projector: Any,
+) -> Tensor:
     """
-    Compute weight gradients using outer products for 3D tensors (sequence data).
+    Compute compressed gradient without materializing full gradient.
 
-    Args:
-        grad_pre_activation: Gradient of pre-activation with shape [batch_size, seq_length, output_dim]
-        input_features: Input features with shape [batch_size, seq_length, input_dim]
-
-    Returns:
-        Tensor of shape [batch_size, output_dim * input_dim] containing per-sample gradients
+    Process:
+    1. Add bias term to input (if needed)
+    2. Apply sparsification BEFORE outer product (reduces dimensions early)
+    3. Compute outer product in compressed space
+    4. Apply projection to get final compressed gradient
     """
-    batch_size = input_features.shape[0]
-    output_dim = grad_pre_activation.shape[2]
-    input_dim = input_features.shape[2]
+    # Determine dimensions
+    is_3d = input.dim() == 3
 
-    grad_tensor = torch.einsum('bsi,bsj->bij', grad_pre_activation, input_features)
-    return grad_tensor.reshape(batch_size, output_dim * input_dim)
+    if is_3d:
+        batch_size, seq_length, in_features = input.shape
+        out_features = grad_output.shape[2]
+    else:
+        batch_size = input.shape[0]
+        in_features = input.shape[-1]
+        out_features = grad_output.shape[-1]
+
+    # Reshape to 2D if needed
+    if is_3d:
+        input_2d = input.reshape(-1, in_features)
+        grad_output_2d = grad_output.reshape(-1, out_features)
+    else:
+        input_2d = input
+        grad_output_2d = grad_output
+
+    # Add bias term BEFORE sparsification
+    if has_bias:
+        ones = torch.ones(input_2d.size(0), 1,
+                         device=input_2d.device,
+                         dtype=input_2d.dtype)
+        input_2d = torch.cat([input_2d, ones], dim=1)
+
+    # Apply sparsification BEFORE outer product (if available)
+    if sparsifier and hasattr(sparsifier, 'sparsifier_comp') and sparsifier.sparsifier_comp != (None, None):
+        sparsifier_output, sparsifier_input = sparsifier.sparsifier_comp
+
+        # Apply sparsifiers
+        grad_output_sparse = sparsifier_output(grad_output_2d)
+        input_sparse = sparsifier_input(input_2d)
+
+        # Compute per-sample gradients with scaling
+        if is_3d:
+            grad_sparse_3d = grad_output_sparse.reshape(batch_size, seq_length, -1)
+            input_sparse_3d = input_sparse.reshape(batch_size, seq_length, -1)
+
+            grad_tensor = torch.einsum('bsi,bsj->bij',
+                                      grad_sparse_3d * batch_size,
+                                      input_sparse_3d)
+        else:
+            grad_tensor = torch.einsum('bi,bj->bij',
+                                      grad_output_sparse * batch_size,
+                                      input_sparse)
+
+        grad = grad_tensor.reshape(batch_size, -1)
+
+    else:
+        # No sparsification: compute outer product directly
+        if is_3d:
+            input_3d = input_2d.reshape(batch_size, seq_length, -1)
+            grad_output_3d = grad_output_2d.reshape(batch_size, seq_length, -1)
+
+            grad_tensor = torch.einsum('bsi,bsj->bij',
+                                      grad_output_3d * batch_size,
+                                      input_3d)
+        else:
+            grad_tensor = torch.einsum('bi,bj->bij',
+                                      grad_output_2d * batch_size,
+                                      input_2d)
+
+        grad = grad_tensor.reshape(batch_size, -1)
+
+    # Apply projection (operates AFTER outer product)
+    if projector and hasattr(projector, 'projector') and projector.projector is not None:
+        grad = projector.projector(grad)
+
+    return grad
+
 
 class GradientHook:
     """
-    Manages hooks for efficient gradient component capturing and projection
-    without requiring custom layer implementations.
+    Hook manager that prevents full gradient materialization through monkey-patching.
+
+    How it works:
+    1. Replaces module.forward with a custom function that uses CompressedLinearBackward
+    2. CompressedLinearBackward.backward() computes ONLY compressed gradients
+    3. Returns None for weight/bias gradients, telling PyTorch to skip full computation
+    4. Stores everything centrally in hook manager (memory efficient)
     """
+
     def __init__(
-            self,
-            model: nn.Module,
-            layer_names: List[str],
-            device: str = 'cpu',
-            register_hooks: bool = True
-        ) -> None:
+        self,
+        model: nn.Module,
+        layer_names: List[str],
+        device: str = 'cpu',
+        register_hooks: bool = True
+    ) -> None:
         """
-        Initialize the hook manager
+        Initialize the hook manager.
 
         Args:
             model: The model to hook
-            layer_names: Names of layers to hook
-            device: Device to use for profiling synchronization
-            register_hooks: Whether to register hooks immediately (default: True)
+            layer_names: Names of layers to hook (only Linear layers supported)
+            device: Device for synchronization
+            register_hooks: Whether to register hooks immediately (monkey-patch forward methods)
         """
         self.model = model
         self.layer_names = layer_names
         self.device = device
 
-        # Create mapping from layer name to index for O(1) lookups
+        # Create mapping from layer name to index
         self.layer_name_to_idx = {name: idx for idx, name in enumerate(layer_names)}
 
-        # Create mapping from layer name to module for O(1) lookups
+        # Create mapping from layer name to module
         self.layer_name_to_module = {}
 
+        # Centralized storage arrays
         self.forward_hooks = [None] * len(layer_names)
-        self.backward_hooks = [None] * len(layer_names)
         self.compressed_grads = [None] * len(layer_names)
         self.inputs = [None] * len(layer_names)
-        self.pre_activations = [None] * len(layer_names)
-        self.normalized = [None] * len(layer_names)
 
-        # Initialize sparsifiers and projectors (to avoid AttributeError when not set)
+        # Compression components
         self.sparsifiers = [None] * len(layer_names)
         self.projectors = [None] * len(layer_names)
 
-        # Flag to track if hooks are currently registered
+        # Track hook registration status
         self.hooks_registered = False
+
+        # Register in global registry
+        # CRITICAL: Store ID, not self, to avoid memory leaks in autograd graph
+        self._hook_manager_id = id(self)
+        _HOOK_MANAGER_REGISTRY[self._hook_manager_id] = self
 
         # Register hooks if requested
         if register_hooks:
             self._register_hooks()
 
-        logger.info(f"Initialized GradientHook with {len(layer_names)} layers (hooks {'registered' if register_hooks else 'NOT registered'})")
+        logger.info(f"Initialized GradientHook with {len(layer_names)} layers")
 
     def _register_hooks(self):
-        """Register forward hooks to target layers (backward hooks are registered dynamically via tensors)"""
+        """
+        Monkey-patch Linear layers to use our custom Function.
+
+        This replaces module.forward with our custom function that prevents
+        full gradient materialization.
+        """
         if self.hooks_registered:
-            logger.warning("Hooks already registered, skipping registration")
+            logger.warning("Hooks already registered, skipping")
             return
 
         for name, module in self.model.named_modules():
             if name in self.layer_names:
                 idx = self.layer_name_to_idx[name]
 
-                # Cache the module for efficient lookup later
+                # Cache the module
                 self.layer_name_to_module[name] = module
 
-                forward_hook = functools.partial(self._forward_hook_fn, name)
+                # Only support Linear layers
+                if not isinstance(module, nn.Linear):
+                    logger.warning(f"Layer {name} is not nn.Linear, skipping")
+                    continue
 
-                # Register only forward hook - backward hooks are registered dynamically on tensors
-                # to avoid BackwardHookFunction wrapper issues with in-place operations
-                self.forward_hooks[idx] = module.register_forward_hook(forward_hook)
+                # Save original forward method (so we can restore it later)
+                module._original_forward = module.forward
+
+                # Create wrapped forward that uses our custom Function
+                wrapped_forward = functools.partial(
+                    self._custom_linear_forward, module, idx
+                )
+
+                # Replace the forward method (monkey-patching)
+                module.forward = wrapped_forward
+
+                logger.debug(f"Wrapped forward for layer {name} (idx={idx})")
 
         self.hooks_registered = True
-        logger.info(f"Successfully registered hooks for {len(self.layer_names)} layers")
+        logger.info(f"Successfully wrapped {len(self.layer_names)} layers")
+
+    def _custom_linear_forward(self, module: nn.Linear, idx: int, input: Tensor) -> Tensor:
+        """
+        Replacement forward method that uses our custom Function.
+
+        During training: Uses CompressedLinearBackward to prevent full gradient
+        During eval: Uses standard F.linear (no overhead)
+        """
+        if module.training and input.requires_grad:
+            # Use our custom backward that computes only compressed gradients
+            # Pass hook_manager_id (not self) to avoid keeping hook manager in autograd graph
+            return CompressedLinearBackward.apply(
+                input, module.weight, module.bias, self._hook_manager_id, idx
+            )
+        else:
+            # Use standard forward during eval
+            return F.linear(input, module.weight, module.bias)
 
     def set_sparsifiers(self, sparsifiers: List[SparsifierContainer]) -> None:
-        """
-        Set specifier objects for each layer
-
-        Args:
-            sparsifiers: List of projector objects, ordered by layer_names
-        """
+        """Set sparsifier objects for each layer."""
         self.sparsifiers = sparsifiers
 
     def set_projectors(self, projectors: List[ProjectorContainer]) -> None:
-        """
-        Set projector objects for each layer
-
-        Args:
-            projectors: List of projector objects, ordered by layer_names
-        """
+        """Set projector objects for each layer."""
         self.projectors = projectors
 
-    def refresh_compressors(self, step: int) -> int:
-        """
-        Refresh all projectors and sparsifiers if needed based on current training step.
-
-        Args:
-            step: Current training step
-
-        Returns:
-            Number of compressors (projectors + sparsifiers) that were refreshed
-        """
-        num_refreshed = 0
-
-        # Refresh sparsifiers
-        for idx, sparsifier in enumerate(self.sparsifiers):
-            if sparsifier is not None and sparsifier.refresh(step):
-                num_refreshed += 1
-
-        # Refresh projectors
-        for idx, projector in enumerate(self.projectors):
-            if projector is not None and projector.refresh(step):
-                num_refreshed += 1
-
-        return num_refreshed
-
     def get_compressed_grads(self) -> List[Tensor]:
-        """
-        Get all captured projected gradients
-
-        Returns:
-            List of projected gradient tensors, ordered by layer_names
-        """
+        """Get all captured compressed gradients."""
         return self.compressed_grads
 
     def get_decompressed_grads(self, selected_indices: List[int]) -> dict:
         """
-        Apply GraSS transpose to recover full gradients from compressed gradients.
-
-        This method aggregates the selected per-sample compressed gradients and then
-        applies the transpose operation to recover full gradients suitable for parameter updates.
+        Apply transpose operations to recover full gradients from compressed gradients.
 
         Args:
-            selected_indices: List of sample indices to aggregate (for data selection)
+            selected_indices: List of sample indices to aggregate
 
         Returns:
-            Dictionary mapping layer names to full gradients [1, p_l] ready for parameter updates
+            Dictionary mapping layer names to full gradients
         """
         full_grads = {}
 
@@ -204,29 +351,23 @@ class GradientHook:
 
             # Aggregate selected samples
             if selected_indices is not None and len(selected_indices) > 0:
-                selected_compressed = compressed_grad[selected_indices]  # [|S|, k_l]
-                aggregated_compressed = selected_compressed.mean(dim=0, keepdim=True)  # [1, k_l]
+                selected_compressed = compressed_grad[selected_indices]
+                aggregated_compressed = selected_compressed.mean(dim=0, keepdim=True)
             else:
-                # If no selection, use mean of all samples
-                aggregated_compressed = compressed_grad.mean(dim=0, keepdim=True)  # [1, k_l]
+                aggregated_compressed = compressed_grad.mean(dim=0, keepdim=True)
 
-            # Get projector and sparsifier for this layer
+            # Get compressors
             projector = self.projectors[idx] if idx < len(self.projectors) else None
             sparsifier = self.sparsifiers[idx] if idx < len(self.sparsifiers) else None
 
-            # Apply transpose in REVERSE order of compression:
-            # Forward compression: g → (sparsify) → g' → (project) → ĝ
-            # Backward transpose:  ĝ → (project^T) → g' → (sparsify^T) → ḡ
-
-            # Step 1: Apply projection transpose (stage 2) if available
+            # Apply transpose in reverse order
             if projector and hasattr(projector, 'transpose'):
-                g_intermediate = projector.transpose(aggregated_compressed)  # ĝ → g'
+                g_intermediate = projector.transpose(aggregated_compressed)
             else:
                 g_intermediate = aggregated_compressed
 
-            # Step 2: Apply sparsification transpose (stage 1) if available
             if sparsifier and hasattr(sparsifier, 'transpose'):
-                g_full = sparsifier.transpose(g_intermediate)  # g' → ḡ
+                g_full = sparsifier.transpose(g_intermediate)
             else:
                 g_full = g_intermediate
 
@@ -235,320 +376,45 @@ class GradientHook:
 
         return full_grads
 
-
-    def _forward_hook_fn(self, name: str, mod: nn.Module, inp: Any, out: Any) -> Any:
+    def refresh_compressors(self, step: int) -> int:
         """
-        Forward hook function that captures inputs and pre-activations
+        Refresh all projectors and sparsifiers if needed.
 
         Args:
-            name: Layer name
-            mod: Module instance
-            inp: Input tensors
-            out: Output tensors
+            step: Current training step
 
         Returns:
-            The output (potentially cloned to avoid in-place modification issues)
+            Number of compressors refreshed
         """
-        # Get the index for this layer
-        idx = self.layer_name_to_idx[name]
+        num_refreshed = 0
 
-        # Store input
-        if isinstance(inp, tuple) and len(inp) > 0:
-            self.inputs[idx] = inp[0].detach()
-        else:
-            self.inputs[idx] = inp.detach()
+        for idx, sparsifier in enumerate(self.sparsifiers):
+            if sparsifier is not None and sparsifier.refresh(step):
+                num_refreshed += 1
 
-        # Store pre-activation (output) - clone to avoid view issues
-        if isinstance(out, tuple):
-            self.pre_activations[idx] = tuple(o.detach() if isinstance(o, torch.Tensor) else o for o in out)
-            # Register tensor hook on the first tensor output to avoid BackwardHookFunction issues
-            if len(out) > 0 and isinstance(out[0], torch.Tensor) and out[0].requires_grad:
-                out[0].register_hook(lambda grad, n=name: self._tensor_backward_hook(n, grad))
-        else:
-            self.pre_activations[idx] = out.detach()
-            # Register tensor hook to avoid BackwardHookFunction issues with in-place ops
-            if isinstance(out, torch.Tensor) and out.requires_grad:
-                out.register_hook(lambda grad, n=name: self._tensor_backward_hook(n, grad))
+        for idx, projector in enumerate(self.projectors):
+            if projector is not None and projector.refresh(step):
+                num_refreshed += 1
 
-        # For LayerNorm, also capture the normalized tensor
-        if isinstance(mod, nn.LayerNorm):
-            x = inp[0] if isinstance(inp, tuple) else inp
-            mean = x.mean(dim=-1, keepdim=True)
-            var = x.var(dim=-1, keepdim=True, unbiased=False)
-            normalized = (x - mean) / torch.sqrt(var + mod.eps)
-            self.normalized[idx] = normalized.detach()
-
-        # Return None to not modify the output
-        return None
-
-    def _tensor_backward_hook(self, name: str, grad_output: Tensor) -> None:
-        """
-        Tensor-level backward hook that computes projected gradients.
-        This is called during backward pass on the output tensor of a layer.
-
-        Args:
-            name: Layer name
-            grad_output: Gradient w.r.t the output tensor
-        """
-        # Get the module and index for this layer
-        idx = self.layer_name_to_idx[name]
-        mod = self.layer_name_to_module.get(name)
-
-        if mod is None:
-            return
-
-        # Calculate the projected gradient based on layer type
-        with torch.no_grad():
-            if isinstance(mod, nn.Linear):
-                grad = self._linear_grad(
-                    mod, idx, grad_output, per_sample=True
-                )
-            elif isinstance(mod, nn.LayerNorm):
-                grad = self._layernorm_grad(
-                    mod, idx, grad_output, per_sample=True
-                )
-            elif isinstance(mod, nn.Embedding):
-                # Embeddings would need their own implementation
-                grad = None
-            else:
-                # Fallback for other layer types
-                grad = None
-
-            if grad is not None:
-                # Store the projected gradient
-                self.compressed_grads[idx] = grad.detach()
-
-    def _backward_hook_fn(self, name: str, mod: nn.Module, grad_input: Any, grad_output: Any) -> None:
-        """
-        Backward hook function that computes projected gradients
-
-        Args:
-            name: Layer name
-            mod: Module instance
-            grad_input: Gradient w.r.t inputs
-            grad_output: Gradient w.r.t outputs
-        """
-        # Get the index for this layer
-        idx = self.layer_name_to_idx[name]
-
-        # Get the gradient of the pre-activation
-        grad_pre_activation = grad_output[0]
-
-        # Calculate the projected gradient based on layer type
-        with torch.no_grad():
-            if isinstance(mod, nn.Linear):
-                grad = self._linear_grad(
-                    mod, idx, grad_pre_activation, per_sample=True
-                )
-            elif isinstance(mod, nn.LayerNorm):
-                grad = self._layernorm_grad(
-                    mod, idx, grad_pre_activation, per_sample=True
-                )
-            elif isinstance(mod, nn.Embedding):
-                # Embeddings would need their own implementation
-                grad = None
-            else:
-                # Fallback for other layer types
-                grad = None
-
-            if grad is not None:
-                # Store the projected gradient
-                self.compressed_grads[idx] = grad.detach()
-
-    def _linear_grad(
-        self,
-        layer: nn.Linear,
-        idx: int,
-        grad_pre_activation: Tensor,
-        per_sample: bool = True
-    ) -> Tensor:
-        """
-        Compute the gradient for Linear layers with strict two-step compression:
-
-        STRICT CONVENTION:
-        - Stage 1 (Sparsification): ALWAYS factorized, operates BEFORE outer product
-          Applied component-wise to (grad_output, input_features)
-        - Stage 2 (Projection): NEVER factorized, operates AFTER outer product
-          Applied to flattened gradient
-
-        Forward compression: (g_out, g_in) → (g_out', g_in') → ĝ
-                            [sparsify components] [outer product] [project]
-
-        Args:
-            layer: Linear layer
-            idx: Layer index
-            grad_pre_activation: Gradient of the pre-activation
-            per_sample: Whether to compute per-sample gradients
-
-        Returns:
-            Compressed gradient tensor [batch, k_l] or [batch, p_l] if no compression
-        """
-        input_features = self.inputs[idx]
-        is_3d = input_features.dim() == 3
-
-        # Get sparsifier and projector for this layer
-        sparsifier = self.sparsifiers[idx] if hasattr(self, 'sparsifiers') and idx < len(self.sparsifiers) else None
-        projector = self.projectors[idx] if hasattr(self, 'projectors') and idx < len(self.projectors) else None
-
-        # Process tensors for gradient computation
-        if is_3d:
-            batch_size, seq_length, hidden_size = input_features.shape
-            input_features_flat = input_features.reshape(-1, hidden_size)
-            grad_pre_activation_flat = grad_pre_activation.reshape(-1, layer.out_features)
-        else:
-            batch_size = input_features.shape[0]
-            input_features_flat = input_features
-            grad_pre_activation_flat = grad_pre_activation
-
-        # Scale gradient for per-sample computation
-        if per_sample:
-            grad_pre_activation_flat = grad_pre_activation_flat * batch_size
-
-        # Add bias term by augmenting input with ones
-        if layer.bias is not None:
-            ones = torch.ones(
-                input_features_flat.size(0), 1,
-                device=input_features_flat.device,
-                dtype=input_features_flat.dtype
-            )
-            input_features_flat = torch.cat([input_features_flat, ones], dim=1)
-
-        # STRICT TWO-STEP COMPRESSION:
-        # Stage 1: Apply sparsification (ALWAYS factorized, operates BEFORE outer product)
-        if sparsifier and hasattr(sparsifier, 'sparsifier_comp') and sparsifier.sparsifier_comp != (None, None):
-            sparsifier_output, sparsifier_input = sparsifier.sparsifier_comp
-
-            if is_3d:
-                # Apply sparsification to components
-                grad_pre_activation_sparse = sparsifier_output(grad_pre_activation_flat).reshape(
-                    batch_size, seq_length, -1
-                )
-                input_features_sparse = sparsifier_input(input_features_flat).reshape(
-                    batch_size, seq_length, -1
-                )
-
-                # Compute outer product with sparsified components
-                grad_tensor = linear_grad_3d(grad_pre_activation_sparse, input_features_sparse)
-            else:
-                # Apply sparsification to components
-                grad_pre_activation_sparse = sparsifier_output(grad_pre_activation_flat)
-                input_features_sparse = sparsifier_input(input_features_flat)
-
-                # Compute outer product with sparsified components
-                grad_tensor = linear_grad_2d(grad_pre_activation_sparse, input_features_sparse)
-
-            grad = grad_tensor.reshape(batch_size, -1)
-        else:
-            # No sparsification: compute outer product directly
-            if is_3d:
-                input_features_3d = input_features_flat.reshape(batch_size, seq_length, -1)
-                grad_pre_activation_3d = grad_pre_activation_flat.reshape(batch_size, seq_length, -1)
-                grad_tensor = linear_grad_3d(grad_pre_activation_3d, input_features_3d)
-            else:
-                grad_tensor = linear_grad_2d(grad_pre_activation_flat, input_features_flat)
-
-            grad = grad_tensor.reshape(batch_size, -1)
-
-        # Stage 2: Apply projection (NEVER factorized, operates AFTER outer product)
-        if projector and hasattr(projector, 'projector') and projector.projector is not None:
-            grad = projector.projector(grad)
-
-        return grad
-
-    def _layernorm_grad(
-        self,
-        layer: nn.LayerNorm,
-        idx: int,
-        grad_pre_activation: Tensor,
-        per_sample: bool = True
-    ) -> Tensor:
-        """
-        Compute the gradient for LayerNorm layers with strict two-step compression:
-
-        STRICT CONVENTION:
-        - Stage 1 (Sparsification): ALWAYS factorized, operates on (grad_weight, grad_bias) separately
-        - Stage 2 (Projection): NEVER factorized, operates on concatenated gradient
-
-        Forward compression: (g_weight, g_bias) → (g_weight', g_bias') → concat → ĝ
-                            [sparsify components]              [project]
-
-        Args:
-            layer: LayerNorm layer
-            idx: Layer index
-            grad_pre_activation: Gradient of the pre-activation
-            per_sample: Whether to compute per-sample gradients
-
-        Returns:
-            Compressed gradient tensor [batch, k_l] or [batch, 2*d] if no compression
-        """
-        if not layer.elementwise_affine:
-            return None
-
-        normalized = self.normalized[idx]
-        if normalized is None:
-            return None
-
-        is_3d = normalized.dim() == 3
-
-        # Get sparsifier and projector for this layer
-        sparsifier = self.sparsifiers[idx] if hasattr(self, 'sparsifiers') and idx < len(self.sparsifiers) else None
-        projector = self.projectors[idx] if hasattr(self, 'projectors') and idx < len(self.projectors) else None
-
-        # Check if we have sparsification (ALWAYS factorized)
-        has_sparsifier = (
-            sparsifier and
-            hasattr(sparsifier, 'sparsifier_comp') and
-            sparsifier.sparsifier_comp != (None, None)
-        )
-
-        # Check if we have projection (NEVER factorized)
-        has_projector = (
-            projector and
-            hasattr(projector, 'projector') and
-            projector.projector is not None
-        )
-
-        # Compute weight and bias gradients
-        if per_sample:
-            grad_pre_activation = grad_pre_activation * normalized.shape[0]
-            if is_3d:
-                grad_weight = torch.einsum("ijk,ijk->ik", grad_pre_activation, normalized)
-                grad_bias = torch.sum(grad_pre_activation, dim=1)
-            else:
-                grad_weight = grad_pre_activation * normalized
-                grad_bias = grad_pre_activation
-        else:
-            if is_3d:
-                grad_weight = torch.sum(grad_pre_activation * normalized, dim=(0, 1))
-                grad_bias = torch.sum(grad_pre_activation, dim=(0, 1))
-            else:
-                grad_weight = torch.sum(grad_pre_activation * normalized, dim=0)
-                grad_bias = torch.sum(grad_pre_activation, dim=0)
-
-        # STRICT TWO-STEP COMPRESSION:
-        # Stage 1: Apply sparsification (ALWAYS factorized, operates on components)
-        if has_sparsifier:
-            sparsifier_weight, sparsifier_bias = sparsifier.sparsifier_comp
-            grad_weight = sparsifier_weight(grad_weight)
-            grad_bias = sparsifier_bias(grad_bias)
-
-        # Concatenate weight and bias gradients
-        grad = torch.cat((grad_weight, grad_bias), dim=1)
-
-        # Stage 2: Apply projection (NEVER factorized, operates on concatenated gradient)
-        if has_projector:
-            grad = projector.projector(grad)
-
-        return grad
+        return num_refreshed
 
     def remove_hooks(self) -> None:
-        """Remove all hooks"""
-        for hook in self.forward_hooks:
-            if hook is not None:
-                hook.remove()
-        for hook in self.backward_hooks:
-            if hook is not None:
-                hook.remove()
+        """Restore original forward methods and cleanup registry."""
+        for name, module in self.layer_name_to_module.items():
+            if hasattr(module, '_original_forward'):
+                module.forward = module._original_forward
+                delattr(module, '_original_forward')
+
         self.forward_hooks = [None] * len(self.layer_names)
-        self.backward_hooks = [None] * len(self.layer_names)
         self.hooks_registered = False
+
+        # Remove from registry
+        if self._hook_manager_id in _HOOK_MANAGER_REGISTRY:
+            del _HOOK_MANAGER_REGISTRY[self._hook_manager_id]
+
+        logger.info("Restored original forward methods for all layers")
+
+    def __del__(self):
+        """Cleanup when hook manager is deleted."""
+        if hasattr(self, '_hook_manager_id') and self._hook_manager_id in _HOOK_MANAGER_REGISTRY:
+            del _HOOK_MANAGER_REGISTRY[self._hook_manager_id]
