@@ -8,11 +8,15 @@ import logging
 import os
 import sys
 import time
+import warnings
 
 import datasets
 import torch
 import torch.distributed as dist
 import transformers
+
+# Suppress torch.compile warnings about custom CUDA kernels (SJLT)
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
 
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
