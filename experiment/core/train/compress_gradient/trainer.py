@@ -205,13 +205,14 @@ class CompGradTrainer(Trainer):
         """
         Override optimizer step to pass selected indices to compressed optimizer.
         """
-        # Get the underlying optimizer (unwrap Accelerate wrapper if present)
-        optimizer = self._get_unwrapped_optimizer()
+        # Unwrap only to check the type
+        unwrapped_optimizer = self._get_unwrapped_optimizer()
 
         # Check if using compressed optimizer and have selected indices
-        if isinstance(optimizer, MeSOAdamW) and self.current_selected_indices is not None:
-            # Call optimizer with selected_indices
-            optimizer.step(selected_indices=list(self.current_selected_indices))
+        if isinstance(unwrapped_optimizer, MeSOAdamW) and self.current_selected_indices is not None:
+            # Call through the (potentially wrapped) optimizer to preserve Accelerate functionality
+            # AcceleratedOptimizer will forward the selected_indices kwarg to MeSOAdamW
+            self.optimizer.step(selected_indices=list(self.current_selected_indices))
             # Reset selected indices after use
             self.current_selected_indices = None
         else:
@@ -245,9 +246,12 @@ class CompGradTrainer(Trainer):
         # Refresh compressors if needed
         # This must happen BEFORE forward/backward passes to ensure gradients
         # are computed with the refreshed projectors
-        optimizer = self._get_unwrapped_optimizer()
-        if isinstance(optimizer, MeSOAdamW):
-            optimizer.refresh_compressors_if_needed()
+        # Note: We call this on the unwrapped optimizer because refresh_compressors_if_needed()
+        # is a custom MeSOAdamW method that AcceleratedOptimizer doesn't know about.
+        # This is safe because it only reads state and refreshes compressors, not performing optimizer steps.
+        unwrapped_optimizer = self._get_unwrapped_optimizer()
+        if isinstance(unwrapped_optimizer, MeSOAdamW):
+            unwrapped_optimizer.refresh_compressors_if_needed()
 
         try:
             val_batch = next(self.val_dataloader_iter)

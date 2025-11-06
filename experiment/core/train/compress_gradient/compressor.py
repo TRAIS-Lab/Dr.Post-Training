@@ -69,7 +69,6 @@ class SparsifierContainer(BaseContainer):
         self.mask_indices = (None, None)  # (output_indices, input_indices) for mask
         self.intermediate_dims = None  # (k_out', k_in')
 
-        # Refresh mechanism
         self.update_compressor_freq = update_compressor_freq
         self.base_seed = None
         self.current_step = 0
@@ -217,6 +216,25 @@ class SparsifierContainer(BaseContainer):
                 input_proj = input_sparsifier.projector
                 input_proj.refresh(base_refresh_seed + 1)
 
+            # CRITICAL: Update mask_indices after refresh for random_mask projections
+            # The projector's refresh() now immediately regenerates active_indices,
+            # so we need to update our cached copy that is used in transpose()
+            if self.mask_indices is not None and self.mask_indices != (None, None):
+                output_sparsifier = self.sparsifier_comp[0]
+                input_sparsifier = self.sparsifier_comp[1]
+                output_proj = output_sparsifier.projector
+                input_proj = input_sparsifier.projector
+
+                # Extract updated mask indices
+                output_indices = output_proj.active_indices
+                input_indices = input_proj.active_indices
+
+                if output_indices is None or input_indices is None:
+                    logger.warning(f"Failed to update mask indices for {self.name} after refresh")
+                else:
+                    self.mask_indices = (output_indices, input_indices)
+                    logger.debug(f"Updated mask_indices for {self.name} after refresh at step {step}")
+
             return True
 
         except Exception as e:
@@ -245,8 +263,6 @@ class ProjectorContainer(BaseContainer):
     def __init__(self, name: str, index: int, update_compressor_freq: int = 200):
         super().__init__(name, index)
         self.projector = None  # Non-factorized projector function
-
-        # Refresh mechanism (similar to GaLore)
         self.update_compressor_freq = update_compressor_freq
         self.base_seed = None
         self.current_step = 0

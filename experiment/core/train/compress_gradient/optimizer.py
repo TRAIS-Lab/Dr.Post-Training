@@ -176,7 +176,6 @@ class MeSOAdamW(Optimizer):
         current_step = self.get_current_step()
 
         # Add 1 because we want to refresh for the NEXT step
-        # (current_step is the last completed step)
         next_step = current_step + 1
 
         num_refreshed = self.grad_hook.refresh_compressors(next_step)

@@ -713,8 +713,10 @@ class CudaProjector(AbstractProjector):
             new_seed (int): New random seed
         """
         self.seed = new_seed
-        # Force regeneration on next project/transpose call
-        self.current_ensemble_id = -1
+        # Immediately regenerate randomness for ensemble_id=0
+        # This ensures active_indices and other state are updated synchronously
+        self._generate_randomness(ensemble_id=0)
+        self.current_ensemble_id = 0
 
     def free_memory(self) -> None:
         """A no-op method."""
