@@ -137,6 +137,22 @@ class CompGradTrainer(Trainer):
         logger.info(f"  Compressed optimizer: {self.args.use_compressed_optimizer}")
         logger.info("="*60)
 
+    def _get_unwrapped_optimizer(self):
+        """
+        Get the underlying optimizer, unwrapping AcceleratedOptimizer if present.
+
+        HuggingFace's Accelerate library wraps optimizers with AcceleratedOptimizer,
+        which breaks isinstance() checks. This helper unwraps it.
+
+        Returns:
+            The underlying optimizer (e.g., MeSOAdamW or AdamW)
+        """
+        optimizer = self.optimizer
+        if hasattr(optimizer, 'optimizer'):
+            # Unwrap AcceleratedOptimizer
+            optimizer = optimizer.optimizer
+        return optimizer
+
     def create_optimizer(self):
         """
         Setup the optimizer with optional compressed state storage.
@@ -189,10 +205,13 @@ class CompGradTrainer(Trainer):
         """
         Override optimizer step to pass selected indices to compressed optimizer.
         """
+        # Get the underlying optimizer (unwrap Accelerate wrapper if present)
+        optimizer = self._get_unwrapped_optimizer()
+
         # Check if using compressed optimizer and have selected indices
-        if isinstance(self.optimizer, MeSOAdamW) and self.current_selected_indices is not None:
+        if isinstance(optimizer, MeSOAdamW) and self.current_selected_indices is not None:
             # Call optimizer with selected_indices
-            self.optimizer.step(selected_indices=list(self.current_selected_indices))
+            optimizer.step(selected_indices=list(self.current_selected_indices))
             # Reset selected indices after use
             self.current_selected_indices = None
         else:
@@ -222,6 +241,13 @@ class CompGradTrainer(Trainer):
         """
         model.train()
         args = self.args
+
+        # Refresh compressors if needed
+        # This must happen BEFORE forward/backward passes to ensure gradients
+        # are computed with the refreshed projectors
+        optimizer = self._get_unwrapped_optimizer()
+        if isinstance(optimizer, MeSOAdamW):
+            optimizer.refresh_compressors_if_needed()
 
         try:
             val_batch = next(self.val_dataloader_iter)

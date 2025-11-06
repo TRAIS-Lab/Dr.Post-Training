@@ -181,8 +181,7 @@ class MeSOAdamW(Optimizer):
 
         num_refreshed = self.grad_hook.refresh_compressors(next_step)
         if num_refreshed > 0:
-            logger.info(f"Refreshed {num_refreshed} projectors at step {current_step} (for step {next_step})")
-            print(f"Refreshed {num_refreshed} projectors at step {current_step} (for step {next_step})")
+            logger.info(f"Refreshed {num_refreshed} compressors at step {current_step} (for step {next_step})")
 
         return num_refreshed
 
