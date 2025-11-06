@@ -118,7 +118,7 @@ class TrainingArguments(TA):
         default=False,
         metadata={
             "help": (
-                "Whether to use the compressed optimizer (AdamWMeSO). "
+                "Whether to use the compressed optimizer (MeSOAdamW). "
                 "When True, uses compressed optimizer states for memory efficiency. "
                 "Requires gradient compression to be enabled (sparsification or projection)."
             )

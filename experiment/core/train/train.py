@@ -54,7 +54,6 @@ def find_trainable_layers(model, lora_only=True):
                 # This is a PEFT LoRA wrapper, attach hooks to the base_layer
                 base_layer_name = f"{name}.base_layer"
                 layer_names.append(base_layer_name)
-                logger.debug(f"Found LoRA layer: {name} -> will attach hooks to {base_layer_name}")
         else:
             # Find all Linear layers (for full fine-tuning)
             if isinstance(module, torch.nn.Linear):

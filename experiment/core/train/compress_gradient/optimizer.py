@@ -21,12 +21,12 @@ from .hook import GradientHook
 logger = logging.getLogger(__name__)
 
 
-class AdamWMeSO(Optimizer):
+class MeSOAdamW(Optimizer):
     """
     AdamW optimizer that maintains states in compressed gradient space.
 
     This is a general implementation that works with any compression method
-    that provides a transpose operation (GraSS, LoGra, GaLore, etc.).
+    that provides a transpose operation (GraSS, LoGra, etc.).
 
     The optimizer:
     1. Receives compressed gradients from hooks
@@ -76,7 +76,7 @@ class AdamWMeSO(Optimizer):
         self._param_to_layer_name = {}
         self._setup_param_mapping()
 
-        logger.info(f"Initialized AdamWMeSO optimizer")
+        logger.info(f"Initialized MeSOAdamW optimizer")
         logger.info(f"  Compressed layers: {len(self.compressed_layer_names)}")
         logger.info(f"  Learning rate: {lr}")
         logger.info(f"  Betas: {betas}")
@@ -101,8 +101,6 @@ class AdamWMeSO(Optimizer):
                 self._param_to_layer_name[id(module.weight)] = (layer_name, 'weight')
             if hasattr(module, 'bias') and module.bias is not None:
                 self._param_to_layer_name[id(module.bias)] = (layer_name, 'bias')
-
-        logger.debug(f"Mapped {len(self._param_to_layer_name)} parameters to layer names")
 
     def _aggregate_compressed_grads(self, selected_indices: Optional[List[int]] = None) -> Dict[str, torch.Tensor]:
         """
@@ -274,9 +272,6 @@ class AdamWMeSO(Optimizer):
             state['exp_avg'] = torch.zeros_like(compressed_grad.squeeze(0))  # First moment in compressed space [k_l]
             state['exp_avg_sq'] = torch.zeros_like(compressed_grad.squeeze(0))  # Second moment in compressed space [k_l]
 
-            logger.debug(f"Initialized compressed state for {layer_name}: "
-                        f"param shape {param.shape}, compressed state shape {compressed_grad.shape}")
-
         # Get hyperparameters
         beta1, beta2 = group['betas']
         state['step'] += 1
@@ -425,11 +420,11 @@ class AdamWMeSO(Optimizer):
         }
 
 
-class SGDMeSO(Optimizer):
+class MeSOSGD(Optimizer):
     """
     SGD optimizer with momentum that maintains states in compressed gradient space.
 
-    Simpler variant of AdamWMeSO for comparison and debugging.
+    Simpler variant of MeSOAdamW for comparison and debugging.
     """
 
     def __init__(

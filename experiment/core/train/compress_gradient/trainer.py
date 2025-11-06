@@ -17,7 +17,7 @@ from torch import Tensor
 
 from transformers import Trainer
 
-from .optimizer import AdamWMeSO
+from .optimizer import MeSOAdamW
 from .hook import GradientHook
 from .utils import greedy_selection
 
@@ -142,7 +142,7 @@ class CompGradTrainer(Trainer):
         Setup the optimizer with optional compressed state storage.
 
         If use_compressed_optimizer is True and gradient compression is enabled,
-        uses AdamWMeSO which maintains optimizer states in compressed space.
+        uses MeSOAdamW which maintains optimizer states in compressed space.
         """
         # Check if we should use compressed optimizer
         use_compressed = (
@@ -164,10 +164,10 @@ class CompGradTrainer(Trainer):
                 use_compressed = False
 
         if use_compressed:
-            logger.info("Using AdamWMeSO optimizer with compressed state storage")
+            logger.info("Using MeSOAdamW optimizer with compressed state storage")
 
             # Create compressed optimizer
-            self.optimizer = AdamWMeSO(
+            self.optimizer = MeSOAdamW(
                 params=self.model.parameters(),
                 grad_hook=self.grad_hook,
                 lr=self.args.learning_rate,
@@ -190,7 +190,7 @@ class CompGradTrainer(Trainer):
         Override optimizer step to pass selected indices to compressed optimizer.
         """
         # Check if using compressed optimizer and have selected indices
-        if isinstance(self.optimizer, AdamWMeSO) and self.current_selected_indices is not None:
+        if isinstance(self.optimizer, MeSOAdamW) and self.current_selected_indices is not None:
             # Call optimizer with selected_indices
             self.optimizer.step(selected_indices=list(self.current_selected_indices))
             # Reset selected indices after use
@@ -425,8 +425,6 @@ class CompGradTrainer(Trainer):
         # Save results
         with open(output_file, "w") as f:
             json.dump(self.evaluation_results, f, indent=2)
-
-        logger.debug(f"Saved evaluation results to {output_file}")
 
     def on_train_end(self):
         """Called at the end of training to save final results."""

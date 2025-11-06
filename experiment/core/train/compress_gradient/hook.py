@@ -61,10 +61,15 @@ class CompressedLinearBackward(Function):
             raise RuntimeError(f"Hook manager {hook_manager_id} not found in registry")
 
         # Store input for backward pass (centralized storage)
+        # Store at original dtype - will be cast during backward if needed
         hook_manager.inputs[layer_idx] = input.detach()
 
+        # Cast input to weight dtype for computation (handles mixed precision)
+        # This mimics PyTorch's autocast behavior
+        input_compute = input.to(weight.dtype) if input.dtype != weight.dtype else input
+
         # Standard forward pass (same as nn.Linear)
-        output = F.linear(input, weight, bias)
+        output = F.linear(input_compute, weight, bias)
         return output
 
     @staticmethod
@@ -88,8 +93,14 @@ class CompressedLinearBackward(Function):
         # Retrieve stored input
         input = hook_manager.inputs[layer_idx]
 
+        # Cast input to match grad_output dtype for mixed precision training
+        # This ensures all operations in _compute_compressed_grad work correctly
+        input = input.to(grad_output.dtype)
+
         # Compute grad_input (needed for backprop to previous layers)
-        grad_input = grad_output @ weight
+        # Cast weight to match grad_output dtype (important for mixed precision training)
+        # This mimics PyTorch's internal behavior in linear backward
+        grad_input = grad_output @ weight.to(grad_output.dtype)
 
         # Compute compressed gradient directly (without full gradient)
         with torch.no_grad():
@@ -296,8 +307,6 @@ class GradientHook:
 
                 # Replace the forward method (monkey-patching)
                 module.forward = wrapped_forward
-
-                logger.debug(f"Wrapped forward for layer {name} (idx={idx})")
 
         self.hooks_registered = True
         logger.info(f"Successfully wrapped {len(self.layer_names)} layers")

@@ -23,7 +23,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
 
 from core.train.compress_gradient.hook import GradientHook
 from core.train.compress_gradient.compressor import setup_model_compressors
-from core.train.compress_gradient.optimizer import AdamWMeSO
+from core.train.compress_gradient.optimizer import MeSOAdamW
 
 from GaLore.galore_torch import GaLoreAdamW
 
@@ -231,7 +231,7 @@ def setup_full_adamw():
     return model, optimizer, tokenizer
 
 def setup_full_meso():
-    """Full fine-tuning with MeSO (AdamWMeSO)"""
+    """Full fine-tuning with MeSO (MeSOAdamW)"""
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
         dtype=torch.float32,
@@ -283,7 +283,7 @@ def setup_full_meso():
     grad_hook.set_sparsifiers(sparsifiers)
     grad_hook.set_projectors(projectors)
 
-    optimizer = AdamWMeSO(
+    optimizer = MeSOAdamW(
         model.parameters(),
         grad_hook=grad_hook,
         lr=5e-5,
@@ -494,7 +494,7 @@ def setup_full_sgd_momentum_gradient_checkpointing():
 
 def setup_full_meso_gradient_checkpointing():
     """
-    Full fine-tuning with MeSO (AdamWMeSO) + gradient checkpointing.
+    Full fine-tuning with MeSO (MeSOAdamW) + gradient checkpointing.
 
     UPDATED: Now uses the optimized hook.py with Solution 1 built-in!
     - Eliminates pre_activations storage (never used in gradient computation)
@@ -555,7 +555,7 @@ def setup_full_meso_gradient_checkpointing():
     grad_hook.set_sparsifiers(sparsifiers)
     grad_hook.set_projectors(projectors)
 
-    optimizer = AdamWMeSO(
+    optimizer = MeSOAdamW(
         model.parameters(),
         grad_hook=grad_hook,
         lr=5e-5,
@@ -700,7 +700,7 @@ def get_all_methods():
         ("Full + SGD (momentum=0.9) + GC", setup_full_sgd_momentum_gradient_checkpointing),
         ("Full + AdamW", setup_full_adamw),
         ("Full + AdamW + GC", setup_full_adamw_gradient_checkpointing),
-        ("Full + MeSO (AdamWMeSO)", setup_full_meso),
+        ("Full + MeSO (MeSOAdamW)", setup_full_meso),
         ("Full + MeSO + GC", setup_full_meso_gradient_checkpointing),
         ("Full + GaLore", setup_full_galore),
         ("Full + GaLore + GC", setup_full_galore_gradient_checkpointing),
