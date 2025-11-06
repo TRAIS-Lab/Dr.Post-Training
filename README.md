@@ -94,7 +94,7 @@ The unified training script accepts the following arguments:
   - `LoGra` - Low-rank Gradient compression (Gaussian-64×64)
   - Auto-enabled when `--data_selection` is not `NA` or `--optimizer` is `MeSO`
 - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
-  - Resamples random projections every N steps (similar to GaLore's update_compressor_freq)
+  - Resamples random projections every N steps
   - Helps maintain compression quality throughout training
   - Set to large value (e.g., `1000000`) to disable refresh
 
