@@ -130,8 +130,8 @@ def _compute_compressed_grad(
     grad_output: Tensor,
     input: Tensor,
     has_bias: bool,
-    sparsifier: Any,
-    projector: Any,
+    sparsifier: SparsifierContainer,
+    projector: ProjectorContainer,
 ) -> Tensor:
     """
     Compute compressed gradient without materializing full gradient.
@@ -161,55 +161,31 @@ def _compute_compressed_grad(
         input_2d = input
         grad_output_2d = grad_output
 
-    # Add bias term BEFORE sparsification
+    # Add bias compression
     if has_bias:
-        ones = torch.ones(input_2d.size(0), 1,
-                         device=input_2d.device,
-                         dtype=input_2d.dtype)
+        ones = torch.ones(input_2d.size(0), 1, device=input_2d.device, dtype=input_2d.dtype)
         input_2d = torch.cat([input_2d, ones], dim=1)
 
-    # Apply sparsification BEFORE outer product (if available)
-    if sparsifier and hasattr(sparsifier, 'sparsifier_comp') and sparsifier.sparsifier_comp != (None, None):
-        sparsifier_output, sparsifier_input = sparsifier.sparsifier_comp
+    # Stage 1: Sparsification outer product
+    grad_output_sparse, input_sparse = sparsifier.forward((grad_output_2d, input_2d))
 
-        # Apply sparsifiers
-        grad_output_sparse = sparsifier_output(grad_output_2d)
-        input_sparse = sparsifier_input(input_2d)
+    # Stage 1.5: outer product in sparse space (with scaling)
+    if is_3d:
+        grad_sparse_3d = grad_output_sparse.reshape(batch_size, seq_length, -1)
+        input_sparse_3d = input_sparse.reshape(batch_size, seq_length, -1)
 
-        # Compute per-sample gradients with scaling
-        if is_3d:
-            grad_sparse_3d = grad_output_sparse.reshape(batch_size, seq_length, -1)
-            input_sparse_3d = input_sparse.reshape(batch_size, seq_length, -1)
-
-            grad_tensor = torch.einsum('bsi,bsj->bij',
-                                      grad_sparse_3d * batch_size,
-                                      input_sparse_3d)
-        else:
-            grad_tensor = torch.einsum('bi,bj->bij',
-                                      grad_output_sparse * batch_size,
-                                      input_sparse)
-
-        grad = grad_tensor.reshape(batch_size, -1)
-
+        grad_tensor = torch.einsum('bsi,bsj->bij',
+                                    grad_sparse_3d * batch_size,
+                                    input_sparse_3d)
     else:
-        # No sparsification: compute outer product directly
-        if is_3d:
-            input_3d = input_2d.reshape(batch_size, seq_length, -1)
-            grad_output_3d = grad_output_2d.reshape(batch_size, seq_length, -1)
+        grad_tensor = torch.einsum('bi,bj->bij',
+                                    grad_output_sparse * batch_size,
+                                    input_sparse)
 
-            grad_tensor = torch.einsum('bsi,bsj->bij',
-                                      grad_output_3d * batch_size,
-                                      input_3d)
-        else:
-            grad_tensor = torch.einsum('bi,bj->bij',
-                                      grad_output_2d * batch_size,
-                                      input_2d)
+    grad = grad_tensor.reshape(batch_size, -1)
 
-        grad = grad_tensor.reshape(batch_size, -1)
-
-    # Apply projection (operates AFTER outer product)
-    if projector and hasattr(projector, 'projector') and projector.projector is not None:
-        grad = projector.projector(grad)
+    # Stage 2: Projection
+    grad = projector.forward(grad)
 
     return grad
 
@@ -395,15 +371,18 @@ class GradientHook:
         Returns:
             Number of compressors refreshed
         """
-        num_refreshed = 0
+        num_sparsifiers_refreshed = 0
+        num_projectors_refreshed = 0
 
         for idx, sparsifier in enumerate(self.sparsifiers):
             if sparsifier is not None and sparsifier.refresh(step):
-                num_refreshed += 1
+                num_sparsifiers_refreshed += 1
 
         for idx, projector in enumerate(self.projectors):
             if projector is not None and projector.refresh(step):
-                num_refreshed += 1
+                num_projectors_refreshed += 1
+
+        num_refreshed = num_sparsifiers_refreshed + num_projectors_refreshed
 
         return num_refreshed
 
