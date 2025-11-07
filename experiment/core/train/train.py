@@ -25,9 +25,12 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
 from ..data.get_training_dataset import get_training_dataset
 from ..data.get_validation_dataset import get_dataset
 
-from .compress_gradient.hook import GradientHook
-from .compress_gradient.trainer import CompGradTrainer
-from .compress_gradient.compressor import setup_model_compressors, create_sample_inputs
+from .compress_gradient import (
+    GradientHook,
+    CompGradTrainer,
+    setup_model_compressors,
+    create_sample_inputs
+)
 
 from .data_arguments import DataArguments, get_data_statistics
 from .model_arguments import ModelArguments, add_padding_to_tokenizer

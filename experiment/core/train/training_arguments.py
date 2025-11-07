@@ -109,7 +109,7 @@ class TrainingArguments(TA):
         default=200,
         metadata={
             "help": (
-                "Number of steps between projector refreshes (similar to GaLore's update_compressor_freq). "
+                "Number of steps between projector refreshes. "
                 "Set to a large value (e.g., 1000000) to effectively disable refresh. Default: 200"
             )
         },

@@ -192,8 +192,6 @@ class CompGradTrainer(Trainer):
                 weight_decay=self.args.weight_decay,
             )
 
-            logger.info("Compressed optimizer initialized successfully")
-
         else:
             # Use standard Hugging Face optimizer creation
             logger.info("Using standard AdamW optimizer")
@@ -250,6 +248,7 @@ class CompGradTrainer(Trainer):
         # is a custom MeSOAdamW method that AcceleratedOptimizer doesn't know about.
         # This is safe because it only reads state and refreshes compressors, not performing optimizer steps.
         unwrapped_optimizer = self._get_unwrapped_optimizer()
+
         if isinstance(unwrapped_optimizer, MeSOAdamW):
             unwrapped_optimizer.refresh_compressors_if_needed()
 
