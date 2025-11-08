@@ -132,9 +132,6 @@ def _compute_compressed_grad(grad_output: Tensor, input: Tensor, has_bias: bool,
     Process:
     1. Add bias term to input if needed (gradient-specific preprocessing)
     2. Pass components to compressor which handles:
-       - Sparsification of components (handles 2D/3D automatically)
-       - Kronecker product computation
-       - Projection to final compressed space
     """
     # Gradient-specific preprocessing: Add bias column if needed
     if has_bias:
@@ -273,45 +270,6 @@ class GradientHook:
     def get_compressed_grads(self) -> List[Tensor]:
         """Get all captured compressed gradients."""
         return self.compressed_grads
-
-    def get_decompressed_grads(self, selected_indices: List[int]) -> dict:
-        """
-        Apply transpose operations to recover full gradients from compressed gradients.
-
-        Args:
-            selected_indices: List of sample indices to aggregate
-
-        Returns:
-            Dictionary mapping layer names to full gradients
-        """
-        full_grads = {}
-
-        for idx, layer_name in enumerate(self.layer_names):
-            compressed_grad = self.compressed_grads[idx]
-
-            if compressed_grad is None:
-                continue
-
-            # Aggregate selected samples
-            if selected_indices is not None and len(selected_indices) > 0:
-                selected_compressed = compressed_grad[selected_indices]
-                aggregated_compressed = selected_compressed.mean(dim=0, keepdim=True)
-            else:
-                aggregated_compressed = compressed_grad.mean(dim=0, keepdim=True)
-
-            # Get compressor (unified API)
-            compressor = self.compressors[idx] if idx < len(self.compressors) else None
-
-            # Apply decompression using unified API with scale="backward"
-            if compressor and hasattr(compressor, 'transpose'):
-                g_full = compressor.transpose(aggregated_compressed, scale="backward")
-            else:
-                g_full = aggregated_compressed
-
-            if g_full is not None:
-                full_grads[layer_name] = g_full
-
-        return full_grads
 
     def refresh_compressors(self, step: int):
         """

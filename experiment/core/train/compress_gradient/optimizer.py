@@ -609,6 +609,12 @@ class MeSOSGD(Optimizer):
         self._param_to_layer_name = {}
         self._setup_param_mapping()
 
+        logger.info(f"Initialized MeSOSGD optimizer")
+        logger.info(f"  Compressed layers: {len(self.compressed_layer_names)}")
+        logger.info(f"  Learning rate: {lr}")
+        logger.info(f"  Momentum: {momentum}")
+        logger.info(f"  Weight decay: {weight_decay}")
+
     def _setup_param_mapping(self):
         """Create mapping from parameters to layer names."""
         model = self.grad_hook.model
@@ -628,41 +634,187 @@ class MeSOSGD(Optimizer):
         param_id = id(param)
         return self._param_to_layer_name.get(param_id, (None, None))
 
+    def _aggregate_compressed_grads(self, selected_indices: Optional[List[int]] = None) -> Dict[str, torch.Tensor]:
+        """
+        Aggregate compressed gradients for selected samples.
+
+        This extracts compressed gradients directly from the hook without decompressing them.
+
+        Args:
+            selected_indices: Optional list of sample indices to aggregate
+
+        Returns:
+            Dictionary mapping layer names to aggregated compressed gradients [1, k_l]
+        """
+        compressed_grads_dict = {}
+
+        for idx, layer_name in enumerate(self.grad_hook.layer_names):
+            compressed_grad = self.grad_hook.compressed_grads[idx]
+
+            if compressed_grad is None:
+                continue
+
+            # Aggregate selected samples
+            if selected_indices is not None and len(selected_indices) > 0:
+                selected_compressed = compressed_grad[selected_indices]  # [|S|, k_l]
+                aggregated_compressed = selected_compressed.mean(dim=0, keepdim=True)  # [1, k_l]
+            else:
+                # If no selection, use mean of all samples
+                aggregated_compressed = compressed_grad.mean(dim=0, keepdim=True)  # [1, k_l]
+
+            compressed_grads_dict[layer_name] = aggregated_compressed
+
+        return compressed_grads_dict
+
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None, selected_indices: Optional[List[int]] = None):
-        """Perform a single optimization step."""
+        """
+        Perform a single optimization step.
+
+        This implementation processes gradients layer-by-layer to minimize memory usage.
+        Instead of decompressing all gradients at once, we decompress each layer's
+        gradient/momentum only when needed.
+
+        Args:
+            closure: Optional closure to reevaluate the model and return the loss
+            selected_indices: Optional list of sample indices to use (for data selection)
+        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
-        # Get decompressed (full) gradients from transpose
-        # Note: SGD doesn't maintain states in compressed space, so we need full gradients
-        full_grads_dict = self.grad_hook.get_decompressed_grads(selected_indices)
+        # Aggregate compressed gradients (don't decompress yet - we'll do it layer-by-layer)
+        compressed_grads_dict = self._aggregate_compressed_grads(selected_indices)
 
+        # Update each parameter group
         for group in self.param_groups:
             for p in group['params']:
-                if p.grad is None:
-                    continue
-
+                # Get layer information
                 layer_name, param_type = self._get_layer_info(p)
 
-                if layer_name is not None and layer_name in full_grads_dict:
-                    full_grad = full_grads_dict[layer_name]
-
-                    # Apply weight decay
-                    if group['weight_decay'] != 0:
-                        p.mul_(1 - group['lr'] * group['weight_decay'])
-
-                    # Simple SGD update (no momentum for now, can add later)
-                    p.add_(full_grad.view_as(p), alpha=-group['lr'])
+                # Check if this parameter should use compressed optimization
+                if layer_name is not None and layer_name in compressed_grads_dict:
+                    # Use compressed gradient pathway (layer-by-layer decompression)
+                    self._step_compressed(p, compressed_grads_dict[layer_name], group, layer_name)
                 else:
-                    # Standard update
-                    grad = p.grad
-
-                    if group['weight_decay'] != 0:
-                        p.mul_(1 - group['lr'] * group['weight_decay'])
-
-                    p.add_(grad, alpha=-group['lr'])
+                    # Use standard gradient pathway (for non-compressed layers)
+                    if p.grad is None:
+                        continue
+                    self._step_standard(p, group)
 
         return loss
+
+    def _step_compressed(self, param, compressed_grad, group, layer_name):
+        """
+        Update parameter using compressed gradient optimization.
+
+        This maintains momentum in compressed space and uses transpose
+        to project updates back to parameter space layer-by-layer.
+
+        Args:
+            param: Parameter tensor to update
+            compressed_grad: Compressed gradient [1, k_l] - already aggregated
+            group: Optimizer parameter group
+            layer_name: Name of the layer
+        """
+        state = self.state[param]
+
+        # Get compressor for this layer
+        layer_idx = self.grad_hook.layer_name_to_idx[layer_name]
+        compressor = self.grad_hook.compressors[layer_idx] if layer_idx < len(self.grad_hook.compressors) else None
+
+        # Check if we can use compressed states
+        can_compress = (
+            compressor is not None and
+            hasattr(compressor, 'transpose')
+        )
+
+        if not can_compress:
+            # Fallback to standard update if compression not available
+            self._step_standard(param, group)
+            return
+
+        # Initialize state if needed
+        if len(state) == 0:
+            # Initialize momentum buffer in compressed space (squeeze to remove batch dim)
+            state['momentum_buffer'] = torch.zeros_like(compressed_grad.squeeze(0))  # [k_l]
+
+        # Get momentum coefficient
+        momentum = group['momentum']
+
+        # Update momentum in compressed space
+        # compressed_grad is [1, k_l], squeeze to [k_l]
+        compressed_grad_vec = compressed_grad.squeeze(0)
+
+        # Dimension assertion
+        assert compressed_grad_vec.shape == state['momentum_buffer'].shape, \
+            f"Compressed gradient dimension mismatch for {layer_name}: " \
+            f"grad {compressed_grad_vec.shape} vs state {state['momentum_buffer'].shape}"
+
+        if momentum != 0:
+            # v_t = momentum * v_{t-1} + g_t (in compressed space)
+            state['momentum_buffer'].mul_(momentum).add_(compressed_grad_vec)
+            compressed_update = state['momentum_buffer']
+        else:
+            # No momentum: use gradient directly
+            compressed_update = compressed_grad_vec
+
+        # Decompress update back to parameter space using transpose
+        # compressed_update is [k_l], need to add batch dim to make [1, k_l]
+        if compressed_update.dim() == 1:
+            compressed_update_batch = compressed_update.unsqueeze(0)
+        else:
+            compressed_update_batch = compressed_update
+
+        # Apply decompression using compressor API
+        full_update = compressor.transpose(compressed_update_batch, scale="backward")  # [1, p_l]
+
+        # Dimension check: full_update should match parameter size
+        param_numel = param.numel()
+        assert full_update.numel() == param_numel, \
+            f"Full update size mismatch for {layer_name}: " \
+            f"expected {param_numel}, got {full_update.numel()}"
+
+        # Apply weight decay (in parameter space)
+        if group['weight_decay'] != 0:
+            param.mul_(1 - group['lr'] * group['weight_decay'])
+
+        # Apply update
+        param.add_(full_update.view_as(param), alpha=-group['lr'])
+
+    def _step_standard(self, param, group):
+        """
+        Standard SGD update for parameters without compression.
+
+        Args:
+            param: Parameter tensor to update
+            group: Optimizer parameter group
+        """
+        grad = param.grad
+        if grad is None:
+            return
+
+        state = self.state[param]
+
+        # Get momentum coefficient
+        momentum = group['momentum']
+
+        if momentum != 0:
+            # Initialize momentum buffer if needed
+            if 'momentum_buffer' not in state:
+                state['momentum_buffer'] = torch.zeros_like(param)
+
+            # Update momentum
+            state['momentum_buffer'].mul_(momentum).add_(grad)
+            update = state['momentum_buffer']
+        else:
+            # No momentum: use gradient directly
+            update = grad
+
+        # Apply weight decay
+        if group['weight_decay'] != 0:
+            param.mul_(1 - group['lr'] * group['weight_decay'])
+
+        # Apply update
+        param.add_(update, alpha=-group['lr'])
