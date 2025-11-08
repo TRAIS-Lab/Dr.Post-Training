@@ -474,9 +474,8 @@ class MeSOAdamW(Optimizer):
         assert compressed_update_batch.shape[1] == compressed_update.shape[-1], \
             f"Compressed update dimension mismatch after unsqueeze"
 
-        # Apply decompression using unified compressor API
-        # compressor.transpose() handles both stages: projector^T then sparsifier^T
-        full_update = compressor.transpose(compressed_update_batch, scale="backward")  # ĝ → ḡ [1, p_l]
+        # Apply decompression (scale is "forward" since compressed gradient comes from "forward" scaling)
+        full_update = compressor.transpose(compressed_update_batch, scale="forward")  # ĝ → ḡ [1, p_l]
 
         # Dimension check: full_update should match parameter size
         param_numel = param.numel()
