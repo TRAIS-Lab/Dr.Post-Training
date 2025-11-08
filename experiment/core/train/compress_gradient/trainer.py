@@ -164,16 +164,16 @@ class CompGradTrainer(Trainer):
         use_compressed = (
             self.args.use_compressed_optimizer and
             self.grad_hook is not None and
-            len(self.grad_hook.projectors) > 0
+            len(self.grad_hook.compressors) > 0
         )
 
         if use_compressed:
-            # Check that projectors are actually set up
-            has_projectors = any(p is not None for p in self.grad_hook.projectors)
+            # Check that compressors are actually set up
+            has_compressors = any(c is not None for c in self.grad_hook.compressors)
 
-            if not has_projectors:
+            if not has_compressors:
                 logger.warning(
-                    "use_compressed_optimizer=True but no projectors found! "
+                    "use_compressed_optimizer=True but no compressors found! "
                     "Falling back to standard optimizer. "
                     "Make sure to set sparsification and/or projection arguments."
                 )

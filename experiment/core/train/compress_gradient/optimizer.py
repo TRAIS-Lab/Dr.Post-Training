@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Callable
 import logging
 
 from .hook import GradientHook
+from .compressor import Compressor
 logger = logging.getLogger(__name__)
 
 
@@ -162,125 +163,67 @@ class MeSOAdamW(Optimizer):
         self,
         state_old: torch.Tensor,
         layer_idx: int,
+        old_compressor: Compressor,
         is_second_moment: bool = False
     ) -> torch.Tensor:
         """
         Transform optimizer state from old subspace to new subspace during compressor refresh.
 
-        This implements the mathematically-principled transformation:
-            state_new = C_new @ C_old^T @ state_old
+        **For first moments (is_second_moment=False)**:
+            m_new = M @ m_old where M = P_new @ P_old^T
 
-        Where C = P ∘ S (projector composed with sparsifier)
+        **For second moments (is_second_moment=True)**:
+            Simply zero out - variance transformation is too complex and expensive.
+            The optimizer will rebuild second moments from scratch.
 
         Args:
             state_old: Old optimizer state in compressed space [k_old]
             layer_idx: Index of the layer
-            is_second_moment: If True, transform sqrt(v) and square result; if False, transform m directly
+            old_compressor: Old Compressor (before refresh) for transformation
+            is_second_moment: If True, zero out; if False, use linear transformation
 
         Returns:
             Transformed state in new compressed space [k_new]
         """
-        projector = self.grad_hook.projectors[layer_idx]
-        sparsifier = self.grad_hook.sparsifiers[layer_idx]
+        new_compressor = self.grad_hook.compressors[layer_idx]
+        layer_name = new_compressor.name if hasattr(new_compressor, 'name') else f"layer_{layer_idx}"
 
-        # Get old compressors (saved during refresh)
-        old_projector = projector.old_projector if hasattr(projector, 'old_projector') else None
-        old_sparsifier_comp = sparsifier.old_sparsifier_comp if hasattr(sparsifier, 'old_sparsifier_comp') else None
+        k_old = state_old.shape[0]
+        norm_old = state_old.norm().item()
 
-        # If no old compressors saved, cannot transform
-        if old_projector is None:
-            logger.warning(f"No old projector for layer {layer_idx}, cannot transform state")
-            return state_old
+        moment_type = "2nd_moment" if is_second_moment else "1st_moment"
+        print(f"[STATE TRANSFORM] {layer_name}: {moment_type}, k={k_old}, norm_old={norm_old:.4e}")
 
-        # Handle second moment specially: transform sqrt(v) then square
+        # For second moments, simply zero out (too complex to transform correctly)
         if is_second_moment:
-            state_to_transform = state_old.sqrt()
-        else:
-            state_to_transform = state_old
+            # Determine k_new
+            dummy = torch.zeros(1, k_old, device=state_old.device, dtype=state_old.dtype)
+            dummy_full = old_compressor.transpose(dummy, scale="forward")
+            dummy_new = new_compressor.forward(dummy_full, scale="forward")
+            k_new = dummy_new.shape[1]
 
+            state_new = torch.zeros(k_new, device=state_old.device, dtype=state_old.dtype)
+            norm_new = 0.0
+
+            print(f"  → ZEROED OUT: k={k_new}, norm_new={norm_new:.4e}")
+            return state_new
+
+        # For first moments, use simple linear transformation
         # Add batch dimension if needed [k] -> [1, k]
-        if state_to_transform.dim() == 1:
-            state_to_transform = state_to_transform.unsqueeze(0)
-
-        # Step 1: Decompress using old projector transpose
-        # state_old [1, k_old] -> intermediate [1, k'_old]
-        old_proj_obj = old_projector.projector
-        intermediate = old_proj_obj.transpose(state_to_transform, ensemble_id=0)
-
-        # Step 2: Decompress using old sparsifier transpose (if available)
-        # intermediate [1, k'_old] -> full [1, p_l]
-        if old_sparsifier_comp is not None and old_sparsifier_comp != (None, None):
-            # Use old sparsifier for transpose
-            old_output_sparsifier = old_sparsifier_comp[0]
-            old_input_sparsifier = old_sparsifier_comp[1]
-
-            # Get old dimensions
-            if hasattr(sparsifier, 'old_intermediate_dims') and sparsifier.old_intermediate_dims is not None:
-                k_out_prime_old, k_in_prime_old = sparsifier.old_intermediate_dims
-            else:
-                logger.warning(f"No old intermediate dims for layer {layer_idx}, using current dims")
-                k_out_prime_old, k_in_prime_old = sparsifier.intermediate_dims
-
-            # Reshape intermediate to 2D: [1, k'_old] -> [k_out'_old, k_in'_old]
-            G_intermediate = intermediate.reshape(k_out_prime_old, k_in_prime_old)
-
-            # Get old projector objects
-            old_output_proj = old_output_sparsifier.projector
-            old_input_proj = old_input_sparsifier.projector
-
-            d_out = old_output_proj.feature_dim
-            d_in = old_input_proj.feature_dim
-
-            # Apply transpose using vec-trick (same as SparsifierContainer.transpose)
-            # Check if old sparsifier used masks
-            old_mask_indices = sparsifier.old_mask_indices if hasattr(sparsifier, 'old_mask_indices') else None
-
-            if old_mask_indices is not None and old_mask_indices != (None, None):
-                # OPTIMIZED PATH: random_mask uses scatter
-                output_indices_old, input_indices_old = old_mask_indices
-
-                # Initialize full matrix with zeros
-                G_full = torch.zeros(d_out, d_in, device=intermediate.device, dtype=intermediate.dtype)
-
-                # Scatter operation
-                output_idx_expanded = output_indices_old.unsqueeze(1).expand(k_out_prime_old, k_in_prime_old)
-                input_idx_expanded = input_indices_old.unsqueeze(0).expand(k_out_prime_old, k_in_prime_old)
-
-                flat_indices = output_idx_expanded * d_in + input_idx_expanded
-                G_full.view(-1).scatter_(0, flat_indices.reshape(-1), G_intermediate.reshape(-1))
-
-                full = G_full.reshape(1, -1)
-            else:
-                # GENERAL PATH: dense projections use vec-trick
-                G_transposed = G_intermediate.t()
-                G_output_transposed = old_output_proj.transpose(G_transposed, ensemble_id=0)
-                G_output_transposed = G_output_transposed.t()
-                G_full = old_input_proj.transpose(G_output_transposed, ensemble_id=0)
-                full = G_full.reshape(1, -1)
+        if state_old.dim() == 1:
+            state_old_batch = state_old.unsqueeze(0)
         else:
-            full = intermediate
+            state_old_batch = state_old
 
-        # Step 3: Recompress using new sparsifier forward (if available)
-        # full [1, p_l] -> intermediate_new [1, k'_new]
-        if sparsifier and hasattr(sparsifier, 'forward'):
-            intermediate_new = sparsifier.forward(full)
-        else:
-            intermediate_new = full
-
-        # Step 4: Recompress using new projector forward
-        # intermediate_new [1, k'_new] -> state_new [1, k_new]
-        if projector and hasattr(projector, 'forward'):
-            state_new_batch = projector.forward(intermediate_new)
-        else:
-            state_new_batch = intermediate_new
-
-        # Remove batch dimension [1, k_new] -> [k_new]
+        # Transform: m_new = M @ m_old where M = P_new @ P_old^T
+        full = old_compressor.transpose(state_old_batch, scale="backward")
+        state_new_batch = new_compressor.forward(full, scale="backward")
         state_new = state_new_batch.squeeze(0)
 
-        # If second moment, square the result
-        if is_second_moment:
-            state_new = state_new.square()
+        k_new = state_new.shape[0]
+        norm_new = state_new.norm().item()
 
+        print(f"  → TRANSFORMED: k={k_new}, norm_new={norm_new:.4e}, ratio={norm_new/norm_old if norm_old > 0 else 0:.4f}")
         return state_new
 
     def refresh_compressors_if_needed(self) -> int:
@@ -303,30 +246,49 @@ class MeSOAdamW(Optimizer):
         # Add 1 because we want to refresh for the NEXT step
         next_step = current_step + 1
 
-        num_refreshed = self.grad_hook.refresh_compressors(next_step)
+        num_refreshed, old_compressors = self.grad_hook.refresh_compressors(next_step)
 
         if num_refreshed > 0:
-            logger.info(f"Refreshed {num_refreshed} compressors at step {current_step} (for step {next_step})")
+            print(f"Refreshed {num_refreshed} compressors at step {current_step} (for step {next_step})")
 
             # CRITICAL: Transform optimizer states after refresh
             # This stabilizes training by mapping states from old to new subspace
-            self._transform_all_optimizer_states()
+            # Pass old compressor containers temporarily for transformation, then discard
+            self._transform_all_optimizer_states(old_compressors)
+
+            # Old containers are no longer needed, they'll be garbage collected
+
+            # Debug: Check which layers have states after transformation
+            print(f"Checking optimizer states after transformation...")
+            for group in self.param_groups:
+                for p in group['params']:
+                    layer_name, _ = self._get_layer_info(p)
+                    if layer_name is not None:
+                        state = self.state.get(p, {})
+                        if 'exp_avg' in state and 'exp_avg_sq' in state:
+                            is_compressed = layer_name in self.compressed_layer_names
+                            has_nan = torch.isnan(state['exp_avg_sq']).any()
+                            if has_nan:
+                                logger.error(f"Layer {layer_name} (compressed={is_compressed}): exp_avg_sq has NaN!")
 
         return num_refreshed
 
-    def _transform_all_optimizer_states(self) -> int:
+    def _transform_all_optimizer_states(self, old_compressors: Compressor) -> int:
         """
         Transform all optimizer states after compressor refresh.
 
         This is called automatically after refresh to stabilize training by
         mapping first and second moments from the old subspace to the new one.
 
+        Args:
+            old_compressors: List of old CompressorContainers (before refresh)
+
         Returns:
             Number of layers with transformed states
         """
         num_transformed = 0
         num_no_state = 0
-        num_no_old_projector = 0
+        num_no_old_compressor = 0
         num_compressed_layers = len(self.compressed_layer_names)
 
         for group in self.param_groups:
@@ -346,10 +308,11 @@ class MeSOAdamW(Optimizer):
                 # Get layer index
                 layer_idx = self.grad_hook.layer_name_to_idx[layer_name]
 
-                # Check if old compressors are available
-                projector = self.grad_hook.projectors[layer_idx]
-                if not hasattr(projector, 'old_projector') or projector.old_projector is None:
-                    num_no_old_projector += 1
+                # Check if old compressor is available
+                old_compressor = old_compressors[layer_idx] if layer_idx < len(old_compressors) else None
+
+                if old_compressor is None:
+                    num_no_old_compressor += 1
                     continue
 
                 try:
@@ -357,6 +320,7 @@ class MeSOAdamW(Optimizer):
                     state['exp_avg'] = self._transform_optimizer_state(
                         state['exp_avg'],
                         layer_idx,
+                        old_compressor,
                         is_second_moment=False
                     )
 
@@ -364,6 +328,7 @@ class MeSOAdamW(Optimizer):
                     state['exp_avg_sq'] = self._transform_optimizer_state(
                         state['exp_avg_sq'],
                         layer_idx,
+                        old_compressor,
                         is_second_moment=True
                     )
 
@@ -375,7 +340,7 @@ class MeSOAdamW(Optimizer):
                     continue
 
         if num_transformed > 0:
-            logger.info(f"Successfully transformed optimizer states for {num_transformed} layers")
+            print(f"Successfully transformed optimizer states for {num_transformed} layers")
 
         return num_transformed
 
@@ -442,15 +407,14 @@ class MeSOAdamW(Optimizer):
         """
         state = self.state[param]
 
-        # Get projector and sparsifier for this layer
+        # Get compressor for this layer (unified API)
         layer_idx = self.grad_hook.layer_name_to_idx[layer_name]
-        projector = self.grad_hook.projectors[layer_idx] if layer_idx < len(self.grad_hook.projectors) else None
-        sparsifier = self.grad_hook.sparsifiers[layer_idx] if layer_idx < len(self.grad_hook.sparsifiers) else None
+        compressor = self.grad_hook.compressors[layer_idx] if layer_idx < len(self.grad_hook.compressors) else None
 
         # Check if we can use compressed states
         can_compress = (
-            projector is not None and
-            hasattr(projector, 'transpose')
+            compressor is not None and
+            hasattr(compressor, 'transpose')
         )
 
         if not can_compress:
@@ -510,24 +474,15 @@ class MeSOAdamW(Optimizer):
         assert compressed_update_batch.shape[1] == compressed_update.shape[-1], \
             f"Compressed update dimension mismatch after unsqueeze"
 
-        # Step 1: Apply projection transpose (stage 2)
-        g_intermediate = projector.transpose(compressed_update_batch)  # ĝ → g' [1, k']
+        # Apply decompression using unified compressor API
+        # compressor.transpose() handles both stages: projector^T then sparsifier^T
+        full_update = compressor.transpose(compressed_update_batch, scale="backward")  # ĝ → ḡ [1, p_l]
 
-        # Dimension check: g_intermediate should have batch dim = 1
-        assert g_intermediate.shape[0] == 1, \
-            f"Intermediate gradient batch dimension should be 1, got {g_intermediate.shape[0]}"
-
-        # Step 2: Apply sparsification transpose (stage 1) if available
-        if sparsifier and hasattr(sparsifier, 'transpose'):
-            full_update = sparsifier.transpose(g_intermediate)  # g' → ḡ [1, p_l]
-
-            # Dimension check: full_update should match parameter size
-            param_numel = param.numel()
-            assert full_update.numel() == param_numel, \
-                f"Full update size mismatch for {layer_name}: " \
-                f"expected {param_numel}, got {full_update.numel()}"
-        else:
-            full_update = g_intermediate
+        # Dimension check: full_update should match parameter size
+        param_numel = param.numel()
+        assert full_update.numel() == param_numel, \
+            f"Full update size mismatch for {layer_name}: " \
+            f"expected {param_numel}, got {full_update.numel()}"
 
         # Apply weight decay (in parameter space)
         if group['weight_decay'] != 0:
@@ -560,9 +515,23 @@ class MeSOAdamW(Optimizer):
         beta1, beta2 = group['betas']
         state['step'] += 1
 
+        # Check gradient for NaN/Inf
+        if torch.isnan(grad).any() or torch.isinf(grad).any():
+            logger.error(f"Standard AdamW: NaN/Inf in gradient! Skipping update.")
+            return
+
         # Update biased first and second moment estimates
         state['exp_avg'].mul_(beta1).add_(grad, alpha=1 - beta1)
         state['exp_avg_sq'].mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+        # Check states for NaN/Inf
+        if torch.isnan(state['exp_avg_sq']).any() or torch.isinf(state['exp_avg_sq']).any():
+            logger.error(f"Standard AdamW: NaN/Inf in exp_avg_sq after update! grad_norm={grad.norm():.2e}")
+            logger.error(f"  exp_avg_sq: min={state['exp_avg_sq'].min():.2e}, max={state['exp_avg_sq'].max():.2e}")
+            logger.error(f"  Resetting exp_avg_sq to avoid corruption")
+            state['exp_avg_sq'].zero_()
+            state['exp_avg_sq'].add_(grad.square())
+            return
 
         # Bias correction
         bias_correction1 = 1 - beta1 ** state['step']
@@ -624,7 +593,7 @@ class MeSOSGD(Optimizer):
     def __init__(
         self,
         params,
-        grad_hook,
+        grad_hook: GradientHook,
         lr: float = 0.01,
         momentum: float = 0.9,
         weight_decay: float = 0.0,

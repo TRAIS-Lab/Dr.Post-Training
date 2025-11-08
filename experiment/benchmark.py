@@ -264,14 +264,14 @@ def setup_full_meso():
         "proj_type": "sjlt",
     }
 
-    sparsifiers, projectors = setup_model_compressors(
+    compressors = setup_model_compressors(
         model=model,
         layer_names=layer_names,
         sparsifier_kwargs=sparsifier_kwargs,
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(device),
-        update_compressor_freq=200
+        update_freq=200
     )
 
     grad_hook = GradientHook(
@@ -280,8 +280,7 @@ def setup_full_meso():
         device=str(device),
         register_hooks=True
     )
-    grad_hook.set_sparsifiers(sparsifiers)
-    grad_hook.set_projectors(projectors)
+    grad_hook.set_compressors(compressors)
 
     optimizer = MeSOAdamW(
         model.parameters(),
@@ -536,14 +535,14 @@ def setup_full_meso_gradient_checkpointing():
         "proj_type": "sjlt",
     }
 
-    sparsifiers, projectors = setup_model_compressors(
+    compressors = setup_model_compressors(
         model=model,
         layer_names=layer_names,
         sparsifier_kwargs=sparsifier_kwargs,
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(device),
-        update_compressor_freq=200
+        update_freq=200
     )
 
     grad_hook = GradientHook(
@@ -552,8 +551,7 @@ def setup_full_meso_gradient_checkpointing():
         device=str(device),
         register_hooks=True
     )
-    grad_hook.set_sparsifiers(sparsifiers)
-    grad_hook.set_projectors(projectors)
+    grad_hook.set_compressors(compressors)
 
     optimizer = MeSOAdamW(
         model.parameters(),

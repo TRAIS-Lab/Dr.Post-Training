@@ -109,13 +109,15 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
 
     # Load training dataset
-    train_dataset = get_training_dataset(data_dir=data_args.data_dir,
-                                         task=training_args.analysis_dataset,
-                                         tokenizer=tokenizer,
-                                         max_seq_length=data_args.max_seq_length,
-                                         sample_percentage=data_args.percentage,
-                                         seed=data_args.sample_data_seed,
-                                         train_files=data_args.train_files if data_args.train_files else None)
+    train_dataset = get_training_dataset(
+        data_dir=data_args.data_dir,
+        task=training_args.analysis_dataset,
+        tokenizer=tokenizer,
+        max_seq_length=data_args.max_seq_length,
+        sample_percentage=data_args.percentage,
+        seed=data_args.sample_data_seed,
+        train_files=data_args.train_files if data_args.train_files else None
+    )
 
     get_data_statistics(train_dataset)
 
@@ -170,9 +172,15 @@ def main():
         logger.warning("WARNING: No trainable layers found! Check model and lora_only setting.")
 
     # Determine if hooks should be registered based on training method
-    # Only register hooks for methods that require gradient computation (GREATS, GradNorm)
-    should_register_hooks = training_args.method in ['GREATS', 'GradNorm']
+    # Register hooks for methods that require gradient computation (GREATS, GradNorm)
+    # OR when using MeSO (use_compressed_optimizer) with gradient compression
+    should_register_hooks = (
+        training_args.method in ['GREATS', 'GradNorm'] or
+        (training_args.use_compressed_optimizer and (training_args.sparsification is not None or training_args.projection is not None))
+    )
     logger.info(f"Training method: {training_args.method} - Hooks will be {'registered' if should_register_hooks else 'NOT registered'}")
+    if training_args.use_compressed_optimizer and should_register_hooks:
+        logger.info("  Hooks enabled for MeSO (use_compressed_optimizer=True) with gradient compression")
 
     # Create gradient hook
     grad_hook = GradientHook(
@@ -189,7 +197,13 @@ def main():
 
         # Parse sparsification argument
         if training_args.sparsification is None:
-            sparsifier_kwargs = None
+            sparsifier_kwargs = {
+                "proj_dim": -1,
+                "proj_max_batch_size": 64,
+                "proj_seed": training_args.seed,
+                "device": str(training_args.device),
+                "proj_type": "identity",
+            }
             logger.info("  Sparsification: Disabled")
         else:
             sparsification_method, sparsification_dim = training_args.sparsification.split("-")
@@ -213,12 +227,12 @@ def main():
         if training_args.projection is None:
             projector_kwargs = {
                 "proj_dim": -1,
-                "proj_max_batch_size": 1,
+                "proj_max_batch_size": 64,
                 "proj_seed": training_args.seed,
                 "device": str(training_args.device),
                 "proj_type": "identity",
             }
-            logger.info("  Projection: Identity (no projection)")
+            logger.info("  Projection: Disabled")
         else:
             proj_method, proj_dim = training_args.projection.split("-")
             assert "*" not in proj_dim, "Projection dimension must not be factorized."
@@ -245,19 +259,18 @@ def main():
 
         # Set up compressors using sample inputs
         logger.info("Setting up model compressors...")
-        sparsifiers, projectors = setup_model_compressors(
+        compressors = setup_model_compressors(
             model=model,
             layer_names=layer_names,
             sparsifier_kwargs=sparsifier_kwargs,
             projector_kwargs=projector_kwargs,
             sample_inputs=sample_inputs,
             device=str(training_args.device),
-            update_compressor_freq=training_args.update_compressor_freq
+            update_freq=training_args.update_compressor_freq
         )
 
-        grad_hook.set_sparsifiers(sparsifiers)
-        grad_hook.set_projectors(projectors)
-        logger.info(f"  Set {len(sparsifiers)} sparsifiers and {len(projectors)} projectors (refreshed every {training_args.update_compressor_freq} steps)")
+        grad_hook.set_compressors(compressors)
+        logger.info(f"  Set {len(compressors)} unified compressors (refreshed every {training_args.update_compressor_freq} steps)")
 
         logger.info("Gradient compression setup completed!")
     else:

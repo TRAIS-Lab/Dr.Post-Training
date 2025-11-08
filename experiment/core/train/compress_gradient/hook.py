@@ -24,7 +24,7 @@ from torch.autograd import Function
 import functools
 import logging
 
-from .compressor import SparsifierContainer, ProjectorContainer
+from .compressor import Compressor
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +108,7 @@ class CompressedLinearBackward(Function):
                 grad_output=grad_output,
                 input=input,
                 has_bias=(bias is not None),
-                sparsifier=hook_manager.sparsifiers[layer_idx],
-                projector=hook_manager.projectors[layer_idx],
+                compressor=hook_manager.compressors[layer_idx],
             )
 
             # Store compressed gradient in hook manager
@@ -126,68 +125,32 @@ class CompressedLinearBackward(Function):
         return grad_input, None, None, None, None
 
 
-def _compute_compressed_grad(
-    grad_output: Tensor,
-    input: Tensor,
-    has_bias: bool,
-    sparsifier: SparsifierContainer,
-    projector: ProjectorContainer,
-) -> Tensor:
+def _compute_compressed_grad(grad_output: Tensor, input: Tensor, has_bias: bool, compressor: Compressor) -> Tensor:
     """
     Compute compressed gradient without materializing full gradient.
 
     Process:
-    1. Add bias term to input (if needed)
-    2. Apply sparsification BEFORE outer product (reduces dimensions early)
-    3. Compute outer product in compressed space
-    4. Apply projection to get final compressed gradient
+    1. Add bias term to input if needed (gradient-specific preprocessing)
+    2. Pass components to compressor which handles:
+       - Sparsification of components (handles 2D/3D automatically)
+       - Kronecker product computation
+       - Projection to final compressed space
     """
-    # Determine dimensions
-    is_3d = input.dim() == 3
-
-    if is_3d:
-        batch_size, seq_length, in_features = input.shape
-        out_features = grad_output.shape[2]
-    else:
-        batch_size = input.shape[0]
-        in_features = input.shape[-1]
-        out_features = grad_output.shape[-1]
-
-    # Reshape to 2D if needed
-    if is_3d:
-        input_2d = input.reshape(-1, in_features)
-        grad_output_2d = grad_output.reshape(-1, out_features)
-    else:
-        input_2d = input
-        grad_output_2d = grad_output
-
-    # Add bias compression
+    # Gradient-specific preprocessing: Add bias column if needed
     if has_bias:
-        ones = torch.ones(input_2d.size(0), 1, device=input_2d.device, dtype=input_2d.dtype)
-        input_2d = torch.cat([input_2d, ones], dim=1)
+        # Determine if input is 3D (batch, seq, features) or 2D (batch, features)
+        if input.dim() == 3:
+            batch_size, seq_length, in_features = input.shape
+            ones = torch.ones(batch_size, seq_length, 1, device=input.device, dtype=input.dtype)
+        else:
+            ones = torch.ones(input.size(0), 1, device=input.device, dtype=input.dtype)
 
-    # Stage 1: Sparsification outer product
-    grad_output_sparse, input_sparse = sparsifier.forward((grad_output_2d, input_2d))
+        input = torch.cat([input, ones], dim=-1)
 
-    # Stage 1.5: outer product in sparse space (with scaling)
-    if is_3d:
-        grad_sparse_3d = grad_output_sparse.reshape(batch_size, seq_length, -1)
-        input_sparse_3d = input_sparse.reshape(batch_size, seq_length, -1)
+    # Delegate to compressor: it handles component-based compression
+    compressed_grad = compressor.forward((grad_output, input))
 
-        grad_tensor = torch.einsum('bsi,bsj->bij',
-                                    grad_sparse_3d * batch_size,
-                                    input_sparse_3d)
-    else:
-        grad_tensor = torch.einsum('bi,bj->bij',
-                                    grad_output_sparse * batch_size,
-                                    input_sparse)
-
-    grad = grad_tensor.reshape(batch_size, -1)
-
-    # Stage 2: Projection
-    grad = projector.forward(grad)
-
-    return grad
+    return compressed_grad
 
 
 class GradientHook:
@@ -232,9 +195,8 @@ class GradientHook:
         self.compressed_grads = [None] * len(layer_names)
         self.inputs = [None] * len(layer_names)
 
-        # Compression components
-        self.sparsifiers = [None] * len(layer_names)
-        self.projectors = [None] * len(layer_names)
+        # Unified compressors (handles all compression/decompression operations)
+        self.compressors = [None] * len(layer_names)
 
         # Track hook registration status
         self.hooks_registered = False
@@ -304,13 +266,9 @@ class GradientHook:
             # Use standard forward during eval
             return F.linear(input, module.weight, module.bias)
 
-    def set_sparsifiers(self, sparsifiers: List[SparsifierContainer]) -> None:
-        """Set sparsifier objects for each layer."""
-        self.sparsifiers = sparsifiers
-
-    def set_projectors(self, projectors: List[ProjectorContainer]) -> None:
-        """Set projector objects for each layer."""
-        self.projectors = projectors
+    def set_compressors(self, compressors: List[Compressor]) -> None:
+        """Set unified compressor objects for each layer."""
+        self.compressors = compressors
 
     def get_compressed_grads(self) -> List[Tensor]:
         """Get all captured compressed gradients."""
@@ -341,50 +299,45 @@ class GradientHook:
             else:
                 aggregated_compressed = compressed_grad.mean(dim=0, keepdim=True)
 
-            # Get compressors
-            projector = self.projectors[idx] if idx < len(self.projectors) else None
-            sparsifier = self.sparsifiers[idx] if idx < len(self.sparsifiers) else None
+            # Get compressor (unified API)
+            compressor = self.compressors[idx] if idx < len(self.compressors) else None
 
-            # Apply transpose in reverse order
-            if projector and hasattr(projector, 'transpose'):
-                g_intermediate = projector.transpose(aggregated_compressed)
+            # Apply decompression using unified API with scale="backward"
+            if compressor and hasattr(compressor, 'transpose'):
+                g_full = compressor.transpose(aggregated_compressed, scale="backward")
             else:
-                g_intermediate = aggregated_compressed
-
-            if sparsifier and hasattr(sparsifier, 'transpose'):
-                g_full = sparsifier.transpose(g_intermediate)
-            else:
-                g_full = g_intermediate
+                g_full = aggregated_compressed
 
             if g_full is not None:
                 full_grads[layer_name] = g_full
 
         return full_grads
 
-    def refresh_compressors(self, step: int) -> int:
+    def refresh_compressors(self, step: int):
         """
-        Refresh all projectors and sparsifiers if needed.
+        Refresh all compressors if needed.
 
         Args:
             step: Current training step
 
         Returns:
-            Number of compressors refreshed
+            Tuple of (num_refreshed, old_compressors) where:
+                - num_refreshed: Number of compressors refreshed
+                - old_compressors: List of old CompressorContainers (or None if not refreshed)
         """
-        num_sparsifiers_refreshed = 0
-        num_projectors_refreshed = 0
+        num_refreshed = 0
+        old_compressors = []
 
-        for idx, sparsifier in enumerate(self.sparsifiers):
-            if sparsifier is not None and sparsifier.refresh(step):
-                num_sparsifiers_refreshed += 1
+        for idx, compressor in enumerate(self.compressors):
+            if compressor is not None:
+                old_container = compressor.refresh(step)
+                old_compressors.append(old_container)
+                if old_container is not None:
+                    num_refreshed += 1
+            else:
+                old_compressors.append(None)
 
-        for idx, projector in enumerate(self.projectors):
-            if projector is not None and projector.refresh(step):
-                num_projectors_refreshed += 1
-
-        num_refreshed = num_sparsifiers_refreshed + num_projectors_refreshed
-
-        return num_refreshed
+        return num_refreshed, old_compressors
 
     def remove_hooks(self) -> None:
         """Restore original forward methods and cleanup registry."""

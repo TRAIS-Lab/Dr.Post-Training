@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -29,7 +29,7 @@ class ProjectionType(str, Enum):
     random_mask: str = "random_mask"
 
 
-def _generate_rademacher_matrix(
+def _rademacher(
     matrix: Tensor,
     generator: torch.Generator,
     dtype: torch.dtype,
@@ -50,7 +50,7 @@ def _generate_rademacher_matrix(
     return matrix.to(dtype=dtype)
 
 
-def _generate_mask_indices(
+def _mask(
     input_dim: int,
     output_dim: int,
     generator: torch.Generator,
@@ -75,7 +75,7 @@ def _generate_mask_indices(
     return indices.sort()[0]
 
 
-def _preprocess_features(
+def _preprocess(
     features: Union[dict, Tensor],
     device: torch.device,
     dtype: torch.dtype,
@@ -121,7 +121,8 @@ class AbstractProjector(ABC):
             seed (int): Random seed for the generation of the sketching
                 (projection) matrix.
             proj_type (ProjectionType): The random projection type used for the
-                projection. Available options are "sjlt", "rademacher", "normal".
+                projection. Available options are "sjlt" (if cuda), "rademacher",
+                "normal", "random_mask", "identity".
             device (torch.device): Device to use. Defaults to cpu.
         """
         self.feature_dim = feature_dim
@@ -270,7 +271,7 @@ class BasicProjector(AbstractProjector):
                 block will be given a unique generator states.
         """
         self.generator.set_state(generator_state)
-        self.active_indices = _generate_mask_indices(
+        self.active_indices = _mask(
             self.feature_dim,
             self.proj_dim,
             self.generator,
@@ -301,7 +302,7 @@ class BasicProjector(AbstractProjector):
         if self.proj_type == ProjectionType.normal:
             self.proj_matrix.normal_(generator=self.generator)
         elif self.proj_type == ProjectionType.rademacher:
-            self.proj_matrix = _generate_rademacher_matrix(
+            self.proj_matrix = _rademacher(
                 self.proj_matrix,
                 self.generator,
                 self.dtype,
@@ -310,18 +311,21 @@ class BasicProjector(AbstractProjector):
             msg = f"Projection type {self.proj_type} not recognized."
             raise KeyError(msg)
 
-    def project(self, features: Union[dict, Tensor], ensemble_id: int) -> Tensor:
+    def project(self, features: Union[dict, Tensor], ensemble_id: int, scale: str = "forward") -> Tensor:
         """Performs the random projection on the feature matrix.
 
         Args:
             features (Union[dict, Tensor]): A batch of features or a dictionary
                 of batch of features.
             ensemble_id (int): A unique ID for this ensemble.
+            scale (str): Scaling mode for norm preservation
+                - "forward": Scale by 1/√k for d→k projection (default)
+                - "backward": Scale by 1/√d for k→d projection
 
         Returns:
             Tensor: The projected features.
         """
-        features = _preprocess_features(features, self.device, self.dtype)
+        features = _preprocess(features, self.device, self.dtype)
 
         if ensemble_id != self.ensemble_id:
             self.ensemble_id = ensemble_id
@@ -355,18 +359,25 @@ class BasicProjector(AbstractProjector):
                     features.type(self.dtype) @ self.proj_matrix[:, : (ed - st)]
                 )
 
-        # Normalize by sqrt(proj_dim) for distance preservation
-        # (consistent with CudaProjector and Johnson-Lindenstrauss lemma)
-        sketch /= self.proj_dim**0.5
+        # Apply scaling for norm preservation
+        if scale == "forward":
+            # Scale by 1/√k for d→k projection (norm preservation)
+            sketch = sketch / (self.proj_dim ** 0.5)
+        elif scale == "backward":
+            # Scale by 1/√d for k→d projection (used in transpose scenarios)
+            sketch = sketch / (self.feature_dim ** 0.5)
 
         return sketch.type(features.dtype)
 
-    def transpose(self, projected_features: Tensor, ensemble_id: int = 0) -> Tensor:
+    def transpose(self, projected_features: Tensor, ensemble_id: int = 0, scale: str = "forward") -> Tensor:
         """Apply transpose of projection to recover original feature space.
 
         Args:
             projected_features (Tensor): Features in projected space [batch, proj_dim]
             ensemble_id (int): A unique ID for this ensemble
+            scale (str): Scaling mode for norm preservation
+                - "forward": Scale by 1/√k for d→k projection (default)
+                - "backward": Scale by 1/√d for k→d projection
 
         Returns:
             Tensor: Features in original space [batch, feature_dim]
@@ -392,8 +403,6 @@ class BasicProjector(AbstractProjector):
             return projected_features
 
         # For dense projections: P^T @ projected_features
-        # Undo normalization first
-        # projected_features = projected_features  (self.proj_dim**0.5)
 
         original = torch.zeros(
             size=(projected_features.size(0), self.feature_dim),
@@ -412,7 +421,14 @@ class BasicProjector(AbstractProjector):
                 ed = min((ind + 1) * self.block_size, self.proj_dim)
                 original += projected_features[:, st:ed] @ self.proj_matrix[:, : (ed - st)].T
 
-        original /= self.proj_dim**0.5
+        # Apply scaling for norm preservation
+        if scale == "forward":
+            # Scale by 1/√k for d→k projection (norm preservation)
+            original = original / (self.proj_dim ** 0.5)
+        elif scale == "backward":
+            # Scale by 1/√d for k→d projection (used in transpose scenarios)
+            original = original / (self.feature_dim ** 0.5)
+
         return original.type(projected_features.dtype)
 
     def refresh(self, new_seed: int) -> None:
@@ -428,7 +444,6 @@ class BasicProjector(AbstractProjector):
             self._gen_randomness_mask(self.generator_states[0])
         elif self.num_blocks == 1:
             self._gen_randomness_dense(self.generator_states[0])
-        # For multi-block, randomness is generated on-the-fly in project/transpose
 
 
 class CudaProjector(AbstractProjector):
@@ -445,7 +460,6 @@ class CudaProjector(AbstractProjector):
         seed: int,
         proj_type: ProjectionType,
         device: torch.device,
-        max_batch_size: int,
         dtype: torch.dtype = torch.float32,
     ) -> None:
         """Initializes hyperparameters for CudaProjector.
@@ -460,10 +474,6 @@ class CudaProjector(AbstractProjector):
                 projection. Available options are "sjlt", "rademacher", "normal",
                 "random_mask", "identity".
             device (torch.device): Device to use.
-            max_batch_size (int): Explicitly constrains the batch size of
-                the CudaProjector is going to use for projection.
-                Set this if you get a 'The batch size of the CudaProjector is
-                too large for your GPU' error. Must be either 8, 16, or 32.
             dtype (torch.dtype): The dtype used in the projector.
 
         Raises:
@@ -471,7 +481,6 @@ class CudaProjector(AbstractProjector):
             ModuleNotFoundError: When sjlt is not installed.
         """
         super().__init__(feature_dim, proj_dim, seed, proj_type, device)
-        self.max_batch_size = max_batch_size
         self.dtype = dtype
 
         if self.device.type != "cuda":
@@ -568,7 +577,7 @@ class CudaProjector(AbstractProjector):
         if output_dim is None:
             output_dim = self.proj_dim
 
-        self.active_indices = _generate_mask_indices(
+        self.active_indices = _mask(
             input_dim,
             output_dim,
             self.generator,
@@ -593,7 +602,7 @@ class CudaProjector(AbstractProjector):
         if method == "normal":
             self.proj_matrix.normal_(generator=self.generator)
         elif method == "rademacher":
-            self.proj_matrix = _generate_rademacher_matrix(
+            self.proj_matrix = _rademacher(
                 self.proj_matrix,
                 self.generator,
                 self.dtype,
@@ -628,17 +637,16 @@ class CudaProjector(AbstractProjector):
             msg = f"Unknown projection type: {self.proj_type}"
             raise ValueError(msg)
 
-    def project(
-        self,
-        features: Union[dict, Tensor],
-        ensemble_id: int,
-    ) -> Tensor:
+    def project(self, features: Union[dict, Tensor], ensemble_id: int, scale: str = "forward") -> Tensor:
         """Performs the random projection on the feature matrix.
 
         Args:
             features (Union[dict, Tensor]): A batch of features or a dictionary
                 of batch of features.
             ensemble_id (int): A unique ID for this ensemble.
+            scale (str): Scaling mode for norm preservation
+                - "forward": Scale by 1/√k for d→k projection (default)
+                - "backward": Scale by 1/√d for k→d projection
 
         Returns:
             Tensor: The projected features.
@@ -648,14 +656,21 @@ class CudaProjector(AbstractProjector):
             self._generate_randomness(ensemble_id)
             self.current_ensemble_id = ensemble_id
 
-        features = _preprocess_features(features, self.device, self.dtype)
+        features = _preprocess(features, self.device, self.dtype)
 
-        if self.proj_type == ProjectionType.sjlt:
+        if self.proj_type in [ProjectionType.rademacher, ProjectionType.normal]:
+            result = features @ self.proj_matrix
+            # Apply scaling for norm preservation
+            if scale == "forward":
+                # Scale by 1/√k for d→k projection
+                result /= (self.proj_dim ** 0.5)
+            elif scale == "backward":
+                # Scale by 1/√d for k→d projection
+                result /= (self.feature_dim ** 0.5)
+
+        elif self.proj_type == ProjectionType.sjlt:
             with torch.no_grad():
                 result = self.sjlt(features)
-
-        elif self.proj_type in [ProjectionType.rademacher, ProjectionType.normal]:
-            result = features @ self.proj_matrix / (self.proj_dim**0.5)
 
         elif self.proj_type == ProjectionType.random_mask:
             result = features[:, self.active_indices]
@@ -665,44 +680,53 @@ class CudaProjector(AbstractProjector):
 
         return result
 
-    def transpose(self, projected_features: Tensor, ensemble_id: int = 0) -> Tensor:
+    def transpose(self, features: Union[dict, Tensor], ensemble_id: int = 0, scale: str = "forward") -> Tensor:
         """Apply transpose of projection to recover original feature space.
 
         Args:
-            projected_features (Tensor): Features in projected space [batch, proj_dim]
-            ensemble_id (int): A unique ID for this ensemble
+            features (Union[dict, Tensor]): A batch of features or a dictionary
+                of batch of features.
+            ensemble_id (int): A unique ID for this ensemble.
+            scale (str): Scaling mode for norm preservation
+                - "forward": Scale by 1/√k for d→k projection (default)
+                - "backward": Scale by 1/√d for k→d projection
 
         Returns:
-            Tensor: Features in original space [batch, feature_dim]
+            Tensor: The transposed-projected features
         """
         # Regenerate randomness if the ensemble_id has changed
         if ensemble_id != self.current_ensemble_id:
             self._generate_randomness(ensemble_id)
             self.current_ensemble_id = ensemble_id
 
-        if self.proj_type == ProjectionType.sjlt:
+        features = _preprocess(features, self.device, self.dtype)
+
+        if self.proj_type in [ProjectionType.rademacher, ProjectionType.normal]:
+            result = features @ self.proj_matrix.T
+            # Apply scaling for norm preservation
+            if scale == "forward":
+                # Scale by 1/√k for d→k projection
+                result /= (self.proj_dim ** 0.5)
+            elif scale == "backward":
+                # Scale by 1/√d for k→d projection
+                result /= (self.feature_dim ** 0.5)
+
+        elif self.proj_type == ProjectionType.sjlt:
             # SJLT has its own transpose method
             with torch.no_grad():
-                result = self.sjlt.transpose(projected_features)
-
-        elif self.proj_type in [ProjectionType.rademacher, ProjectionType.normal]:
-            # Undo normalization first
-            # projected_features = projected_features * (self.proj_dim**0.5)
-            # P^T @ projected_features
-            result = projected_features @ self.proj_matrix.T
-            result /= self.proj_dim**0.5
+                result = self.sjlt.transpose(features)
 
         elif self.proj_type == ProjectionType.random_mask:
             # Scatter operation
             result = torch.zeros(
-                projected_features.size(0), self.feature_dim,
-                dtype=projected_features.dtype,
+                features.size(0), self.feature_dim,
+                dtype=features.dtype,
                 device=self.device
             )
-            result[:, self.active_indices] = projected_features
+            result[:, self.active_indices] = features
 
         elif self.proj_type == ProjectionType.identity:
-            result = projected_features
+            result = features
 
         return result
 
@@ -736,7 +760,6 @@ class ChunkedCudaProjector:
         max_chunk_size: int,
         dim_per_chunk: list,
         feature_batch_size: int,
-        proj_max_batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
@@ -748,17 +771,16 @@ class ChunkedCudaProjector:
             max_chunk_size (int): The maximum size of each chunk.
             dim_per_chunk (list): The number of feature dimensions per chunk.
             feature_batch_size (int): The batch size of input feature.
-            proj_max_batch_size (int): The maximum batch size for each projector.
             device (torch.device): Device to use.
             dtype (torch.dtype): The dtype of the projected matrix.
         """
         self.projector_per_chunk = projector_per_chunk
         self.proj_dim = self.projector_per_chunk[0].proj_dim
         self.proj_type = self.projector_per_chunk[0].proj_type
+        self.feature_dim = sum(dim_per_chunk)  # Total feature dimension across all chunks
         self.dim_per_chunk = dim_per_chunk
         self.feature_batch_size = feature_batch_size
         self.max_chunk_size = max_chunk_size
-        self.proj_max_batch_size = proj_max_batch_size
         self.device = device
         self.dtype = dtype
         self.input_allocated = False
@@ -784,90 +806,16 @@ class ChunkedCudaProjector:
         del self.ch_input
         self.input_allocated = False
 
-    def dict_project(self, features: Union[dict, Tensor], ensemble_id: int) -> Tensor:
+    def project(self, features: Union[dict, Tensor], ensemble_id: int, scale: str = "forward") -> Tensor:
         """Performs the random projection on the feature matrix.
 
         Args:
             features (Union[dict, Tensor]): A batch of features or a dictionary
                 of batch of features.
             ensemble_id (int): A unique ID for this ensemble.
-
-        Raises:
-            ValueError: The number of accumulated #feature dim does not match
-                dim_per_chunk.
-
-        Returns:
-            Tensor: The projected features.
-        """
-        self.allocate_input()
-        ch_output = torch.zeros(
-            size=(self.feature_batch_size, self.proj_dim),
-            device=self.device,
-            dtype=self.dtype,
-        )
-        pointer = 0
-        # iterate over feature dimensions, keep a counter of #dim so far, and when prev
-        # chunk reaches max_chunk_size, project and accumulate.
-        projector_index = 0
-        vector_dim = 1
-        for _, p in enumerate(features.values()):
-            # check the shape of p, if vector then unsqueeze.
-            if len(p.shape) <= vector_dim:
-                p_flat = p.data.unsqueeze(-1)
-            else:
-                p_flat = p.data.flatten(start_dim=1)
-
-            feature_dim_size = p_flat.size(1)
-            # if current accumulated params exceed max_chunk_size,
-            # then stop accumulation.
-            if pointer + feature_dim_size > self.max_chunk_size:
-                # fill remaining entries with 0
-                if pointer != self.dim_per_chunk[projector_index]:
-                    msg = "Current number of accumulated #dim does not match \
-                    the #feature dim of current chunk."
-                    raise ValueError(msg)
-                # project and accumulate
-                ch_output.add_(
-                    self.projector_per_chunk[projector_index].project(
-                        self.ch_input[:, :pointer].contiguous(),
-                        ensemble_id=ensemble_id,
-                    ),
-                )
-                # reset counter
-                pointer = 0
-                projector_index += 1
-
-            # continue accumulation
-            actual_bs = min(self.ch_input.size(0), p_flat.size(0))
-            self.ch_input[:actual_bs, pointer : pointer + feature_dim_size].copy_(
-                p_flat,
-            )
-            pointer += feature_dim_size
-
-        # at the end, we need to project remaining items
-        # fill remaining entries with 0
-        if pointer != self.dim_per_chunk[projector_index]:
-            msg = "Current number of accumulated #dim does not match \
-                    the #feature dim of current chunk."
-            raise ValueError(msg)
-
-        # project and accumulate
-        ch_output[:actual_bs].add_(
-            self.projector_per_chunk[projector_index].project(
-                self.ch_input[:actual_bs, :pointer].contiguous(),
-                ensemble_id=ensemble_id,
-            ),
-        )
-
-        return ch_output[:actual_bs]
-
-    def project(self, features: Union[dict, Tensor], ensemble_id: int) -> Tensor:
-        """Performs the random projection on the feature matrix.
-
-        Args:
-            features (Union[dict, Tensor]): A batch of features or a dictionary
-                of batch of features.
-            ensemble_id (int): A unique ID for this ensemble.
+            scale (str): Scaling mode for norm preservation
+                - "forward": Scale by 1/√k for d→k projection (default)
+                - "backward": Scale by 1/√d for k→d projection
 
         Returns:
             Tensor: The projected features.
@@ -891,12 +839,56 @@ class ChunkedCudaProjector:
                 self.projector_per_chunk[chunk_idx].project(
                     features[:, pointer : pointer + chunk_dim].contiguous(),
                     ensemble_id=ensemble_id,
+                    scale=scale,
                 ),
             )
 
             pointer += chunk_dim
 
         return ch_output
+
+    def transpose(self, projected_features: Tensor, ensemble_id: int = 0, scale: str = "forward") -> Tensor:
+        """Apply transpose of projection to recover original feature space.
+
+        Args:
+            projected_features (Tensor): Features in projected space [batch, proj_dim]
+            ensemble_id (int): A unique ID for this ensemble
+            scale (str): Scaling mode for norm preservation
+
+        Returns:
+            Tensor: Features in original space [batch, feature_dim]
+        """
+        # Allocate output tensor for full feature space
+        original = torch.zeros(
+            size=(projected_features.size(0), self.feature_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        pointer = 0
+        for chunk_idx, chunk_dim in enumerate(self.dim_per_chunk):
+            # Each chunk projector transposes from proj_dim back to its chunk_dim
+            chunk_result = self.projector_per_chunk[chunk_idx].transpose(
+                projected_features,
+                ensemble_id=ensemble_id,
+                scale=scale,
+            )
+            original[:, pointer : pointer + chunk_dim] = chunk_result
+
+            pointer += chunk_dim
+
+        return original
+
+    def refresh(self, new_seed: int) -> None:
+        """Refresh all chunk projectors with new randomness.
+
+        Args:
+            new_seed (int): New random seed
+        """
+        # Refresh each chunk projector with a unique seed
+        for idx, projector in enumerate(self.projector_per_chunk):
+            chunk_seed = new_seed + idx * 1000
+            projector.refresh(chunk_seed)
 
 
 def make_random_projector(
@@ -921,9 +913,9 @@ def make_random_projector(
             about to be projected. The typical type of feature are gradients of
             torch.nn.Module model but can be restricted to this.
         proj_dim (int): Dimension of the projected feature.
-        proj_max_batch_size (int): The maximum batch size if the CudaProjector is
-            used. Must be a multiple of 8. The maximum batch size is 32 for A100
-            GPUs, 16 for V100 GPUs, 40 for H100 GPUs.
+        proj_max_batch_size (int): The batch size used to calculate safe chunk sizes
+            for ChunkedCudaProjector (to avoid int32 overflow). This determines when
+            parameters need to be split into multiple chunks. Not stored in projectors.
         device (torch.device): Device to use. Defaults to cpu.
         proj_seed (int): Random seed used by the projector. Defaults to 0.
         proj_type (ProjectionType): The random projection type used for the
@@ -952,7 +944,6 @@ def make_random_projector(
                 seed=proj_seed,
                 proj_type=proj_type,
                 device=device,
-                max_batch_size=proj_max_batch_size,
                 dtype=dtype,
             )
         else:  # we have to use the ChunkedCudaProjector
@@ -976,7 +967,6 @@ def make_random_projector(
                     seed=seeds[i],
                     proj_type=proj_type,
                     device=device,
-                    max_batch_size=proj_max_batch_size,
                     dtype=dtype,
                 )
                 for i, chunk_size in enumerate(param_chunk_sizes)
@@ -986,7 +976,6 @@ def make_random_projector(
                 max_chunk_size,
                 param_chunk_sizes,
                 feature_batch_size,
-                proj_max_batch_size,
                 device,
                 dtype,
             )
@@ -1012,7 +1001,7 @@ def random_project(
     proj_type: str = "normal",
     *,
     device: Union[str, torch.device] = "cpu",
-) -> Callable:
+) -> Union[BasicProjector, CudaProjector, ChunkedCudaProjector]:
     """Randomly projects the features to a smaller dimension.
 
     Args:
@@ -1025,21 +1014,20 @@ def random_project(
             about to be projected. The typical type of feature are gradients of
             torch.nn.Module model but can restricted to this.
         proj_dim (int): Dimension of the projected feature.
-        proj_max_batch_size (int): The maximum batch size if the CudaProjector is
-            used. Must be a multiple of 8. The maximum batch size is 32 for A100
-            GPUs, 16 for V100 GPUs, 40 for H100 GPUs.
+        proj_max_batch_size (int): The batch size used to calculate safe chunk sizes
+            for ChunkedCudaProjector (to avoid int32 overflow). This determines when
+            parameters need to be split into multiple chunks.
         proj_seed (int): Random seed used by the projector. Defaults to 0.
         proj_type (str): The random projection type used for the projection.
-            Available options are "sjlt", "rademacher", "normal", "random_mask",
-            "grass", or "grass_N" where N is the intermediate dimension multiplier
-            (e.g., "grass_4" means intermediate_dim = 4 * proj_dim).
+            Available options are "identity" "sjlt", "rademacher", "normal", "random_mask".
         device (Union[str, torch.device]): "cuda" or "cpu". Defaults to "cpu".
 
     Raises:
         ValueError: When an invalid proj_type or device is provided.
 
     Returns:
-        A function that takes projects feature to a smaller dimension.
+        A projector object (BasicProjector, CudaProjector, or ChunkedCudaProjector)
+        that can be used to project features via the .project() method.
     """
     # check the type of feature
     if isinstance(feature, dict):
@@ -1083,7 +1071,7 @@ def random_project(
 
     proj_type = proj_type_mapping[proj_type]
 
-    projector = make_random_projector(
+    return make_random_projector(
         param_shape_list=param_shape_list,
         feature_batch_size=feature_batch_size,
         proj_dim=proj_dim,
@@ -1093,31 +1081,3 @@ def random_project(
         proj_type=proj_type,
         dtype=dtype,
     )
-
-    def _random_project_func(
-        feature: Union[Dict[str, Tensor], Tensor],
-        ensemble_id: int = 0,
-    ) -> Tensor:
-        """The projection function using constructed projector.
-
-        Args:
-            feature (Union[Dict[str, Tensor], Tensor]): The feature needs to be
-                projected. This can simple be a tensor with size [feature_batch_size,
-                feature_dim]. Or typically, if the this is gradient of some
-                torch.nn.Module models, it will have the structure similar to the
-                result of model.named_parameters().
-            ensemble_id (int): A unique ID for this ensemble. Defaults to 0.
-
-        Returns:
-            The projected result of feature, which is a tensor with size
-                [feature_batch_size, proj_dim].
-        """
-        # Check if we should use the memory-efficient dict_project
-        if isinstance(projector, ChunkedCudaProjector) and isinstance(feature, dict):
-            return projector.dict_project(feature, ensemble_id)
-
-        return projector.project(feature, ensemble_id)
-
-    # Attach projector to function so that we can extract active_indices later
-    _random_project_func.projector = projector
-    return _random_project_func

@@ -1,528 +1,561 @@
 """
-Projector container classes for gradient compression.
+Compression container classes for two-stage tensor compression.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Any, Optional, List, Tuple, Union
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import logging
 
 from torch import Tensor
-from .projection import random_project
+from .projection import random_project, AbstractProjector, ProjectionType
 
 # Configure logger
 logger = logging.getLogger(__name__)
 
-class BaseContainer:
-    """
-    Base container for compression functions associated with a layer.
 
-    Note: This is an abstract base. Use SparsifierContainer or ProjectorContainer.
+class ProjectionContainer(ABC):
+    """
+    Abstract base class for compression containers.
     """
     def __init__(self, name: str, index: int):
         self.name = name
         self.index = index
 
-    def refresh(self, step: int) -> bool:
-        """
-        Refresh the compressor if needed.
+    @abstractmethod
+    def forward(self, input: Any, scale: str = "forward") -> Any:
+        pass
 
-        Args:
-            step: Current training step
-        Returns:
-            True if refreshed, False otherwise
-        """
-        raise NotImplementedError("BaseContainer does not implement refresh()")
+    @abstractmethod
+    def transpose(self, input: Any, scale: str = "forward") -> Any:
+        pass
 
-class SparsifierContainer(BaseContainer):
+    @abstractmethod
+    def refresh(self, step: int) -> Any:
+        pass
+
+
+class Sparsifier(ProjectionContainer):
     """
     Container for sparsification (first stage of two-step compression).
 
-    Sparsification is ALWAYS factorized, operating component-wise:
-    - sparsifier_output: Acts on gradient w.r.t. pre-activation (d_out → k_out')
-    - sparsifier_input: Acts on input features (d_in → k_in')
-
-    Forward:  (g_out, g_in) → (g_out', g_in')  [via gather for random_mask or matrix mult for dense]
-    Transpose: (g_out', g_in') → (ḡ_out, ḡ_in)  [via scatter for random_mask or vec-trick for dense]
-
-    Attributes:
-        sparsifier_comp: Tuple of (sparsifier_output, sparsifier_input) functions
-        mask_indices: Tuple of (output_indices, input_indices) for random_mask transpose
-        intermediate_dims: Tuple of (k_out', k_in') after sparsification
-        original_dims: Tuple of (d_out, d_in) before sparsification
-        update_compressor_freq: Number of steps between refreshes
-        base_seed: Base random seed
-        current_step: Current training step
+    Sparsification is always factorized, operating component-wise:
+        Pv = (P_1 ⊗ P_2) (v_1 ⊗ v_2) = (P_1 v_1) ⊗ (P_2 v_2),
+    with P_1 in R^{d_1 * k_1'}, P_2 in R^{d_2 * k_2'}, and v in R^{d_1 * d_2}.
     """
-    def __init__(self, name: str, index: int, update_compressor_freq: int = 200):
+    def __init__(self, name: str, index: int, update_freq: int = 200):
         super().__init__(name, index)
         # Sparsifier functions (always factorized)
-        self.sparsifier_comp = (None, None)  # (output_sparsifier, input_sparsifier)
+        self.sparsifier_comp: Tuple[AbstractProjector, AbstractProjector] = (None, None)
 
-        # Transpose-related attributes
-        self.mask_indices = (None, None)  # (output_indices, input_indices) for mask
-        self.intermediate_dims = None  # (k_out', k_in')
+        # Dimensions after sparsification
+        self.intermediate_dims = None  # (k_1', k_2')
 
-        # Old compressor for state transformation during refresh
-        self.old_sparsifier_comp = None  # Saved before refresh
-        self.old_mask_indices = None  # Saved before refresh
-        self.old_intermediate_dims = None  # Saved before refresh
-
-        self.update_compressor_freq = update_compressor_freq
+        self.update_freq = update_freq
         self.base_seed = None
         self.current_step = 0
 
-    def transpose(self, g_intermediate: torch.Tensor) -> torch.Tensor:
-        """
-        Apply sparsification transpose: g' → ḡ
-
-        This implements the transpose of the sparsification operation, which is the
-        first stage of the two-step compression (applied in REVERSE order during decompression).
-
-        For random_mask: Uses optimized scatter operation based on mask indices.
-        For dense projections: Uses vec-trick: vec((P_out)ᵀ @ G' @ P_in) where G' is [k_out', k_in']
-
-        Args:
-            g_intermediate: Intermediate gradient after projection transpose [1, k_out' * k_in']
-                           (already aggregated, single sample)
-
-        Returns:
-            Full gradient after sparsification transpose [1, d_out * d_in]
-        """
-        if self.sparsifier_comp == (None, None):
-            # No sparsification, return as-is
-            return g_intermediate
-
-        if g_intermediate is None:
-            return None
-
-        # Get dimensions
-        if self.intermediate_dims is None:
-            raise ValueError(f"Cannot transpose sparsifier {self.name}: dimensions not set")
-
-        k_out_prime, k_in_prime = self.intermediate_dims
-
-        # Ensure we have [1, k'] format
-        if g_intermediate.dim() == 1:
-            g_intermediate = g_intermediate.unsqueeze(0)
-
-        # OPTIMIZED PATH: random_mask sparsification uses scatter
-        if self.mask_indices is not None and self.mask_indices != (None, None):
-            output_indices, input_indices = self.mask_indices
-
-            # Get projector objects to access original dimensions
-            output_sparsifier = self.sparsifier_comp[0]
-            input_sparsifier = self.sparsifier_comp[1]
-
-            output_proj = output_sparsifier.projector
-            input_proj = input_sparsifier.projector
-
-            # Get original dimensions from projector
-            d_out = output_proj.feature_dim  # Original output dimension
-            d_in = input_proj.feature_dim    # Original input dimension
-
-            # Reshape from flattened to 2D matrix: [1, k_out' * k_in'] → [k_out', k_in']
-            G_intermediate = g_intermediate.reshape(k_out_prime, k_in_prime)
-
-            # Initialize full gradient matrix with zeros
-            G_full = torch.zeros(d_out, d_in, device=g_intermediate.device, dtype=g_intermediate.dtype)
-
-            # Scatter operation: G_full[output_indices[:, None], input_indices[None, :]] = G_intermediate
-            # Use advanced indexing with meshgrid for 2D scatter
-            output_idx_expanded = output_indices.unsqueeze(1).expand(k_out_prime, k_in_prime)
-            input_idx_expanded = input_indices.unsqueeze(0).expand(k_out_prime, k_in_prime)
-
-            # Flatten indices and values for 1D scatter
-            flat_indices = output_idx_expanded * d_in + input_idx_expanded
-            G_full.view(-1).scatter_(0, flat_indices.reshape(-1), G_intermediate.reshape(-1))
-
-            # Flatten and add batch dimension: [1, d_out * d_in]
-            result = G_full.reshape(1, -1)
-            return result
-
-        # GENERAL PATH: dense projections use vec-trick
-        # Reshape from flattened to 2D matrix: [1, k_out' * k_in'] → [k_out', k_in']
-        G_intermediate = g_intermediate.reshape(k_out_prime, k_in_prime)
-
-        # Get projector objects from the sparsifier closures
-        output_sparsifier = self.sparsifier_comp[0]
-        input_sparsifier = self.sparsifier_comp[1]
-
-        if not (hasattr(output_sparsifier, 'projector') and hasattr(input_sparsifier, 'projector')):
-            raise ValueError(f"Sparsifier {self.name} does not have projector objects")
-
-        output_proj = output_sparsifier.projector
-        input_proj = input_sparsifier.projector
-
-        d_out = output_proj.feature_dim
-        d_in = input_proj.feature_dim
-
-        # Apply transpose using vec-trick: vec((P_out)ᵀ @ G' @ P_in)
-        # Step 1: Apply output projector transpose column-wise
-        # Treat columns as batch: transpose [k_in', k_out'] where each column is a sample
-        G_transposed = G_intermediate.t()  # [k_in', k_out']
-
-        G_output_transposed = output_proj.transpose(G_transposed, ensemble_id=0)  # [k_in', d_out]
-
-        G_output_transposed = G_output_transposed.t()  # [d_out, k_in']
-
-        # Step 2: Apply input projector transpose row-wise
-        # Treat rows as batch: [d_out, k_in'] where each row is a sample
-        G_full = input_proj.transpose(G_output_transposed, ensemble_id=0)  # [d_out, d_in]
-
-        # Flatten and add batch dimension: [1, d_out * d_in]
-        result = G_full.reshape(1, -1)
-
-        return result
-
-    def forward(
-        self,
-        input_data: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    def forward(self, input: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], scale: str = "forward") -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """
         Apply sparsification forward pass with automatic mode detection.
 
-        This method supports two modes:
+        This method supports two input types:
 
-        **Mode 1 - Gradient Compression** (tuple input):
-            Input: (g_out, g_in) - gradient components
-            Output: (g_out_sparse, g_in_sparse) - sparsified components
+        Mode 1 - Factorized Sparsification (tuple input):
+            Input: (v_1, v_2) - input components [batch, d_1] and [batch, d_2]
+            Output: (v_1_sparse, v_2_sparse) - sparsified components [batch, k_1'] and [batch, k_2']
             Use case: During gradient computation, apply sparsifiers to each component
 
-        **Mode 2 - State Transformation** (tensor input):
-            Input: m_full_vec - vector in full parameter space [1, d_out * d_in]
-            Output: m_sparse_vec - sparsified vector [1, k_out' * k_in']
-            Use case: During optimizer state transformation, apply to general matrices
+        Mode 2 - Sparsification (tensor input):
+            Input: v - full input [1, d_1 * d_2]
+            Output: v_sparse - sparsified vector [1, k_1' * k_2']
+            Use case: During optimizer state transformation, apply to general state vector
 
         Args:
-            input_data: Either a tuple (g_out, g_in) or a tensor m_full_vec
+            input: Either (Mode 1) a tuple (v_1, v_2) or (Mode 2) a tensor v
+            scale: Scaling mode for norm preservation
+                - "forward": Scale to preserve forward projection norm
+                - "backward": Scale to preserve backward projection norm
 
         Returns:
-            Either a tuple (g_out_sparse, g_in_sparse) or a tensor m_sparse_vec
+            Either a tuple (v_1_sparse, v_2_sparse) or a tensor v_sparse
         """
-        if self.sparsifier_comp == (None, None):
-            # No sparsification, return as-is
-            return input_data
-
-        if input_data is None:
-            return None
-
         # Mode detection based on input type
-        if isinstance(input_data, tuple):
-            # MODE 1: Gradient compression (component-wise)
-            return self._forward_components(input_data)
+        if isinstance(input, tuple):
+            # MODE 1: component-wise
+            return self._forward_components(input, scale=scale)
         else:
-            # MODE 2: State transformation (matrix via vec-trick)
-            return self._forward_matrix(input_data)
+            # MODE 2: via vec-trick
+            return self._forward_full(input, scale=scale)
 
-    def _forward_components(
-        self,
-        components: Tuple[torch.Tensor, torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_components(self, input_components: Tuple[torch.Tensor, torch.Tensor], scale: str = "forward") -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply sparsifiers to gradient components (Mode 1).
+        Apply sparsifiers to input components (Mode 1).
 
         Args:
-            components: (g_out, g_in) - gradient w.r.t. output and input
+            input_components: (component_1, component_2) - tuple of input components
+            scale: Scaling mode passed to projectors
 
         Returns:
-            (g_out_sparse, g_in_sparse) - sparsified components
+            (component_1_sparse, component_2_sparse) - sparsified components
         """
-        g_out, g_in = components
-        output_sparsifier, input_sparsifier = self.sparsifier_comp
+        component_1, component_2 = input_components
+        sparsifier_1, sparsifier_2 = self.sparsifier_comp
 
-        # Apply sparsifiers component-wise
-        g_out_sparse = output_sparsifier(g_out, ensemble_id=0)
-        g_in_sparse = input_sparsifier(g_in, ensemble_id=0)
+        # Apply sparsifiers component-wise, passing through scale parameter
+        component_1_sparse = sparsifier_1.project(component_1, ensemble_id=0, scale=scale)
+        component_2_sparse = sparsifier_2.project(component_2, ensemble_id=0, scale=scale)
 
-        return g_out_sparse, g_in_sparse
+        return component_1_sparse, component_2_sparse
 
-    def _forward_matrix(self, m_full_vec: torch.Tensor) -> torch.Tensor:
+    def _forward_full(self, input: torch.Tensor, scale: str = "forward") -> torch.Tensor:
         """
-        Apply sparsification to a general matrix using vec-trick dual (Mode 2).
+        Apply sparsification to the full input using vec-trick (Mode 2).
 
-        This is used during optimizer state transformation when refreshing compressors.
-        Unlike transpose(), this applies the forward sparsification S = P_in ⊗ P_out
-        to a general vector that doesn't have the gradient's outer-product structure.
+        This method handles arbitrary tensor inputs. Unlike forward_components(), this operates
+        on a flattened vector without assuming specific outer-product structure.
 
         Uses the vec-trick dual identity:
             (A ⊗ B) vec(C) = vec(B C A^T)
 
-        where A = P_in, B = P_out, C = unvec(m_full_vec)
+        where A = S_2, B = S_1, C = matrix(input), S_i are sparsifiers
 
         Args:
-            m_full_vec: Vector in full parameter space [1, d_out * d_in]
+            input: Full input vector [1, d_1 * d_2]
+            scale: Scaling mode passed to projectors
 
         Returns:
-            Sparsified vector [1, k_out' * k_in']
+            Sparsified vector [1, k_1' * k_2']
         """
         # Ensure we have [1, p] format
-        if m_full_vec.dim() == 1:
-            m_full_vec = m_full_vec.unsqueeze(0)
+        if input.dim() == 1:
+            input = input.unsqueeze(0)
 
         # Get dimensions
         if self.intermediate_dims is None:
             raise ValueError(f"Cannot forward sparsifier {self.name}: dimensions not set")
 
-        k_out_prime, k_in_prime = self.intermediate_dims
+        k_1_prime, k_2_prime = self.intermediate_dims
 
         # Get sparsifier objects
-        output_sparsifier = self.sparsifier_comp[0]
-        input_sparsifier = self.sparsifier_comp[1]
+        sparsifier_1, sparsifier_2 = self.sparsifier_comp
 
-        if not (hasattr(output_sparsifier, 'projector') and hasattr(input_sparsifier, 'projector')):
-            raise ValueError(f"Sparsifier {self.name} does not have projector objects")
-
-        output_proj = output_sparsifier.projector
-        input_proj = input_sparsifier.projector
-
-        d_out = output_proj.feature_dim
-        d_in = input_proj.feature_dim
-
-        # Reshape from flattened to 2D matrix: [1, d_out * d_in] → [d_out, d_in]
-        M_full = m_full_vec.reshape(d_out, d_in)
+        # Reshape from flattened to 2D matrix: [1, d_1 * d_2] → [d_1, d_2]
+        input_matrix = input.reshape(sparsifier_1.feature_dim, sparsifier_2.feature_dim)
 
         # OPTIMIZED PATH: random_mask sparsification uses gather
-        if self.mask_indices is not None and self.mask_indices != (None, None):
-            output_indices, input_indices = self.mask_indices
+        if sparsifier_1.proj_type == ProjectionType.random_mask and sparsifier_2.proj_type == ProjectionType.random_mask:
+            # Access indices directly from the sparsifier objects
+            indices_1 = sparsifier_1.active_indices
+            indices_2 = sparsifier_2.active_indices
 
-            # Gather operation: M_intermediate = M_full[output_indices[:, None], input_indices[None, :]]
+            # Gather operation: M_intermediate = M_full[indices_1[:, None], indices_2[None, :]]
             # Use advanced indexing for 2D gather
-            output_idx_expanded = output_indices.unsqueeze(1).expand(k_out_prime, k_in_prime)
-            input_idx_expanded = input_indices.unsqueeze(0).expand(k_out_prime, k_in_prime)
+            idx_1_expanded = indices_1.unsqueeze(1).expand(k_1_prime, k_2_prime)
+            idx_2_expanded = indices_2.unsqueeze(0).expand(k_1_prime, k_2_prime)
 
             # Gather values
-            flat_indices = output_idx_expanded * d_in + input_idx_expanded
-            M_intermediate = M_full.reshape(-1)[flat_indices].reshape(k_out_prime, k_in_prime)
+            d_2 = sparsifier_2.feature_dim
+            flat_indices = idx_1_expanded * d_2 + idx_2_expanded
+            intermediate = input_matrix.reshape(-1)[flat_indices].reshape(k_1_prime, k_2_prime)
 
-            # Flatten and add batch dimension: [1, k_out' * k_in']
-            result = M_intermediate.reshape(1, -1)
-            return result
+            # Flatten and add batch dimension: [1, k_1' * k_2']
+            return intermediate.reshape(1, -1)
 
         # GENERAL PATH: dense projections use vec-trick dual
-        # This is the REVERSE of the transpose() operation
-        # transpose() does: G_intermediate -> transpose -> output_proj.transpose -> transpose -> input_proj.transpose -> G_full
-        # forward() does:   M_full -> input_proj.project -> transpose -> output_proj.project -> transpose -> M_intermediate
+        # Step 1: Apply second sparsifier forward
+        # Treat rows as batch: [d_1, d_2] where each row is a sample of dimension d_2
+        temp = sparsifier_2.project(input_matrix, ensemble_id=0, scale=scale)  # [d_1, d_2] @ S_2 -> [d_1, k_2']
 
-        # Step 1: Apply input projector forward (reverse of input_proj.transpose)
-        # Treat rows as batch: [d_out, d_in] where each row is a sample of dimension d_in
-        M_temp = input_proj.project(M_full, ensemble_id=0)  # [d_out, d_in] @ P_in -> [d_out, k_in']
+        # Step 2: Transpose for next operation
+        temp_T = temp.t()  # [k_2', d_1]
 
-        # Step 2: Transpose (reverse of transpose)
-        M_temp_T = M_temp.t()  # [k_in', d_out]
+        # Step 3: Apply first sparsifier forward
+        # Treat columns as batch: [k_2', d_1] where each column is a sample of dimension d_1
+        intermediate_T = sparsifier_1.project(temp_T, ensemble_id=0, scale=scale)  # [k_2', d_1] @ S_1 -> [k_2', k_1']
 
-        # Step 3: Apply output projector forward (reverse of output_proj.transpose)
-        # Treat columns as batch: [k_in', d_out] where each column is a sample of dimension d_out
-        M_intermediate_T = output_proj.project(M_temp_T, ensemble_id=0)  # [k_in', d_out] @ P_out -> [k_in', k_out']
+        # Step 4: Transpose back to standard form
+        intermediate = intermediate_T.t()  # [k_1', k_2']
 
-        # Step 4: Transpose back (reverse of transpose)
-        M_intermediate = M_intermediate_T.t()  # [k_out', k_in']
+        # Flatten and add batch dimension: [1, k_1' * k_2']
+        return intermediate.reshape(1, -1)
 
-        # Flatten and add batch dimension: [1, k_out' * k_in']
-        result = M_intermediate.reshape(1, -1)
+    def transpose(self, input: torch.Tensor, scale: str = "forward") -> torch.Tensor:
+        """
+        This implements the transpose of the sparsification operation, mapping from
+        the intermediate space back to the full space.
 
-        return result
+        For random_mask: Uses optimized scatter operation based on mask indices.
+        For dense projections: Uses vec-trick: vec((S_1)ᵀ @ X' @ S_2) where X' is [k_1', k_2']
 
-    def refresh(self, step: int) -> bool:
+        Args:
+            input: tensor [1, k_1' * k_2']
+            scale: Scaling mode passed to projectors
+
+        Returns:
+            Full tensor after sparsification transpose [1, d_1 * d_2]
+        """
+        # Get dimensions
+        if self.intermediate_dims is None:
+            raise ValueError(f"Cannot transpose sparsifier {self.name}: dimensions not set")
+
+        k_1_prime, k_2_prime = self.intermediate_dims
+        expected_size = k_1_prime * k_2_prime
+
+        # Ensure we have [1, k'] format
+        if input.dim() == 1:
+            input = input.unsqueeze(0)
+
+        # Dimension validation
+        actual_size = input.shape[1]
+        if actual_size != expected_size:
+            raise ValueError(
+                f"Sparsifier.transpose dimension mismatch for {self.name}: "
+                f"expected [1, {expected_size}] but got {input.shape}. "
+                f"intermediate_dims=({k_1_prime}, {k_2_prime})"
+            )
+
+        # Get sparsifier objects
+        sparsifier_1 = self.sparsifier_comp[0]
+        sparsifier_2 = self.sparsifier_comp[1]
+
+        # OPTIMIZED PATH: random_mask sparsification uses scatter
+        if sparsifier_1.proj_type == ProjectionType.random_mask and sparsifier_2.proj_type == ProjectionType.random_mask:
+            # Access indices directly from the sparsifier objects
+            indices_1 = sparsifier_1.active_indices
+            indices_2 = sparsifier_2.active_indices
+
+            # Get original dimensions from sparsifiers
+            d_1 = sparsifier_1.feature_dim  # Original first dimension
+            d_2 = sparsifier_2.feature_dim  # Original second dimension
+
+            # Reshape from flattened to 2D matrix: [1, k_1' * k_2'] → [k_1', k_2']
+            intermediate = input.reshape(k_1_prime, k_2_prime)
+
+            # Initialize full tensor matrix with zeros
+            full_matrix = torch.zeros(d_1, d_2, device=input.device, dtype=input.dtype)
+
+            # Scatter operation: full_matrix[indices_1[:, None], indices_2[None, :]] = intermediate
+            # Use advanced indexing with meshgrid for 2D scatter
+            idx_1_expanded = indices_1.unsqueeze(1).expand(k_1_prime, k_2_prime)
+            idx_2_expanded = indices_2.unsqueeze(0).expand(k_1_prime, k_2_prime)
+
+            # Flatten indices and values for 1D scatter
+            flat_indices = idx_1_expanded * d_2 + idx_2_expanded
+            full_matrix.view(-1).scatter_(0, flat_indices.reshape(-1), intermediate.reshape(-1))
+
+            # Flatten and add batch dimension: [1, d_1 * d_2]
+            return full_matrix.reshape(1, -1)
+
+        # GENERAL PATH: dense projections use vec-trick
+        # Reshape from flattened to 2D matrix: [1, k_1' * k_2'] → [k_1', k_2']
+        intermediate = input.reshape(k_1_prime, k_2_prime)
+
+        if not (hasattr(sparsifier_1, 'feature_dim') and hasattr(sparsifier_2, 'feature_dim')):
+            raise ValueError(f"Sparsifier {self.name} does not have valid sparsifier objects")
+
+        d_1 = sparsifier_1.feature_dim
+        d_2 = sparsifier_2.feature_dim
+
+        # Apply transpose using vec-trick: vec((S_1)ᵀ @ X' @ S_2)
+        # Step 1: Apply first sparsifier transpose column-wise
+        # Treat columns as batch: transpose [k_2', k_1'] where each column is a sample
+        intermediate_T = intermediate.t()  # [k_2', k_1']
+
+        temp_T = sparsifier_1.transpose(intermediate_T, ensemble_id=0, scale=scale)  # [k_2', d_1]
+
+        temp = temp_T.t()  # [d_1, k_2']
+
+        # Step 2: Apply second sparsifier transpose row-wise
+        # Treat rows as batch: [d_1, k_2'] where each row is a sample
+        full_matrix = sparsifier_2.transpose(temp, ensemble_id=0, scale=scale)  # [d_1, d_2]
+
+        # Flatten and add batch dimension: [1, d_1 * d_2]
+        return full_matrix.reshape(1, -1)
+
+
+    def refresh(self, step: int) -> Sparsifier:
         """
         Check if sparsifier should be refreshed and refresh if needed.
 
-        Similar to GaLore's check: `if iter % self.update_compressor_freq == 0`
+        Similar to GaLore's check: `if iter % self.update_freq == 0`
 
         Args:
             step: Current training step
-            device: Device to place tensors on
 
         Returns:
-            True if sparsifier was refreshed, False otherwise
+            Old Sparsifier if refresh occurred (for state transformation), None otherwise
         """
         self.current_step = step
 
         # Check if refresh is needed
-        if step <= 0 or step % self.update_compressor_freq != 0:
-            return False
+        if step <= 0 or step % self.update_freq != 0:
+            return None
 
         if self.sparsifier_comp == (None, None):
             logger.warning(f"No sparsifiers for layer {self.name}, skipping refresh")
-            return False
+            return None
 
-        # Save old compressor state for state transformation
-        # CRITICAL: Save before refresh so optimizer can transform states
-        self.old_sparsifier_comp = self.sparsifier_comp
-        self.old_mask_indices = self.mask_indices
-        self.old_intermediate_dims = self.intermediate_dims
+        # Create temporary container with old sparsifier state (shallow copy for minimal memory)
+        old_container = Sparsifier(self.name, self.index, self.update_freq)
+        old_container.sparsifier_comp = self.sparsifier_comp  # Share reference temporarily
+        old_container.intermediate_dims = self.intermediate_dims
 
         # Calculate refresh seed
-        refresh_epoch = self.current_step // self.update_compressor_freq
+        refresh_epoch = self.current_step // self.update_freq
         base_refresh_seed = self.base_seed + int(1e6) * refresh_epoch
 
-        try:
-            # Refresh output sparsifier
-            if self.sparsifier_comp[0] is not None:
-                output_sparsifier = self.sparsifier_comp[0]
-                output_proj = output_sparsifier.projector
-                output_proj.refresh(base_refresh_seed)
+        # Refresh first sparsifier
+        if self.sparsifier_comp[0] is not None:
+            sparsifier_1 = self.sparsifier_comp[0]
+            sparsifier_1.refresh(base_refresh_seed)
 
-            # Refresh input sparsifier (use different seed)
-            if self.sparsifier_comp[1] is not None:
-                input_sparsifier = self.sparsifier_comp[1]
-                input_proj = input_sparsifier.projector
-                input_proj.refresh(base_refresh_seed + 1)
+        # Refresh second sparsifier (use different seed)
+        if self.sparsifier_comp[1] is not None:
+            sparsifier_2 = self.sparsifier_comp[1]
+            sparsifier_2.refresh(base_refresh_seed + 1)
 
-            # CRITICAL: Update mask_indices after refresh for random_mask projections
-            # The projector's refresh() now immediately regenerates active_indices,
-            # so we need to update our cached copy that is used in transpose()
-            if self.mask_indices is not None and self.mask_indices != (None, None):
-                output_sparsifier = self.sparsifier_comp[0]
-                input_sparsifier = self.sparsifier_comp[1]
-                output_proj = output_sparsifier.projector
-                input_proj = input_sparsifier.projector
+        return old_container
 
-                # Extract updated mask indices
-                output_indices = output_proj.active_indices
-                input_indices = input_proj.active_indices
-
-                if output_indices is None or input_indices is None:
-                    logger.warning(f"Failed to update mask indices for {self.name} after refresh")
-                else:
-                    self.mask_indices = (output_indices, input_indices)
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Error refreshing sparsifier for {self.name}: {e}")
-            return False
-
-class ProjectorContainer(BaseContainer):
+class Projector(ProjectionContainer):
     """
-    Container for projector functions associated with a layer.
-    Used to store projectors without modifying the original layer.
+    Container for projection functions (second stage of two-step compression).
 
-    STRICT CONVENTION:
-    - ProjectorContainer ALWAYS contains non-factorized projector (stored in self.projector)
-    - Projectors operate AFTER outer product on flattened gradient
-    - Projectors are NEVER factorized (use SparsifierContainer for factorized operations)
-
-    Attributes:
-        projector: Projection function (ALWAYS non-factorized)
-        mask_indices: Tuple of (output_indices, input_indices) from sparsifier (for reference)
-        intermediate_dims: Tuple of (k_out', k_in') after sparsification
-        original_dims: Tuple of (d_out, d_in) original gradient dimensions
-        update_compressor_freq: Number of steps between projector refreshes (similar to GaLore)
-        base_seed: Base random seed for projector initialization
-        current_step: Current training step (for tracking refresh)
+    Projection is a simple, one-step projection:
+        Pv = P v.
+    with P in R^{k * k'} and v in R^{k'}.
     """
-    def __init__(self, name: str, index: int, update_compressor_freq: int = 200):
+    def __init__(self, name: str, index: int, update_freq: int = 200):
         super().__init__(name, index)
-        self.projector = None  # Non-factorized projector function
+        self.projector: AbstractProjector = None
 
-        # Old projector for state transformation during refresh
-        self.old_projector = None  # Saved before refresh
-
-        self.update_compressor_freq = update_compressor_freq
+        self.update_freq = update_freq
         self.base_seed = None
         self.current_step = 0
 
-    def forward(self, intermediate_grad: Tensor) -> Tensor:
+    def forward(self, input: Tensor, scale: str = "forward") -> Tensor:
         """
-        Apply projection forward pass: g' → ĝ
-
-        This applies the non-factorized projection to the intermediate gradient
-        (after sparsification).
+        This applies the final projection to the intermediate tensor (after sparsification).
 
         Args:
-            intermediate_grad: Intermediate gradient [batch, k'_l] after sparsification
+            input: batch vector [batch, k'] after sparsification
+            scale: Scaling mode passed to projector
 
         Returns:
-            Compressed gradient [batch, k_l] after projection
+            Compressed batch vector [batch, k] after projection
         """
-        if intermediate_grad is None:
-            return None
+        return self.projector.project(input, ensemble_id=0, scale=scale)
 
-        # Delegate to projector's forward method
-        if self.projector is not None:
-            result = self.projector(intermediate_grad, ensemble_id=0)
-            return result
-
-        # No projection configured, return as-is (identity projection)
-        return intermediate_grad
-
-    def transpose(self, compressed_grad: Tensor) -> Tensor:
+    def transpose(self, input: Tensor, scale: str = "forward") -> Tensor:
         """
-        Apply ONLY projection transpose: ĝ → g'
-
-        This should NOT handle sparsification transpose. The sparsification transpose
-        is handled by SparsifierContainer.transpose().
-
-        According to the strict two-step architecture:
-        - ProjectorContainer handles stage 2 transpose (projection)
-        - SparsifierContainer handles stage 1 transpose (sparsification)
+        This applies the transpose of the projection to map back to the intermediate space.
 
         Args:
-            compressed_grad: Compressed gradient [1, k_l] (already aggregated)
+            input: Compressed batch vector [batch, k]
+            scale: Scaling mode passed to projector
 
         Returns:
-            Intermediate gradient after projection transpose [1, k'_l]
+            Intermediate tensor after projection transpose [batch, k']
         """
-        if compressed_grad is None:
-            return None
+        return self.projector.transpose(input, ensemble_id=0, scale=scale)
 
-        # Delegate to projector's transpose method
-        if self.projector is not None:
-            proj_obj = self.projector.projector
-
-            # Get dimensions for verification
-            proj_dim = proj_obj.proj_dim
-            feature_dim = proj_obj.feature_dim
-
-            result = proj_obj.transpose(compressed_grad, ensemble_id=0)
-            return result
-
-        # No projection configured, return as-is (identity projection)
-        return compressed_grad
-
-    def refresh(self, step: int) -> bool:
+    def refresh(self, step: int) -> Projector:
         """
         Check if projector should be refreshed and refresh if needed.
 
-        Similar to GaLore's check: `if iter % self.update_compressor_freq == 0`
+        Similar to GaLore's check: `if iter % self.update_freq == 0`
 
         Args:
             step: Current training step
-            device: Device to place tensors on
 
         Returns:
-            True if projector was refreshed, False otherwise
+            Old Projector if refresh occurred (for state transformation), None otherwise
         """
         self.current_step = step
 
         # Check if refresh is needed
-        if step <= 0 or step % self.update_compressor_freq != 0:
-            return False
+        if step <= 0 or step % self.update_freq != 0:
+            return None
 
         if not hasattr(self, 'projector') or self.projector is None:
             logger.warning(f"No projector for layer {self.name}, skipping refresh")
-            return False
+            return None
 
-        # Save old projector for state transformation
-        # CRITICAL: Save before refresh so optimizer can transform states
-        self.old_projector = self.projector
+        # Create temporary container with old projector (shallow copy for minimal memory)
+        # This will be used for state transformation and then discarded
+        old_container = Projector(self.name, self.index, self.update_freq)
+        old_container.projector = self.projector  # Share reference temporarily
 
         # Calculate refresh seed
-        refresh_epoch = self.current_step // self.update_compressor_freq
+        refresh_epoch = self.current_step // self.update_freq
         refresh_seed = self.base_seed + int(1e6) * refresh_epoch
 
-        try:
-            # Get projector object and call its refresh method
-            proj_obj = self.projector.projector
-            proj_obj.refresh(refresh_seed)
-            return True
-        except Exception as e:
-            logger.error(f"Error refreshing projector for {self.name}: {e}")
-            return False
+        # Get projector object and call its refresh method
+        # This modifies self.projector in place
+        proj_obj = self.projector
+        proj_obj.refresh(refresh_seed)
+        return old_container
+
+
+class Compressor(ProjectionContainer):
+    """
+    Unified container that encapsulates the full two-stage compression pipeline.
+        Forward:   input → Sparsifier → Projector → compressed
+        Transpose: compressed → Projector^T → Sparsifier^T → full
+    """
+
+    def __init__(self, name: str, index: int, update_freq: int = 200):
+        super().__init__(name, index)
+        self.sparsifier: Sparsifier = None
+        self.projector: Projector = None
+
+        self.update_freq = update_freq
+        self.base_seed = None
+        self.current_step = 0
+
+    def forward(self, input: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], scale: str = "forward") -> torch.Tensor:
+        """
+        Apply full compression pipeline: input → sparsifier → Kronecker product → projector → output
+
+        It supports two input modes:
+        1. Component mode (tuple input): (component1, component2)
+           - Components can be 2D [batch, features] or 3D [batch, seq, features]
+           - Applies sparsification to each component, then computes Kronecker product
+           - Applies projection
+           - Example use: Gradient compression where components are (grad_output, input)
+
+        2. Direct mode (tensor input): [1, d]
+           - Input is a full vector, which conceptually corresponds to the Kronecker product of two components of Component mode
+           - Applies sparsification via vec-trick
+           - Applies projection
+           - Example use: Optimizer state transformation during refresh
+
+        Args:
+            input: Either a tuple of components or a full tensor
+            scale: Scaling mode. Forward preserves forward projection's norm, backward preserves backward projection's norm
+
+        Returns:
+            Compressed output tensor
+        """
+        if isinstance(input, tuple):
+            # MODE 1: Component-based compression (Kronecker product)
+            component1, component2 = input
+
+            # Detect if components are 3D or 2D
+            is_3d = component2.dim() == 3
+
+            if is_3d:
+                # Extract dimensions for 3D case
+                batch_size, seq_length, _ = component2.shape
+
+                # Reshape to 2D for sparsification
+                component1_2d = component1.reshape(-1, component1.shape[-1])
+                component2_2d = component2.reshape(-1, component2.shape[-1])
+            else:
+                # Already 2D
+                batch_size = component2.shape[0]
+                component1_2d = component1
+                component2_2d = component2
+
+            # Stage 1: Apply sparsification to each component
+            component1_sparse, component2_sparse = self.sparsifier.forward(
+                (component1_2d, component2_2d), scale=scale
+            )
+
+            # Stage 1.5: Compute Kronecker product (outer product)
+            if is_3d:
+                # Reshape back to 3D for proper outer product computation
+                component1_sparse_3d = component1_sparse.reshape(batch_size, seq_length, -1)
+                component2_sparse_3d = component2_sparse.reshape(batch_size, seq_length, -1)
+
+                # Compute outer product with batch scaling
+                outer_product = torch.einsum(
+                    'bsi,bsj->bij',
+                    component1_sparse_3d * batch_size,
+                    component2_sparse_3d
+                )
+            else:
+                # Compute outer product for 2D case with batch scaling
+                outer_product = torch.einsum(
+                    'bi,bj->bij',
+                    component1_sparse * batch_size,
+                    component2_sparse
+                )
+
+            # Flatten the outer product result
+            intermediate = outer_product.reshape(batch_size, -1)
+
+            # Stage 2: Apply projection
+            output = self.projector.forward(intermediate, scale=scale)
+
+        else:
+            # MODE 2: Full tensor compression (via vec-trick)
+            # Stage 1: Apply sparsifier
+            intermediate = self.sparsifier.forward(input, scale=scale)
+
+            # Stage 2: Apply projector
+            output = self.projector.forward(intermediate, scale=scale)
+        return output
+
+    def transpose(self, input: torch.Tensor, scale: str = "forward") -> torch.Tensor:
+        """
+        Apply full decompression pipeline: input → projector^T → sparsifier^T → output
+
+        Note: Operations are applied in REVERSE order compared to forward.
+
+        Args:
+            input: Compressed vector [1, k]
+            scale: Scaling mode passed to projectors
+
+        Returns:
+            Full (decompressed) tensor [1, d]
+        """
+        # Stage 1 (reverse): Apply projector transpose
+        intermediate = self.projector.transpose(input, scale=scale)
+
+        # Stage 2 (reverse): Apply sparsifier transpose
+        output = self.sparsifier.transpose(intermediate, scale=scale)
+
+        return output
+
+    def refresh(self, step: int) -> Compressor:
+        """
+        Refresh both sparsifier and projector if needed.
+
+        Args:
+            step: Current training step
+
+        Returns:
+            Old Compressor with old components if refresh occurred, None otherwise
+        """
+        self.current_step = step
+
+        # Check if refresh is needed
+        if step <= 0 or step % self.update_freq != 0:
+            return None
+
+        # Refresh both components
+        old_sparsifier = self.sparsifier.refresh(step)
+        old_projector = self.projector.refresh(step)
+
+        # If either component was refreshed, return old container
+        old_container = Compressor(self.name, self.index, self.update_freq)
+
+        old_container.sparsifier = old_sparsifier
+        old_container.projector = old_projector
+
+        # Copy other attributes
+        old_container.base_seed = self.base_seed
+        old_container.current_step = self.current_step
+
+        return old_container
 
 
 def setup_model_compressors(
@@ -532,31 +565,32 @@ def setup_model_compressors(
     projector_kwargs: Optional[Dict[str, Any]] = None,
     sample_inputs: Optional[Dict[str, Tensor]] = None,
     device: str = 'cpu',
-    update_compressor_freq: int = 200
-) -> Tuple[List[SparsifierContainer], List[ProjectorContainer]]:
+    update_freq: int = 200
+) -> List[Compressor]:
     """
-    Sets up sparsifiers and projectors for each layer in the model.
+    Sets up unified Compressors for each layer in the model.
+
+    Each Compressor encapsulates both sparsification and projection stages.
 
     Args:
         model: The PyTorch model
-        layer_names: Names of layers to set projectors for
+        layer_names: Names of layers to set compressors for
         sparsifier_kwargs: Keyword arguments for sparsifier configuration (optional)
         projector_kwargs: Keyword arguments for projector configuration (optional)
         sample_inputs: Input batch to run a forward pass (optional)
         device: Device to run the model on
-        update_compressor_freq: Number of steps between projector refreshes (default: 200)
+        update_freq: Number of steps between compressor refreshes (default: 200)
 
     Returns:
-        Tuple of (sparsifiers, projectors) lists, ordered by layer_names
+        List of Compressors, ordered by layer_names
     """
     if sample_inputs is None:
-        return [], []
+        return []
 
-    # Initialize containers lists
-    sparsifiers = [None] * len(layer_names) if sparsifier_kwargs else []
-    projectors = [None] * len(layer_names) if projector_kwargs else []
+    # Initialize compressors list
+    compressors = [None] * len(layer_names)
     if not (sparsifier_kwargs or projector_kwargs):
-        return sparsifiers, projectors
+        return compressors
 
     # Create name to index mapping for faster lookup
     name_to_index = {name: idx for idx, name in enumerate(layer_names)}
@@ -627,8 +661,11 @@ def setup_model_compressors(
         if module_name in layer_names:
             idx = name_to_index[module_name]
 
-            # Create sparsifier (ALWAYS factorized)
-            sparsifier = SparsifierContainer(module_name, idx, update_compressor_freq=update_compressor_freq)
+            # Create unified compressor container
+            compressor = Compressor(module_name, idx, update_freq=update_freq)
+
+            # Create sparsifier (ALWAYS factorized) - Stage 1
+            sparsifier = Sparsifier(module_name, idx, update_freq=update_freq)
             base_seed = sparsifier_seed + int(1e4) * module_id
             sparse_kwargs = sparsifier_kwargs_copy.copy()
 
@@ -662,10 +699,9 @@ def setup_model_compressors(
 
             # Store base seed for refresh
             sparsifier.base_seed = base_seed
-            sparsifiers[idx] = sparsifier
 
-            # Create projector (ALWAYS non-factorized, operates after sparsification)
-            projector = ProjectorContainer(module_name, idx, update_compressor_freq=update_compressor_freq)
+            # Create projector (ALWAYS non-factorized, operates after sparsification) - Stage 2
+            projector = Projector(module_name, idx, update_freq=update_freq)
             base_seed = projector_seed + int(1e4) * module_id + 1
             proj_kwargs = projector_kwargs_copy.copy()
 
@@ -697,19 +733,24 @@ def setup_model_compressors(
             # Check if projector was successfully initialized
             if projector.projector is None:
                 logger.warning(f"Skipping layer {module_name}: projector setup failed")
-                # Remove the sparsifier we just added since we need both
-                sparsifiers[idx] = None
                 continue
 
             # Store base seed for refresh
             projector.base_seed = base_seed
-            projectors[idx] = projector
 
-    return sparsifiers, projectors
+            # Assemble compressor container with both stages
+            compressor.sparsifier = sparsifier
+            compressor.projector = projector
+            compressor.base_seed = sparsifier.base_seed  # Use sparsifier's seed as base
+            compressor.current_step = 0
+
+            compressors[idx] = compressor
+
+    return compressors
 
 
 def _setup_linear_sparsifier(
-    sparsifier: SparsifierContainer,
+    sparsifier: Sparsifier,
     layer: nn.Linear,
     layer_input: Tensor,
     pre_activation: Tensor,
@@ -720,11 +761,11 @@ def _setup_linear_sparsifier(
     Set up sparsifier for a Linear layer.
 
     STRICT CONVENTION:
-    - SparsifierContainer MUST contain factorized sparsifiers
+    - Sparsifier MUST contain factorized sparsifiers
     - Sparsifiers operate BEFORE outer product on components
 
     Args:
-        container: SparsifierContainer to store the sparsifier functions
+        container: Sparsifier to store the sparsifier functions
         layer: Linear layer
         layer_input: Input tensor to the layer
         pre_activation: Output tensor from the layer
@@ -754,23 +795,34 @@ def _setup_linear_sparsifier(
             input_features = input_features.reshape(batch_size, seq_length, -1)
 
     # Sparsifiers are ALWAYS factorized
-    dumb_grad_comp_1 = torch.zeros_like(pre_activation.view(-1, pre_activation.shape[-1]))
+    sample_comp_1 = torch.zeros_like(pre_activation.view(-1, pre_activation.shape[-1]))
 
-    projector_grad_comp_1 = random_project(
-        dumb_grad_comp_1,
-        dumb_grad_comp_1.shape[0],
-        proj_dim=kwargs.get("proj_dim"),
+    # For identity projection, use feature dimension instead of -1
+    proj_dim_comp_1 = kwargs.get("proj_dim")
+    if kwargs.get("proj_type") == "identity" and proj_dim_comp_1 == -1:
+        proj_dim_comp_1 = sample_comp_1.shape[-1]
+
+    sparsifier_comp_1 = random_project(
+        sample_comp_1,
+        sample_comp_1.shape[0],
+        proj_dim=proj_dim_comp_1,
         proj_max_batch_size=kwargs.get("proj_max_batch_size"),
         proj_seed=base_seed,
         proj_type=kwargs.get("proj_type", "normal"),
         device=kwargs.get("device", "cpu")
     )
 
-    dumb_grad_comp_2 = torch.zeros_like(input_features.view(-1, input_features.shape[-1]))
-    projector_grad_comp_2 = random_project(
-        dumb_grad_comp_2,
-        dumb_grad_comp_2.shape[0],
-        proj_dim=kwargs.get("proj_dim"),
+    sample_comp_2 = torch.zeros_like(input_features.view(-1, input_features.shape[-1]))
+
+    # For identity projection, use feature dimension instead of -1
+    proj_dim_comp_2 = kwargs.get("proj_dim")
+    if kwargs.get("proj_type") == "identity" and proj_dim_comp_2 == -1:
+        proj_dim_comp_2 = sample_comp_2.shape[-1]
+
+    sparsifier_comp_2 = random_project(
+        sample_comp_2,
+        sample_comp_2.shape[0],
+        proj_dim=proj_dim_comp_2,
         proj_max_batch_size=kwargs.get("proj_max_batch_size"),
         proj_seed=base_seed + 1,
         proj_type=kwargs.get("proj_type", "normal"),
@@ -780,37 +832,17 @@ def _setup_linear_sparsifier(
     # Store dimensions needed for transpose operation
     # Test projection to get actual intermediate dimensions
     # IMPORTANT: This also initializes active_indices for random_mask projectors
-    test_out = projector_grad_comp_1(dumb_grad_comp_1[:1], ensemble_id=0)
-    test_in = projector_grad_comp_2(dumb_grad_comp_2[:1], ensemble_id=0)
-    sparsifier.intermediate_dims = (test_out.shape[-1], test_in.shape[-1])
-
-    # Extract mask indices AFTER dry run (if using random_mask)
-    # The dry run above initialized active_indices for ensemble_id=0
-    if kwargs.get("proj_type") == "random_mask":
-        # Extract from the created projectors BEFORE torch.compile
-        # The projector function has a .projector attribute that contains the CudaProjector
-        output_indices = projector_grad_comp_1.projector.active_indices
-        input_indices = projector_grad_comp_2.projector.active_indices
-
-        if output_indices is None or input_indices is None:
-            logger.warning(f"Failed to initialize mask indices for {sparsifier.name} - will use dense path")
-            sparsifier.mask_indices = (None, None)
-        else:
-            sparsifier.mask_indices = (output_indices, input_indices)
-    else:
-        # For dense projections, explicitly set to (None, None) to use vec-trick path
-        sparsifier.mask_indices = (None, None)
+    test_comp_1 = sparsifier_comp_1.project(sample_comp_1[:1], ensemble_id=0)
+    test_comp_2 = sparsifier_comp_2.project(sample_comp_2[:1], ensemble_id=0)
+    sparsifier.intermediate_dims = (test_comp_1.shape[-1], test_comp_2.shape[-1])
 
     # Store factorized sparsifiers in sparsifier_comp
-    sparsifier.sparsifier_comp = (
-        torch.compile(projector_grad_comp_1),
-        torch.compile(projector_grad_comp_2)
-    )
+    sparsifier.sparsifier_comp = (sparsifier_comp_1, sparsifier_comp_2)
 
 
 def _setup_linear_projector(
-    projector: ProjectorContainer,
-    sparsifier: SparsifierContainer,
+    projector: Projector,
+    sparsifier: Sparsifier,
     layer: nn.Linear,
     layer_input: Tensor,
     pre_activation: Tensor,
@@ -821,13 +853,13 @@ def _setup_linear_projector(
     Set up projector for a Linear layer after sparsification.
 
     STRICT CONVENTION:
-    - ProjectorContainer MUST contain non-factorized projectors
+    - Projector MUST contain non-factorized projectors
     - Projectors operate AFTER outer product on flattened gradient
-    - Sparsifiers (in SparsifierContainer) are ALWAYS factorized
+    - Sparsifiers (in Sparsifier) are ALWAYS factorized
 
     Args:
-        projector: ProjectorContainer to store the projector
-        sparsifier: SparsifierContainer with sparsification functions
+        projector: Projector to store the projector
+        sparsifier: Sparsifier with sparsification functions
         layer: Linear layer
         layer_input: Input tensor to the layer
         pre_activation: Output tensor from the layer
@@ -840,14 +872,14 @@ def _setup_linear_projector(
     batch_size = pre_activation.shape[0]
     is_3d = layer_input.dim() == 3
 
-    # Extract sparsifier components (using new naming convention)
-    sparsifier_grad_comp_1, sparsifier_grad_comp_2 = sparsifier.sparsifier_comp
+    # Extract sparsifier components
+    sparsifier_comp_1, sparsifier_comp_2 = sparsifier.sparsifier_comp
 
     # Get sample tensors to determine output dimensions of sparsifiers
     if is_3d:
         sample_pre_activation = pre_activation[:1, :1].reshape(-1, pre_activation.shape[-1])
-        sparse_sample_pre_activation = sparsifier_grad_comp_1(sample_pre_activation)
-        sparsified_output_dim = sparse_sample_pre_activation.shape[-1]
+        sparse_sample_pre_activation = sparsifier_comp_1.project(sample_pre_activation, ensemble_id=0)
+        sparsified_dim_1 = sparse_sample_pre_activation.shape[-1]
 
         input_features = layer_input
         if layer.bias is not None:
@@ -860,12 +892,12 @@ def _setup_linear_projector(
             input_features_with_bias = input_features
 
         sample_input_features = input_features_with_bias[:1, :1].reshape(-1, input_features_with_bias.shape[-1])
-        sparse_sample_input_features = sparsifier_grad_comp_2(sample_input_features)
-        sparsified_input_dim = sparse_sample_input_features.shape[-1]
+        sparse_sample_input_features = sparsifier_comp_2.project(sample_input_features, ensemble_id=0)
+        sparsified_dim_2 = sparse_sample_input_features.shape[-1]
     else:
         sample_pre_activation = pre_activation[:1]
-        sparse_sample_pre_activation = sparsifier_grad_comp_1(sample_pre_activation)
-        sparsified_output_dim = sparse_sample_pre_activation.shape[-1]
+        sparse_sample_pre_activation = sparsifier_comp_1.project(sample_pre_activation, ensemble_id=0)
+        sparsified_dim_1 = sparse_sample_pre_activation.shape[-1]
 
         input_features = layer_input
         if layer.bias is not None:
@@ -877,23 +909,28 @@ def _setup_linear_projector(
             input_features_with_bias = input_features
 
         sample_input_features = input_features_with_bias[:1]
-        sparse_sample_input_features = sparsifier_grad_comp_2(sample_input_features)
-        sparsified_input_dim = sparse_sample_input_features.shape[-1]
+        sparse_sample_input_features = sparsifier_comp_2.project(sample_input_features, ensemble_id=0)
+        sparsified_dim_2 = sparse_sample_input_features.shape[-1]
 
-    # Create non-factorized projector (operates on flattened gradient after sparsification)
-    # Calculate outer product dimension after sparsification
-    gradient_dim = sparsified_output_dim * sparsified_input_dim
+    # Create non-factorized projector (operates on flattened intermediate after sparsification)
+    # Calculate dimension after sparsification
+    intermediate_dim = sparsified_dim_1 * sparsified_dim_2
 
-    dumb_grad_full = torch.zeros(
-        (batch_size, gradient_dim),
+    sample_intermediate = torch.zeros(
+        (batch_size, intermediate_dim),
         device=pre_activation.device,
         dtype=pre_activation.dtype
     )
 
+    # For identity projection, use feature dimension instead of -1
+    proj_dim = kwargs.get("proj_dim")
+    if kwargs.get("proj_type") == "identity" and proj_dim == -1:
+        proj_dim = intermediate_dim
+
     projector_func = random_project(
-        dumb_grad_full,
-        dumb_grad_full.shape[0],
-        proj_dim=kwargs.get("proj_dim"),
+        sample_intermediate,
+        sample_intermediate.shape[0],
+        proj_dim=proj_dim,
         proj_max_batch_size=kwargs.get("proj_max_batch_size"),
         proj_seed=base_seed,
         proj_type=kwargs.get("proj_type", "normal"),
@@ -901,11 +938,11 @@ def _setup_linear_projector(
     )
 
     # Store in projector attribute
-    projector.projector = torch.compile(projector_func)
+    projector.projector = projector_func
 
 
 def _setup_layernorm_sparsifier(
-    container: SparsifierContainer,
+    sparsifier: Sparsifier,
     layer: nn.LayerNorm,
     layer_input: Tensor,
     pre_activation: Tensor,
@@ -916,11 +953,11 @@ def _setup_layernorm_sparsifier(
     Set up sparsifier for a LayerNorm layer.
 
     STRICT CONVENTION:
-    - SparsifierContainer MUST contain factorized sparsifiers
+    - Sparsifier MUST contain factorized sparsifiers
     - Sparsifiers operate BEFORE outer product on components
 
     Args:
-        container: SparsifierContainer to store the sparsifier functions
+        container: Sparsifier to store the sparsifier functions
         layer: LayerNorm layer
         layer_input: Input tensor to the layer
         pre_activation: Output tensor from the layer
@@ -931,22 +968,34 @@ def _setup_layernorm_sparsifier(
         return
 
     # Sparsifiers are ALWAYS factorized
-    dumb_grad_comp_1 = torch.zeros((pre_activation.shape[0], pre_activation.shape[-1]))
-    projector_grad_comp_1 = random_project(
-        dumb_grad_comp_1,
-        dumb_grad_comp_1.shape[0],
-        proj_dim=kwargs.get("proj_dim"),
+    sample_comp_1 = torch.zeros((pre_activation.shape[0], pre_activation.shape[-1]))
+
+    # For identity projection, use feature dimension instead of -1
+    proj_dim_comp_1 = kwargs.get("proj_dim")
+    if kwargs.get("proj_type") == "identity" and proj_dim_comp_1 == -1:
+        proj_dim_comp_1 = sample_comp_1.shape[-1]
+
+    sparsifier_comp_1 = random_project(
+        sample_comp_1,
+        sample_comp_1.shape[0],
+        proj_dim=proj_dim_comp_1,
         proj_max_batch_size=kwargs.get("proj_max_batch_size"),
         proj_seed=base_seed,
         proj_type=kwargs.get("proj_type", "normal"),
         device=kwargs.get("device", "cpu")
     )
 
-    dumb_grad_comp_2 = torch.zeros((pre_activation.shape[0], pre_activation.shape[-1]))
-    projector_grad_comp_2 = random_project(
-        dumb_grad_comp_2,
-        dumb_grad_comp_2.shape[0],
-        proj_dim=kwargs.get("proj_dim"),
+    sample_comp_2 = torch.zeros((pre_activation.shape[0], pre_activation.shape[-1]))
+
+    # For identity projection, use feature dimension instead of -1
+    proj_dim_comp_2 = kwargs.get("proj_dim")
+    if kwargs.get("proj_type") == "identity" and proj_dim_comp_2 == -1:
+        proj_dim_comp_2 = sample_comp_2.shape[-1]
+
+    sparsifier_comp_2 = random_project(
+        sample_comp_2,
+        sample_comp_2.shape[0],
+        proj_dim=proj_dim_comp_2,
         proj_max_batch_size=kwargs.get("proj_max_batch_size"),
         proj_seed=base_seed + 1,
         proj_type=kwargs.get("proj_type", "normal"),
@@ -956,37 +1005,17 @@ def _setup_layernorm_sparsifier(
     # Store dimensions needed for transpose operation
     # Test projection to get actual intermediate dimensions
     # IMPORTANT: This also initializes active_indices for random_mask projectors
-    test_out = projector_grad_comp_1(dumb_grad_comp_1[:1], ensemble_id=0)
-    test_in = projector_grad_comp_2(dumb_grad_comp_2[:1], ensemble_id=0)
-    container.intermediate_dims = (test_out.shape[-1], test_in.shape[-1])
-
-    # Extract mask indices AFTER dry run (if using random_mask)
-    # The dry run above initialized active_indices for ensemble_id=0
-    if kwargs.get("proj_type") == "random_mask":
-        # Extract from the created projectors BEFORE torch.compile
-        # The projector function has a .projector attribute that contains the CudaProjector
-        output_indices = projector_grad_comp_1.projector.active_indices
-        input_indices = projector_grad_comp_2.projector.active_indices
-
-        if output_indices is None or input_indices is None:
-            logger.warning(f"Failed to initialize mask indices for {container.name} - will use dense path")
-            container.mask_indices = (None, None)
-        else:
-            container.mask_indices = (output_indices, input_indices)
-    else:
-        # For dense projections, explicitly set to (None, None) to use vec-trick path
-        container.mask_indices = (None, None)
+    test_comp_1 = sparsifier_comp_1.project(sample_comp_1[:1], ensemble_id=0)
+    test_comp_2 = sparsifier_comp_2.project(sample_comp_2[:1], ensemble_id=0)
+    sparsifier.intermediate_dims = (test_comp_1.shape[-1], test_comp_2.shape[-1])
 
     # Store factorized sparsifiers in sparsifier_comp
-    container.sparsifier_comp = (
-        torch.compile(projector_grad_comp_1),
-        torch.compile(projector_grad_comp_2)
-    )
+    sparsifier.sparsifier_comp = (sparsifier_comp_1, sparsifier_comp_2)
 
 
 def _setup_layernorm_projector(
-    projector: ProjectorContainer,
-    sparsifier: SparsifierContainer,
+    projector: Projector,
+    sparsifier: Sparsifier,
     layer: nn.LayerNorm,
     layer_input: Tensor,
     pre_activation: Tensor,
@@ -997,13 +1026,13 @@ def _setup_layernorm_projector(
     Set up projector for a LayerNorm layer after sparsification.
 
     STRICT CONVENTION:
-    - ProjectorContainer MUST contain non-factorized projectors
+    - Projector MUST contain non-factorized projectors
     - Projectors operate AFTER outer product on flattened gradient
-    - Sparsifiers (in SparsifierContainer) are ALWAYS factorized
+    - Sparsifiers (in Sparsifier) are ALWAYS factorized
 
     Args:
-        projector: ProjectorContainer to store the projector
-        sparsifier: SparsifierContainer with sparsification functions
+        projector: Projector to store the projector
+        sparsifier: Sparsifier with sparsification functions
         layer: LayerNorm layer
         layer_input: Input tensor to the layer
         pre_activation: Output tensor from the layer
@@ -1014,26 +1043,31 @@ def _setup_layernorm_projector(
         return
 
     # Apply sparsification to get correct dimensions for projector setup
-    sparsifier_grad_comp_1, sparsifier_grad_comp_2 = sparsifier.sparsifier_comp
+    sparsifier_comp_1, sparsifier_comp_2 = sparsifier.sparsifier_comp
 
     # Get sample tensors to determine output dimensions of sparsifiers
     sample_pre_activation = pre_activation[:1]
-    sparse_sample_pre_activation = sparsifier_grad_comp_1(sample_pre_activation)
+    sparse_sample_pre_activation = sparsifier_comp_1.project(sample_pre_activation, ensemble_id=0)
 
     # Create non-factorized projector (operates on concatenated sparsified components)
-    # For LayerNorm: gradient is concatenation of weight and bias gradients
-    gradient_dim = sparse_sample_pre_activation.shape[-1] * 2  # weight + bias
+    # For LayerNorm: intermediate is concatenation of weight and bias components
+    intermediate_dim = sparse_sample_pre_activation.shape[-1] * 2  # weight + bias
 
-    dumb_grad_full = torch.zeros(
-        (pre_activation.shape[0], gradient_dim),
+    sample_intermediate = torch.zeros(
+        (pre_activation.shape[0], intermediate_dim),
         device=pre_activation.device,
         dtype=pre_activation.dtype
     )
 
+    # For identity projection, use feature dimension instead of -1
+    proj_dim = kwargs.get("proj_dim")
+    if kwargs.get("proj_type") == "identity" and proj_dim == -1:
+        proj_dim = intermediate_dim
+
     projector_func = random_project(
-        dumb_grad_full,
-        dumb_grad_full.shape[0],
-        proj_dim=kwargs.get("proj_dim"),
+        sample_intermediate,
+        sample_intermediate.shape[0],
+        proj_dim=proj_dim,
         proj_max_batch_size=kwargs.get("proj_max_batch_size"),
         proj_seed=base_seed,
         proj_type=kwargs.get("proj_type", "normal"),
@@ -1041,4 +1075,4 @@ def _setup_layernorm_projector(
     )
 
     # Store in projector attribute
-    projector.projector = torch.compile(projector_func)
+    projector.projector = projector_func
