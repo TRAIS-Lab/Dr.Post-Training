@@ -128,157 +128,141 @@ class Sparsifier(ProjectionContainer):
         where A = S_2, B = S_1, C = matrix(input), S_i are sparsifiers
 
         Args:
-            input: Full input vector [1, d_1 * d_2]
+            input: Full input vector [batch, d_1 * d_2]
             scale: Scaling mode passed to projectors
 
         Returns:
-            Sparsified vector [1, k_1' * k_2']
+            Sparsified vector [batch, k_1' * k_2']
         """
-        # Ensure we have [1, p] format
         if input.dim() == 1:
-            input = input.unsqueeze(0)
+            input = input.unsqueeze(0)  # Handle single vector case
 
-        # Get dimensions
+        batch_size = input.shape[0]  # Get batch size
+
         if self.intermediate_dims is None:
             raise ValueError(f"Cannot forward sparsifier {self.name}: dimensions not set")
 
         k_1_prime, k_2_prime = self.intermediate_dims
 
-        # Get sparsifier objects
         sparsifier_1, sparsifier_2 = self.sparsifier_comp
+        d_1 = sparsifier_1.feature_dim
+        d_2 = sparsifier_2.feature_dim
 
-        # Reshape from flattened to 2D matrix: [1, d_1 * d_2] → [d_1, d_2]
-        input_matrix = input.reshape(sparsifier_1.feature_dim, sparsifier_2.feature_dim)
+        # Reshape from flattened to batched 2D matrix: [batch, d_1 * d_2] -> [batch, d_1, d_2]
+        input_matrix = input.reshape(batch_size, d_1, d_2)
 
         # OPTIMIZED PATH: random_mask sparsification uses gather
         if sparsifier_1.proj_type == ProjectionType.random_mask and sparsifier_2.proj_type == ProjectionType.random_mask:
-            # Access indices directly from the sparsifier objects
             indices_1 = sparsifier_1.active_indices
             indices_2 = sparsifier_2.active_indices
 
-            # Gather operation: M_intermediate = M_full[indices_1[:, None], indices_2[None, :]]
-            # Use advanced indexing for 2D gather
-            idx_1_expanded = indices_1.unsqueeze(1).expand(k_1_prime, k_2_prime)
-            idx_2_expanded = indices_2.unsqueeze(0).expand(k_1_prime, k_2_prime)
+            # Batched advanced indexing for 2D gather
+            # Select [b, indices_1, indices_2] for all b in B
+            intermediate = input_matrix[:, indices_1[:, None], indices_2[None, :]]
 
-            # Gather values
-            d_2 = sparsifier_2.feature_dim
-            flat_indices = idx_1_expanded * d_2 + idx_2_expanded
-            intermediate = input_matrix.reshape(-1)[flat_indices].reshape(k_1_prime, k_2_prime)
+            # Flatten batch items: [batch, k_1', k_2'] -> [batch, k_1' * k_2']
+            return intermediate.reshape(batch_size, -1)
 
-            # Flatten and add batch dimension: [1, k_1' * k_2']
-            return intermediate.reshape(1, -1)
+        # GENERAL PATH: dense projections use vec-trick dual: vec(P1 @ C @ P2.T)
 
-        # GENERAL PATH: dense projections use vec-trick dual
-        # Step 1: Apply second sparsifier forward
-        # Treat rows as batch: [d_1, d_2] where each row is a sample of dimension d_2
-        temp = sparsifier_2.project(input_matrix, ensemble_id=0, scale=scale)  # [d_1, d_2] @ S_2 -> [d_1, k_2']
+        # 1. Apply second sparsifier forward (P2)
+        #    Input: [batch, d_1, d_2] -> [batch * d_1, d_2]
+        temp = sparsifier_2.project(input_matrix.reshape(batch_size * d_1, d_2), ensemble_id=0, scale=scale)
+        #    Output: [batch * d_1, k_2'] -> [batch, d_1, k_2']
+        temp = temp.reshape(batch_size, d_1, k_2_prime)
 
-        # Step 2: Transpose for next operation
-        temp_T = temp.t()  # [k_2', d_1]
+        # 2. Transpose for next operation: [batch, d_1, k_2'] -> [batch, k_2', d_1]
+        temp_T = temp.transpose(1, 2)
 
-        # Step 3: Apply first sparsifier forward
-        # Treat columns as batch: [k_2', d_1] where each column is a sample of dimension d_1
-        intermediate_T = sparsifier_1.project(temp_T, ensemble_id=0, scale=scale)  # [k_2', d_1] @ S_1 -> [k_2', k_1']
+        # 3. Apply first sparsifier forward (P1)
+        #    Input: [batch, k_2', d_1] -> [batch * k_2', d_1]
+        intermediate_T = sparsifier_1.project(temp_T.reshape(batch_size * k_2_prime, d_1), ensemble_id=0, scale=scale)
+        #    Output: [batch * k_2', k_1'] -> [batch, k_2', k_1']
+        intermediate_T = intermediate_T.reshape(batch_size, k_2_prime, k_1_prime)
 
-        # Step 4: Transpose back to standard form
-        intermediate = intermediate_T.t()  # [k_1', k_2']
+        # 4. Transpose back to standard form: [batch, k_2', k_1'] -> [batch, k_1', k_2']
+        intermediate = intermediate_T.transpose(1, 2)
 
-        # Flatten and add batch dimension: [1, k_1' * k_2']
-        return intermediate.reshape(1, -1)
+        # 5. Flatten batch items: [batch, k_1', k_2'] -> [batch, k_1' * k_2']
+        return intermediate.reshape(batch_size, -1)
 
     def transpose(self, input: torch.Tensor, scale: str = "forward") -> torch.Tensor:
         """
         This implements the transpose of the sparsification operation, mapping from
         the intermediate space back to the full space.
 
-        For random_mask: Uses optimized scatter operation based on mask indices.
-        For dense projections: Uses vec-trick: vec((S_1)ᵀ @ X' @ S_2) where X' is [k_1', k_2']
+        Supports batching (input shape [batch, k']).
 
         Args:
-            input: tensor [1, k_1' * k_2']
+            input: tensor [batch, k_1' * k_2']
             scale: Scaling mode passed to projectors
 
         Returns:
-            Full tensor after sparsification transpose [1, d_1 * d_2]
+            Full tensor after sparsification transpose [batch, d_1 * d_2]
         """
-        # Get dimensions
         if self.intermediate_dims is None:
             raise ValueError(f"Cannot transpose sparsifier {self.name}: dimensions not set")
 
         k_1_prime, k_2_prime = self.intermediate_dims
         expected_size = k_1_prime * k_2_prime
 
-        # Ensure we have [1, k'] format
         if input.dim() == 1:
-            input = input.unsqueeze(0)
+            input = input.unsqueeze(0)  # Handle single vector case [k'] -> [1, k']
 
-        # Dimension validation
+        batch_size = input.shape[0] # Get batch size
         actual_size = input.shape[1]
+
         if actual_size != expected_size:
             raise ValueError(
                 f"Sparsifier.transpose dimension mismatch for {self.name}: "
-                f"expected [1, {expected_size}] but got {input.shape}. "
+                f"expected [batch, {expected_size}] but got {input.shape}. "
                 f"intermediate_dims=({k_1_prime}, {k_2_prime})"
             )
 
-        # Get sparsifier objects
         sparsifier_1 = self.sparsifier_comp[0]
         sparsifier_2 = self.sparsifier_comp[1]
-
-        # OPTIMIZED PATH: random_mask sparsification uses scatter
-        if sparsifier_1.proj_type == ProjectionType.random_mask and sparsifier_2.proj_type == ProjectionType.random_mask:
-            # Access indices directly from the sparsifier objects
-            indices_1 = sparsifier_1.active_indices
-            indices_2 = sparsifier_2.active_indices
-
-            # Get original dimensions from sparsifiers
-            d_1 = sparsifier_1.feature_dim  # Original first dimension
-            d_2 = sparsifier_2.feature_dim  # Original second dimension
-
-            # Reshape from flattened to 2D matrix: [1, k_1' * k_2'] → [k_1', k_2']
-            intermediate = input.reshape(k_1_prime, k_2_prime)
-
-            # Initialize full tensor matrix with zeros
-            full_matrix = torch.zeros(d_1, d_2, device=input.device, dtype=input.dtype)
-
-            # Scatter operation: full_matrix[indices_1[:, None], indices_2[None, :]] = intermediate
-            # Use advanced indexing with meshgrid for 2D scatter
-            idx_1_expanded = indices_1.unsqueeze(1).expand(k_1_prime, k_2_prime)
-            idx_2_expanded = indices_2.unsqueeze(0).expand(k_1_prime, k_2_prime)
-
-            # Flatten indices and values for 1D scatter
-            flat_indices = idx_1_expanded * d_2 + idx_2_expanded
-            full_matrix.view(-1).scatter_(0, flat_indices.reshape(-1), intermediate.reshape(-1))
-
-            # Flatten and add batch dimension: [1, d_1 * d_2]
-            return full_matrix.reshape(1, -1)
-
-        # GENERAL PATH: dense projections use vec-trick
-        # Reshape from flattened to 2D matrix: [1, k_1' * k_2'] → [k_1', k_2']
-        intermediate = input.reshape(k_1_prime, k_2_prime)
-
-        if not (hasattr(sparsifier_1, 'feature_dim') and hasattr(sparsifier_2, 'feature_dim')):
-            raise ValueError(f"Sparsifier {self.name} does not have valid sparsifier objects")
 
         d_1 = sparsifier_1.feature_dim
         d_2 = sparsifier_2.feature_dim
 
-        # Apply transpose using vec-trick: vec((S_1)ᵀ @ X' @ S_2)
-        # Step 1: Apply first sparsifier transpose column-wise
-        # Treat columns as batch: transpose [k_2', k_1'] where each column is a sample
-        intermediate_T = intermediate.t()  # [k_2', k_1']
+        # Reshape to batched 2D matrix: [batch, k_1' * k_2'] -> [batch, k_1', k_2']
+        intermediate = input.reshape(batch_size, k_1_prime, k_2_prime)
 
-        temp_T = sparsifier_1.transpose(intermediate_T, ensemble_id=0, scale=scale)  # [k_2', d_1]
+        # OPTIMIZED PATH: random_mask sparsification uses scatter
+        if sparsifier_1.proj_type == ProjectionType.random_mask and sparsifier_2.proj_type == ProjectionType.random_mask:
+            indices_1 = sparsifier_1.active_indices
+            indices_2 = sparsifier_2.active_indices
 
-        temp = temp_T.t()  # [d_1, k_2']
+            full_matrix = torch.zeros(batch_size, d_1, d_2, device=input.device, dtype=input.dtype)
 
-        # Step 2: Apply second sparsifier transpose row-wise
-        # Treat rows as batch: [d_1, k_2'] where each row is a sample
-        full_matrix = sparsifier_2.transpose(temp, ensemble_id=0, scale=scale)  # [d_1, d_2]
+            # Batched scatter using advanced indexing:
+            # full_matrix[b, indices_1, indices_2] = intermediate[b]
+            full_matrix[:, indices_1[:, None], indices_2[None, :]] = intermediate
 
-        # Flatten and add batch dimension: [1, d_1 * d_2]
-        return full_matrix.reshape(1, -1)
+            # Flatten and return: [batch, d_1 * d_2]
+            return full_matrix.reshape(batch_size, -1)
+
+        # GENERAL PATH: dense projections use vec-trick with batched operations
+        # 1. Reshape intermediate for component-wise transpose: [batch, k_1', k_2'] -> [batch, k_2', k_1']
+        intermediate_T = intermediate.transpose(1, 2)
+
+        # 2. Apply sparsifier_1 transpose
+        #    Input: [batch * k_2', k_1']
+        temp_T = sparsifier_1.transpose(intermediate_T.reshape(batch_size * k_2_prime, k_1_prime), ensemble_id=0, scale=scale)
+        #    Output: [batch * k_2', d_1] -> [batch, k_2', d_1]
+        temp_T = temp_T.reshape(batch_size, k_2_prime, d_1)
+
+        # 3. Transpose back: [batch, k_2', d_1] -> [batch, d_1, k_2']
+        temp = temp_T.transpose(1, 2)
+
+        # 4. Apply sparsifier_2 transpose
+        #    Input: [batch * d_1, k_2']
+        full_matrix = sparsifier_2.transpose(temp.reshape(batch_size * d_1, k_2_prime), ensemble_id=0, scale=scale)
+        #    Output: [batch * d_1, d_2] -> [batch, d_1, d_2]
+        full_matrix = full_matrix.reshape(batch_size, d_1, d_2)
+
+        # 5. Flatten and return: [batch, d_1 * d_2]
+        return full_matrix.reshape(batch_size, -1)
 
 
     def refresh(self, step: int) -> Sparsifier:
@@ -831,7 +815,6 @@ def _setup_linear_sparsifier(
 
     # Store dimensions needed for transpose operation
     # Test projection to get actual intermediate dimensions
-    # IMPORTANT: This also initializes active_indices for random_mask projectors
     test_comp_1 = sparsifier_comp_1.project(sample_comp_1[:1], ensemble_id=0)
     test_comp_2 = sparsifier_comp_2.project(sample_comp_2[:1], ensemble_id=0)
     sparsifier.intermediate_dims = (test_comp_1.shape[-1], test_comp_2.shape[-1])
@@ -1004,7 +987,6 @@ def _setup_layernorm_sparsifier(
 
     # Store dimensions needed for transpose operation
     # Test projection to get actual intermediate dimensions
-    # IMPORTANT: This also initializes active_indices for random_mask projectors
     test_comp_1 = sparsifier_comp_1.project(sample_comp_1[:1], ensemble_id=0)
     test_comp_2 = sparsifier_comp_2.project(sample_comp_2[:1], ensemble_id=0)
     sparsifier.intermediate_dims = (test_comp_1.shape[-1], test_comp_2.shape[-1])
@@ -1064,7 +1046,7 @@ def _setup_layernorm_projector(
     if kwargs.get("proj_type") == "identity" and proj_dim == -1:
         proj_dim = intermediate_dim
 
-    projector_func = random_project(
+    projector = random_project(
         sample_intermediate,
         sample_intermediate.shape[0],
         proj_dim=proj_dim,
@@ -1075,4 +1057,4 @@ def _setup_layernorm_projector(
     )
 
     # Store in projector attribute
-    projector.projector = projector_func
+    projector.projector = projector
