@@ -190,6 +190,7 @@ class CompGradTrainer(Trainer):
                 betas=(self.args.adam_beta1, self.args.adam_beta2),
                 eps=self.args.adam_epsilon,
                 weight_decay=self.args.weight_decay,
+                zero_first_moment_on_refresh=False,
             )
 
         else:

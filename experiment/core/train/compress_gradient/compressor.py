@@ -415,14 +415,14 @@ class Compressor(ProjectionContainer):
            - Applies projection
            - Example use: Gradient compression where components are (grad_output, input)
 
-        2. Direct mode (tensor input): [1, d]
-           - Input is a full vector, which conceptually corresponds to the Kronecker product of two components of Component mode
+        2. Direct mode (tensor input): [batch, d]
+           - Input is a batch of full vectors
            - Applies sparsification via vec-trick
            - Applies projection
            - Example use: Optimizer state transformation during refresh
 
         Args:
-            input: Either a tuple of components or a full tensor
+            input: Either a tuple of batch components or batch full vectors
             scale: Scaling mode. Forward preserves forward projection's norm, backward preserves backward projection's norm
 
         Returns:

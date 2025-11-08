@@ -44,6 +44,8 @@ class MeSOAdamW(Optimizer):
         weight_decay: Weight decay coefficient (L2 penalty)
         compressed_layer_names: Optional list of layer names to apply compression.
                                 If None, will attempt compression on all layers.
+        zero_first_moment_on_refresh: If True, zero out first moment on compressor refresh
+                                      (for debugging/control experiments). Default: False.
     """
 
     def __init__(
@@ -54,7 +56,8 @@ class MeSOAdamW(Optimizer):
         betas: tuple = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
-        compressed_layer_names: Optional[List[str]] = None
+        compressed_layer_names: Optional[List[str]] = None,
+        zero_first_moment_on_refresh: bool = False
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -72,6 +75,7 @@ class MeSOAdamW(Optimizer):
 
         self.grad_hook = grad_hook
         self.compressed_layer_names = compressed_layer_names or grad_hook.layer_names
+        self.zero_first_moment_on_refresh = zero_first_moment_on_refresh
 
         # Create mapping from parameter to layer name
         self._param_to_layer_name = {}
@@ -82,6 +86,7 @@ class MeSOAdamW(Optimizer):
         logger.info(f"  Learning rate: {lr}")
         logger.info(f"  Betas: {betas}")
         logger.info(f"  Weight decay: {weight_decay}")
+        logger.info(f"  Zero first moment on refresh: {zero_first_moment_on_refresh}")
 
     def _setup_param_mapping(self):
         """
@@ -170,7 +175,8 @@ class MeSOAdamW(Optimizer):
         Transform optimizer state from old subspace to new subspace during compressor refresh.
 
         **For first moments (is_second_moment=False)**:
-            m_new = M @ m_old where M = P_new @ P_old^T
+            If zero_first_moment_on_refresh=True: Zero out (for control experiment)
+            If zero_first_moment_on_refresh=False: m_new = M @ m_old where M = P_new @ P_old^T
 
         **For second moments (is_second_moment=True)**:
             Simply zero out - variance transformation is too complex and expensive.
@@ -180,7 +186,7 @@ class MeSOAdamW(Optimizer):
             state_old: Old optimizer state in compressed space [k_old]
             layer_idx: Index of the layer
             old_compressor: Old Compressor (before refresh) for transformation
-            is_second_moment: If True, zero out; if False, use linear transformation
+            is_second_moment: If True, zero out; if False, use linear transformation (unless zero_first_moment_on_refresh=True)
 
         Returns:
             Transformed state in new compressed space [k_new]
@@ -194,8 +200,10 @@ class MeSOAdamW(Optimizer):
         moment_type = "2nd_moment" if is_second_moment else "1st_moment"
         print(f"[STATE TRANSFORM] {layer_name}: {moment_type}, k={k_old}, norm_old={norm_old:.4e}")
 
-        # For second moments, simply zero out (too complex to transform correctly)
-        if is_second_moment:
+        # Check if we should zero out this moment
+        should_zero = is_second_moment or (not is_second_moment and self.zero_first_moment_on_refresh)
+
+        if should_zero:
             # Determine k_new
             dummy = torch.zeros(1, k_old, device=state_old.device, dtype=state_old.dtype)
             dummy_full = old_compressor.transpose(dummy, scale="forward")
@@ -205,10 +213,11 @@ class MeSOAdamW(Optimizer):
             state_new = torch.zeros(k_new, device=state_old.device, dtype=state_old.dtype)
             norm_new = 0.0
 
-            print(f"  → ZEROED OUT: k={k_new}, norm_new={norm_new:.4e}")
+            reason = "2nd moment" if is_second_moment else "1st moment (control experiment)"
+            print(f"  → ZEROED OUT ({reason}): k={k_new}, norm_new={norm_new:.4e}")
             return state_new
 
-        # For first moments, use simple linear transformation
+        # For first moments (when not zeroing), use simple linear transformation
         # Add batch dimension if needed [k] -> [1, k]
         if state_old.dim() == 1:
             state_old_batch = state_old.unsqueeze(0)
@@ -217,7 +226,7 @@ class MeSOAdamW(Optimizer):
 
         # Transform: m_new = M @ m_old where M = P_new @ P_old^T
         full = old_compressor.transpose(state_old_batch, scale="backward")
-        state_new_batch = new_compressor.forward(full, scale="backward")
+        state_new_batch = new_compressor.forward(full, scale="forward")
         state_new = state_new_batch.squeeze(0)
 
         k_new = state_new.shape[0]
