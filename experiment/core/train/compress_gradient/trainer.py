@@ -135,6 +135,8 @@ class CompGradTrainer(Trainer):
         logger.info(f"  Validation set size: {len(val_dataset)}")
         logger.info(f"  Evaluation set size: {len(eval_dataset)}")
         logger.info(f"  Compressed optimizer: {self.args.use_compressed_optimizer}")
+        if self.args.method in ['GREATS', 'GradNorm'] and not self.args.use_compressed_optimizer:
+            logger.info(f"  Note: Hooks will be toggled per step (enabled for selection, disabled for optimization)")
         logger.info("="*60)
 
     def _get_unwrapped_optimizer(self):
@@ -323,6 +325,13 @@ class CompGradTrainer(Trainer):
                 'labels': inputs['labels'][selected_ind]
             }
 
+        # Disable hooks for standard optimizer (allows full gradient computation)
+        # MeSOAdamW uses compressed gradients, standard optimizers need full gradients
+        using_compressed_optimizer = isinstance(unwrapped_optimizer, MeSOAdamW)
+        if not using_compressed_optimizer and self.grad_hook.hooks_registered:
+            logger.debug("Disabling hooks for standard optimizer (will compute full gradients)")
+            self.grad_hook.disable_hooks()
+
         # Regular training step on selected batch
         inputs = self._prepare_inputs(inputs)
 
@@ -336,6 +345,11 @@ class CompGradTrainer(Trainer):
             loss = loss / self.args.gradient_accumulation_steps
 
         loss.backward()
+
+        # Re-enable hooks for next selection phase
+        if not using_compressed_optimizer and self.grad_hook.hooks_registered:
+            logger.debug("Re-enabling hooks for next iteration")
+            self.grad_hook.enable_hooks()
 
         return loss.detach()
 

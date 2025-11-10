@@ -201,6 +201,9 @@ class GradientHook:
         # Track hook registration status
         self.hooks_registered = False
 
+        # Track whether hooks are enabled (can disable without unregistering)
+        self.hooks_enabled = True
+
         # Register in global registry: Store ID, not self, to avoid memory leaks in autograd graph
         self._hook_manager_id = id(self)
         _HOOK_MANAGER_REGISTRY[self._hook_manager_id] = self
@@ -254,20 +257,29 @@ class GradientHook:
 
         During training: Uses CompressedLinearBackward to prevent full gradient
         During eval: Uses standard F.linear (no overhead)
+        Can also be disabled via hooks_enabled flag for temporary standard gradient computation
         """
-        if module.training and input.requires_grad:
+        if module.training and input.requires_grad and self.hooks_enabled:
             # Use our custom backward that computes only compressed gradients
             # Pass hook_manager_id (not self) to avoid keeping hook manager in autograd graph
             return CompressedLinearBackward.apply(
                 input, module.weight, module.bias, self._hook_manager_id, idx
             )
         else:
-            # Use standard forward during eval
+            # Use standard forward during eval OR when hooks are disabled
             return F.linear(input, module.weight, module.bias)
 
     def set_compressors(self, compressors: List[Compressor]) -> None:
         """Set unified compressor objects for each layer."""
         self.compressors = compressors
+
+    def enable_hooks(self) -> None:
+        """Enable hooks to compute compressed gradients (default)."""
+        self.hooks_enabled = True
+
+    def disable_hooks(self) -> None:
+        """Disable hooks to allow standard gradient computation."""
+        self.hooks_enabled = False
 
     def get_compressed_grads(self) -> List[Tensor]:
         """Get all captured compressed gradients."""
