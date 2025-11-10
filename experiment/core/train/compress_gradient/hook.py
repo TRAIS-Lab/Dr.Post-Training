@@ -15,7 +15,11 @@ This prevents PyTorch from computing full gradients that we don't need.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, List
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,8 +47,7 @@ class CompressedLinearBackward(Function):
     """
 
     @staticmethod
-    def forward(ctx, input: Tensor, weight: Tensor, bias: Tensor | None,
-                hook_manager_id: int, layer_idx: int) -> Tensor:
+    def forward(ctx, input: Tensor, weight: Tensor, bias: Tensor | None, hook_manager_id: int, layer_idx: int) -> Tensor:
         """
         Forward pass: standard linear transformation.
 
@@ -198,8 +201,7 @@ class GradientHook:
         # Track hook registration status
         self.hooks_registered = False
 
-        # Register in global registry
-        # CRITICAL: Store ID, not self, to avoid memory leaks in autograd graph
+        # Register in global registry: Store ID, not self, to avoid memory leaks in autograd graph
         self._hook_manager_id = id(self)
         _HOOK_MANAGER_REGISTRY[self._hook_manager_id] = self
 
@@ -281,7 +283,7 @@ class GradientHook:
         Returns:
             Tuple of (num_refreshed, old_compressors) where:
                 - num_refreshed: Number of compressors refreshed
-                - old_compressors: List of old CompressorContainers (or None if not refreshed)
+                - old_compressors: List of old Compressor (or None if not refreshed)
         """
         num_refreshed = 0
         old_compressors = []

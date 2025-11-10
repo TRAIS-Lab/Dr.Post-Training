@@ -2,13 +2,7 @@
 General memory-efficient optimizer for compressed gradient training.
 
 This optimizer works with any compression method that provides a transpose operation,
-including GraSS, LoGra, GaLore, or custom projectors.
-
-Key features:
-- Optimizer states stored in compressed space
-- Works with hook-based per-sample gradient computation
-- Supports data selection (e.g., GREATS)
-- Generic design: works with any projector with transpose method
+including GraSS, LoGra, or custom projectors.
 """
 
 import torch
@@ -19,6 +13,7 @@ import logging
 
 from .hook import GradientHook
 from .compressor import Compressor
+from .utils import apply_hadamard_matvec, stochastic_diagonal_estimation
 logger = logging.getLogger(__name__)
 
 
@@ -44,8 +39,10 @@ class MeSOAdamW(Optimizer):
         weight_decay: Weight decay coefficient (L2 penalty)
         compressed_layer_names: Optional list of layer names to apply compression.
                                 If None, will attempt compression on all layers.
-        zero_first_moment_on_refresh: If True, zero out first moment on compressor refresh
-                                      (for debugging/control experiments). Default: False.
+        stochastic_num_samples: Number of samples for stochastic second moment transform.
+                                If > 0: use stochastic estimation (efficient, approximate).
+                                If None or 0: use exact (M ⊙ M) @ v transformation (expensive, exact).
+                                Default: 100 (stochastic)
     """
 
     def __init__(
@@ -57,7 +54,7 @@ class MeSOAdamW(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.0,
         compressed_layer_names: Optional[List[str]] = None,
-        zero_first_moment_on_refresh: bool = False
+        stochastic_num_samples: Optional[int] = 100
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -75,18 +72,23 @@ class MeSOAdamW(Optimizer):
 
         self.grad_hook = grad_hook
         self.compressed_layer_names = compressed_layer_names or grad_hook.layer_names
-        self.zero_first_moment_on_refresh = zero_first_moment_on_refresh
+        self.stochastic_num_samples = stochastic_num_samples
 
         # Create mapping from parameter to layer name
         self._param_to_layer_name = {}
         self._setup_param_mapping()
+
+        # Determine transformation mode from stochastic_num_samples
+        use_stochastic = stochastic_num_samples is not None and stochastic_num_samples > 0
 
         logger.info(f"Initialized MeSOAdamW optimizer")
         logger.info(f"  Compressed layers: {len(self.compressed_layer_names)}")
         logger.info(f"  Learning rate: {lr}")
         logger.info(f"  Betas: {betas}")
         logger.info(f"  Weight decay: {weight_decay}")
-        logger.info(f"  Zero first moment on refresh: {zero_first_moment_on_refresh}")
+        logger.info(f"  Second moment transform: {'stochastic' if use_stochastic else 'exact'}")
+        if use_stochastic:
+            logger.info(f"  Stochastic samples: {stochastic_num_samples}")
 
     def _setup_param_mapping(self):
         """
@@ -164,91 +166,433 @@ class MeSOAdamW(Optimizer):
                     return state['step']
         return 0
 
-    def _transform_optimizer_state(
+    def _is_sparsifier_random_mask(self, old_compressor: Compressor, new_compressor: Compressor) -> bool:
+        """
+        Check if random_mask sparsifier is used in both old and new compressors.
+
+        This generally allows us to work in intermediate space k' instead of full space D,
+        providing significant speedup even for optimizer states transformation.
+        """
+        from .projection import ProjectionType
+
+        old_sparsifier = old_compressor.sparsifier
+        new_sparsifier = new_compressor.sparsifier
+
+        old_s1, old_s2 = old_sparsifier.sparsifier_comp
+        new_s1, new_s2 = new_sparsifier.sparsifier_comp
+
+        # Check if all sparsifier components use random_mask
+        sparsifiers_use_random_mask = (
+            old_s1.proj_type == ProjectionType.random_mask and
+            old_s2.proj_type == ProjectionType.random_mask and
+            new_s1.proj_type == ProjectionType.random_mask and
+            new_s2.proj_type == ProjectionType.random_mask
+        )
+
+        return sparsifiers_use_random_mask
+
+    def _transform_first_moment(
         self,
         state_old: torch.Tensor,
         layer_idx: int,
-        old_compressor: Compressor,
-        is_second_moment: bool = False
+        old_compressor: Compressor
     ) -> torch.Tensor:
         """
-        Transform optimizer state from old subspace to new subspace during compressor refresh.
+        Transform first moment (momentum) from old subspace to new subspace during compressor refresh:
+            m_new = M @ m_old where M = P_new @ P_old^T
 
-        **For first moments (is_second_moment=False)**:
-            If zero_first_moment_on_refresh=True: Zero out (for control experiment)
-            If zero_first_moment_on_refresh=False: m_new = M @ m_old where M = P_new @ P_old^T
-
-        **For second moments (is_second_moment=True)**:
-            Simply zero out - variance transformation is too complex and expensive.
-            The optimizer will rebuild second moments from scratch.
+        When random_mask sparsifiers is used, we provide an optimized method that avoids full
+        materialization in the M's D-dimensional space by working in intermediate space.
 
         Args:
-            state_old: Old optimizer state in compressed space [k_old]
+            state_old: Old first moment in compressed space [k]
             layer_idx: Index of the layer
             old_compressor: Old Compressor (before refresh) for transformation
-            is_second_moment: If True, zero out; if False, use linear transformation (unless zero_first_moment_on_refresh=True)
 
         Returns:
-            Transformed state in new compressed space [k_new]
+            Transformed first moment in new compressed space [k]
         """
         new_compressor = self.grad_hook.compressors[layer_idx]
-        layer_name = new_compressor.name if hasattr(new_compressor, 'name') else f"layer_{layer_idx}"
 
-        k_old = state_old.shape[0]
         norm_old = state_old.norm().item()
 
-        moment_type = "2nd_moment" if is_second_moment else "1st_moment"
-        print(f"[STATE TRANSFORM] {layer_name}: {moment_type}, k={k_old}, norm_old={norm_old:.4e}")
-
-        # Check if we should zero out this moment
-        should_zero = is_second_moment or (not is_second_moment and self.zero_first_moment_on_refresh)
-
-        if should_zero:
-            # Determine k_new
-            dummy = torch.zeros(1, k_old, device=state_old.device, dtype=state_old.dtype)
-            dummy_full = old_compressor.transpose(dummy, scale="forward")
-            dummy_new = new_compressor.forward(dummy_full, scale="forward")
-            k_new = dummy_new.shape[1]
-
-            state_new = torch.zeros(k_new, device=state_old.device, dtype=state_old.dtype)
-            norm_new = 0.0
-
-            reason = "2nd moment" if is_second_moment else "1st moment (control experiment)"
-            print(f"  → ZEROED OUT ({reason}): k={k_new}, norm_new={norm_new:.4e}")
-            return state_new
-
-        # For first moments (when not zeroing), use simple linear transformation
         # Add batch dimension if needed [k] -> [1, k]
         if state_old.dim() == 1:
             state_old_batch = state_old.unsqueeze(0)
         else:
             state_old_batch = state_old
 
-        # Transform: m_new = M @ m_old where M = P_new @ P_old^T
-        full = old_compressor.transpose(state_old_batch, scale="backward")
-        state_new_batch = new_compressor.forward(full, scale="forward")
-        state_new = state_new_batch.squeeze(0)
+        if self._is_sparsifier_random_mask(old_compressor, new_compressor):
+            # Optimized transform for random_mask: works in intermediate space k' to avoid
+            # full D-dimensional materialization
+            # Mathematical flow:
+            # 1. Map from compressed to old intermediate: m_old_inter = Proj_old^T @ m_old
+            # 2. Apply sparse index mapping: m_new_inter = Spars_new @ Spars_old^T @ m_old_inter
+            # 3. Map from new intermediate to new compressed: m_new = Proj_new @ m_new_inter
 
-        k_new = state_new.shape[0]
+            # Extract components
+            old_sparsifier = old_compressor.sparsifier
+            new_sparsifier = new_compressor.sparsifier
+            old_projector = old_compressor.projector
+            new_projector = new_compressor.projector
+
+            # Get sparsifier indices
+            old_s1, old_s2 = old_sparsifier.sparsifier_comp
+            new_s1, new_s2 = new_sparsifier.sparsifier_comp
+
+            old_idx1, old_idx2 = old_s1.active_indices, old_s2.active_indices
+            new_idx1, new_idx2 = new_s1.active_indices, new_s2.active_indices
+
+            k1, k2 = len(old_idx1), len(old_idx2)
+
+            # Step 1: Transform state_old from compressed to old intermediate space
+            # [1, k] → Proj_old^T → [1, k']
+            m_old_inter = old_projector.transpose(state_old_batch)  # [1, k']
+
+            # Step 2: Reshape to matrix form for index operations
+            m_old_matrix = m_old_inter.squeeze(0).reshape(k1, k2)
+
+            # Step 3: Apply sparse index mapping: Spars_new @ Spars_old^T
+            # Build index mappings for O(1) lookup
+            old_to_compressed_1 = {idx.item(): i for i, idx in enumerate(old_idx1)}
+            old_to_compressed_2 = {idx.item(): i for i, idx in enumerate(old_idx2)}
+
+            # Initialize result matrix in new intermediate space
+            m_new_matrix = torch.zeros(k1, k2, device=state_old_batch.device, dtype=state_old_batch.dtype)
+
+            # Map values through index intersection
+            for i_new in range(k1):
+                idx1_new = new_idx1[i_new].item()
+                if idx1_new in old_to_compressed_1:
+                    i_old = old_to_compressed_1[idx1_new]
+                    for j_new in range(k2):
+                        idx2_new = new_idx2[j_new].item()
+                        if idx2_new in old_to_compressed_2:
+                            j_old = old_to_compressed_2[idx2_new]
+                            # Copy value: Spars_new @ Spars_old^T has 1 at overlapping indices
+                            m_new_matrix[i_new, j_new] = m_old_matrix[i_old, j_old]
+
+            # Step 4: Map from new intermediate to new compressed space
+            m_new_inter = m_new_matrix.reshape(1, -1)  # [1, k']
+            m_new = new_projector.forward(m_new_inter)  # [1, k]
+            state_new = m_new.squeeze(0)
+        else:
+            # Transform: m_new = M @ m_old where M = P_new @ P_old^T
+            full = old_compressor.transpose(state_old_batch)
+            state_new_batch = new_compressor.forward(full)
+            state_new = state_new_batch.squeeze(0)
+
+        # Rescale to match original norm
         norm_new = state_new.norm().item()
+        if norm_new > 1e-10 and norm_old > 1e-10:
+            scale_factor = norm_old / norm_new
+            state_new.mul_(scale_factor)
 
-        print(f"  → TRANSFORMED: k={k_new}, norm_new={norm_new:.4e}, ratio={norm_new/norm_old if norm_old > 0 else 0:.4f}")
         return state_new
+
+    def _second_moment_postprocessing(
+        self,
+        v_new: torch.Tensor,
+        state_old: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Apply common post-processing to second moment transformation result.
+
+        This includes:
+        1. Clamping negative values to zero (sanity check for numerical errors)
+        2. Rescaling to match original norm (empirical stability improvement)
+
+        Args:
+            v_new: Transformed second moment
+            state_old: Original second moment (for norm reference)
+
+        Returns:
+            Post-processed second moment
+        """
+        # Sanity check: all values should be non-negative
+        if (v_new < 0).any():
+            v_new.clamp_(min=0)
+
+        # Empirical norm adjustment: rescale to match original norm
+        norm_new = v_new.norm().item()
+        norm_old = state_old.norm().item()
+        if norm_new > 1e-10 and norm_old > 1e-10:
+            scale_factor = norm_old / norm_new
+            v_new.mul_(scale_factor)
+
+        return v_new
+
+    def _transform_second_moment_exact(
+        self,
+        state_old: torch.Tensor,
+        layer_idx: int,
+        old_compressor: Compressor,
+        chunk_size: int = 256
+    ) -> torch.Tensor:
+        """
+        Transform second moment from old subspace to new subspace during compressor refresh:
+            v_new = (M ⊙ M) @ v_old,
+        where M = P_new @ P_old^T and ⊙ is element-wise product.
+
+        Given compressed gradients ĝ_old = P_old @ g and ĝ_new = P_new @ g,
+        and the relationship ĝ_new ≈ M @ ĝ_old, the second moment transforms as:
+            E[ĝ_new²] = E[(M @ ĝ_old)²] = (M ⊙ M) @ E[ĝ_old²]
+
+        Args:
+            state_old: Old second moment in compressed space [k]
+            layer_idx: Index of the layer
+            old_compressor: Old Compressor (before refresh)
+            chunk_size: Number of basis vectors to process per batch (for memory efficiency).
+                       If None, automatically determined based on layer size.
+
+        Returns:
+            Transformed second moment in new compressed space [k]
+        """
+        new_compressor = self.grad_hook.compressors[layer_idx]
+
+        if self._is_sparsifier_random_mask(old_compressor, new_compressor):
+            # Get sparsifier indices
+            old_s1, old_s2 = old_compressor.sparsifier.sparsifier_comp
+            new_s1, new_s2 = new_compressor.sparsifier.sparsifier_comp
+
+            old_idx1, old_idx2 = old_s1.active_indices, old_s2.active_indices
+            new_idx1, new_idx2 = new_s1.active_indices, new_s2.active_indices
+
+            k1, k2 = len(old_idx1), len(old_idx2)
+            k_prime = k1 * k2
+
+            # Step 1: Transform state_old from compressed to intermediate space
+            state_old_inter = old_compressor.projector.transpose(state_old.unsqueeze(0)).squeeze(0) # [k']
+
+            # Step 2: Reshape to matrix form
+            V_old_matrix = state_old_inter.reshape(k1, k2)  # [k_1', k_2']
+
+            # Step 3: Apply sparse index transformation (T ⊙ T) @ V_old where T = Spars_new @ Spars_old^T
+            # Build index mappings
+            old_to_compressed_1 = {idx.item(): i for i, idx in enumerate(old_idx1)}
+            old_to_compressed_2 = {idx.item(): i for i, idx in enumerate(old_idx2)}
+
+            # For each position in new intermediate space, compute contribution from old space
+            V_inter_new_matrix = torch.zeros(k1, k2, device=state_old.device, dtype=state_old.dtype)
+
+            # Iterate over new intermediate positions
+            for i_new in range(k1):
+                idx1_new = new_idx1[i_new].item()
+                for j_new in range(k2):
+                    idx2_new = new_idx2[j_new].item()
+
+                    # Check if this index exists in old subspace
+                    if idx1_new in old_to_compressed_1 and idx2_new in old_to_compressed_2:
+                        i_old = old_to_compressed_1[idx1_new]
+                        j_old = old_to_compressed_2[idx2_new]
+                        # Direct copy for overlapping indices (T[i,j] = 1)
+                        V_inter_new_matrix[i_new, j_new] = V_old_matrix[i_old, j_old]
+
+            # Flatten to vector form
+            V_inter_new = V_inter_new_matrix.reshape(-1)  # [k']
+
+            # Step 4: Compute (M_proj ⊙ M_proj) @ V_inter_new using basis vectors
+            # where M_proj = Proj_new @ Proj_old^T
+            chunk_size = min(chunk_size, k_prime)
+            v_new = apply_hadamard_matvec(
+                M_proj_forward=new_compressor.projector.forward,
+                source_vector=V_inter_new,
+                result_size=state_old.shape[0],
+                chunk_size=chunk_size,
+                source_size=k_prime,
+                device=state_old.device,
+                dtype=state_old.dtype
+            )
+
+        else:
+            # General case: compute (M ⊙ M) @ state_old where M = P_new @ P_old^T
+            # We use a composition function for M_proj_forward
+            def compose_forward(I_chunk):
+                # P_old^T @ I_chunk^T = P_old^T @ [e_i, e_{i+1}, ...]
+                full_chunk = old_compressor.transpose(I_chunk)  # [chunk_size, d]
+                # P_new @ full_chunk
+                return new_compressor.forward(full_chunk)  # [chunk_size, k]
+
+            v_new = apply_hadamard_matvec(
+                M_proj_forward=compose_forward,
+                source_vector=state_old,
+                result_size=state_old.shape[0],
+                chunk_size=chunk_size,
+                source_size=state_old.shape[0],
+                device=state_old.device,
+                dtype=state_old.dtype
+            )
+
+        # Apply common post-processing (clamping and norm adjustment)
+        v_new = self._second_moment_postprocessing(v_new, state_old)
+
+        return v_new
+
+    def _transform_second_moment_stochastic(
+        self,
+        state_old: torch.Tensor,
+        layer_idx: int,
+        old_compressor: Compressor,
+        num_samples: int = 100
+    ) -> torch.Tensor:
+        """
+        Transform second moment from old subspace to new subspace during compressor refresh using a probabilistic diagonal estimator.
+            - For A = M V_old M^T, we want v_new = diag(A)
+            - Probabilistic diagonal estimator: diag(A) ≈ (1/N) Σ z_i ⊙ (A z_i)
+            - Compute A z_i = M V_old M^T z_i as: M (V_old (M^T z_i))
+
+        Args:
+            state_old: Old second moment in compressed space [k]
+            layer_idx: Index of the layer
+            old_compressor: Old Compressor (before refresh)
+            num_samples: Number of random samples for approximation (default: 100)
+
+        Returns:
+            Approximated second moment in new compressed space [k]
+        """
+        new_compressor = self.grad_hook.compressors[layer_idx]
+
+        if self._is_sparsifier_random_mask(old_compressor, new_compressor):
+            # Optimized path for random_mask: work in intermediate space
+
+            # Prepare intermediate space setup
+            old_s1, old_s2 = old_compressor.sparsifier.sparsifier_comp
+            new_s1, new_s2 = new_compressor.sparsifier.sparsifier_comp
+            old_idx1, old_idx2 = old_s1.active_indices, old_s2.active_indices
+            new_idx1, new_idx2 = new_s1.active_indices, new_s2.active_indices
+            k1, k2 = len(old_idx1), len(old_idx2)
+
+            # Transform state_old to intermediate space and reshape to matrix
+            state_old_inter = old_compressor.projector.transpose(state_old.unsqueeze(0)).squeeze(0)
+            V_old_matrix = state_old_inter.reshape(k1, k2)
+
+            # Build index mappings for sparse operations
+            old_to_compressed_1 = {idx.item(): i for i, idx in enumerate(old_idx1)}
+            old_to_compressed_2 = {idx.item(): i for i, idx in enumerate(old_idx2)}
+            new_to_compressed_1 = {idx.item(): i for i, idx in enumerate(new_idx1)}
+            new_to_compressed_2 = {idx.item(): i for i, idx in enumerate(new_idx2)}
+
+            # Build mapping list for efficient indexing
+            common_idx1 = set(old_to_compressed_1.keys()) & set(new_to_compressed_1.keys())
+            common_idx2 = set(old_to_compressed_2.keys()) & set(new_to_compressed_2.keys())
+            mapping_list_1 = [(new_to_compressed_1[idx], old_to_compressed_1[idx]) for idx in common_idx1]
+            mapping_list_2 = [(new_to_compressed_2[idx], old_to_compressed_2[idx]) for idx in common_idx2]
+
+            # Define computation function: compute M V_old M^T z
+            def compute_Mz(z: torch.Tensor) -> torch.Tensor:
+                """Compute M V_old M^T z in intermediate space."""
+                # Map z to new intermediate space
+                z_inter = new_compressor.projector.transpose(z)  # [1, k']
+                z_inter_matrix = z_inter.squeeze(0).reshape(k1, k2)
+
+                # Apply sparse mapping: Spars_old @ (Spars_new^T @ z_inter)
+                z_mapped_to_old = torch.zeros(k1, k2, device=state_old.device, dtype=state_old.dtype)
+                for new_pos1, old_pos1 in mapping_list_1:
+                    for new_pos2, old_pos2 in mapping_list_2:
+                        z_mapped_to_old[old_pos1, old_pos2] = z_inter_matrix[new_pos1, new_pos2]
+
+                # Element-wise multiply with V_old_matrix
+                B_i_matrix = V_old_matrix * z_mapped_to_old
+
+                # Apply sparse mapping back: Spars_new @ (Spars_old^T @ B_i)
+                B_i_mapped_to_new = torch.zeros(k1, k2, device=state_old.device, dtype=state_old.dtype)
+                for new_pos1, old_pos1 in mapping_list_1:
+                    for new_pos2, old_pos2 in mapping_list_2:
+                        B_i_mapped_to_new[new_pos1, new_pos2] = B_i_matrix[old_pos1, old_pos2]
+
+                # Project to new compressed space
+                B_i_inter = B_i_mapped_to_new.reshape(1, -1)
+                y_i = new_compressor.projector.forward(B_i_inter)
+                return y_i
+
+            v_new = stochastic_diagonal_estimation(
+                compute_Mz_func=compute_Mz,
+                result_size=state_old.shape[0],
+                num_samples=num_samples,
+                device=state_old.device,
+                dtype=state_old.dtype,
+                seed=42
+            )
+
+        else:
+            # General case: compute M V_old M^T directly
+            # V_old is diagonal, so we use state_old as the diagonal entries
+            v_old_diag = state_old  # [k]
+
+            # Define computation function: compute M V_old M^T z
+            def compute_Mz(z: torch.Tensor) -> torch.Tensor:
+                """Compute M V_old M^T z = M (V_old (M^T z))."""
+                # Step 1: M^T z = P_old @ (P_new^T @ z)
+                step_a1 = new_compressor.transpose(z)  # [1, d]
+                a_i = old_compressor.forward(step_a1)  # [1, k]
+
+                # Step 2: V_old * (M^T z) - element-wise product
+                b_i = v_old_diag[None, :] * a_i  # [1, k]
+
+                # Step 3: M b = P_new @ (P_old^T @ b)
+                step_c1 = old_compressor.transpose(b_i)  # [1, d]
+                y_i = new_compressor.forward(step_c1)  # [1, k]
+
+                return y_i
+
+            v_new = stochastic_diagonal_estimation(
+                compute_Mz_func=compute_Mz,
+                result_size=state_old.shape[0],
+                num_samples=num_samples,
+                device=state_old.device,
+                dtype=state_old.dtype,
+                seed=42 + layer_idx
+            )
+
+        # Apply common post-processing (clamping and norm adjustment)
+        v_new = self._second_moment_postprocessing(v_new, state_old)
+
+        return v_new
+
+    def _transform_second_moment(
+        self,
+        state_old: torch.Tensor,
+        layer_idx: int,
+        old_compressor: Compressor
+    ) -> torch.Tensor:
+        """
+        Transform second moment (variance) from old subspace to new subspace during compressor refresh.
+
+        Two transformation methods controlled by stochastic_num_samples:
+
+        1. Stochastic estimation (stochastic_num_samples > 0, default):
+           v_new ≈ E[z ⊙ (M V_old M^T z)] using random sampling
+
+        2. Exact (stochastic_num_samples = None or 0):
+           v_new = (M ⊙ M) @ v_old
+
+        Args:
+            state_old: Old second moment in compressed space [k]
+            layer_idx: Index of the layer
+            old_compressor: Old Compressor (before refresh) for transformation
+
+        Returns:
+            Transformed second moment in new compressed space [k]
+        """
+        if self.stochastic_num_samples is not None and self.stochastic_num_samples > 0:
+            return self._transform_second_moment_stochastic(
+                state_old, layer_idx, old_compressor,
+                num_samples=self.stochastic_num_samples
+            )
+        else:
+            return self._transform_second_moment_exact(
+                state_old, layer_idx, old_compressor
+            )
 
     def refresh_compressors_if_needed(self) -> int:
         """
         Refresh compressors if needed based on current step.
 
-        This should be called BEFORE forward/backward passes to ensure
+        This should be called before forward/backward passes to ensure
         gradients are computed with the correct (refreshed) projectors.
 
         Returns:
             Number of compressors refreshed
-
-        Note:
-            This method is preferred over automatic refresh in step() because
-            it allows refresh to happen before gradient computation, matching
-            GaLore's behavior.
         """
         current_step = self.get_current_step()
 
@@ -258,31 +602,12 @@ class MeSOAdamW(Optimizer):
         num_refreshed, old_compressors = self.grad_hook.refresh_compressors(next_step)
 
         if num_refreshed > 0:
-            print(f"Refreshed {num_refreshed} compressors at step {current_step} (for step {next_step})")
-
-            # CRITICAL: Transform optimizer states after refresh
-            # This stabilizes training by mapping states from old to new subspace
-            # Pass old compressor containers temporarily for transformation, then discard
-            self._transform_all_optimizer_states(old_compressors)
-
-            # Old containers are no longer needed, they'll be garbage collected
-
-            # Debug: Check which layers have states after transformation
-            print(f"Checking optimizer states after transformation...")
-            for group in self.param_groups:
-                for p in group['params']:
-                    layer_name, _ = self._get_layer_info(p)
-                    if layer_name is not None:
-                        state = self.state.get(p, {})
-                        if 'exp_avg' in state and 'exp_avg_sq' in state:
-                            is_compressed = layer_name in self.compressed_layer_names
-                            has_nan = torch.isnan(state['exp_avg_sq']).any()
-                            if has_nan:
-                                logger.error(f"Layer {layer_name} (compressed={is_compressed}): exp_avg_sq has NaN!")
+            # Transform optimizer states after refresh
+            self._transform_optimizer_states(old_compressors)
 
         return num_refreshed
 
-    def _transform_all_optimizer_states(self, old_compressors: Compressor) -> int:
+    def _transform_optimizer_states(self, old_compressors: Compressor) -> int:
         """
         Transform all optimizer states after compressor refresh.
 
@@ -290,7 +615,7 @@ class MeSOAdamW(Optimizer):
         mapping first and second moments from the old subspace to the new one.
 
         Args:
-            old_compressors: List of old CompressorContainers (before refresh)
+            old_compressors: List of old Compressor (before refresh)
 
         Returns:
             Number of layers with transformed states
@@ -298,7 +623,6 @@ class MeSOAdamW(Optimizer):
         num_transformed = 0
         num_no_state = 0
         num_no_old_compressor = 0
-        num_compressed_layers = len(self.compressed_layer_names)
 
         for group in self.param_groups:
             for p in group['params']:
@@ -326,30 +650,15 @@ class MeSOAdamW(Optimizer):
 
                 try:
                     # Transform first moment
-                    state['exp_avg'] = self._transform_optimizer_state(
-                        state['exp_avg'],
-                        layer_idx,
-                        old_compressor,
-                        is_second_moment=False
-                    )
-
+                    state['exp_avg'] = self._transform_first_moment(state['exp_avg'], layer_idx, old_compressor)
                     # Transform second moment
-                    state['exp_avg_sq'] = self._transform_optimizer_state(
-                        state['exp_avg_sq'],
-                        layer_idx,
-                        old_compressor,
-                        is_second_moment=True
-                    )
-
+                    state['exp_avg_sq'] = self._transform_second_moment(state['exp_avg_sq'], layer_idx, old_compressor)
                     num_transformed += 1
 
                 except Exception as e:
                     logger.error(f"Failed to transform state for layer {layer_name}: {e}")
                     # Continue with other layers even if one fails
                     continue
-
-        if num_transformed > 0:
-            print(f"Successfully transformed optimizer states for {num_transformed} layers")
 
         return num_transformed
 
@@ -365,11 +674,6 @@ class MeSOAdamW(Optimizer):
 
         Returns:
             Optional loss value if closure is provided
-
-        Note:
-            For correct refresh timing (matching GaLore), call refresh_compressors_if_needed()
-            BEFORE your forward/backward passes in the training loop. This ensures gradients
-            are computed with refreshed projectors.
         """
         loss = None
         if closure is not None:
@@ -432,7 +736,8 @@ class MeSOAdamW(Optimizer):
             return
 
         # Initialize state if needed
-        if len(state) == 0:
+        is_first_step = len(state) == 0
+        if is_first_step:
             state['step'] = 0
 
             # Initialize compressed states (squeeze to remove batch dim)
@@ -477,20 +782,8 @@ class MeSOAdamW(Optimizer):
         else:
             compressed_update_batch = compressed_update
 
-        # Dimension assertion: ensure batch dimension is correct
-        assert compressed_update_batch.shape[0] == 1, \
-            f"Compressed update batch dimension should be 1, got {compressed_update_batch.shape[0]}"
-        assert compressed_update_batch.shape[1] == compressed_update.shape[-1], \
-            f"Compressed update dimension mismatch after unsqueeze"
-
-        # Apply decompression (scale is "forward" since compressed gradient comes from "forward" scaling)
-        full_update = compressor.transpose(compressed_update_batch, scale="forward")  # ĝ → ḡ [1, p_l]
-
-        # Dimension check: full_update should match parameter size
-        param_numel = param.numel()
-        assert full_update.numel() == param_numel, \
-            f"Full update size mismatch for {layer_name}: " \
-            f"expected {param_numel}, got {full_update.numel()}"
+        # Apply decompression
+        full_update = compressor.transpose(compressed_update_batch)  # ĝ → ḡ [1, p_l]
 
         # Apply weight decay (in parameter space)
         if group['weight_decay'] != 0:
@@ -523,23 +816,9 @@ class MeSOAdamW(Optimizer):
         beta1, beta2 = group['betas']
         state['step'] += 1
 
-        # Check gradient for NaN/Inf
-        if torch.isnan(grad).any() or torch.isinf(grad).any():
-            logger.error(f"Standard AdamW: NaN/Inf in gradient! Skipping update.")
-            return
-
         # Update biased first and second moment estimates
         state['exp_avg'].mul_(beta1).add_(grad, alpha=1 - beta1)
         state['exp_avg_sq'].mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-
-        # Check states for NaN/Inf
-        if torch.isnan(state['exp_avg_sq']).any() or torch.isinf(state['exp_avg_sq']).any():
-            logger.error(f"Standard AdamW: NaN/Inf in exp_avg_sq after update! grad_norm={grad.norm():.2e}")
-            logger.error(f"  exp_avg_sq: min={state['exp_avg_sq'].min():.2e}, max={state['exp_avg_sq'].max():.2e}")
-            logger.error(f"  Resetting exp_avg_sq to avoid corruption")
-            state['exp_avg_sq'].zero_()
-            state['exp_avg_sq'].add_(grad.square())
-            return
 
         # Bias correction
         bias_correction1 = 1 - beta1 ** state['step']
@@ -775,8 +1054,8 @@ class MeSOSGD(Optimizer):
         else:
             compressed_update_batch = compressed_update
 
-        # Apply decompression using compressor API
-        full_update = compressor.transpose(compressed_update_batch, scale="backward")  # [1, p_l]
+        # Apply decompression
+        full_update = compressor.transpose(compressed_update_batch)  # [1, p_l]
 
         # Dimension check: full_update should match parameter size
         param_numel = param.numel()

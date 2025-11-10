@@ -42,20 +42,27 @@ sbatch train.sh [options]
 #### Examples
 
 ```bash
-# Baseline (without MeSO and data selection), full fine-tuning
+# Baseline
+# Full fine-tuning (without MeSO and data selection)
 sbatch train.sh --task mmlu --subject sociology --model llama3-1b
 
-# Full fine-tuning with MeSO without data selection
-sbatch train.sh --task mmlu --subject sociology --model llama3-1b --MeSO --compression <GraSS/LoGra>
+# LoRA fine-tuning (without MeSO and data selection)
+sbatch train.sh --task mmlu --subject sociology --model llama3-1b --lora
 
-# Full fine-tuning with regular optimizer (AdamW) with GREATS data selection
+# Data Selection
+# Full fine-tuning with GREATS data selection
 sbatch train.sh --task mmlu --subject sociology --model llama3-1b --data_selection GREATS --compression <GraSS/LoGra>
 
-# Full fine-tuning with both GREATS data selection and MeSO
-sbatch train.sh --task mmlu --subject sociology --model llama3-1b --MeSO --data_selection GREATS --compression <GraSS/LoGra>
+# LoRA fine-tuning with GREATS data selection
+sbatch train.sh --task mmlu --subject sociology --model llama3-1b --lora --data_selection GREATS --compression <GraSS/LoGra>
 
-# LoRA with MeSO
-sbatch train.sh --task mmlu --subject sociology --model llama3-1b --lora --MeSO --compression GraSS
+# MeSO Fine-Tuning
+# MeSO fine-tuning without data selection
+sbatch train.sh --task mmlu --subject sociology --model llama3-1b --MeSO --compression <GraSS/LoGra>
+
+# Both MeSO and Data Selection
+# MeSO fine-tuning with GREATS data selection
+sbatch train.sh --task mmlu --subject sociology --model llama3-1b --MeSO --data_selection GREATS --compression <GraSS/LoGra>
 ```
 
 #### Parameters

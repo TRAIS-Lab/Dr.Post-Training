@@ -12,13 +12,12 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from typing import Dict, List, Union, Optional
 
 import torch
 from torch import Tensor
 
-from .utils import vectorize, get_parameter_chunk_sizes
+from .utils import vectorize, get_parameter_chunk_sizes, _rademacher, _mask
 
 class ProjectionType(str, Enum):
     """Projection type used for projectors."""
@@ -27,52 +26,6 @@ class ProjectionType(str, Enum):
     rademacher: str = "rademacher"
     sjlt: str = "sjlt"
     random_mask: str = "random_mask"
-
-
-def _rademacher(
-    matrix: Tensor,
-    generator: torch.Generator,
-    dtype: torch.dtype,
-) -> Tensor:
-    """Generate Rademacher random matrix in-place.
-
-    Args:
-        matrix (Tensor): The matrix to fill with Rademacher values.
-        generator (torch.Generator): Random number generator.
-        dtype (torch.dtype): Target dtype for the matrix.
-
-    Returns:
-        Tensor: The filled matrix.
-    """
-    matrix.bernoulli_(p=0.5, generator=generator)
-    matrix *= 2.0
-    matrix -= 1.0
-    return matrix.to(dtype=dtype)
-
-
-def _mask(
-    input_dim: int,
-    output_dim: int,
-    generator: torch.Generator,
-    device: torch.device,
-) -> Tensor:
-    """Generate sorted random mask indices.
-
-    Args:
-        input_dim (int): Input dimension.
-        output_dim (int): Output dimension (number of indices to select).
-        generator (torch.Generator): Random number generator.
-        device (torch.device): Device for the indices.
-
-    Returns:
-        Tensor: Sorted indices tensor.
-    """
-    indices = torch.randperm(
-        input_dim,
-        generator=generator,
-        device=device,
-    )[:output_dim]
-    return indices.sort()[0]
 
 
 def _preprocess(
@@ -311,16 +264,13 @@ class BasicProjector(AbstractProjector):
             msg = f"Projection type {self.proj_type} not recognized."
             raise KeyError(msg)
 
-    def project(self, features: Union[dict, Tensor], ensemble_id: int, scale: str = "forward") -> Tensor:
+    def project(self, features: Union[dict, Tensor], ensemble_id: int) -> Tensor:
         """Performs the random projection on the feature matrix.
 
         Args:
             features (Union[dict, Tensor]): A batch of features or a dictionary
                 of batch of features.
             ensemble_id (int): A unique ID for this ensemble.
-            scale (str): Scaling mode for norm preservation
-                - "forward": Scale by 1/√k for d→k projection (default)
-                - "backward": Scale by 1/√d for k→d projection
 
         Returns:
             Tensor: The projected features.
@@ -359,25 +309,16 @@ class BasicProjector(AbstractProjector):
                     features.type(self.dtype) @ self.proj_matrix[:, : (ed - st)]
                 )
 
-        # Apply scaling for norm preservation
-        if scale == "forward":
-            # Scale by 1/√k for d→k projection (norm preservation)
-            sketch = sketch / (self.proj_dim ** 0.5)
-        elif scale == "backward":
-            # Scale by 1/√d for k→d projection (used in transpose scenarios)
-            sketch = sketch / (self.feature_dim ** 0.5)
+        sketch = sketch / (self.proj_dim ** 0.5)
 
         return sketch.type(features.dtype)
 
-    def transpose(self, projected_features: Tensor, ensemble_id: int = 0, scale: str = "forward") -> Tensor:
+    def transpose(self, projected_features: Tensor, ensemble_id: int = 0) -> Tensor:
         """Apply transpose of projection to recover original feature space.
 
         Args:
             projected_features (Tensor): Features in projected space [batch, proj_dim]
             ensemble_id (int): A unique ID for this ensemble
-            scale (str): Scaling mode for norm preservation
-                - "forward": Scale by 1/√k for d→k projection (default)
-                - "backward": Scale by 1/√d for k→d projection
 
         Returns:
             Tensor: Features in original space [batch, feature_dim]
@@ -421,13 +362,7 @@ class BasicProjector(AbstractProjector):
                 ed = min((ind + 1) * self.block_size, self.proj_dim)
                 original += projected_features[:, st:ed] @ self.proj_matrix[:, : (ed - st)].T
 
-        # Apply scaling for norm preservation
-        if scale == "forward":
-            # Scale by 1/√k for d→k projection (norm preservation)
-            original = original / (self.proj_dim ** 0.5)
-        elif scale == "backward":
-            # Scale by 1/√d for k→d projection (used in transpose scenarios)
-            original = original / (self.feature_dim ** 0.5)
+        original = original / (self.proj_dim ** 0.5)
 
         return original.type(projected_features.dtype)
 
@@ -494,23 +429,21 @@ class CudaProjector(AbstractProjector):
         self.current_ensemble_id = -1  # Init to -1 to force generation on first call
 
         # Initialize placeholders for projection components
-        self.sjlt = None
-        self.proj_matrix = None
-        self.active_indices = None
-
-        # Check for sjlt import early if needed
         if self.proj_type == ProjectionType.sjlt:
+            # Check for sjlt import early if needed
             try:
                 from sjlt import SJLTProjection  # noqa: F401
             except ImportError:
                 msg = "sjlt not found. Please run `pip install sjlt` to install."
                 raise ModuleNotFoundError(msg) from None
+            self.sjlt = None
+        elif self.proj_type in [ProjectionType.rademacher, ProjectionType.normal]:
+            self.proj_matrix = None
+        elif self.proj_type == ProjectionType.random_mask:
+            self.active_indices = None
 
-    def _gen_randomness_sjlt(
-        self,
-        input_dim: Optional[int] = None,
-        output_dim: Optional[int] = None,
-    ) -> None:
+
+    def _gen_randomness_sjlt(self, input_dim: Optional[int] = None, output_dim: Optional[int] = None) -> None:
         """Generates randomness for 'sjlt' projection.
 
         Args:
@@ -561,11 +494,7 @@ class CudaProjector(AbstractProjector):
         self.sjlt.rand_indices.copy_(rand_indices)
         self.sjlt.rand_signs.copy_(rand_signs.to(torch.int8))
 
-    def _gen_randomness_mask(
-        self,
-        input_dim: Optional[int] = None,
-        output_dim: Optional[int] = None,
-    ) -> None:
+    def _gen_randomness_mask(self, input_dim: Optional[int] = None, output_dim: Optional[int] = None) -> None:
         """Generate random mask indices for random_mask projection.
 
         Args:
@@ -637,16 +566,13 @@ class CudaProjector(AbstractProjector):
             msg = f"Unknown projection type: {self.proj_type}"
             raise ValueError(msg)
 
-    def project(self, features: Union[dict, Tensor], ensemble_id: int, scale: str = "forward") -> Tensor:
+    def project(self, features: Union[dict, Tensor], ensemble_id: int) -> Tensor:
         """Performs the random projection on the feature matrix.
 
         Args:
             features (Union[dict, Tensor]): A batch of features or a dictionary
                 of batch of features.
             ensemble_id (int): A unique ID for this ensemble.
-            scale (str): Scaling mode for norm preservation
-                - "forward": Scale by 1/√k for d→k projection (default)
-                - "backward": Scale by 1/√d for k→d projection
 
         Returns:
             Tensor: The projected features.
@@ -660,13 +586,7 @@ class CudaProjector(AbstractProjector):
 
         if self.proj_type in [ProjectionType.rademacher, ProjectionType.normal]:
             result = features @ self.proj_matrix
-            # Apply scaling for norm preservation
-            if scale == "forward":
-                # Scale by 1/√k for d→k projection
-                result /= (self.proj_dim ** 0.5)
-            elif scale == "backward":
-                # Scale by 1/√d for k→d projection
-                result /= (self.feature_dim ** 0.5)
+            result /= (self.proj_dim ** 0.5)
 
         elif self.proj_type == ProjectionType.sjlt:
             with torch.no_grad():
@@ -680,16 +600,13 @@ class CudaProjector(AbstractProjector):
 
         return result
 
-    def transpose(self, features: Union[dict, Tensor], ensemble_id: int = 0, scale: str = "forward") -> Tensor:
+    def transpose(self, features: Union[dict, Tensor], ensemble_id: int = 0) -> Tensor:
         """Apply transpose of projection to recover original feature space.
 
         Args:
             features (Union[dict, Tensor]): A batch of features or a dictionary
                 of batch of features.
             ensemble_id (int): A unique ID for this ensemble.
-            scale (str): Scaling mode for norm preservation
-                - "forward": Scale by 1/√k for d→k projection (default)
-                - "backward": Scale by 1/√d for k→d projection
 
         Returns:
             Tensor: The transposed-projected features
@@ -703,13 +620,7 @@ class CudaProjector(AbstractProjector):
 
         if self.proj_type in [ProjectionType.rademacher, ProjectionType.normal]:
             result = features @ self.proj_matrix.T
-            # Apply scaling for norm preservation
-            if scale == "forward":
-                # Scale by 1/√k for d→k projection
-                result /= (self.proj_dim ** 0.5)
-            elif scale == "backward":
-                # Scale by 1/√d for k→d projection
-                result /= (self.feature_dim ** 0.5)
+            result /= (self.proj_dim ** 0.5)
 
         elif self.proj_type == ProjectionType.sjlt:
             # SJLT has its own transpose method
@@ -806,16 +717,13 @@ class ChunkedCudaProjector:
         del self.ch_input
         self.input_allocated = False
 
-    def project(self, features: Union[dict, Tensor], ensemble_id: int, scale: str = "forward") -> Tensor:
+    def project(self, features: Union[dict, Tensor], ensemble_id: int) -> Tensor:
         """Performs the random projection on the feature matrix.
 
         Args:
             features (Union[dict, Tensor]): A batch of features or a dictionary
                 of batch of features.
             ensemble_id (int): A unique ID for this ensemble.
-            scale (str): Scaling mode for norm preservation
-                - "forward": Scale by 1/√k for d→k projection (default)
-                - "backward": Scale by 1/√d for k→d projection
 
         Returns:
             Tensor: The projected features.
@@ -839,7 +747,6 @@ class ChunkedCudaProjector:
                 self.projector_per_chunk[chunk_idx].project(
                     features[:, pointer : pointer + chunk_dim].contiguous(),
                     ensemble_id=ensemble_id,
-                    scale=scale,
                 ),
             )
 
@@ -847,13 +754,12 @@ class ChunkedCudaProjector:
 
         return ch_output
 
-    def transpose(self, projected_features: Tensor, ensemble_id: int = 0, scale: str = "forward") -> Tensor:
+    def transpose(self, projected_features: Tensor, ensemble_id: int = 0) -> Tensor:
         """Apply transpose of projection to recover original feature space.
 
         Args:
             projected_features (Tensor): Features in projected space [batch, proj_dim]
             ensemble_id (int): A unique ID for this ensemble
-            scale (str): Scaling mode for norm preservation
 
         Returns:
             Tensor: Features in original space [batch, feature_dim]
@@ -871,7 +777,6 @@ class ChunkedCudaProjector:
             chunk_result = self.projector_per_chunk[chunk_idx].transpose(
                 projected_features,
                 ensemble_id=ensemble_id,
-                scale=scale,
             )
             original[:, pointer : pointer + chunk_dim] = chunk_result
 

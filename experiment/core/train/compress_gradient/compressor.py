@@ -30,11 +30,11 @@ class ProjectionContainer(ABC):
         self.index = index
 
     @abstractmethod
-    def forward(self, input: Any, scale: str = "forward") -> Any:
+    def forward(self, input: Any) -> Any:
         pass
 
     @abstractmethod
-    def transpose(self, input: Any, scale: str = "forward") -> Any:
+    def transpose(self, input: Any) -> Any:
         pass
 
     @abstractmethod
@@ -62,7 +62,7 @@ class Sparsifier(ProjectionContainer):
         self.base_seed = None
         self.current_step = 0
 
-    def forward(self, input: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], scale: str = "forward") -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    def forward(self, input: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """
         Apply sparsification forward pass with automatic mode detection.
 
@@ -80,9 +80,6 @@ class Sparsifier(ProjectionContainer):
 
         Args:
             input: Either (Mode 1) a tuple (v_1, v_2) or (Mode 2) a tensor v
-            scale: Scaling mode for norm preservation
-                - "forward": Scale to preserve forward projection norm
-                - "backward": Scale to preserve backward projection norm
 
         Returns:
             Either a tuple (v_1_sparse, v_2_sparse) or a tensor v_sparse
@@ -90,18 +87,17 @@ class Sparsifier(ProjectionContainer):
         # Mode detection based on input type
         if isinstance(input, tuple):
             # MODE 1: component-wise
-            return self._forward_components(input, scale=scale)
+            return self._forward_components(input)
         else:
             # MODE 2: via vec-trick
-            return self._forward_full(input, scale=scale)
+            return self._forward_full(input)
 
-    def _forward_components(self, input_components: Tuple[torch.Tensor, torch.Tensor], scale: str = "forward") -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_components(self, input_components: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Apply sparsifiers to input components (Mode 1).
 
         Args:
             input_components: (component_1, component_2) - tuple of input components
-            scale: Scaling mode passed to projectors
 
         Returns:
             (component_1_sparse, component_2_sparse) - sparsified components
@@ -109,13 +105,13 @@ class Sparsifier(ProjectionContainer):
         component_1, component_2 = input_components
         sparsifier_1, sparsifier_2 = self.sparsifier_comp
 
-        # Apply sparsifiers component-wise, passing through scale parameter
-        component_1_sparse = sparsifier_1.project(component_1, ensemble_id=0, scale=scale)
-        component_2_sparse = sparsifier_2.project(component_2, ensemble_id=0, scale=scale)
+        # Apply sparsifiers component-wise
+        component_1_sparse = sparsifier_1.project(component_1, ensemble_id=0)
+        component_2_sparse = sparsifier_2.project(component_2, ensemble_id=0)
 
         return component_1_sparse, component_2_sparse
 
-    def _forward_full(self, input: torch.Tensor, scale: str = "forward") -> torch.Tensor:
+    def _forward_full(self, input: torch.Tensor) -> torch.Tensor:
         """
         Apply sparsification to the full input using vec-trick (Mode 2).
 
@@ -129,7 +125,6 @@ class Sparsifier(ProjectionContainer):
 
         Args:
             input: Full input vector [batch, d_1 * d_2]
-            scale: Scaling mode passed to projectors
 
         Returns:
             Sparsified vector [batch, k_1' * k_2']
@@ -145,16 +140,14 @@ class Sparsifier(ProjectionContainer):
         k_1_prime, k_2_prime = self.intermediate_dims
 
         sparsifier_1, sparsifier_2 = self.sparsifier_comp
-        d_1 = sparsifier_1.feature_dim
-        d_2 = sparsifier_2.feature_dim
+        d_1, d_2 = sparsifier_1.feature_dim, sparsifier_2.feature_dim
 
         # Reshape from flattened to batched 2D matrix: [batch, d_1 * d_2] -> [batch, d_1, d_2]
         input_matrix = input.reshape(batch_size, d_1, d_2)
 
         # OPTIMIZED PATH: random_mask sparsification uses gather
         if sparsifier_1.proj_type == ProjectionType.random_mask and sparsifier_2.proj_type == ProjectionType.random_mask:
-            indices_1 = sparsifier_1.active_indices
-            indices_2 = sparsifier_2.active_indices
+            indices_1, indices_2 = sparsifier_1.active_indices, sparsifier_2.active_indices
 
             # Batched advanced indexing for 2D gather
             # Select [b, indices_1, indices_2] for all b in B
@@ -167,7 +160,7 @@ class Sparsifier(ProjectionContainer):
 
         # 1. Apply second sparsifier forward (P2)
         #    Input: [batch, d_1, d_2] -> [batch * d_1, d_2]
-        temp = sparsifier_2.project(input_matrix.reshape(batch_size * d_1, d_2), ensemble_id=0, scale=scale)
+        temp = sparsifier_2.project(input_matrix.reshape(batch_size * d_1, d_2), ensemble_id=0)
         #    Output: [batch * d_1, k_2'] -> [batch, d_1, k_2']
         temp = temp.reshape(batch_size, d_1, k_2_prime)
 
@@ -176,7 +169,7 @@ class Sparsifier(ProjectionContainer):
 
         # 3. Apply first sparsifier forward (P1)
         #    Input: [batch, k_2', d_1] -> [batch * k_2', d_1]
-        intermediate_T = sparsifier_1.project(temp_T.reshape(batch_size * k_2_prime, d_1), ensemble_id=0, scale=scale)
+        intermediate_T = sparsifier_1.project(temp_T.reshape(batch_size * k_2_prime, d_1), ensemble_id=0)
         #    Output: [batch * k_2', k_1'] -> [batch, k_2', k_1']
         intermediate_T = intermediate_T.reshape(batch_size, k_2_prime, k_1_prime)
 
@@ -186,7 +179,7 @@ class Sparsifier(ProjectionContainer):
         # 5. Flatten batch items: [batch, k_1', k_2'] -> [batch, k_1' * k_2']
         return intermediate.reshape(batch_size, -1)
 
-    def transpose(self, input: torch.Tensor, scale: str = "forward") -> torch.Tensor:
+    def transpose(self, input: torch.Tensor) -> torch.Tensor:
         """
         This implements the transpose of the sparsification operation, mapping from
         the intermediate space back to the full space.
@@ -195,7 +188,6 @@ class Sparsifier(ProjectionContainer):
 
         Args:
             input: tensor [batch, k_1' * k_2']
-            scale: Scaling mode passed to projectors
 
         Returns:
             Full tensor after sparsification transpose [batch, d_1 * d_2]
@@ -209,8 +201,7 @@ class Sparsifier(ProjectionContainer):
         if input.dim() == 1:
             input = input.unsqueeze(0)  # Handle single vector case [k'] -> [1, k']
 
-        batch_size = input.shape[0] # Get batch size
-        actual_size = input.shape[1]
+        batch_size, actual_size = input.shape
 
         if actual_size != expected_size:
             raise ValueError(
@@ -219,19 +210,16 @@ class Sparsifier(ProjectionContainer):
                 f"intermediate_dims=({k_1_prime}, {k_2_prime})"
             )
 
-        sparsifier_1 = self.sparsifier_comp[0]
-        sparsifier_2 = self.sparsifier_comp[1]
+        sparsifier_1, sparsifier_2 = self.sparsifier_comp
 
-        d_1 = sparsifier_1.feature_dim
-        d_2 = sparsifier_2.feature_dim
+        d_1, d_2 = sparsifier_1.feature_dim, sparsifier_2.feature_dim
 
         # Reshape to batched 2D matrix: [batch, k_1' * k_2'] -> [batch, k_1', k_2']
         intermediate = input.reshape(batch_size, k_1_prime, k_2_prime)
 
         # OPTIMIZED PATH: random_mask sparsification uses scatter
         if sparsifier_1.proj_type == ProjectionType.random_mask and sparsifier_2.proj_type == ProjectionType.random_mask:
-            indices_1 = sparsifier_1.active_indices
-            indices_2 = sparsifier_2.active_indices
+            indices_1, indices_2 = sparsifier_1.active_indices, sparsifier_2.active_indices
 
             full_matrix = torch.zeros(batch_size, d_1, d_2, device=input.device, dtype=input.dtype)
 
@@ -248,7 +236,7 @@ class Sparsifier(ProjectionContainer):
 
         # 2. Apply sparsifier_1 transpose
         #    Input: [batch * k_2', k_1']
-        temp_T = sparsifier_1.transpose(intermediate_T.reshape(batch_size * k_2_prime, k_1_prime), ensemble_id=0, scale=scale)
+        temp_T = sparsifier_1.transpose(intermediate_T.reshape(batch_size * k_2_prime, k_1_prime), ensemble_id=0)
         #    Output: [batch * k_2', d_1] -> [batch, k_2', d_1]
         temp_T = temp_T.reshape(batch_size, k_2_prime, d_1)
 
@@ -257,7 +245,7 @@ class Sparsifier(ProjectionContainer):
 
         # 4. Apply sparsifier_2 transpose
         #    Input: [batch * d_1, k_2']
-        full_matrix = sparsifier_2.transpose(temp.reshape(batch_size * d_1, k_2_prime), ensemble_id=0, scale=scale)
+        full_matrix = sparsifier_2.transpose(temp.reshape(batch_size * d_1, k_2_prime), ensemble_id=0)
         #    Output: [batch * d_1, d_2] -> [batch, d_1, d_2]
         full_matrix = full_matrix.reshape(batch_size, d_1, d_2)
 
@@ -324,31 +312,29 @@ class Projector(ProjectionContainer):
         self.base_seed = None
         self.current_step = 0
 
-    def forward(self, input: Tensor, scale: str = "forward") -> Tensor:
+    def forward(self, input: Tensor) -> Tensor:
         """
         This applies the final projection to the intermediate tensor (after sparsification).
 
         Args:
             input: batch vector [batch, k'] after sparsification
-            scale: Scaling mode passed to projector
 
         Returns:
             Compressed batch vector [batch, k] after projection
         """
-        return self.projector.project(input, ensemble_id=0, scale=scale)
+        return self.projector.project(input, ensemble_id=0)
 
-    def transpose(self, input: Tensor, scale: str = "forward") -> Tensor:
+    def transpose(self, input: Tensor) -> Tensor:
         """
         This applies the transpose of the projection to map back to the intermediate space.
 
         Args:
             input: Compressed batch vector [batch, k]
-            scale: Scaling mode passed to projector
 
         Returns:
             Intermediate tensor after projection transpose [batch, k']
         """
-        return self.projector.transpose(input, ensemble_id=0, scale=scale)
+        return self.projector.transpose(input, ensemble_id=0)
 
     def refresh(self, step: int) -> Projector:
         """
@@ -404,7 +390,7 @@ class Compressor(ProjectionContainer):
         self.base_seed = None
         self.current_step = 0
 
-    def forward(self, input: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], scale: str = "forward") -> torch.Tensor:
+    def forward(self, input: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]) -> torch.Tensor:
         """
         Apply full compression pipeline: input → sparsifier → Kronecker product → projector → output
 
@@ -423,7 +409,6 @@ class Compressor(ProjectionContainer):
 
         Args:
             input: Either a tuple of batch components or batch full vectors
-            scale: Scaling mode. Forward preserves forward projection's norm, backward preserves backward projection's norm
 
         Returns:
             Compressed output tensor
@@ -450,7 +435,7 @@ class Compressor(ProjectionContainer):
 
             # Stage 1: Apply sparsification to each component
             component1_sparse, component2_sparse = self.sparsifier.forward(
-                (component1_2d, component2_2d), scale=scale
+                (component1_2d, component2_2d)
             )
 
             # Stage 1.5: Compute Kronecker product (outer product)
@@ -477,18 +462,18 @@ class Compressor(ProjectionContainer):
             intermediate = outer_product.reshape(batch_size, -1)
 
             # Stage 2: Apply projection
-            output = self.projector.forward(intermediate, scale=scale)
+            output = self.projector.forward(intermediate)
 
         else:
             # MODE 2: Full tensor compression (via vec-trick)
             # Stage 1: Apply sparsifier
-            intermediate = self.sparsifier.forward(input, scale=scale)
+            intermediate = self.sparsifier.forward(input)
 
             # Stage 2: Apply projector
-            output = self.projector.forward(intermediate, scale=scale)
+            output = self.projector.forward(intermediate)
         return output
 
-    def transpose(self, input: torch.Tensor, scale: str = "forward") -> torch.Tensor:
+    def transpose(self, input: torch.Tensor) -> torch.Tensor:
         """
         Apply full decompression pipeline: input → projector^T → sparsifier^T → output
 
@@ -496,16 +481,15 @@ class Compressor(ProjectionContainer):
 
         Args:
             input: Compressed vector [1, k]
-            scale: Scaling mode passed to projectors
 
         Returns:
             Full (decompressed) tensor [1, d]
         """
         # Stage 1 (reverse): Apply projector transpose
-        intermediate = self.projector.transpose(input, scale=scale)
+        intermediate = self.projector.transpose(input)
 
         # Stage 2 (reverse): Apply sparsifier transpose
-        output = self.sparsifier.transpose(intermediate, scale=scale)
+        output = self.sparsifier.transpose(intermediate)
 
         return output
 

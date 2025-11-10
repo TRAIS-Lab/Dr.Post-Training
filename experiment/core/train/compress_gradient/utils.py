@@ -1,11 +1,161 @@
 import torch
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable
 from torch import Tensor
 
 # Configure logger
 logger = logging.getLogger(__name__)
 
+def _rademacher(
+    matrix: Tensor,
+    generator: torch.Generator,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Generate Rademacher random matrix in-place.
+
+    Args:
+        matrix (Tensor): The matrix to fill with Rademacher values.
+        generator (torch.Generator): Random number generator.
+        dtype (torch.dtype): Target dtype for the matrix.
+
+    Returns:
+        Tensor: The filled matrix.
+    """
+    matrix.bernoulli_(p=0.5, generator=generator)
+    matrix *= 2.0
+    matrix -= 1.0
+    return matrix.to(dtype=dtype)
+
+
+def _mask(
+    input_dim: int,
+    output_dim: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> Tensor:
+    """Generate sorted random mask indices.
+
+    Args:
+        input_dim (int): Input dimension.
+        output_dim (int): Output dimension (number of indices to select).
+        generator (torch.Generator): Random number generator.
+        device (torch.device): Device for the indices.
+
+    Returns:
+        Tensor: Sorted indices tensor.
+    """
+    indices = torch.randperm(
+        input_dim,
+        generator=generator,
+        device=device,
+    )[:output_dim]
+    return indices.sort()[0]
+
+def apply_hadamard_matvec(
+    M_proj_forward: Callable,
+    source_vector: Tensor,
+    result_size: int,
+    chunk_size: int,
+    source_size: int,
+    device: torch.device,
+    dtype: torch.dtype
+) -> Tensor:
+    """
+    Compute (M ⊙ M) @ source_vector efficiently using chunked basis vectors.
+
+    This is a helper for computing v_new = (M ⊙ M) @ v where M is a projection matrix.
+    Instead of materializing M, we compute it chunk by chunk using basis vectors.
+
+    Args:
+        M_proj_forward: Function that maps basis vectors to get chunks of M^T
+                       (e.g., projector.forward or composition of transpose+forward)
+        source_vector: Vector to multiply [source_size]
+        result_size: Size of output vector
+        chunk_size: Number of basis vectors per chunk
+        source_size: Size of source vector (dimension to chunk over)
+        device: Device for computation
+        dtype: Data type for computation
+
+    Returns:
+        Result vector [result_size]
+    """
+    v_new = torch.zeros(result_size, device=device, dtype=dtype)
+    num_chunks = (source_size + chunk_size - 1) // chunk_size
+
+    for chunk_idx in range(num_chunks):
+        chunk_start = chunk_idx * chunk_size
+        chunk_end = min(chunk_start + chunk_size, source_size)
+        chunk_size_actual = chunk_end - chunk_start
+
+        # Create identity chunk representing basis vectors
+        I_chunk = torch.zeros(chunk_size_actual, source_size, device=device, dtype=dtype)
+        for i in range(chunk_size_actual):
+            I_chunk[i, chunk_start + i] = 1.0
+
+        # Map through projector to get M_chunk^T
+        M_chunk_T = M_proj_forward(I_chunk)  # [chunk_size, result_size]
+
+        # Transpose and compute Hadamard square
+        M_chunk = M_chunk_T.T  # [result_size, chunk_size]
+        M_sq_chunk = M_chunk.square()  # [result_size, chunk_size]
+
+        # Accumulate: v_new += (M_chunk ⊙ M_chunk) @ source_vector[chunk]
+        source_chunk = source_vector[chunk_start:chunk_end]  # [chunk_size]
+        v_new.add_(torch.mv(M_sq_chunk, source_chunk))
+
+    return v_new
+
+def stochastic_diagonal_estimation(
+    compute_Mz_func: Callable[[Tensor], Tensor],
+    result_size: int,
+    num_samples: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int = 42
+) -> Tensor:
+    """
+    Estimate diagonal of matrix A using stochastic estimation.
+
+    For a matrix A, computes diag(A) ≈ (1/N) Σ z_i ⊙ (A z_i) where z_i are Rademacher vectors.
+
+    Args:
+        compute_Mz_func: Function that computes A @ z given z [1, k] -> [1, k]
+        result_size: Size of the diagonal vector to estimate
+        num_samples: Number of Rademacher samples to use
+        device: Device for computation
+        dtype: Data type for computation
+        seed: Random seed for reproducibility
+
+    Returns:
+        Estimated diagonal vector [result_size]
+    """
+    # Initialize accumulator
+    v_accum = torch.zeros(result_size, device=device, dtype=dtype)
+
+    # Set random seed for reproducibility
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+
+    # Stochastic sampling loop
+    for sample_idx in range(num_samples):
+        # 1. Sample z ~ Rademacher({-1, 1}) [1, k]
+        z = torch.randint(0, 2, (1, result_size),
+                        generator=generator,
+                        device=device, dtype=dtype) * 2 - 1
+
+        # 2. Compute y_i = A @ z_i
+        y_i = compute_Mz_func(z)  # [1, k]
+
+        # 3. Compute h_i = z_i ⊙ y_i (element-wise product)
+        h_i = z * y_i  # [1, k]
+
+        # 4. Accumulate
+        v_accum.add_(h_i.squeeze(0))
+
+    # Average over samples
+    v_result = v_accum / num_samples
+
+    return v_result
 
 def vectorize(
     g: Dict[str, Tensor],
