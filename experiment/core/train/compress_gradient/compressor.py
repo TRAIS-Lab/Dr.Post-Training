@@ -275,21 +275,74 @@ class Sparsifier(ProjectionContainer):
             logger.warning(f"No sparsifiers for layer {self.name}, skipping refresh")
             return None
 
-        # Create temporary container with old sparsifier state (shallow copy for minimal memory)
+        # Create new projector objects with OLD state
         old_container = Sparsifier(self.name, self.index, self.update_freq)
-        old_container.sparsifier_comp = self.sparsifier_comp  # Share reference temporarily
         old_container.intermediate_dims = self.intermediate_dims
 
-        # Calculate refresh seed
+        # Calculate OLD seed (current state before refresh)
+        if self.current_step == self.update_freq:
+            # First refresh: old state is initial state
+            old_base_seed = self.base_seed
+        else:
+            old_refresh_epoch = (self.current_step // self.update_freq) - 1
+            old_base_seed = self.base_seed + int(1e6) * old_refresh_epoch
+
+        # Create new projector objects with OLD seeds to preserve old state
+        from .projection import random_project
+
+        sparsifier_1_old = self.sparsifier_comp[0]
+        if sparsifier_1_old is not None:
+            # Create new projector with old seed
+            sample_tensor = torch.zeros(1, sparsifier_1_old.feature_dim,
+                                       device=sparsifier_1_old.device,
+                                       dtype=sparsifier_1_old.dtype)
+            old_proj_1 = random_project(
+                sample_tensor,
+                feature_batch_size=1,
+                proj_dim=sparsifier_1_old.proj_dim,
+                proj_max_batch_size=100,
+                proj_seed=old_base_seed,
+                proj_type=sparsifier_1_old.proj_type.value,  # Extract enum value
+                device=sparsifier_1_old.device
+            )
+            # Initialize the projector by calling project() to set up active_indices etc.
+            _ = old_proj_1.project(sample_tensor, ensemble_id=0)
+        else:
+            old_proj_1 = None
+
+        sparsifier_2_old = self.sparsifier_comp[1]
+        if sparsifier_2_old is not None:
+            # Create new projector with old seed
+            sample_tensor = torch.zeros(1, sparsifier_2_old.feature_dim,
+                                       device=sparsifier_2_old.device,
+                                       dtype=sparsifier_2_old.dtype)
+            old_proj_2 = random_project(
+                sample_tensor,
+                feature_batch_size=1,
+                proj_dim=sparsifier_2_old.proj_dim,
+                proj_max_batch_size=100,
+                proj_seed=old_base_seed + 1,
+                proj_type=sparsifier_2_old.proj_type.value,  # Extract enum value
+                device=sparsifier_2_old.device
+            )
+            # Initialize the projector by calling project() to set up active_indices etc.
+            _ = old_proj_2.project(sample_tensor, ensemble_id=0)
+        else:
+            old_proj_2 = None
+
+        old_container.sparsifier_comp = (old_proj_1, old_proj_2)
+        old_container.base_seed = self.base_seed
+
+        # Calculate NEW refresh seed
         refresh_epoch = self.current_step // self.update_freq
         base_refresh_seed = self.base_seed + int(1e6) * refresh_epoch
 
-        # Refresh first sparsifier
+        # Refresh first sparsifier with new seed
         if self.sparsifier_comp[0] is not None:
             sparsifier_1 = self.sparsifier_comp[0]
             sparsifier_1.refresh(base_refresh_seed)
 
-        # Refresh second sparsifier (use different seed)
+        # Refresh second sparsifier with new seed
         if self.sparsifier_comp[1] is not None:
             sparsifier_2 = self.sparsifier_comp[1]
             sparsifier_2.refresh(base_refresh_seed + 1)
@@ -358,12 +411,39 @@ class Projector(ProjectionContainer):
             logger.warning(f"No projector for layer {self.name}, skipping refresh")
             return None
 
-        # Create temporary container with old projector (shallow copy for minimal memory)
-        # This will be used for state transformation and then discarded
+        # Create new projector object with OLD state
         old_container = Projector(self.name, self.index, self.update_freq)
-        old_container.projector = self.projector  # Share reference temporarily
 
-        # Calculate refresh seed
+        # Calculate OLD seed (current state before refresh)
+        if self.current_step == self.update_freq:
+            # First refresh: old state is initial state
+            old_refresh_seed = self.base_seed
+        else:
+            old_refresh_epoch = (self.current_step // self.update_freq) - 1
+            old_refresh_seed = self.base_seed + int(1e6) * old_refresh_epoch
+
+        # Create new projector object with OLD seed to preserve old state
+        from .projection import random_project
+
+        projector_old = self.projector
+        sample_tensor = torch.zeros(1, projector_old.feature_dim,
+                                   device=projector_old.device,
+                                   dtype=projector_old.dtype)
+        old_proj = random_project(
+            sample_tensor,
+            feature_batch_size=1,
+            proj_dim=projector_old.proj_dim,
+            proj_max_batch_size=100,
+            proj_seed=old_refresh_seed,
+            proj_type=projector_old.proj_type.value,  # Extract enum value
+            device=projector_old.device
+        )
+        # Initialize the projector by calling project() to set up SJLT/active_indices etc.
+        _ = old_proj.project(sample_tensor, ensemble_id=0)
+
+        old_container.projector = old_proj
+
+        # Calculate NEW refresh seed
         refresh_epoch = self.current_step // self.update_freq
         refresh_seed = self.base_seed + int(1e6) * refresh_epoch
 

@@ -256,21 +256,30 @@ class MeSOAdamW(Optimizer):
             # Build index mappings for O(1) lookup
             old_to_compressed_1 = {idx.item(): i for i, idx in enumerate(old_idx1)}
             old_to_compressed_2 = {idx.item(): i for i, idx in enumerate(old_idx2)}
+            new_to_compressed_1 = {idx.item(): i for i, idx in enumerate(new_idx1)}
+            new_to_compressed_2 = {idx.item(): i for i, idx in enumerate(new_idx2)}
+
+            # Find common indices and build mapping lists
+            common_idx1 = set(old_to_compressed_1.keys()) & set(new_to_compressed_1.keys())
+            common_idx2 = set(old_to_compressed_2.keys()) & set(new_to_compressed_2.keys())
+            mapping_list_1 = [(new_to_compressed_1[idx], old_to_compressed_1[idx]) for idx in common_idx1]
+            mapping_list_2 = [(new_to_compressed_2[idx], old_to_compressed_2[idx]) for idx in common_idx2]
+
+            # Pre-compute index tensors for vectorized operations
+            new_pos1_tensor = torch.tensor([new_pos1 for new_pos1, _ in mapping_list_1], device=state_old_batch.device)
+            old_pos1_tensor = torch.tensor([old_pos1 for _, old_pos1 in mapping_list_1], device=state_old_batch.device)
+            new_pos2_tensor = torch.tensor([new_pos2 for new_pos2, _ in mapping_list_2], device=state_old_batch.device)
+            old_pos2_tensor = torch.tensor([old_pos2 for _, old_pos2 in mapping_list_2], device=state_old_batch.device)
+
+            # Pre-compute meshgrid indices for 2D indexing
+            new_i, new_j = torch.meshgrid(new_pos1_tensor, new_pos2_tensor, indexing='ij')
+            old_i, old_j = torch.meshgrid(old_pos1_tensor, old_pos2_tensor, indexing='ij')
 
             # Initialize result matrix in new intermediate space
             m_new_matrix = torch.zeros(k1, k2, device=state_old_batch.device, dtype=state_old_batch.dtype)
 
-            # Map values through index intersection
-            for i_new in range(k1):
-                idx1_new = new_idx1[i_new].item()
-                if idx1_new in old_to_compressed_1:
-                    i_old = old_to_compressed_1[idx1_new]
-                    for j_new in range(k2):
-                        idx2_new = new_idx2[j_new].item()
-                        if idx2_new in old_to_compressed_2:
-                            j_old = old_to_compressed_2[idx2_new]
-                            # Copy value: Spars_new @ Spars_old^T has 1 at overlapping indices
-                            m_new_matrix[i_new, j_new] = m_old_matrix[i_old, j_old]
+            # Vectorized mapping through index intersection
+            m_new_matrix[new_i, new_j] = m_old_matrix[old_i, old_j]
 
             # Step 4: Map from new intermediate to new compressed space
             m_new_inter = m_new_matrix.reshape(1, -1)  # [1, k']
@@ -298,27 +307,41 @@ class MeSOAdamW(Optimizer):
         """
         Apply common post-processing to second moment transformation result.
 
-        This includes:
-        1. Clamping negative values to zero (sanity check for numerical errors)
-        2. Rescaling to match original norm (empirical stability improvement)
+        This preserves the effective denominator magnitude (RMS of sqrt(second_moment))
+        to maintain similar learning rate scale after transformation.
 
         Args:
             v_new: Transformed second moment
-            state_old: Original second moment (for norm reference)
+            state_old: Original second moment (for RMS reference)
 
         Returns:
             Post-processed second moment
         """
-        # Sanity check: all values should be non-negative
-        if (v_new < 0).any():
-            v_new.clamp_(min=0)
+        # Sanity check: clamp negative values to zero (from numerical errors in stochastic estimation)
+        v_new.clamp_(min=0)
 
-        # Empirical norm adjustment: rescale to match original norm
-        norm_new = v_new.norm().item()
-        norm_old = state_old.norm().item()
-        if norm_new > 1e-10 and norm_old > 1e-10:
-            scale_factor = norm_old / norm_new
-            v_new.mul_(scale_factor)
+        # Preserve effective denominator magnitude
+        # In AdamW: denom = sqrt(exp_avg_sq) + eps
+        # We want: RMS(sqrt(v_new)) ≈ RMS(sqrt(state_old))
+        # This maintains the typical learning rate scale
+
+        # Compute RMS of sqrt on the ACTUAL transformed values (including zeros)
+        # Don't clamp to floor first - that would artificially inflate the RMS
+        old_rms_sqrt = torch.sqrt(state_old.clamp(min=0)).pow(2).mean().sqrt()
+        new_rms_sqrt = torch.sqrt(v_new.clamp(min=0)).pow(2).mean().sqrt()
+
+        # Scale to preserve RMS if old state is meaningful
+        # We allow new_rms_sqrt to be very small (happens when most transformed values are zeros)
+        if old_rms_sqrt > 1e-10 and new_rms_sqrt > 1e-15:
+            # Scale to preserve RMS(sqrt(second_moment))
+            # We want: sqrt(v_new_scaled) = sqrt(v_new) * scale
+            # So: v_new_scaled = v_new * scale^2
+            scale = old_rms_sqrt / new_rms_sqrt
+            v_new.mul_(scale.pow(2))
+
+        # Apply floor clamp (after preserving the true RMS)
+        # This prevents division by zero in AdamW without affecting the RMS calculation
+        v_new.clamp_(min=1e-10)
 
         return v_new
 
@@ -478,27 +501,33 @@ class MeSOAdamW(Optimizer):
             mapping_list_1 = [(new_to_compressed_1[idx], old_to_compressed_1[idx]) for idx in common_idx1]
             mapping_list_2 = [(new_to_compressed_2[idx], old_to_compressed_2[idx]) for idx in common_idx2]
 
+            # Pre-compute index tensors for vectorized operations
+            new_pos1_tensor = torch.tensor([new_pos1 for new_pos1, _ in mapping_list_1], device=state_old.device)
+            old_pos1_tensor = torch.tensor([old_pos1 for _, old_pos1 in mapping_list_1], device=state_old.device)
+            new_pos2_tensor = torch.tensor([new_pos2 for new_pos2, _ in mapping_list_2], device=state_old.device)
+            old_pos2_tensor = torch.tensor([old_pos2 for _, old_pos2 in mapping_list_2], device=state_old.device)
+
+            # Pre-compute meshgrid indices for 2D indexing
+            new_i, new_j = torch.meshgrid(new_pos1_tensor, new_pos2_tensor, indexing='ij')
+            old_i, old_j = torch.meshgrid(old_pos1_tensor, old_pos2_tensor, indexing='ij')
+
             # Define computation function: compute M V_old M^T z
             def compute_Mz(z: torch.Tensor) -> torch.Tensor:
-                """Compute M V_old M^T z in intermediate space."""
+                """Compute M V_old M^T z in intermediate space (vectorized)."""
                 # Map z to new intermediate space
                 z_inter = new_compressor.projector.transpose(z)  # [1, k']
                 z_inter_matrix = z_inter.squeeze(0).reshape(k1, k2)
 
                 # Apply sparse mapping: Spars_old @ (Spars_new^T @ z_inter)
                 z_mapped_to_old = torch.zeros(k1, k2, device=state_old.device, dtype=state_old.dtype)
-                for new_pos1, old_pos1 in mapping_list_1:
-                    for new_pos2, old_pos2 in mapping_list_2:
-                        z_mapped_to_old[old_pos1, old_pos2] = z_inter_matrix[new_pos1, new_pos2]
+                z_mapped_to_old[old_i, old_j] = z_inter_matrix[new_i, new_j]
 
                 # Element-wise multiply with V_old_matrix
                 B_i_matrix = V_old_matrix * z_mapped_to_old
 
                 # Apply sparse mapping back: Spars_new @ (Spars_old^T @ B_i)
                 B_i_mapped_to_new = torch.zeros(k1, k2, device=state_old.device, dtype=state_old.dtype)
-                for new_pos1, old_pos1 in mapping_list_1:
-                    for new_pos2, old_pos2 in mapping_list_2:
-                        B_i_mapped_to_new[new_pos1, new_pos2] = B_i_matrix[old_pos1, old_pos2]
+                B_i_mapped_to_new[new_i, new_j] = B_i_matrix[old_i, old_j]
 
                 # Project to new compressed space
                 B_i_inter = B_i_mapped_to_new.reshape(1, -1)
@@ -599,11 +628,16 @@ class MeSOAdamW(Optimizer):
         # Add 1 because we want to refresh for the NEXT step
         next_step = current_step + 1
 
+        logger.info(f"Checking compressor refresh: current_step={current_step}, next_step={next_step}")
+
         num_refreshed, old_compressors = self.grad_hook.refresh_compressors(next_step)
 
         if num_refreshed > 0:
+            logger.info(f"Refreshed {num_refreshed} compressors, now transforming optimizer states...")
             # Transform optimizer states after refresh
             self._transform_optimizer_states(old_compressors)
+        else:
+            logger.debug(f"No compressor refresh needed at step {next_step}")
 
         return num_refreshed
 
@@ -627,7 +661,7 @@ class MeSOAdamW(Optimizer):
         for group in self.param_groups:
             for p in group['params']:
                 # Get layer information
-                layer_name, _ = self._get_layer_info(p)
+                layer_name, param_type = self._get_layer_info(p)
 
                 # Only transform compressed layers with existing states
                 if layer_name is None or layer_name not in self.compressed_layer_names:
@@ -646,19 +680,34 @@ class MeSOAdamW(Optimizer):
 
                 if old_compressor is None:
                     num_no_old_compressor += 1
+                    logger.debug(f"Skipping {layer_name}/{param_type}: no old compressor at index {layer_idx}")
                     continue
 
                 try:
                     # Transform first moment
                     state['exp_avg'] = self._transform_first_moment(state['exp_avg'], layer_idx, old_compressor)
+
                     # Transform second moment
                     state['exp_avg_sq'] = self._transform_second_moment(state['exp_avg_sq'], layer_idx, old_compressor)
+
+                    # Check for numerical issues
+                    has_nan_first = torch.isnan(state['exp_avg']).any() or torch.isinf(state['exp_avg']).any()
+                    has_nan_second = torch.isnan(state['exp_avg_sq']).any() or torch.isinf(state['exp_avg_sq']).any()
+                    has_negative_second = (state['exp_avg_sq'] < 0).any()
+
+                    if has_nan_first or has_nan_second or has_negative_second:
+                        logger.warning(f"Numerical issues in {layer_name}/{param_type}: nan_first={has_nan_first}, nan_second={has_nan_second}, negative_second={has_negative_second}")
+
                     num_transformed += 1
 
                 except Exception as e:
-                    logger.error(f"Failed to transform state for layer {layer_name}: {e}")
+                    logger.error(f"Failed to transform state for layer {layer_name}/{param_type}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     # Continue with other layers even if one fails
                     continue
+
+        logger.info(f"State transformation complete: transformed={num_transformed}, no_state={num_no_state}, no_old_compressor={num_no_old_compressor}")
 
         return num_transformed
 
@@ -785,12 +834,38 @@ class MeSOAdamW(Optimizer):
         # Apply decompression
         full_update = compressor.transpose(compressed_update_batch)  # ĝ → ḡ [1, p_l]
 
+        # CRITICAL: Extract the correct portion for this parameter
+        # The decompressed gradient contains both weight and bias (if applicable)
+        # We need to extract just the part for this specific parameter
+        layer_name_for_param, param_type = self._get_layer_info(param)
+
+        # Get the module to check if it has bias
+        module = self.grad_hook.model
+        for attr in layer_name.split('.'):
+            module = getattr(module, attr)
+
+        has_bias = hasattr(module, 'bias') and module.bias is not None
+
+        if has_bias and param_type == 'bias':
+            # Extract bias portion: last out_features elements
+            # For Linear: full_update is [1, in_features * out_features + out_features]
+            # Bias is the last out_features elements
+            param_numel = param.numel()
+            param_update = full_update[:, -param_numel:].reshape(param.shape)
+        elif has_bias and param_type == 'weight':
+            # Extract weight portion: first (total - out_features) elements
+            param_numel = param.numel()
+            param_update = full_update[:, :param_numel].reshape(param.shape)
+        else:
+            # No bias, so full_update is just the weight
+            param_update = full_update.reshape(param.shape)
+
         # Apply weight decay (in parameter space)
         if group['weight_decay'] != 0:
             param.mul_(1 - group['lr'] * group['weight_decay'])
 
         # Apply update
-        param.add_(full_update.view_as(param), alpha=-step_size)
+        param.add_(param_update, alpha=-step_size)
 
     def _step_standard(self, param, group):
         """
