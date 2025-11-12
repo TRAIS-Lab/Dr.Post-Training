@@ -7,19 +7,19 @@
 #
 # Usage:
 #     # List available methods
-#     bash benchmark.sh --list
+#     bash experiment/benchmark/benchmark.sh --list
 #
 #     # Run all methods
-#     bash benchmark.sh
+#     bash experiment/benchmark/benchmark.sh
 #
 #     # Run specific methods (by index)
-#     bash benchmark.sh 0 7 8
+#     bash experiment/benchmark/benchmark.sh 0 7 8
 #
 #     # Run only aggregation on existing results
-#     bash benchmark.sh --aggregate
+#     bash experiment/benchmark/benchmark.sh --aggregate
 #
 #     # Run with custom output directory
-#     OUTPUT_DIR=my_results bash benchmark.sh
+#     OUTPUT_DIR=my_results bash experiment/benchmark/benchmark.sh
 #
 
 cd ~/Project/Efficient-Fine-Tuning

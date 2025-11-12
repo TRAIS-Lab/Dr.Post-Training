@@ -26,17 +26,16 @@ pip install -r requirements.txt
 
 ## Running Experiments
 
-Navigate to the experiment directory:
-```bash
-cd experiment/job
-```
-
 ### Unified Training Script
 
 Single script for all tasks and training modes with named arguments:
 
 ```bash
-sbatch train.sh [options]
+# From project root
+bash experiment/train/train.sh [options]
+
+# Or with SLURM
+sbatch experiment/train/train.sh [options]
 ```
 
 #### Examples
@@ -44,25 +43,25 @@ sbatch train.sh [options]
 ```bash
 # Baseline
 # Full fine-tuning (without MeSO and data selection)
-sbatch train.sh --task mmlu --subject sociology --model llama3-1b
+sbatch experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b
 
 # LoRA fine-tuning (without MeSO and data selection)
-sbatch train.sh --task mmlu --subject sociology --model llama3-1b --lora
+sbatch experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b --lora
 
 # Data Selection
 # Full fine-tuning with GREATS data selection
-sbatch train.sh --task mmlu --subject sociology --model llama3-1b --data_selection GREATS --compression <GraSS/LoGra>
+sbatch experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b --data_selection GREATS --compression <GraSS/LoGra>
 
 # LoRA fine-tuning with GREATS data selection
-sbatch train.sh --task mmlu --subject sociology --model llama3-1b --lora --data_selection GREATS --compression <GraSS/LoGra>
+sbatch experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b --lora --data_selection GREATS --compression <GraSS/LoGra>
 
 # MeSO Fine-Tuning
 # MeSO fine-tuning without data selection
-sbatch train.sh --task mmlu --subject sociology --model llama3-1b --MeSO --compression <GraSS/LoGra>
+sbatch experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b --MeSO --compression <GraSS/LoGra>
 
 # Both MeSO and Data Selection
 # MeSO fine-tuning with GREATS data selection
-sbatch train.sh --task mmlu --subject sociology --model llama3-1b --MeSO --data_selection GREATS --compression <GraSS/LoGra>
+sbatch experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b --MeSO --data_selection GREATS --compression <GraSS/LoGra>
 ```
 
 #### Parameters
