@@ -22,19 +22,19 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           DataCollatorForSeq2Seq, HfArgumentParser, set_seed)
 
-from ..data.get_training_dataset import get_training_dataset
-from ..data.get_validation_dataset import get_dataset
+from experiment.data.get_training_dataset import get_training_dataset
+from experiment.data.get_validation_dataset import get_dataset
 
-from .compress_gradient import (
+from compress_gradient import (
     GradientHook,
     CompGradTrainer,
     setup_model_compressors,
     create_sample_inputs
 )
 
-from .data_arguments import DataArguments, get_data_statistics
-from .model_arguments import ModelArguments, add_padding_to_tokenizer
-from .training_arguments import TrainingArguments
+from experiment.train.data_arguments import DataArguments, get_data_statistics
+from experiment.train.model_arguments import ModelArguments, add_padding_to_tokenizer
+from experiment.train.training_arguments import TrainingArguments
 
 
 logger = logging.getLogger(__name__)

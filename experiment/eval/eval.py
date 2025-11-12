@@ -28,9 +28,6 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from mmlu import compute_accuracy as compute_mmlu_accuracy
 from tydiqa import compute_accuracy as compute_tydiqa_accuracy
 

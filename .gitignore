@@ -42,6 +42,7 @@ dist
 *.pdf
 *.tex
 *.nfs*
+*.txt
 
 */log
 */job

@@ -29,10 +29,15 @@ def compute_grad_dotprod(
     grad_hook: GradientHook,
     batch_train: Dict[str, Tensor],
     batch_val: Dict[str, Tensor],
-    return_similarity: bool = True
+    return_similarity: bool = True,
+    return_compressed_grads: bool = False
 ):
     """
-    Compute gradient dot products using simple backward pass + hooks.
+    Compute gradient dot products using layer-by-layer accumulation.
+
+    This implementation accumulates dot products layer-by-layer instead of
+    concatenating all gradients first, which is more memory efficient and
+    provides better cache locality.
 
     Args:
         model: The model
@@ -40,10 +45,12 @@ def compute_grad_dotprod(
         batch_train: Training batch of size [batch_size]
         batch_val: Validation batch of size [batch_size]
         return_similarity: Whether to return similarity matrix
+        return_compressed_grads: Whether to return per-sample compressed gradients for reuse
 
     Returns:
         - grad_dot_scores: [batch_size] gradient similarity with validation
         - similarity_matrix: [batch_size, batch_size] if return_similarity else None
+        - train_compressed_grads: List of per-sample compressed gradients if return_compressed_grads else None
     """
     # Move validation batch to same device as training
     device = batch_train['input_ids'].device
@@ -57,10 +64,6 @@ def compute_grad_dotprod(
 
     # Get validation gradients from hooks
     val_grads = grad_hook.get_compressed_grads()
-    # Concatenate all layers: each is [batch_size, compressed_grad_dim]
-    val_grads_concat = torch.cat([g for g in val_grads if g is not None], dim=1)  # [batch_size, total_dim]
-    # Average over validation batch
-    val_grad_avg = val_grads_concat.mean(dim=0, keepdim=True)  # [1, total_dim]
 
     # Step 2: Compute training gradients (per-sample)
     model.zero_grad()
@@ -70,22 +73,56 @@ def compute_grad_dotprod(
 
     # Get training gradients from hooks
     train_grads = grad_hook.get_compressed_grads()
-    # Concatenate all layers: each is [batch_size, compressed_grad_dim]
-    train_grads_concat = torch.cat([g for g in train_grads if g is not None], dim=1)  # [batch_size, total_dim]
 
-    # Step 3: Compute GradDot scores
-    # [batch_size, total_dim] x [total_dim, 1] -> [batch_size]
-    grad_dot_scores = torch.matmul(train_grads_concat, val_grad_avg.t()).squeeze(-1)
-    grad_dot_scores = grad_dot_scores.cpu().detach()
+    # Step 3: Compute dot products layer-by-layer
+    # Determine batch size from first non-None gradient
+    batch_size = None
+    for g in train_grads:
+        if g is not None:
+            batch_size = g.shape[0]
+            break
 
-    # Step 4: Compute similarity matrix if requested
+    if batch_size is None:
+        raise ValueError("No valid gradients found in train_grads")
+
+    # Initialize accumulators on device
+    grad_dot_scores = torch.zeros(batch_size, device=device)
     similarity_matrix = None
     if return_similarity:
-        # [batch_size, total_dim] x [total_dim, batch_size] -> [batch_size, batch_size]
-        similarity_matrix = torch.matmul(train_grads_concat, train_grads_concat.t())
-        similarity_matrix = similarity_matrix.cpu().detach()
+        similarity_matrix = torch.zeros(batch_size, batch_size, device=device)
 
-    return grad_dot_scores, similarity_matrix
+    # Accumulate dot products layer by layer
+    for train_g, val_g in zip(train_grads, val_grads):
+        if train_g is None or val_g is None:
+            continue
+
+        # Average validation gradient for this layer: [layer_dim]
+        val_g_avg = val_g.mean(dim=0)
+
+        # Gradient dot product for this layer using fused matrix-vector multiply
+        # torch.addmv(input, mat, vec) computes: input + mat @ vec
+        # [batch_size, layer_dim] @ [layer_dim] -> [batch_size]
+        torch.addmv(grad_dot_scores, train_g, val_g_avg, out=grad_dot_scores)
+
+        # Similarity matrix for this layer if requested using fused matrix-matrix multiply
+        # torch.addmm(input, mat1, mat2) computes: input + mat1 @ mat2
+        # [batch_size, layer_dim] @ [layer_dim, batch_size] -> [batch_size, batch_size]
+        if return_similarity:
+            torch.addmm(similarity_matrix, train_g, train_g.t(), out=similarity_matrix)
+
+    # Detach from computation graph (keep on GPU for efficiency)
+    grad_dot_scores = grad_dot_scores.detach()
+    if similarity_matrix is not None:
+        similarity_matrix = similarity_matrix.detach()
+
+    # Step 4: Return per-sample compressed gradients if requested
+    # These can be reused for optimization to avoid recomputing gradients
+    train_compressed_grads = None
+    if return_compressed_grads:
+        # Deep copy to avoid being overwritten by subsequent operations
+        train_compressed_grads = [g.clone() if g is not None else None for g in train_grads]
+
+    return grad_dot_scores, similarity_matrix, train_compressed_grads
 
 
 class CompGradTrainer(Trainer):
@@ -135,7 +172,9 @@ class CompGradTrainer(Trainer):
         logger.info(f"  Validation set size: {len(val_dataset)}")
         logger.info(f"  Evaluation set size: {len(eval_dataset)}")
         logger.info(f"  Compressed optimizer: {self.args.use_compressed_optimizer}")
-        if self.args.method in ['GREATS', 'GradNorm'] and not self.args.use_compressed_optimizer:
+        if self.args.use_compressed_optimizer and self.args.method in ['GREATS', 'GradNorm']:
+            logger.info(f"  Optimization: Reusing compressed gradients (no second forward/backward)")
+        elif self.args.method in ['GREATS', 'GradNorm'] and not self.args.use_compressed_optimizer:
             logger.info(f"  Note: Hooks will be toggled per step (enabled for selection, disabled for optimization)")
         logger.info("="*60)
 
@@ -261,15 +300,20 @@ class CompGradTrainer(Trainer):
             self.val_dataloader_iter = iter(self.get_val_dataloader(self.val_dataset, batch_size=4, shuffle=True))
             val_batch = next(self.val_dataloader_iter)
 
+        # Check if using compressed optimizer (determines if we can reuse gradients)
+        using_compressed_optimizer = isinstance(unwrapped_optimizer, MeSOAdamW)
+
         # Perform selection based on method
         if args.method == 'GREATS':
             # Compute gradients and scores using simple backward
-            scores, similarity_matrix = compute_grad_dotprod(
+            # If using MeSO, also return compressed gradients to reuse them
+            scores, similarity_matrix, saved_compressed_grads = compute_grad_dotprod(
                 model=model,
                 grad_hook=self.grad_hook,
                 batch_train=inputs,
                 batch_val=val_batch,
-                return_similarity=True
+                return_similarity=True,
+                return_compressed_grads=using_compressed_optimizer
             )
 
             # Select samples
@@ -282,13 +326,13 @@ class CompGradTrainer(Trainer):
 
         elif args.method == "GradNorm":
             # Use diagonal of similarity matrix as gradient norm
-            _, similarity_matrix = compute_grad_dotprod(
+            _, similarity_matrix, saved_compressed_grads = compute_grad_dotprod(
                 model=model,
                 grad_hook=self.grad_hook,
                 batch_train=inputs,
                 batch_val=val_batch,
-                optimizer=self.optimizer,
-                return_similarity=True
+                return_similarity=True,
+                return_compressed_grads=using_compressed_optimizer
             )
 
             scores = torch.diag(similarity_matrix)
@@ -300,6 +344,8 @@ class CompGradTrainer(Trainer):
 
         elif args.method == "MaxLoss":
             # Select highest loss samples
+            # No compressed gradients to save for MaxLoss
+            saved_compressed_grads = None
             with torch.no_grad():
                 losses = []
                 for i in range(len(inputs['input_ids'])):
@@ -314,44 +360,86 @@ class CompGradTrainer(Trainer):
             )
         else:
             selected_ind = None
+            saved_compressed_grads = None
 
         # Store selected indices for compressed optimizer
         self.current_selected_indices = selected_ind
 
-        if selected_ind is not None:
-            inputs = {
-                'input_ids': inputs['input_ids'][selected_ind],
-                'attention_mask': inputs['attention_mask'][selected_ind],
-                'labels': inputs['labels'][selected_ind]
-            }
+        # OPTIMIZATION: Reuse compressed gradients for MeSO optimizer
+        # If we have saved compressed gradients and using MeSO, skip second forward/backward
+        can_reuse_grads = (
+            using_compressed_optimizer and
+            saved_compressed_grads is not None and
+            selected_ind is not None
+        )
 
-        # Disable hooks for standard optimizer (allows full gradient computation)
-        # MeSOAdamW uses compressed gradients, standard optimizers need full gradients
-        using_compressed_optimizer = isinstance(unwrapped_optimizer, MeSOAdamW)
-        if not using_compressed_optimizer and self.grad_hook.hooks_registered:
-            logger.debug("Disabling hooks for standard optimizer (will compute full gradients)")
-            self.grad_hook.disable_hooks()
+        if can_reuse_grads:
+            # === OPTIMIZED PATH: Reuse compressed gradients ===
+            # Inject saved compressed gradients back into hook for selected indices
+            # The optimizer will aggregate these when we call step()
+            logger.debug(f"Reusing compressed gradients from selection pass (optimization active)")
+            self.grad_hook.compressed_grads = saved_compressed_grads
 
-        # Regular training step on selected batch
-        inputs = self._prepare_inputs(inputs)
+            # Compute loss for logging purposes only (no backward needed)
+            if selected_ind is not None:
+                selected_inputs = {
+                    'input_ids': inputs['input_ids'][selected_ind],
+                    'attention_mask': inputs['attention_mask'][selected_ind],
+                    'labels': inputs['labels'][selected_ind]
+                }
+            else:
+                selected_inputs = inputs
 
-        with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs)
+            selected_inputs = self._prepare_inputs(selected_inputs)
 
-        if self.args.n_gpu > 1:
-            loss = loss.mean()
+            with torch.no_grad():
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, selected_inputs)
 
-        if self.args.gradient_accumulation_steps > 1:
-            loss = loss / self.args.gradient_accumulation_steps
+                if self.args.n_gpu > 1:
+                    loss = loss.mean()
 
-        loss.backward()
+                if self.args.gradient_accumulation_steps > 1:
+                    loss = loss / self.args.gradient_accumulation_steps
 
-        # Re-enable hooks for next selection phase
-        if not using_compressed_optimizer and self.grad_hook.hooks_registered:
-            logger.debug("Re-enabling hooks for next iteration")
-            self.grad_hook.enable_hooks()
+            # Note: optimizer.step() will be called later in training loop
+            # It will use the compressed gradients we just injected
 
-        return loss.detach()
+            return loss.detach()
+
+        else:
+            # === STANDARD PATH: Second forward/backward pass ===
+            if selected_ind is not None:
+                inputs = {
+                    'input_ids': inputs['input_ids'][selected_ind],
+                    'attention_mask': inputs['attention_mask'][selected_ind],
+                    'labels': inputs['labels'][selected_ind]
+                }
+
+            # Disable hooks for standard optimizer (allows full gradient computation)
+            # MeSOAdamW uses compressed gradients, standard optimizers need full gradients
+            if not using_compressed_optimizer and self.grad_hook.hooks_registered:
+                self.grad_hook.disable_hooks()
+
+            # Regular training step on selected batch
+            inputs = self._prepare_inputs(inputs)
+
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+
+            if self.args.n_gpu > 1:
+                loss = loss.mean()
+
+            if self.args.gradient_accumulation_steps > 1:
+                loss = loss / self.args.gradient_accumulation_steps
+
+            loss.backward()
+
+            # Re-enable hooks for next selection phase
+            if not using_compressed_optimizer and self.grad_hook.hooks_registered:
+                self.grad_hook.enable_hooks()
+
+            return loss.detach()
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         """
