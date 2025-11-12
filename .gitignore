@@ -45,8 +45,8 @@ dist
 *.txt
 
 */log
-*/job
-*/data/*
+*/data/train
+*/data/eval
 */out
 
 # debug
