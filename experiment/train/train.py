@@ -22,8 +22,8 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           DataCollatorForSeq2Seq, HfArgumentParser, set_seed)
 
-from experiment.data.get_training_dataset import get_training_dataset
-from experiment.data.get_validation_dataset import get_dataset
+from experiment.data.get_train_dataset import get_training_dataset
+from experiment.data.get_val_dataset import get_dataset
 
 from compress_gradient import (
     GradientHook,

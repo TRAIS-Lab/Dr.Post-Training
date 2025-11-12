@@ -5,7 +5,7 @@ import pandas as pd
 from datasets import Dataset
 from transformers import PreTrainedTokenizerBase
 
-from get_validation_dataset import tokenize
+from experiment.data.get_val_dataset import tokenize
 
 # llama-chat model's instruction format
 B_INST, E_INST = "[INST]", "[/INST]"
