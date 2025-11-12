@@ -6,24 +6,45 @@
 # Automatically aggregates results at the end with detailed breakdown.
 #
 # Usage:
+#     # List available methods
+#     bash benchmark.sh --list
+#
 #     # Run all methods
-#     bash run_benchmark.sh
+#     bash benchmark.sh
 #
 #     # Run specific methods (by index)
-#     bash run_benchmark.sh 0 7 8
+#     bash benchmark.sh 0 7 8
+#
+#     # Run only aggregation on existing results
+#     bash benchmark.sh --aggregate
 #
 #     # Run with custom output directory
-#     OUTPUT_DIR=my_results bash run_benchmark.sh
+#     OUTPUT_DIR=my_results bash benchmark.sh
 #
 
-cd ~/Project/Efficient-Fine-Tuning/experiment
+cd ~/Project/Efficient-Fine-Tuning
+
+# Set PYTHONPATH to include project root for imports
+export PYTHONPATH="/home/pbb/Project/Efficient-Fine-Tuning:$PYTHONPATH"
 
 set -e  # Exit on error
 
+# Check for special flags
+AGGREGATE_ONLY=false
+LIST_ONLY=false
+
+if [ "$1" = "--aggregate" ]; then
+    AGGREGATE_ONLY=true
+    shift  # Remove --aggregate from arguments
+elif [ "$1" = "--list" ]; then
+    LIST_ONLY=true
+    shift  # Remove --list from arguments
+fi
+
 # Configuration
-OUTPUT_DIR="${OUTPUT_DIR:-benchmark_results}"
-PYTHON="${PYTHON:-python}"
-BENCHMARK_SCRIPT="benchmark/benchmark.py"
+OUTPUT_DIR="${OUTPUT_DIR:-experiment/benchmark/benchmark_results}"
+PYTHON="${PYTHON:-/home/pbb/miniconda3/envs/IF/bin/python}"
+BENCHMARK_SCRIPT="experiment/benchmark/benchmark.py"
 
 # Colors for output
 RED='\033[0;31m'
@@ -53,41 +74,57 @@ print_info() {
 
 # Check if benchmark.py exists
 if [ ! -f "$BENCHMARK_SCRIPT" ]; then
-    print_error "benchmark.py not found in current directory"
+    print_error "benchmark.py not found at $BENCHMARK_SCRIPT"
     exit 1
+fi
+
+# Handle --list flag: just show available methods and exit
+if [ "$LIST_ONLY" = true ]; then
+    print_header "AVAILABLE BENCHMARK METHODS"
+    $PYTHON $BENCHMARK_SCRIPT --list
+    exit 0
 fi
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 print_success "Output directory: $OUTPUT_DIR"
 
-# Get list of available methods
-print_info "Fetching available methods..."
-METHODS_OUTPUT=$($PYTHON $BENCHMARK_SCRIPT --list 2>&1)
-echo "$METHODS_OUTPUT"
-
-# Determine which methods to run
-if [ $# -eq 0 ]; then
-    print_info "No method indices specified, will run ALL methods"
-    # Extract method indices from --list output (lines like " 0: Method Name" or "10: Method Name")
-    METHODS_TO_RUN=$(echo "$METHODS_OUTPUT" | grep -E "^ *[0-9]+:" | sed 's/^[[:space:]]*//' | cut -d: -f1)
+# If aggregate-only mode, skip to aggregation
+if [ "$AGGREGATE_ONLY" = true ]; then
+    print_header "AGGREGATE-ONLY MODE"
+    print_info "Skipping benchmark runs, will only aggregate existing results"
+    SUCCESSFUL_RUNS=1  # Set to 1 to allow aggregation to proceed
 else
-    METHODS_TO_RUN="$@"
-    print_info "Running specified methods: $METHODS_TO_RUN"
+    # Get list of available methods
+    print_info "Fetching available methods..."
+    METHODS_OUTPUT=$($PYTHON $BENCHMARK_SCRIPT --list 2>&1)
+    echo "$METHODS_OUTPUT"
+
+    # Determine which methods to run
+    if [ $# -eq 0 ]; then
+        print_info "No method indices specified, will run ALL methods"
+        # Extract method indices from --list output (lines like " 0: Method Name" or "10: Method Name")
+        METHODS_TO_RUN=$(echo "$METHODS_OUTPUT" | grep -E "^ *[0-9]+:" | sed 's/^[[:space:]]*//' | cut -d: -f1)
+    else
+        METHODS_TO_RUN="$@"
+        print_info "Running specified methods: $METHODS_TO_RUN"
+    fi
 fi
 
-# Count total methods
-TOTAL_METHODS=$(echo "$METHODS_TO_RUN" | wc -w)
-print_header "Starting benchmark of $TOTAL_METHODS method(s)"
+# Only run benchmarks if not in aggregate-only mode
+if [ "$AGGREGATE_ONLY" = false ]; then
+    # Count total methods
+    TOTAL_METHODS=$(echo "$METHODS_TO_RUN" | wc -w)
+    print_header "Starting benchmark of $TOTAL_METHODS method(s)"
 
-# Track successful and failed runs
-SUCCESSFUL_RUNS=0
-FAILED_RUNS=0
-FAILED_METHODS=""
+    # Track successful and failed runs
+    SUCCESSFUL_RUNS=0
+    FAILED_RUNS=0
+    FAILED_METHODS=""
 
-# Run each method
-CURRENT=0
-for METHOD_IDX in $METHODS_TO_RUN; do
+    # Run each method
+    CURRENT=0
+    for METHOD_IDX in $METHODS_TO_RUN; do
     CURRENT=$((CURRENT + 1))
 
     print_header "[$CURRENT/$TOTAL_METHODS] Running method $METHOD_IDX"
@@ -129,22 +166,30 @@ for METHOD_IDX in $METHODS_TO_RUN; do
     fi
 
     echo ""
-done
+    done
 
-# Summary
-print_header "BENCHMARK RUN SUMMARY"
-echo -e "Total methods:    ${TOTAL_METHODS}"
-echo -e "Successful:       ${GREEN}${SUCCESSFUL_RUNS}${NC}"
-if [ $FAILED_RUNS -gt 0 ]; then
-    echo -e "Failed:           ${RED}${FAILED_RUNS}${NC}"
-    echo -e "Failed methods:   ${RED}${FAILED_METHODS}${NC}"
+    # Summary
+    print_header "BENCHMARK RUN SUMMARY"
+    echo -e "Total methods:    ${TOTAL_METHODS}"
+    echo -e "Successful:       ${GREEN}${SUCCESSFUL_RUNS}${NC}"
+    if [ $FAILED_RUNS -gt 0 ]; then
+        echo -e "Failed:           ${RED}${FAILED_RUNS}${NC}"
+        echo -e "Failed methods:   ${RED}${FAILED_METHODS}${NC}"
+    else
+        echo -e "Failed:           ${GREEN}0${NC}"
+    fi
+    echo ""
 else
-    echo -e "Failed:           ${GREEN}0${NC}"
+    # In aggregate-only mode, set defaults for summary
+    TOTAL_METHODS=0
+    FAILED_RUNS=0
+    FAILED_METHODS=""
 fi
-echo ""
 
 # Aggregate results
-if [ $SUCCESSFUL_RUNS -gt 0 ]; then
+# In aggregate-only mode, always try to aggregate
+# Otherwise, only aggregate if there were successful runs
+if [ "$AGGREGATE_ONLY" = true ] || [ $SUCCESSFUL_RUNS -gt 0 ]; then
     print_header "AGGREGATING RESULTS"
     print_info "Running aggregation with detailed breakdown..."
 
@@ -156,7 +201,9 @@ if [ $SUCCESSFUL_RUNS -gt 0 ]; then
         print_info "Output files:"
         echo "  - Aggregated JSON: benchmark.json"
         echo "  - Individual results: $OUTPUT_DIR/result_*.json"
-        echo "  - Logs: $OUTPUT_DIR/log_*.txt"
+        if [ "$AGGREGATE_ONLY" = false ]; then
+            echo "  - Logs: $OUTPUT_DIR/log_*.txt"
+        fi
     else
         print_error "Aggregation failed"
         exit 1
