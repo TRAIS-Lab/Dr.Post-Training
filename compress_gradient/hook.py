@@ -259,7 +259,7 @@ class GradientHook:
         During eval: Uses standard F.linear (no overhead)
         Can also be disabled via hooks_enabled flag for temporary standard gradient computation
         """
-        if module.training and input.requires_grad and self.hooks_enabled:
+        if module.weight.requires_grad and self.hooks_enabled:
             # Use our custom backward that computes only compressed gradients
             # Pass hook_manager_id (not self) to avoid keeping hook manager in autograd graph
             return CompressedLinearBackward.apply(

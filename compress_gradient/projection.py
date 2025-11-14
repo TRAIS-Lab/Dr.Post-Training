@@ -195,6 +195,8 @@ class BasicProjector(AbstractProjector):
         self.get_generator_states()
         if proj_type == ProjectionType.random_mask:
             self._gen_randomness_mask(self.generator_states[0])
+        elif proj_type == ProjectionType.identity:
+            pass  # No randomness needed for identity projection
         else:
             self._gen_randomness_dense(self.generator_states[0])
 
@@ -282,6 +284,8 @@ class BasicProjector(AbstractProjector):
             self.get_generator_states()  # regenerate random seeds for new ensemble_id
             if self.proj_type == ProjectionType.random_mask:
                 self._gen_randomness_mask(self.generator_states[0])
+            elif self.proj_type == ProjectionType.identity:
+                pass  # No randomness needed for identity projection
             elif self.num_blocks == 1:
                 self._gen_randomness_dense(self.generator_states[0])
 
@@ -561,7 +565,7 @@ class CudaProjector(AbstractProjector):
         elif self.proj_type == ProjectionType.random_mask:
             self._gen_randomness_mask()
         elif self.proj_type == ProjectionType.identity:
-            pass
+            pass  # No randomness needed for identity projection
         else:
             msg = f"Unknown projection type: {self.proj_type}"
             raise ValueError(msg)
