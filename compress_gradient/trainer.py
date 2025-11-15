@@ -62,9 +62,6 @@ class CompGradTrainer(Trainer):
         # Create validation dataloader iterator for efficient batch sampling during training
         self.val_dataloader_iter = iter(self.get_val_dataloader(self.val_dataset, batch_size=self.args.per_device_train_batch_size, shuffle=True))
 
-        # Track selected indices for compressed optimizer
-        self.current_selected_indices = None
-
         logger.info("="*60)
         logger.info("Initialized HookTrainer")
         logger.info(f"  Selection method: {self.args.method} (fraction: {self.args.selection_frac})")
@@ -139,23 +136,30 @@ class CompGradTrainer(Trainer):
 
         return self.optimizer
 
-    def optimizer_step(self, *args, **kwargs):
+    def _select_compressed_grads(self, compressed_grads, selected_indices):
         """
-        Override optimizer step to pass selected indices to compressed optimizer.
-        """
-        # Unwrap only to check the type
-        unwrapped_optimizer = self._get_unwrapped_optimizer()
+        Select compressed gradients for chosen samples.
 
-        # Check if using compressed optimizer and have selected indices
-        if isinstance(unwrapped_optimizer, MeSOAdamW) and self.current_selected_indices is not None:
-            # Call through the (potentially wrapped) optimizer to preserve Accelerate functionality
-            # AcceleratedOptimizer will forward the selected_indices kwarg to MeSOAdamW
-            self.optimizer.step(selected_indices=list(self.current_selected_indices))
-            # Reset selected indices after use
-            self.current_selected_indices = None
-        else:
-            # Standard optimizer step
-            super().optimizer_step(*args, **kwargs)
+        This keeps all selection logic within the trainer - the optimizer doesn't
+        need to know about data selection at all. The optimizer will then aggregate
+        these selected gradients.
+
+        Args:
+            compressed_grads: List of per-sample compressed gradients [batch_size, k_l] for each layer
+            selected_indices: Indices of selected samples (list or tensor)
+
+        Returns:
+            List of selected compressed gradients [num_selected, k_l] for each layer
+        """
+        selected_grads = []
+        for grad in compressed_grads:
+            if grad is None:
+                selected_grads.append(None)
+            else:
+                # Select samples only - optimizer will average them
+                selected_grad = grad[selected_indices]  # [num_selected, k_l]
+                selected_grads.append(selected_grad)
+        return selected_grads
 
     def get_val_dataloader(self, val_dataset, batch_size=4, shuffle=True):
         """Create validation dataloader for data selection."""
@@ -204,6 +208,7 @@ class CompGradTrainer(Trainer):
             - grad_dot_scores: [batch_size] gradient similarity with validation
             - similarity_matrix: [batch_size, batch_size] if return_similarity else None
             - train_compressed_grads: List of per-sample compressed gradients if return_compressed_grads else None
+            - train_loss: Training loss (already scaled for multi-GPU and gradient accumulation)
         """
         # Prepare inputs using trainer's method (handles device placement and preprocessing)
         batch_val = self._prepare_inputs(batch_val)
@@ -299,7 +304,7 @@ class CompGradTrainer(Trainer):
             # Deep copy to avoid being overwritten by subsequent operations
             train_compressed_grads = [g.clone() if g is not None else None for g in train_grads]
 
-        return grad_dot_scores, similarity_matrix, train_compressed_grads
+        return grad_dot_scores, similarity_matrix, train_compressed_grads, train_loss.detach()
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """
@@ -309,14 +314,12 @@ class CompGradTrainer(Trainer):
         args = self.args
 
         # Refresh compressors if needed
-        # This must happen BEFORE forward/backward passes to ensure gradients
-        # are computed with the refreshed projectors
-        # Note: We call this on the unwrapped optimizer because refresh_compressors_if_needed()
-        # is a custom MeSOAdamW method that AcceleratedOptimizer doesn't know about.
-        # This is safe because it only reads state and refreshes compressors, not performing optimizer steps.
         unwrapped_optimizer = self._get_unwrapped_optimizer()
+        using_compressed_optimizer = isinstance(unwrapped_optimizer, MeSOAdamW)
 
-        if isinstance(unwrapped_optimizer, MeSOAdamW):
+        if using_compressed_optimizer:
+            # Note: We call this on the unwrapped optimizer because refresh_compressors_if_needed()
+            # is a custom MeSOAdamW method that AcceleratedOptimizer doesn't know about.
             unwrapped_optimizer.refresh_compressors_if_needed()
 
         try:
@@ -326,14 +329,12 @@ class CompGradTrainer(Trainer):
             self.val_dataloader_iter = iter(self.get_val_dataloader(self.val_dataset, batch_size=4, shuffle=True))
             val_batch = next(self.val_dataloader_iter)
 
-        # Check if using compressed optimizer (determines if we can reuse gradients)
-        using_compressed_optimizer = isinstance(unwrapped_optimizer, MeSOAdamW)
 
         # Perform selection based on method
         if args.method == 'GREATS':
             # Compute gradients and scores using simple backward
             # If using MeSO, also return compressed gradients to reuse them
-            scores, similarity_matrix, saved_compressed_grads = self.compute_grad_dotprod(
+            scores, similarity_matrix, saved_compressed_grads, train_loss = self.compute_grad_dotprod(
                 model=model,
                 batch_train=inputs,
                 batch_val=val_batch,
@@ -351,7 +352,7 @@ class CompGradTrainer(Trainer):
 
         elif args.method == "GradNorm":
             # Use diagonal of similarity matrix as gradient norm
-            _, similarity_matrix, saved_compressed_grads = self.compute_grad_dotprod(
+            _, similarity_matrix, saved_compressed_grads, train_loss = self.compute_grad_dotprod(
                 model=model,
                 batch_train=inputs,
                 batch_val=val_batch,
@@ -370,6 +371,7 @@ class CompGradTrainer(Trainer):
             # Select highest loss samples
             # No compressed gradients to save for MaxLoss
             saved_compressed_grads = None
+            train_loss = None  # Will compute in standard path
             with torch.no_grad():
                 losses = []
                 for i in range(len(inputs['input_ids'])):
@@ -385,11 +387,9 @@ class CompGradTrainer(Trainer):
         else:
             selected_ind = None
             saved_compressed_grads = None
+            train_loss = None  # Will compute in standard path
 
-        # Store selected indices for compressed optimizer
-        self.current_selected_indices = selected_ind
-
-        # OPTIMIZATION: Reuse compressed gradients for MeSO optimizer
+        # Reuse compressed gradients for MeSO optimizer
         # If we have saved compressed gradients and using MeSO, skip second forward/backward
         can_reuse_grads = (
             using_compressed_optimizer and
@@ -398,41 +398,14 @@ class CompGradTrainer(Trainer):
         )
 
         if can_reuse_grads:
-            # === OPTIMIZED PATH: Reuse compressed gradients ===
-            # Inject saved compressed gradients back into hook for selected indices
-            # The optimizer will aggregate these when we call step()
-            logger.debug(f"Reusing compressed gradients from selection pass (optimization active)")
-            self.grad_hook.compressed_grads = saved_compressed_grads
-
-            # Compute loss for logging purposes only (no backward needed)
-            if selected_ind is not None:
-                selected_inputs = {
-                    'input_ids': inputs['input_ids'][selected_ind],
-                    'attention_mask': inputs['attention_mask'][selected_ind],
-                    'labels': inputs['labels'][selected_ind]
-                }
-            else:
-                selected_inputs = inputs
-
-            selected_inputs = self._prepare_inputs(selected_inputs)
-
-            with torch.no_grad():
-                with self.compute_loss_context_manager():
-                    loss = self.compute_loss(model, selected_inputs)
-
-                if self.args.n_gpu > 1:
-                    loss = loss.mean()
-
-                if self.args.gradient_accumulation_steps > 1:
-                    loss = loss / self.args.gradient_accumulation_steps
-
-            # Note: optimizer.step() will be called later in training loop
-            # It will use the compressed gradients we just injected
-
-            return loss.detach()
+            # Select compressed gradients for chosen samples
+            self.grad_hook.compressed_grads = self._select_compressed_grads(
+                saved_compressed_grads,
+                selected_ind
+            )
+            return train_loss
 
         else:
-            # === STANDARD PATH: Second forward/backward pass ===
             if selected_ind is not None:
                 inputs = {
                     'input_ids': inputs['input_ids'][selected_ind],

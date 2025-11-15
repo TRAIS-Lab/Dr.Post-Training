@@ -110,14 +110,11 @@ class MeSOAdamW(Optimizer):
             if hasattr(module, 'bias') and module.bias is not None:
                 self._param_to_layer_name[id(module.bias)] = (layer_name, 'bias')
 
-    def _aggregate_compressed_grads(self, selected_indices: Optional[List[int]] = None) -> Dict[str, torch.Tensor]:
+    def _aggregate_compressed_grads(self) -> Dict[str, torch.Tensor]:
         """
-        Aggregate compressed gradients for selected samples.
+        Aggregate compressed gradients by averaging.
 
-        This extracts compressed gradients directly from the hook without decompressing them.
-
-        Args:
-            selected_indices: Optional list of sample indices to aggregate
+        This extracts compressed gradients from the hook and averages them.
 
         Returns:
             Dictionary mapping layer names to aggregated compressed gradients [1, k_l]
@@ -130,15 +127,8 @@ class MeSOAdamW(Optimizer):
             if compressed_grad is None:
                 continue
 
-            # Aggregate selected samples
-            if selected_indices is not None and len(selected_indices) > 0:
-                selected_compressed = compressed_grad[selected_indices]  # [|S|, k_l]
-                aggregated_compressed = selected_compressed.mean(dim=0, keepdim=True)  # [1, k_l]
-            else:
-                # If no selection, use mean of all samples
-                aggregated_compressed = compressed_grad.mean(dim=0, keepdim=True)  # [1, k_l]
-
-            compressed_grads_dict[layer_name] = aggregated_compressed
+            # Average all provided gradients
+            compressed_grads_dict[layer_name] = compressed_grad.mean(dim=0, keepdim=True)  # [1, k_l]
 
         return compressed_grads_dict
 
@@ -712,14 +702,12 @@ class MeSOAdamW(Optimizer):
         return num_transformed
 
     @torch.no_grad()
-    def step(self, closure: Optional[Callable] = None, selected_indices: Optional[List[int]] = None):
+    def step(self, closure: Optional[Callable] = None):
         """
         Perform a single optimization step.
 
         Args:
             closure: Optional closure to reevaluate the model and return the loss
-            selected_indices: Optional list of sample indices to use (for data selection).
-                            If None, uses all samples.
 
         Returns:
             Optional loss value if closure is provided
@@ -729,13 +717,12 @@ class MeSOAdamW(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # Aggregate compressed gradients (don't decompress yet - we'll use them directly)
-        compressed_grads_dict = self._aggregate_compressed_grads(selected_indices)
+        # Aggregate compressed gradients
+        # Note: If trainer pre-filtered gradients to selected samples, we average only those
+        compressed_grads_dict = self._aggregate_compressed_grads()
 
         # Update each parameter group
         for group in self.param_groups:
-            beta1, beta2 = group['betas']
-
             for p in group['params']:
                 # Get layer information
                 layer_name, param_type = self._get_layer_info(p)
@@ -763,7 +750,7 @@ class MeSOAdamW(Optimizer):
 
         Args:
             param: Parameter tensor to update
-            compressed_grad: Compressed gradient [1, k_l] - already aggregated
+            compressed_grad: Compressed gradient [1, k_l]
             group: Optimizer parameter group
             layer_name: Name of the layer
         """
@@ -773,13 +760,7 @@ class MeSOAdamW(Optimizer):
         layer_idx = self.grad_hook.layer_name_to_idx[layer_name]
         compressor = self.grad_hook.compressors[layer_idx] if layer_idx < len(self.grad_hook.compressors) else None
 
-        # Check if we can use compressed states
-        can_compress = (
-            compressor is not None and
-            hasattr(compressor, 'transpose')
-        )
-
-        if not can_compress:
+        if compressor is None:
             # Fallback to standard update if compression not available
             self._step_standard(param, group)
             return
@@ -911,39 +892,6 @@ class MeSOAdamW(Optimizer):
         # Apply update
         param.addcdiv_(state['exp_avg'], denom, value=-step_size)
 
-    def get_memory_stats(self):
-        """
-        Get memory statistics for optimizer states.
-
-        Returns:
-            dict: Memory statistics including compressed and standard state sizes
-        """
-        compressed_size = 0
-        standard_size = 0
-
-        for group in self.param_groups:
-            for p in group['params']:
-                state = self.state.get(p, {})
-                if 'exp_avg' in state:
-                    size = state['exp_avg'].numel() * state['exp_avg'].element_size()
-                    size += state['exp_avg_sq'].numel() * state['exp_avg_sq'].element_size()
-
-                    # Check if this is compressed
-                    layer_name, _ = self._get_layer_info(p)
-                    if layer_name in self.compressed_layer_names:
-                        compressed_size += size
-                    else:
-                        standard_size += size
-
-        total_size = compressed_size + standard_size
-
-        return {
-            'compressed_size_mb': compressed_size / (1024 ** 2),
-            'standard_size_mb': standard_size / (1024 ** 2),
-            'total_size_mb': total_size / (1024 ** 2),
-            'compression_ratio': (compressed_size + standard_size) / compressed_size if compressed_size > 0 else 1.0
-        }
-
 
 class MeSOSGD(Optimizer):
     """
@@ -996,14 +944,13 @@ class MeSOSGD(Optimizer):
         param_id = id(param)
         return self._param_to_layer_name.get(param_id, (None, None))
 
-    def _aggregate_compressed_grads(self, selected_indices: Optional[List[int]] = None) -> Dict[str, torch.Tensor]:
+    def _aggregate_compressed_grads(self) -> Dict[str, torch.Tensor]:
         """
-        Aggregate compressed gradients for selected samples.
+        Aggregate compressed gradients by averaging.
 
-        This extracts compressed gradients directly from the hook without decompressing them.
-
-        Args:
-            selected_indices: Optional list of sample indices to aggregate
+        This extracts compressed gradients from the hook and averages them.
+        Note: If the trainer has pre-filtered to selected samples, we just average
+        those. The optimizer doesn't need to know about sample selection.
 
         Returns:
             Dictionary mapping layer names to aggregated compressed gradients [1, k_l]
@@ -1016,20 +963,16 @@ class MeSOSGD(Optimizer):
             if compressed_grad is None:
                 continue
 
-            # Aggregate selected samples
-            if selected_indices is not None and len(selected_indices) > 0:
-                selected_compressed = compressed_grad[selected_indices]  # [|S|, k_l]
-                aggregated_compressed = selected_compressed.mean(dim=0, keepdim=True)  # [1, k_l]
-            else:
-                # If no selection, use mean of all samples
-                aggregated_compressed = compressed_grad.mean(dim=0, keepdim=True)  # [1, k_l]
+            # Average all provided gradients
+            # If trainer pre-filtered to selected samples, we're averaging only those
+            aggregated_compressed = compressed_grad.mean(dim=0, keepdim=True)  # [1, k_l]
 
             compressed_grads_dict[layer_name] = aggregated_compressed
 
         return compressed_grads_dict
 
     @torch.no_grad()
-    def step(self, closure: Optional[Callable] = None, selected_indices: Optional[List[int]] = None):
+    def step(self, closure: Optional[Callable] = None):
         """
         Perform a single optimization step.
 
@@ -1039,15 +982,17 @@ class MeSOSGD(Optimizer):
 
         Args:
             closure: Optional closure to reevaluate the model and return the loss
-            selected_indices: Optional list of sample indices to use (for data selection)
+
+        Returns:
+            Optional loss value if closure is provided
         """
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
-        # Aggregate compressed gradients (don't decompress yet - we'll do it layer-by-layer)
-        compressed_grads_dict = self._aggregate_compressed_grads(selected_indices)
+        # Aggregate compressed gradients
+        compressed_grads_dict = self._aggregate_compressed_grads()
 
         # Update each parameter group
         for group in self.param_groups:
@@ -1076,7 +1021,7 @@ class MeSOSGD(Optimizer):
 
         Args:
             param: Parameter tensor to update
-            compressed_grad: Compressed gradient [1, k_l] - already aggregated
+            compressed_grad: Compressed gradient [1, k_l]
             group: Optimizer parameter group
             layer_name: Name of the layer
         """
@@ -1086,13 +1031,7 @@ class MeSOSGD(Optimizer):
         layer_idx = self.grad_hook.layer_name_to_idx[layer_name]
         compressor = self.grad_hook.compressors[layer_idx] if layer_idx < len(self.grad_hook.compressors) else None
 
-        # Check if we can use compressed states
-        can_compress = (
-            compressor is not None and
-            hasattr(compressor, 'transpose')
-        )
-
-        if not can_compress:
+        if compressor is None:
             # Fallback to standard update if compression not available
             self._step_standard(param, group)
             return
