@@ -255,19 +255,27 @@ class GradientHook:
         """
         Replacement forward method that uses our custom Function.
 
-        During training: Uses CompressedLinearBackward to prevent full gradient
-        During eval: Uses standard F.linear (no overhead)
-        Can also be disabled via hooks_enabled flag for temporary standard gradient computation
+        When hooks are enabled: Uses CompressedLinearBackward to compute compressed gradients
+        When hooks are disabled: Uses original forward method for proper gradient computation
+
+        Note: Hooks are attached to the actual trainable layers:
+        - For LoRA: lora_A and lora_B modules (the trainable adapters)
+        - For full fine-tuning: the Linear layer weights
         """
-        if module.weight.requires_grad and self.hooks_enabled:
+        if self.hooks_enabled:
             # Use our custom backward that computes only compressed gradients
             # Pass hook_manager_id (not self) to avoid keeping hook manager in autograd graph
             return CompressedLinearBackward.apply(
                 input, module.weight, module.bias, self._hook_manager_id, idx
             )
         else:
-            # Use standard forward during eval OR when hooks are disabled
-            return F.linear(input, module.weight, module.bias)
+            # Use original forward method when hooks are disabled
+            # This ensures proper gradient computation for LoRA and other special layers
+            if hasattr(module, '_original_forward'):
+                return module._original_forward(input)
+            else:
+                # Fallback to F.linear if original forward not available
+                return F.linear(input, module.weight, module.bias)
 
     def set_compressors(self, compressors: List[Compressor]) -> None:
         """Set unified compressor objects for each layer."""

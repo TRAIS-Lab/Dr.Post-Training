@@ -47,20 +47,41 @@ def find_trainable_layers(model, lora_only=True):
 
     Args:
         model: The model to search
-        lora_only: If True, only find LoRA layers. If False, find all Linear layers.
+        lora_only: If True, only find LoRA layers (lora_A and lora_B). If False, find all Linear layers.
 
     Returns:
-        List of layer names (for LoRA, returns base_layer paths)
+        List of layer names
+        - For LoRA: returns paths to lora_A and lora_B modules (e.g., "layer.lora_A.default", "layer.lora_B.default")
+        - For full fine-tuning: returns paths to all Linear layers
     """
     layer_names = []
 
     for name, module in model.named_modules():
         if lora_only:
-            # Find LoRA layers - PEFT wraps layers and the actual computation happens in base_layer
-            if hasattr(module, 'base_layer') and isinstance(module.base_layer, torch.nn.Linear):
-                # This is a PEFT LoRA wrapper, attach hooks to the base_layer
-                base_layer_name = f"{name}.base_layer"
-                layer_names.append(base_layer_name)
+            # Find LoRA adapter layers - these are the actual trainable parameters
+            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                # This is a PEFT LoRA wrapper
+                # lora_A and lora_B can be either ModuleDict or direct nn.Linear
+
+                # Handle lora_A
+                if hasattr(module.lora_A, 'default'):
+                    # ModuleDict case: lora_A['default']
+                    lora_a_name = f"{name}.lora_A.default"
+                    layer_names.append(lora_a_name)
+                elif isinstance(module.lora_A, torch.nn.Linear):
+                    # Direct nn.Linear case
+                    lora_a_name = f"{name}.lora_A"
+                    layer_names.append(lora_a_name)
+
+                # Handle lora_B
+                if hasattr(module.lora_B, 'default'):
+                    # ModuleDict case: lora_B['default']
+                    lora_b_name = f"{name}.lora_B.default"
+                    layer_names.append(lora_b_name)
+                elif isinstance(module.lora_B, torch.nn.Linear):
+                    # Direct nn.Linear case
+                    lora_b_name = f"{name}.lora_B"
+                    layer_names.append(lora_b_name)
         else:
             # Find all Linear layers (for full fine-tuning)
             if isinstance(module, torch.nn.Linear):

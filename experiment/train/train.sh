@@ -64,7 +64,7 @@ use_lora=false
 
 # LoRA-specific defaults (only used if --lora is passed)
 lora_alpha=1
-lora_r=256
+lora_r=8
 lora_dropout=0.1
 
 update_compressor_freq=200
@@ -198,12 +198,23 @@ projection=""
 if [[ -n "$compression" ]]; then
     case "$compression" in
         GraSS)
-            sparsification="random_mask-1024*1024"
-            projection="sjlt-16384"
-            ;;
+			# if lora is used, use smaller sketch sizes
+			if [ "$use_lora" = true ]; then
+				sparsification="random_mask-128*128"
+				projection="sjlt-4096"
+			else
+				sparsification="random_mask-1024*1024"
+				projection="sjlt-16384"
+			fi
+			;;
         LoGra)
-            sparsification="normal-128*128"
-            projection=""
+			if [ "$use_lora" = true ]; then
+				sparsification="normal-64*64"
+				projection=""
+			else
+				sparsification="normal-128*128"
+				projection=""
+			fi
             ;;
         *)
             echo "ERROR: Invalid compression method: $compression"
