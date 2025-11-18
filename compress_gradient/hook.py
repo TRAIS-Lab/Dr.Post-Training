@@ -2,15 +2,7 @@
 Hook manager for efficient gradient compression with prevented materialization.
 
 This implementation uses monkey-patching with custom autograd Functions to prevent
-full gradient materialization. Key technique:
-
-1. **Monkey-Patching**: Replace module.forward with custom function
-2. **Custom Autograd Function**: Control backward pass to compute ONLY compressed gradients
-3. **Return None for weight.grad**: Tells PyTorch to skip full gradient computation
-4. **Centralized Storage**: All data stored in hook manager (memory efficient)
-5. **Global Registry**: Prevents memory leaks in autograd graph
-
-This prevents PyTorch from computing full gradients that we don't need.
+full gradient materialization.
 """
 
 from __future__ import annotations
@@ -232,7 +224,7 @@ class GradientHook:
                 # Cache the module
                 self.layer_name_to_module[name] = module
 
-                # Only support Linear layers
+                # Only support Linear layers (note that lora adapters from peft package are also Linear)
                 if not isinstance(module, nn.Linear):
                     logger.warning(f"Layer {name} is not nn.Linear, skipping")
                     continue

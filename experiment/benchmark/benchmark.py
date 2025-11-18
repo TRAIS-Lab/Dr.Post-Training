@@ -275,6 +275,32 @@ def _profile_data_selection(model, train_batch, val_batch, grad_hook, profile: I
     return grad_dot_scores, similarity_matrix, compressed_grads
 
 
+def _select_compressed_grads(compressed_grads, selected_indices):
+    """
+    Select compressed gradients for chosen samples.
+
+    This keeps the selection logic consistent with trainer.py - the optimizer doesn't
+    need to know about data selection at all. The optimizer will then aggregate
+    these selected gradients.
+
+    Args:
+        compressed_grads: List of per-sample compressed gradients [batch_size, k_l] for each layer
+        selected_indices: Indices of selected samples (list or tensor)
+
+    Returns:
+        List of selected compressed gradients [num_selected, k_l] for each layer
+    """
+    selected_grads = []
+    for grad in compressed_grads:
+        if grad is None:
+            selected_grads.append(None)
+        else:
+            # Select samples only - optimizer will average them
+            selected_grad = grad[selected_indices]  # [num_selected, k_l]
+            selected_grads.append(selected_grad)
+    return selected_grads
+
+
 def _run_single_iteration(model, optimizer, tokenizer, grad_hook, val_batch, selection_method,
                           enable_profiling=False, iter_num=0, is_warmup=False):
     """
@@ -445,8 +471,12 @@ def _run_single_iteration(model, optimizer, tokenizer, grad_hook, val_batch, sel
         if not is_warmup and enable_profiling:
             print(f"  → Reusing compressed gradients from selection (MeSO optimization)")
 
-        # Inject the FULL compressed gradients into the hook
-        grad_hook.compressed_grads = saved_compressed_grads
+        # Select compressed gradients for chosen samples BEFORE injecting
+        # This matches the trainer.py design where selection happens before optimizer
+        grad_hook.compressed_grads = _select_compressed_grads(
+            saved_compressed_grads,
+            selected_indices
+        )
 
         # Compute loss for logging/display only (no backward pass needed!)
         with torch.no_grad():
@@ -567,11 +597,8 @@ def _run_single_iteration(model, optimizer, tokenizer, grad_hook, val_batch, sel
         cuda_timer_sync()
         opt_step_start = time.time()
 
-    # For MeSO + GREATS with gradient reuse, pass selected_indices to optimizer
-    if can_reuse_grads and isinstance(optimizer, MeSOAdamW):
-        optimizer.step(selected_indices=list(selected_indices))
-    else:
-        optimizer.step()
+    # Optimizer step (gradients already filtered if reusing from selection)
+    optimizer.step()
 
     if enable_profiling and ENABLE_DETAILED_PROFILING:
         cuda_timer_sync()
