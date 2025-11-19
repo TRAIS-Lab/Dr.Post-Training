@@ -100,10 +100,53 @@ This generates:
 - `benchmark.json`: Aggregated results from all runs
 - Console output: Formatted comparison table
 
+## Results Folder Structure
+
+Results are automatically organized by configuration settings:
+
+```
+results/
+├── fp32/                    # Float32 precision (default)
+│   ├── result_00.json
+│   ├── result_01.json
+│   └── ...
+├── bf16/                    # BFloat16 precision
+│   ├── result_00.json
+│   └── ...
+└── bf16_flashattn/          # BFloat16 + Flash Attention
+    ├── result_00.json
+    └── ...
+```
+
+**Subfolder naming:**
+- `fp32` - Float32 precision
+- `fp16` - Float16 precision
+- `bf16` - BFloat16 precision
+- `*_flashattn` - Configuration with Flash Attention enabled
+
+**Example workflow:**
+```bash
+# Run with default settings (fp32)
+python benchmark.py --method 6
+# Results saved to: results/fp32/result_06.json
+
+# Switch to Flash Attention + bfloat16
+# Edit benchmark.py:
+#   USE_FLASH_ATTENTION = True
+#   MODEL_DTYPE = torch.bfloat16
+
+python benchmark.py --method 6
+# Results saved to: results/bf16_flashattn/result_06.json
+
+# Aggregate all results (includes all configurations)
+python benchmark.py --aggregate
+# Shows comparison table with Config column
+```
+
 ## Configuration
 
 ### Model & Training Settings
-Edit constants in `benchmark.py` (lines 72-77):
+Edit constants in `benchmark.py` (lines 75-80):
 ```python
 device = 'cuda'
 batch_size = 8              # Training batch size
@@ -112,8 +155,31 @@ num_warmup_iterations = 10  # Warmup (not timed)
 num_timed_iterations = 10   # Timed iterations for throughput
 ```
 
+### Flash Attention & Precision
+Edit model configuration in `benchmark.py` (lines 82-85):
+```python
+USE_FLASH_ATTENTION = False  # Set to True to enable Flash Attention 2
+MODEL_DTYPE = torch.float32  # Options: torch.float32, torch.bfloat16, torch.float16
+# Note: Flash Attention requires bfloat16 or float16 (not float32)
+```
+
+**Examples:**
+```python
+# Default: Standard attention with float32
+USE_FLASH_ATTENTION = False
+MODEL_DTYPE = torch.float32
+
+# Flash Attention with bfloat16 (recommended for A100/H100)
+USE_FLASH_ATTENTION = True
+MODEL_DTYPE = torch.bfloat16
+
+# Flash Attention with float16
+USE_FLASH_ATTENTION = True
+MODEL_DTYPE = torch.float16
+```
+
 ### Profiling Flags
-Edit flags in `benchmark.py` (lines 79-83):
+Edit flags in `benchmark.py` (lines 87-90):
 ```python
 ENABLE_DETAILED_PROFILING = True   # Show millisecond-level timing
 ENABLE_DATA_SELECTION = False      # Test with GREATS (deprecated, use --method 16-21)
@@ -131,10 +197,12 @@ python -m torch.utils.viz_memory memory_snapshots/Full_MeSO.pickle
 
 ## Benchmark Results
 
-After running `--aggregate`:
+After running `--aggregate`, results are displayed with configuration info:
+
+### Single Configuration
 ```
 =======================================================================================================================
-Benchmark Results (Total methods: 22 | Results directory: experiment/benchmark/benchmark_results)
+Benchmark Results (Total methods: 22 | Results directory: results/fp32)
 =======================================================================================================================
 Method                       Peak Mem   Sel(ms)   Fwd(ms)   Bwd(ms)   Opt(ms)   Total(ms)  Throughput
 -----------------------------------------------------------------------------------------------------------------------
@@ -181,6 +249,33 @@ Selection Components:
   Dot Prod:       Gradient similarity computation (layer-by-layer)
   Greedy:         Greedy selection algorithm (choose top samples)
 =======================================================================================================================
+```
+
+### Multiple Configurations (Comparison)
+When aggregating results from multiple configurations (e.g., fp32 vs bf16_flashattn):
+```
+Configurations found:
+  bf16_flashattn: 3 methods
+  fp32: 3 methods
+
+==================================================================================================================================
+Benchmark Results (Total methods: 6 | Results directory: results)
+==================================================================================================================================
+Config           Method                       Peak Mem   Fwd(ms)   Bwd(ms)   Opt(ms)   Total(ms)  Throughput
+----------------------------------------------------------------------------------------------------------------------------------
+bf16_flashattn   Full + AdamW                 18.23 GB   421.3     685.2     108.5     1215.0     6.58 samp/s
+bf16_flashattn   Full + MeSO                  14.92 GB   492.1     656.8     41.7      1190.6     6.72 samp/s
+bf16_flashattn   Full + MeSO + GC             9.87 GB    493.5     1083.6    38.9      1616.0     4.95 samp/s
+fp32             Full + AdamW                 35.13 GB   825.2     1326.8    217.3     2374.6     3.34 samp/s
+fp32             Full + MeSO                  27.88 GB   984.4     1313.2    83.4      2386.3     3.35 samp/s
+fp32             Full + MeSO + GC             18.50 GB   985.5     2167.1    77.8      3235.1     2.47 samp/s
+==================================================================================================================================
+```
+
+**Key observations:**
+- Flash Attention + bfloat16 reduces memory by ~48% (18.23 GB vs 35.13 GB for Full + AdamW)
+- Speed improvement of ~2x (6.58 samp/s vs 3.34 samp/s)
+- Config column allows easy comparison across different precision/attention settings
 ```
 
 ## Key Features

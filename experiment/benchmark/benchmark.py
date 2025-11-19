@@ -26,6 +26,9 @@ Usage:
     python benchmark.py --aggregate
 
 Configuration:
+    USE_FLASH_ATTENTION: Enable Flash Attention 2 (default: False)
+    MODEL_DTYPE: Model precision - torch.float32, torch.bfloat16, or torch.float16 (default: float32)
+                 Note: Flash Attention requires bfloat16 or float16
     ENABLE_DETAILED_PROFILING: Show millisecond-level timing and detailed breakdowns
     ENABLE_DATA_SELECTION: Test with GREATS data selection for applicable methods
     batch_size: Training batch size (default: 8)
@@ -75,6 +78,11 @@ seq_length = 512
 num_warmup_iterations = 10  # Warmup iterations (not timed)
 num_timed_iterations = 10   # Timed iterations for throughput measurement
 num_iterations = num_warmup_iterations + num_timed_iterations  # Total: 20
+
+# Model configuration
+USE_FLASH_ATTENTION = False  # Set to True to enable Flash Attention 2
+MODEL_DTYPE = torch.float32  # Options: torch.float32, torch.bfloat16, torch.float16
+# Note: Flash Attention requires bfloat16 or float16 (not float32)
 
 # Profiling flags
 ENABLE_DETAILED_PROFILING = True  # Set to False for basic benchmark only
@@ -990,10 +998,16 @@ def run_method(method_name, setup_fn, selection_method: Optional[str] = None):
 
 def setup_full_adamw():
     """Full fine-tuning with standard AdamW"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
     model.train()
 
@@ -1006,10 +1020,16 @@ def setup_full_adamw():
 
 def setup_full_meso():
     """Full fine-tuning with MeSO (MeSOAdamW)"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
     model.train()
 
@@ -1069,10 +1089,16 @@ def setup_full_meso():
 
 def setup_full_galore():
     """Full fine-tuning with GaLore"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
     model.train()
 
@@ -1100,10 +1126,16 @@ def setup_full_galore():
 
 def setup_full_sgd():
     """Full fine-tuning with vanilla SGD (no momentum)"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
     model.train()
 
@@ -1116,10 +1148,16 @@ def setup_full_sgd():
 
 def setup_full_sgd_momentum():
     """Full fine-tuning with SGD + momentum"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
     model.train()
 
@@ -1132,10 +1170,16 @@ def setup_full_sgd_momentum():
 
 def setup_lora_sgd():
     """LoRA with SGD (no momentum)"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     lora_config = LoraConfig(
@@ -1158,10 +1202,16 @@ def setup_lora_sgd():
 
 def setup_lora_sgd_momentum():
     """LoRA with SGD + momentum"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     lora_config = LoraConfig(
@@ -1184,10 +1234,16 @@ def setup_lora_sgd_momentum():
 
 def setup_lora_adamw():
     """LoRA with AdamW"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     lora_config = LoraConfig(
@@ -1210,10 +1266,16 @@ def setup_lora_adamw():
 
 def setup_full_adamw_gradient_checkpointing():
     """Full fine-tuning with AdamW + gradient checkpointing"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     # Enable gradient checkpointing
@@ -1229,10 +1291,16 @@ def setup_full_adamw_gradient_checkpointing():
 
 def setup_full_sgd_gradient_checkpointing():
     """Full fine-tuning with vanilla SGD (no momentum) + gradient checkpointing"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     # Enable gradient checkpointing
@@ -1248,10 +1316,16 @@ def setup_full_sgd_gradient_checkpointing():
 
 def setup_full_sgd_momentum_gradient_checkpointing():
     """Full fine-tuning with SGD + momentum + gradient checkpointing"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     # Enable gradient checkpointing
@@ -1274,10 +1348,16 @@ def setup_full_meso_gradient_checkpointing():
     - ~50% reduction in activation memory
     - No special configuration needed - optimization is automatic
     """
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     # Enable gradient checkpointing
@@ -1340,10 +1420,16 @@ def setup_full_meso_gradient_checkpointing():
 
 def setup_full_galore_gradient_checkpointing():
     """Full fine-tuning with GaLore + gradient checkpointing"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     # Enable gradient checkpointing
@@ -1374,10 +1460,16 @@ def setup_full_galore_gradient_checkpointing():
 
 def setup_lora_sgd_gradient_checkpointing():
     """LoRA with SGD (no momentum) + gradient checkpointing"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     # Enable gradient checkpointing
@@ -1403,10 +1495,16 @@ def setup_lora_sgd_gradient_checkpointing():
 
 def setup_lora_sgd_momentum_gradient_checkpointing():
     """LoRA with SGD + momentum + gradient checkpointing"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     # Enable gradient checkpointing
@@ -1432,10 +1530,16 @@ def setup_lora_sgd_momentum_gradient_checkpointing():
 
 def setup_lora_adamw_gradient_checkpointing():
     """LoRA with AdamW + gradient checkpointing"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     # Enable gradient checkpointing
@@ -1461,10 +1565,16 @@ def setup_lora_adamw_gradient_checkpointing():
 
 def setup_full_greats():
     """Full fine-tuning with GREATS data selection (requires compression for gradient computation)"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
     model.train()
 
@@ -1518,10 +1628,16 @@ def setup_full_greats():
 
 def setup_lora_greats():
     """LoRA fine-tuning with GREATS data selection (requires compression for gradient computation)"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     lora_config = LoraConfig(
@@ -1586,10 +1702,16 @@ def setup_lora_greats():
 
 def setup_full_greats_gradient_checkpointing():
     """Full fine-tuning with GREATS data selection + gradient checkpointing"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     # Enable gradient checkpointing
@@ -1646,10 +1768,16 @@ def setup_full_greats_gradient_checkpointing():
 
 def setup_lora_greats_gradient_checkpointing():
     """LoRA fine-tuning with GREATS data selection + gradient checkpointing"""
+    model_kwargs = {
+        'dtype': MODEL_DTYPE,
+        'device_map': device
+    }
+    if USE_FLASH_ATTENTION:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
     model = AutoModelForCausalLM.from_pretrained(
         'meta-llama/Llama-3.2-1B',
-        dtype=torch.float32,
-        device_map=device
+        **model_kwargs
     )
 
     # Enable gradient checkpointing
@@ -1716,6 +1844,29 @@ def setup_lora_greats_gradient_checkpointing():
     return model, optimizer, tokenizer, grad_hook
 
 # =============================================================================
+# Configuration and utility functions
+# =============================================================================
+
+def get_config_subfolder_name():
+    """
+    Generate a subfolder name based on current configuration.
+
+    Returns:
+        str: Subfolder name describing the configuration (e.g., "fp32", "bf16_flashattn")
+    """
+    dtype_map = {
+        torch.float32: "fp32",
+        torch.bfloat16: "bf16",
+        torch.float16: "fp16"
+    }
+    dtype_str = dtype_map.get(MODEL_DTYPE, "unknown")
+
+    if USE_FLASH_ATTENTION:
+        return f"{dtype_str}_flashattn"
+    else:
+        return dtype_str
+
+# =============================================================================
 # Main execution
 # =============================================================================
 
@@ -1751,9 +1902,15 @@ def get_all_methods():
         ("MeSO + GREATS + GC", setup_full_meso_gradient_checkpointing, 'GREATS'),
     ]
 
-def aggregate_results(results_dir='benchmark_results'):
-    """Aggregate results from individual test runs - simplified output"""
+def aggregate_results(results_dir='results'):
+    """
+    Aggregate results from individual test runs - simplified output.
+
+    Looks for results in subfolders (e.g., results/fp32/, results/bf16_flashattn/)
+    or directly in the specified directory for backwards compatibility.
+    """
     results = []
+    configs_found = []
 
     # Name mapping for cleaner display
     name_mapping = {
@@ -1771,37 +1928,85 @@ def aggregate_results(results_dir='benchmark_results'):
         print(f"Error: Results directory '{results_dir}' not found")
         return
 
-    # Load all individual result files
-    for filename in sorted(os.listdir(results_dir)):
-        if filename.startswith('result_') and filename.endswith('.json'):
-            filepath = os.path.join(results_dir, filename)
-            with open(filepath, 'r') as f:
-                result = json.load(f)
-                # Update method name if it's in the mapping
-                if result['method'] in name_mapping:
-                    result['method'] = name_mapping[result['method']]
-                results.append(result)
+    # Look for config subfolders (fp32, bf16, bf16_flashattn, etc.)
+    subfolders = [d for d in os.listdir(results_dir)
+                  if os.path.isdir(os.path.join(results_dir, d))]
+
+    if subfolders:
+        # New structure: results/<config>/*.json
+        print(f"Found configuration folders: {', '.join(subfolders)}")
+        for subfolder in sorted(subfolders):
+            subfolder_path = os.path.join(results_dir, subfolder)
+            subfolder_results = []
+
+            for filename in sorted(os.listdir(subfolder_path)):
+                if filename.startswith('result_') and filename.endswith('.json'):
+                    filepath = os.path.join(subfolder_path, filename)
+                    with open(filepath, 'r') as f:
+                        result = json.load(f)
+                        # Update method name if it's in the mapping
+                        if result['method'] in name_mapping:
+                            result['method'] = name_mapping[result['method']]
+                        # Add config information
+                        result['config'] = subfolder
+                        results.append(result)
+                        subfolder_results.append(result)
+
+            if subfolder_results:
+                configs_found.append((subfolder, len(subfolder_results)))
+    else:
+        # Old structure or direct files: results/*.json (backwards compatibility)
+        for filename in sorted(os.listdir(results_dir)):
+            if filename.startswith('result_') and filename.endswith('.json'):
+                filepath = os.path.join(results_dir, filename)
+                with open(filepath, 'r') as f:
+                    result = json.load(f)
+                    # Update method name if it's in the mapping
+                    if result['method'] in name_mapping:
+                        result['method'] = name_mapping[result['method']]
+                    result['config'] = 'default'
+                    results.append(result)
+
+        if results:
+            configs_found.append(('default', len(results)))
 
     if not results:
-        print(f"No result files found in '{results_dir}'")
+        print(f"No result files found in '{results_dir}' or its subfolders")
         return
 
-    print("\n" + "="*119)
+    # Display found configurations
+    if configs_found:
+        print(f"\nConfigurations found:")
+        for config, count in configs_found:
+            print(f"  {config}: {count} methods")
+
+    print("\n" + "="*135)
     print(f"Benchmark Results (Total methods: {len(results)} | Results directory: {results_dir})")
-    print("="*119)
+    print("="*135)
 
     # Check if any results have selection time
     has_selection = any('avg_selection_total_time' in r for r in results)
+    # Check if we have multiple configs
+    has_multiple_configs = len(set(r.get('config', 'default') for r in results)) > 1
 
     # Single comprehensive table
     if has_selection:
-        print(f"{'Method':<28} {'Peak Mem':<10} {'Sel(ms)':<9} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
-        print("-" * 119)
+        if has_multiple_configs:
+            print(f"{'Config':<16} {'Method':<28} {'Peak Mem':<10} {'Sel(ms)':<9} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
+            print("-" * 135)
+        else:
+            print(f"{'Method':<28} {'Peak Mem':<10} {'Sel(ms)':<9} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
+            print("-" * 119)
     else:
-        print(f"{'Method':<28} {'Peak Mem':<10} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
-        print("-" * 95)
+        if has_multiple_configs:
+            print(f"{'Config':<16} {'Method':<28} {'Peak Mem':<10} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
+            print("-" * 111)
+        else:
+            print(f"{'Method':<28} {'Peak Mem':<10} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
+            print("-" * 95)
 
     for r in results:
+        config = r.get('config', 'default')
         peak_mem = f"{r['absolute_max']:.2f} GB"
         sel_ms = f"{r.get('avg_selection_total_time', 0)*1000:.1f}" if 'avg_selection_total_time' in r and r.get('avg_selection_total_time', 0) > 0 else "-"
         fwd_ms = f"{r.get('avg_forward_time', 0)*1000:.1f}" if 'avg_forward_time' in r else "N/A"
@@ -1811,15 +2016,27 @@ def aggregate_results(results_dir='benchmark_results'):
         throughput = f"{r.get('throughput', 0):.2f} samp/s" if 'throughput' in r else "N/A"
 
         if has_selection:
-            print(f"{r['method']:<28} {peak_mem:<10} {sel_ms:<9} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
+            if has_multiple_configs:
+                print(f"{config:<16} {r['method']:<28} {peak_mem:<10} {sel_ms:<9} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
+            else:
+                print(f"{r['method']:<28} {peak_mem:<10} {sel_ms:<9} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
         else:
-            print(f"{r['method']:<28} {peak_mem:<10} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
+            if has_multiple_configs:
+                print(f"{config:<16} {r['method']:<28} {peak_mem:<10} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
+            else:
+                print(f"{r['method']:<28} {peak_mem:<10} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
 
     if has_selection:
-        print("="*119)
+        if has_multiple_configs:
+            print("="*135)
+        else:
+            print("="*119)
         print("Note: Sel(ms) = Data selection time (GREATS/GradNorm), includes val/train fwd/bwd + dot product")
     else:
-        print("="*95)
+        if has_multiple_configs:
+            print("="*111)
+        else:
+            print("="*95)
 
     # Detailed selection breakdown for methods with selection
     if has_selection:
@@ -1864,8 +2081,8 @@ if __name__ == "__main__":
                         help='List all available methods with their indices')
     parser.add_argument('--aggregate', action='store_true',
                         help='Aggregate results from individual runs')
-    parser.add_argument('--output-dir', type=str, default='benchmark_results',
-                        help='Directory to save individual results (default: benchmark_results)')
+    parser.add_argument('--output-dir', type=str, default='results',
+                        help='Base directory to save results (default: results). Results will be saved in a subfolder based on configuration.')
     parser.add_argument('--memory-snapshot', action='store_true',
                         help='Enable memory snapshot recording for detailed memory profiling')
 
@@ -1889,6 +2106,17 @@ if __name__ == "__main__":
         aggregate_results(args.output_dir)
         sys.exit(0)
 
+    # Validate Flash Attention configuration
+    if USE_FLASH_ATTENTION and MODEL_DTYPE == torch.float32:
+        print("\n" + "="*80)
+        print("⚠ WARNING: Flash Attention requires bfloat16 or float16!")
+        print("="*80)
+        print("Flash Attention is enabled but MODEL_DTYPE is set to float32.")
+        print("Please set MODEL_DTYPE to torch.bfloat16 or torch.float16")
+        print("Example: MODEL_DTYPE = torch.bfloat16")
+        print("="*80 + "\n")
+        sys.exit(1)
+
     print("\n" + "="*80)
     print("MAX MEMORY BENCHMARK")
     print("="*80)
@@ -1898,12 +2126,16 @@ if __name__ == "__main__":
     print(f"Warmup iterations: {num_warmup_iterations} (not timed)")
     print(f"Timed iterations: {num_timed_iterations} (for throughput)")
     print(f"Total iterations: {num_iterations}")
-    print(f"Precision: float32")
+    print(f"Precision: {MODEL_DTYPE}")
+    print(f"Flash Attention: {'ENABLED' if USE_FLASH_ATTENTION else 'DISABLED'}")
     print("="*80 + "\n")
 
-    # Create output directory if running individual tests
+    # Create output directory with configuration subfolder if running individual tests
     if args.method is not None:
-        os.makedirs(args.output_dir, exist_ok=True)
+        config_subfolder = get_config_subfolder_name()
+        output_dir = os.path.join(args.output_dir, config_subfolder)
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Results will be saved to: {output_dir}\n")
 
     if args.method is not None:
         # Run single method
@@ -1918,11 +2150,11 @@ if __name__ == "__main__":
             print(f"Data selection enabled: {selection_method}\n")
         result = run_method(method_name, setup_fn, selection_method)
 
-        # Save individual result
-        output_file = os.path.join(args.output_dir, f'result_{args.method:02d}.json')
-        with open(output_file, 'w') as f:
+        # Save individual result to config subfolder
+        result_file = os.path.join(output_dir, f'result_{args.method:02d}.json')
+        with open(result_file, 'w') as f:
             json.dump(result, f, indent=2)
-        print(f"\nResult saved to: {output_file}")
+        print(f"\nResult saved to: {result_file}")
 
     else:
         # Run all methods (original behavior)
