@@ -129,56 +129,58 @@ python benchmark.py --method 6 --memory-snapshot
 python -m torch.utils.viz_memory memory_snapshots/Full_MeSO.pickle
 ```
 
-## Output
+## Benchmark Results
 
-### Per-Iteration Output
-```
---- Iteration 11/20 (Timed 1/10) ---
-  Forward:   Current =  5.234 GB, Max =  6.123 GB (peak: +0.889 GB, delta: +0.234 GB, time: 245.3ms, model: 240.1ms, loss: 5.2ms)
-  Backward:  Current =  5.456 GB, Max =  7.890 GB (peak: +1.767 GB, delta: +0.222 GB, time: 312.4ms, compute: 310.2ms)
-  Optimizer: Current =  5.234 GB, Max =  8.012 GB (peak: +0.122 GB, delta: -0.222 GB, time: 89.7ms, step: 85.3ms, zero_grad: 4.4ms)
-```
-
-### Final Summary
-```
-================================================================================
-Full + MeSO - FINAL SUMMARY
-================================================================================
-Absolute maximum memory EVER reached: 8.012 GB
-Current memory at end:                5.234 GB
-Peak occurred during:                 BACKWARD pass
-
-Memory growth during timed iterations (iter 1 to 10):
-  Iter 1 max:  7.998 GB
-  Iter 10 max: 8.012 GB
-  Growth:      +0.014 GB
-  Status:      ✓ STABLE
-
-Timing (average per iteration):
-  Setup time:      2.345s
-  Forward:         0.245s (245.3ms)
-  Backward:        0.312s (312.4ms)
-  Optimizer:       0.090s (89.7ms)
-
-================================================================================
-Total/iter:     0.647s (647.4ms)
-Total (10 timed iters): 6.474s
-Throughput:     12.36 samples/s
-================================================================================
-```
-
-### Aggregated Results
 After running `--aggregate`:
 ```
-===============================================================================
-Benchmark Results (Total methods: 22 | Results directory: benchmark_results)
-===============================================================================
-Method                       Peak Mem   Fwd(ms)   Bwd(ms)   Opt(ms)   Total(ms)  Throughput
--------------------------------------------------------------------------------------------
-Full + SGD                   15.234 GB  245.3     512.4     89.7      847.4      9.44 samp/s
-Full + MeSO                  8.012 GB   245.3     312.4     89.7      647.4      12.36 samp/s
-MeSO + GREATS                8.145 GB   0.0       0.0       89.7      789.8      16.46 samp/s
-...
+=======================================================================================================================
+Benchmark Results (Total methods: 22 | Results directory: experiment/benchmark/benchmark_results)
+=======================================================================================================================
+Method                       Peak Mem   Sel(ms)   Fwd(ms)   Bwd(ms)   Opt(ms)   Total(ms)  Throughput
+-----------------------------------------------------------------------------------------------------------------------
+Full + SGD                   25.93 GB   -         862.6     1459.0    36.2      2364.2     3.38 samp/s
+Full + SGD + GC              13.14 GB   -         654.3     1656.1    27.8      2342.1     3.41 samp/s
+Full + SGD-momentum          30.53 GB   -         652.3     1116.6    73.2      1846.1     4.29 samp/s
+Full + SGD-momentum + GC     17.74 GB   -         811.8     2070.7    99.2      2987.0     2.68 samp/s
+Full + AdamW                 35.13 GB   -         825.2     1326.8    217.3     2374.6     3.34 samp/s
+Full + AdamW + GC            24.99 GB   -         656.2     1661.6    207.7     2529.3     3.16 samp/s
+Full + MeSO                  27.88 GB   -         984.4     1313.2    83.4      2386.3     3.35 samp/s
+Full + MeSO + GC             18.50 GB   -         985.5     2167.1    77.8      3235.1     2.47 samp/s
+Full + GaLore                27.84 GB   -         1038.2    1711.5    144.8     2899.9     2.76 samp/s
+Full + GaLore + GC           15.24 GB   -         1033.8    2541.2    129.4     3708.7     2.16 samp/s
+LoRA + SGD                   24.76 GB   -         1240.0    1309.5    3.2       2559.7     3.12 samp/s
+LoRA + SGD + GC              13.18 GB   -         1047.5    2037.0    2.3       3091.7     2.59 samp/s
+LoRA + SGD-momentum          24.96 GB   -         1063.1    1129.5    6.3       2205.0     3.62 samp/s
+LoRA + SGD-momentum + GC     13.39 GB   -         1055.3    2034.7    5.7       3100.6     2.58 samp/s
+LoRA + AdamW                 25.17 GB   -         1060.2    1123.9    14.2      2204.6     3.62 samp/s
+LoRA + AdamW + GC            13.59 GB   -         1071.0    2000.2    13.5      3089.9     2.59 samp/s
+Full + GREATS                30.28 GB   3490.2    505.5     671.6     62.8      4735.5     1.69 samp/s
+Full + GREATS + GC           20.78 GB   4971.0    560.3     1151.1    70.7      6758.9     1.18 samp/s
+LoRA + GREATS                30.91 GB   3765.2    558.9     686.7     0.3       5016.1     1.59 samp/s
+LoRA + GREATS + GC           22.02 GB   5013.3    547.3     1124.6    0.4       6690.0     1.20 samp/s
+MeSO + GREATS                28.55 GB   3472.3    0.0       0.0       81.3      3559.0     1.95 samp/s
+MeSO + GREATS + GC           19.04 GB   4646.9    0.0       0.0       80.6      4733.3     1.52 samp/s
+=======================================================================================================================
+Note: Sel(ms) = Data selection time (GREATS/GradNorm), includes val/train fwd/bwd + dot product
+
+=======================================================================================================================
+DETAILED SELECTION BREAKDOWN
+=======================================================================================================================
+Method                       Val Fwd    Val Bwd    Train Fwd   Train Bwd   Dot Prod    Greedy
+-----------------------------------------------------------------------------------------------------------------------
+Full + GREATS                521.7ms    643.7ms    995.7ms     1312.6ms    13.5ms      2.0ms
+Full + GREATS + GC           513.2ms    1087.0ms   1029.1ms    2321.1ms    14.0ms      6.2ms
+LoRA + GREATS                556.0ms    692.6ms    1074.6ms    1407.8ms    29.9ms      2.9ms
+LoRA + GREATS + GC           516.6ms    1103.7ms   1077.9ms    2278.4ms    33.4ms      3.0ms
+MeSO + GREATS                512.8ms    663.4ms    969.5ms     1302.5ms    14.7ms      3.1ms
+MeSO + GREATS + GC           496.4ms    1044.4ms   975.3ms     2107.4ms    14.0ms      3.9ms
+=======================================================================================================================
+Selection Components:
+  Val Fwd/Bwd:    Validation forward/backward pass (small batch)
+  Train Fwd/Bwd:  Training forward/backward pass (per-sample gradients)
+  Dot Prod:       Gradient similarity computation (layer-by-layer)
+  Greedy:         Greedy selection algorithm (choose top samples)
+=======================================================================================================================
 ```
 
 ## Key Features
