@@ -240,9 +240,18 @@ def _profile_data_selection(model, train_batch, val_batch, grad_hook, profile: I
     cuda_timer_sync()
     dotprod_start = time.time()
 
-    # Initialize accumulators on device
-    grad_dot_scores = torch.zeros(train_batch_size, device=device)
-    similarity_matrix = torch.zeros(train_batch_size, train_batch_size, device=device)
+    # Infer dtype from gradients (important for bfloat16/float16 support)
+    grad_dtype = None
+    for g in train_grads:
+        if g is not None:
+            grad_dtype = g.dtype
+            break
+    if grad_dtype is None:
+        grad_dtype = torch.float32  # Fallback to float32 if no gradients found
+
+    # Initialize accumulators on device with correct dtype
+    grad_dot_scores = torch.zeros(train_batch_size, device=device, dtype=grad_dtype)
+    similarity_matrix = torch.zeros(train_batch_size, train_batch_size, device=device, dtype=grad_dtype)
 
     # Accumulate dot products layer by layer
     for train_g, val_g in zip(train_grads, val_grads):
