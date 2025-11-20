@@ -74,14 +74,15 @@ from experiment.benchmark.GaLore.galore_torch import GaLoreAdamW
 # Configuration
 device = 'cuda'
 batch_size = 8
+val_batch_size = 1
 seq_length = 512
 num_warmup_iterations = 10  # Warmup iterations (not timed)
 num_timed_iterations = 10   # Timed iterations for throughput measurement
 num_iterations = num_warmup_iterations + num_timed_iterations  # Total: 20
 
 # Model configuration
-USE_FLASH_ATTENTION = False  # Set to True to enable Flash Attention 2
-MODEL_DTYPE = torch.float32  # Options: torch.float32, torch.bfloat16, torch.float16
+USE_FLASH_ATTENTION = True  # Set to True to enable Flash Attention 2
+MODEL_DTYPE = torch.bfloat16  # Options: torch.float32, torch.bfloat16, torch.float16
 # Note: Flash Attention requires bfloat16 or float16 (not float32)
 
 # Profiling flags
@@ -700,7 +701,7 @@ def run_method(method_name, setup_fn, selection_method: Optional[str] = None):
     val_batch = None
     if selection_method and grad_hook:
         val_batch = tokenizer(
-            ["Validation sentence for data selection."] * 4,  # Small val batch
+            ["Validation sentence for data selection."] * val_batch_size,  # Small val batch
             return_tensors='pt',
             padding='max_length',
             max_length=seq_length,

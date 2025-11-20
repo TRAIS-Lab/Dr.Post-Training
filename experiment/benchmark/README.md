@@ -201,33 +201,33 @@ After running `--aggregate`, results are displayed with configuration info:
 
 ### Single Configuration
 ```
-=======================================================================================================================
-Benchmark Results (Total methods: 22 | Results directory: results/fp32)
-=======================================================================================================================
+=======================================================================================================================================
+Benchmark Results (Total methods: 22 | Results directory: experiment/benchmark/results)
+=======================================================================================================================================
 Method                       Peak Mem   Sel(ms)   Fwd(ms)   Bwd(ms)   Opt(ms)   Total(ms)  Throughput
 -----------------------------------------------------------------------------------------------------------------------
-Full + SGD                   25.93 GB   -         862.6     1459.0    36.2      2364.2     3.38 samp/s
-Full + SGD + GC              13.14 GB   -         654.3     1656.1    27.8      2342.1     3.41 samp/s
-Full + SGD-momentum          30.53 GB   -         652.3     1116.6    73.2      1846.1     4.29 samp/s
-Full + SGD-momentum + GC     17.74 GB   -         811.8     2070.7    99.2      2987.0     2.68 samp/s
-Full + AdamW                 35.13 GB   -         825.2     1326.8    217.3     2374.6     3.34 samp/s
-Full + AdamW + GC            24.99 GB   -         656.2     1661.6    207.7     2529.3     3.16 samp/s
-Full + MeSO                  27.88 GB   -         984.4     1313.2    83.4      2386.3     3.35 samp/s
-Full + MeSO + GC             18.50 GB   -         985.5     2167.1    77.8      3235.1     2.47 samp/s
-Full + GaLore                27.84 GB   -         1038.2    1711.5    144.8     2899.9     2.76 samp/s
-Full + GaLore + GC           15.24 GB   -         1033.8    2541.2    129.4     3708.7     2.16 samp/s
-LoRA + SGD                   24.76 GB   -         1240.0    1309.5    3.2       2559.7     3.12 samp/s
-LoRA + SGD + GC              13.18 GB   -         1047.5    2037.0    2.3       3091.7     2.59 samp/s
-LoRA + SGD-momentum          24.96 GB   -         1063.1    1129.5    6.3       2205.0     3.62 samp/s
-LoRA + SGD-momentum + GC     13.39 GB   -         1055.3    2034.7    5.7       3100.6     2.58 samp/s
-LoRA + AdamW                 25.17 GB   -         1060.2    1123.9    14.2      2204.6     3.62 samp/s
-LoRA + AdamW + GC            13.59 GB   -         1071.0    2000.2    13.5      3089.9     2.59 samp/s
-Full + GREATS                30.28 GB   3490.2    505.5     671.6     62.8      4735.5     1.69 samp/s
-Full + GREATS + GC           20.78 GB   4971.0    560.3     1151.1    70.7      6758.9     1.18 samp/s
-LoRA + GREATS                30.91 GB   3765.2    558.9     686.7     0.3       5016.1     1.59 samp/s
-LoRA + GREATS + GC           22.02 GB   5013.3    547.3     1124.6    0.4       6690.0     1.20 samp/s
-MeSO + GREATS                28.55 GB   3472.3    0.0       0.0       81.3      3559.0     1.95 samp/s
-MeSO + GREATS + GC           19.04 GB   4646.9    0.0       0.0       80.6      4733.3     1.52 samp/s
+Full + SGD                   15.62 GB   -         154.7     282.4     14.3      454.4      17.55 samp/s
+Full + SGD + GC              9.48 GB    -         152.3     397.0     14.4      567.2      14.07 samp/s
+Full + SGD-momentum          17.92 GB   -         155.4     282.5     37.5      478.4      16.64 samp/s
+Full + SGD-momentum + GC     11.78 GB   -         152.5     397.6     37.3      590.6      13.52 samp/s
+Full + AdamW                 20.22 GB   -         154.5     283.8     91.6      532.9      14.96 samp/s
+Full + AdamW + GC            14.08 GB   -         154.2     400.2     91.7      649.2      12.30 samp/s
+Full + MeSO                  17.03 GB   -         154.5     325.0     41.1      523.6      15.22 samp/s
+Full + MeSO + GC             12.64 GB   -         152.5     439.6     40.6      635.9      12.55 samp/s
+Full + GaLore                15.98 GB   -         156.2     285.5     40.7      485.4      16.41 samp/s
+Full + GaLore + GC           9.84 GB    -         153.2     403.9     40.6      602.0      13.26 samp/s
+LoRA + SGD                   15.01 GB   -         171.6     211.5     1.2       387.4      20.55 samp/s
+LoRA + SGD + GC              9.55 GB    -         170.5     346.3     1.4       521.3      15.31 samp/s
+LoRA + SGD-momentum          15.11 GB   -         172.0     211.3     2.3       388.7      20.47 samp/s
+LoRA + SGD-momentum + GC     9.65 GB    -         172.7     346.1     2.4       524.3      15.22 samp/s
+LoRA + AdamW                 15.21 GB   -         172.7     211.2     5.3       392.1      20.26 samp/s
+LoRA + AdamW + GC            9.75 GB    -         169.8     346.0     4.9       523.6      15.24 samp/s
+Full + GREATS                18.23 GB   712.5     83.8      144.3     20.1      964.4      8.28 samp/s
+Full + GREATS + GC           13.78 GB   888.1     83.4      207.7     20.1      1202.4     6.65 samp/s
+LoRA + GREATS                18.88 GB   797.6     93.0      158.8     0.3       1052.9     7.58 samp/s
+LoRA + GREATS + GC           14.52 GB   1008.1    92.0      235.0     0.4       1338.4     5.97 samp/s
+MeSO + GREATS                17.36 GB   715.7     0.0       0.0       42.5      761.1      9.41 samp/s
+MeSO + GREATS + GC           12.91 GB   887.7     0.0       0.0       40.0      930.8      7.86 samp/s
 =======================================================================================================================
 Note: Sel(ms) = Data selection time (GREATS/GradNorm), includes val/train fwd/bwd + dot product
 
@@ -236,12 +236,12 @@ DETAILED SELECTION BREAKDOWN
 =======================================================================================================================
 Method                       Val Fwd    Val Bwd    Train Fwd   Train Bwd   Dot Prod    Greedy
 -----------------------------------------------------------------------------------------------------------------------
-Full + GREATS                521.7ms    643.7ms    995.7ms     1312.6ms    13.5ms      2.0ms
-Full + GREATS + GC           513.2ms    1087.0ms   1029.1ms    2321.1ms    14.0ms      6.2ms
-LoRA + GREATS                556.0ms    692.6ms    1074.6ms    1407.8ms    29.9ms      2.9ms
-LoRA + GREATS + GC           516.6ms    1103.7ms   1077.9ms    2278.4ms    33.4ms      3.0ms
-MeSO + GREATS                512.8ms    663.4ms    969.5ms     1302.5ms    14.7ms      3.1ms
-MeSO + GREATS + GC           496.4ms    1044.4ms   975.3ms     2107.4ms    14.0ms      3.9ms
+Full + GREATS                84.6ms     141.4ms    155.0ms     324.9ms     5.4ms       0.4ms
+Full + GREATS + GC           83.8ms     205.0ms    153.7ms     439.6ms     5.4ms       0.4ms
+LoRA + GREATS                94.4ms     158.7ms    172.9ms     359.6ms     10.4ms      0.4ms
+LoRA + GREATS + GC           93.1ms     234.9ms    171.3ms     497.5ms     10.7ms      0.4ms
+MeSO + GREATS                85.1ms     141.8ms    155.7ms     325.0ms     5.4ms       0.4ms
+MeSO + GREATS + GC           82.7ms     204.7ms    153.1ms     439.8ms     4.9ms       0.3ms
 =======================================================================================================================
 Selection Components:
   Val Fwd/Bwd:    Validation forward/backward pass (small batch)

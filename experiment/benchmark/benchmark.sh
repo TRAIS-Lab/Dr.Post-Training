@@ -25,7 +25,7 @@
 cd ~/Project/Efficient-Fine-Tuning
 
 # Set PYTHONPATH to include project root for imports
-export PYTHONPATH="/home/pbb/Project/Efficient-Fine-Tuning:$PYTHONPATH"
+export PYTHONPATH="/u/phu1/Project/Efficient-Fine-Tuning:$PYTHONPATH"
 
 set -e  # Exit on error
 
@@ -42,8 +42,8 @@ elif [ "$1" = "--list" ]; then
 fi
 
 # Configuration
-OUTPUT_DIR="${OUTPUT_DIR:-experiment/benchmark/benchmark_results}"
-PYTHON="${PYTHON:-/home/pbb/miniconda3/envs/IF/bin/python}"
+OUTPUT_DIR="${OUTPUT_DIR:-experiment/benchmark/results}"
+PYTHON="${PYTHON:-$HOME/.conda/envs/IF/bin/python}"
 BENCHMARK_SCRIPT="experiment/benchmark/benchmark.py"
 
 # Colors for output
@@ -97,7 +97,21 @@ if [ "$AGGREGATE_ONLY" = true ]; then
 else
     # Get list of available methods
     print_info "Fetching available methods..."
+
+    # Temporarily disable 'set -e' so we can catch the error instead of crashing
+    set +e
     METHODS_OUTPUT=$($PYTHON $BENCHMARK_SCRIPT --list 2>&1)
+    EXIT_CODE=$?
+    set -e
+
+    # Check if it failed
+    if [ $EXIT_CODE -ne 0 ]; then
+        print_error "Failed to list methods (Exit code: $EXIT_CODE)"
+        echo -e "${RED}Python Error Traceback:${NC}"
+        echo "$METHODS_OUTPUT"
+        exit 1
+    fi
+
     echo "$METHODS_OUTPUT"
 
     # Determine which methods to run
@@ -144,25 +158,36 @@ if [ "$AGGREGATE_ONLY" = false ]; then
 
     print_info "Running benchmark (output: $LOG_FILE)..."
 
-    if $PYTHON $BENCHMARK_SCRIPT --method "$METHOD_IDX" --output-dir "$OUTPUT_DIR" 2>&1 | tee "$LOG_FILE"; then
-        if [ -f "$OUTPUT_FILE" ]; then
-            print_success "Method $METHOD_IDX completed successfully"
+    # Run Python and capture exit code
+    # Note: We use PIPESTATUS to get the exit code of python, not tee
+    $PYTHON $BENCHMARK_SCRIPT --method "$METHOD_IDX" --output-dir "$OUTPUT_DIR" 2>&1 | tee "$LOG_FILE"
+    PYTHON_EXIT_CODE=${PIPESTATUS[0]}
+
+    if [ $PYTHON_EXIT_CODE -eq 0 ]; then
+        # Python finished successfully. Now let's find where it saved the file.
+
+        # 1. Try to verify the specific file reported in the log
+        LOG_SAVED_PATH=$(grep "Result saved to:" "$LOG_FILE" | awk '{print $NF}' | tr -d '[:space:]')
+
+        # 2. Alternative: Look for the result file recursively in the output dir
+        FOUND_FILE=$(find "$OUTPUT_DIR" -name "result_$(printf '%02d' ${METHOD_IDX}).json" -print -quit)
+
+        if [ -n "$LOG_SAVED_PATH" ] && [ -f "$LOG_SAVED_PATH" ]; then
+            print_success "Method $METHOD_IDX completed successfully (Verified log path)"
+            SUCCESSFUL_RUNS=$((SUCCESSFUL_RUNS + 1))
+        elif [ -n "$FOUND_FILE" ]; then
+            print_success "Method $METHOD_IDX completed successfully (Found in subfolder)"
             SUCCESSFUL_RUNS=$((SUCCESSFUL_RUNS + 1))
         else
-            print_error "Method $METHOD_IDX completed but no output file generated"
+            print_error "Method $METHOD_IDX finished but output file could not be verified"
+            print_info "Expected pattern: result_$(printf '%02d' ${METHOD_IDX}).json"
             FAILED_RUNS=$((FAILED_RUNS + 1))
             FAILED_METHODS="$FAILED_METHODS $METHOD_IDX"
         fi
     else
-        print_error "Method $METHOD_IDX failed"
+        print_error "Method $METHOD_IDX failed (Exit Code: $PYTHON_EXIT_CODE)"
         FAILED_RUNS=$((FAILED_RUNS + 1))
         FAILED_METHODS="$FAILED_METHODS $METHOD_IDX"
-    fi
-
-    # Wait a bit between runs
-    if [ $CURRENT -lt $TOTAL_METHODS ]; then
-        print_info "Waiting 2 seconds before next run..."
-        sleep 2
     fi
 
     echo ""
