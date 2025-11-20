@@ -23,7 +23,7 @@ pip3 install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 pip3 install sjlt --no-build-isolation
 pip3 install flash-attn --no-build-isolation --no-cache-dir
 
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 > Before installing `flash-attn`, you might need to install `psutil` first.
