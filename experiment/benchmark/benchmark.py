@@ -58,7 +58,7 @@ import argparse
 import os
 import time
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 from dataclasses import dataclass, asdict
 
 # Suppress dynamo warnings about custom CUDA kernels (sjlt)
@@ -69,12 +69,17 @@ from compress_gradient.compressor import setup_model_compressors
 from compress_gradient.optimizer import MeSOAdamW
 from compress_gradient.utils import greedy_selection
 
+# Import utility for finding trainable layers (especially LoRA adapters)
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'train'))
+from train import find_trainable_layers
+
 from experiment.benchmark.GaLore.galore_torch import GaLoreAdamW
 
 # Configuration
 device = 'cuda'
 batch_size = 8
-val_batch_size = 1
+val_batch_size = 4
 seq_length = 512
 num_warmup_iterations = 10  # Warmup iterations (not timed)
 num_timed_iterations = 10   # Timed iterations for throughput measurement
@@ -1659,10 +1664,12 @@ def setup_lora_greats():
         target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
     )
     model = get_peft_model(model, lora_config)
+    # Ensure LoRA adapters match base model dtype (critical for gradient compression)
+    model = model.to(MODEL_DTYPE)
     model.train()
 
-    # Get layer names - for LoRA we need to target the base model's linear layers
-    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    # Get layer names - for LoRA we only compress gradients for adapter layers (lora_A and lora_B)
+    layer_names = find_trainable_layers(model, lora_only=True)
 
     tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-3.2-1B')
     tokenizer.pad_token = tokenizer.eos_token
@@ -1802,10 +1809,12 @@ def setup_lora_greats_gradient_checkpointing():
         target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
     )
     model = get_peft_model(model, lora_config)
+    # Ensure LoRA adapters match base model dtype (critical for gradient compression)
+    model = model.to(MODEL_DTYPE)
     model.train()
 
-    # Get layer names - for LoRA we need to target the base model's linear layers
-    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    # Get layer names - for LoRA we only compress gradients for adapter layers (lora_A and lora_B)
+    layer_names = find_trainable_layers(model, lora_only=True)
 
     tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-3.2-1B')
     tokenizer.pad_token = tokenizer.eos_token
@@ -2015,8 +2024,33 @@ def aggregate_results(results_dir='results'):
             print(f"{'Method':<28} {'Peak Mem':<10} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
             print("-" * 95)
 
+    prev_config = None
+    prev_base_method = None
     for r in results:
         config = r.get('config', 'default')
+        method = r['method']
+
+        # Extract base method name (remove " + GC" suffix if present)
+        base_method = method.replace(' + GC', '')
+
+        # Add separator line when config changes (only for multiple configs)
+        if has_multiple_configs and config != prev_config and prev_config is not None:
+            if has_selection:
+                print("=" * 135)
+            else:
+                print("=" * 111)
+            prev_base_method = None  # Reset base method when config changes
+
+        # Add separator line when base method changes (group method with its GC variant)
+        if base_method != prev_base_method and prev_base_method is not None:
+            if has_selection:
+                print("-" * 135)
+            else:
+                print("-" * 111)
+
+        prev_config = config
+        prev_base_method = base_method
+
         peak_mem = f"{r['absolute_max']:.2f} GB"
         sel_ms = f"{r.get('avg_selection_total_time', 0)*1000:.1f}" if 'avg_selection_total_time' in r and r.get('avg_selection_total_time', 0) > 0 else "-"
         fwd_ms = f"{r.get('avg_forward_time', 0)*1000:.1f}" if 'avg_forward_time' in r else "N/A"
@@ -2027,14 +2061,14 @@ def aggregate_results(results_dir='results'):
 
         if has_selection:
             if has_multiple_configs:
-                print(f"{config:<16} {r['method']:<28} {peak_mem:<10} {sel_ms:<9} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
+                print(f"{config:<16} {method:<28} {peak_mem:<10} {sel_ms:<9} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
             else:
-                print(f"{r['method']:<28} {peak_mem:<10} {sel_ms:<9} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
+                print(f"{method:<28} {peak_mem:<10} {sel_ms:<9} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
         else:
             if has_multiple_configs:
-                print(f"{config:<16} {r['method']:<28} {peak_mem:<10} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
+                print(f"{config:<16} {method:<28} {peak_mem:<10} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
             else:
-                print(f"{r['method']:<28} {peak_mem:<10} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
+                print(f"{method:<28} {peak_mem:<10} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
 
     if has_selection:
         if has_multiple_configs:
