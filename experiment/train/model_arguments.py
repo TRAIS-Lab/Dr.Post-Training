@@ -69,6 +69,11 @@ class ModelArguments:
     lora_dropout: Optional[float] = field(default=0.1, metadata={"help": ("dropout for lora")})
     lora_target_modules: List[str] = field(default_factory=list, metadata={"help": ("target modules for lora")})
 
+    use_flash_attention: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to use Flash Attention 2 (requires flash-attn installed and bfloat16/float16 dtype)"}
+    )
+
 def add_padding_to_tokenizer(tokenizer):
     """ add the padding tokens in the tokenizer """
     if tokenizer.pad_token is None:

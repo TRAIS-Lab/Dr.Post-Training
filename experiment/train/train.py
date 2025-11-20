@@ -143,8 +143,13 @@ def main():
     get_data_statistics(train_dataset)
 
     # Load model - NO CUSTOM LAYER REPLACEMENT!
+    model_kwargs = {"torch_dtype": model_args.torch_dtype}
+    if model_args.use_flash_attention:
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+        logger.info("Flash Attention 2 enabled")
+
     model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path, torch_dtype=model_args.torch_dtype)
+        model_args.model_name_or_path, **model_kwargs)
     add_padding_to_tokenizer(tokenizer)
 
     # Resize embeddings if needed

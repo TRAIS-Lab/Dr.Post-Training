@@ -42,7 +42,8 @@ export base_training_args="--do_train=True \
 --report_to=none \
 --seed=0 \
 --percentage=1.0 \
---selection_frac=0.5"
+--selection_frac=0.5 \
+--use_flash_attention=False"
 
 # Default values
 data_selection="NA"  # NA, GREATS, or GradNorm
@@ -61,6 +62,7 @@ task="mmlu"
 subject="world_religions"
 compression=""  # Will be auto-set based on data_selection/use_compressed_optimizer
 use_lora=false
+use_flash_attention=false  # Enable Flash Attention 2 (requires flash-attn installed)
 
 # LoRA-specific defaults (only used if --lora is passed)
 lora_alpha=1
@@ -136,6 +138,10 @@ while [[ $# -gt 0 ]]; do
             use_lora=true
             shift 1
             ;;
+        --flash_attention)
+            use_flash_attention=true
+            shift 1
+            ;;
         --lora_alpha)
             lora_alpha="$2"
             shift 2
@@ -175,11 +181,19 @@ while [[ $# -gt 0 ]]; do
             echo "  --lora_alpha <alpha>                   LoRA alpha (default: 1, only used if --lora)"
             echo "  --lora_r <r>                           LoRA rank (default: 256, only used if --lora)"
             echo "  --lora_dropout <dropout>               LoRA dropout (default: 0.1, only used if --lora)"
+            echo "  --flash_attention                      Enable Flash Attention 2 (requires bf16/fp16 and flash-attn installed)"
             echo "  --data_dir <dir>                       Data directory (default: data)"
             exit 1
             ;;
     esac
 done
+
+# ========================================
+# Update base_training_args with user-specified Flash Attention setting
+# ========================================
+if [ "$use_flash_attention" = true ]; then
+    base_training_args="${base_training_args/--use_flash_attention=False/--use_flash_attention=True}"
+fi
 
 # ========================================
 # Compression Configuration
@@ -263,6 +277,7 @@ echo "Learning rate: $lr"
 echo "Data selection: $data_selection"
 echo "MeSO: $MeSO"
 echo "Compression: ${compression:-None}"
+echo "Flash Attention: $([ "$use_flash_attention" = true ] && echo "ENABLED" || echo "DISABLED")"
 echo "Batch size: $batch_size"
 echo "Data percentage: $percentage"
 echo "Validation examples: $n_val"

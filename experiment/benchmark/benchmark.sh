@@ -43,7 +43,7 @@ fi
 
 # Configuration
 OUTPUT_DIR="${OUTPUT_DIR:-experiment/benchmark/results}"
-PYTHON="${PYTHON:-$HOME/.conda/envs/IF/bin/python}"
+PYTHON="${PYTHON:-$HOME/miniconda3/envs/IF/bin/python}"
 BENCHMARK_SCRIPT="experiment/benchmark/benchmark.py"
 
 # Colors for output
