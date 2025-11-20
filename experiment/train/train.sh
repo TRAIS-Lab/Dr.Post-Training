@@ -17,10 +17,10 @@
 #SBATCH --mail-user=pbb@illinois.edu
 #SBATCH --mail-type="END"
 
-cd ~/Project/Efficient-Fine-Tuning
+cd $HOME/Project/Efficient-Fine-Tuning
 
 # Set PYTHONPATH to include project root for imports
-export PYTHONPATH="/home/pbb/Project/Efficient-Fine-Tuning:$PYTHONPATH"
+export PYTHONPATH="$HOME/Project/Efficient-Fine-Tuning:$PYTHONPATH"
 
 # Base training arguments
 export base_training_args="--do_train=True \
