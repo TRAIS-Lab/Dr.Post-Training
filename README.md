@@ -20,9 +20,10 @@ conda activate IF
 
 conda install -c "nvidia/label/cuda-12.4.0" cudatoolkit
 pip3 install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-pip3 install sjlt --no-build-isolation
 
 pip3 install packaging ninja
+
+pip3 install sjlt --no-build-isolation
 pip install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
 
 pip3 install -r requirements.txt
