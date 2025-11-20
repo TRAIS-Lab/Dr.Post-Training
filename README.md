@@ -21,10 +21,12 @@ conda activate IF
 conda install -c "nvidia/label/cuda-12.4.0" cudatoolkit
 pip3 install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 pip3 install sjlt --no-build-isolation
-pip install flash-attn --no-build-isolation --no-cache-dir
+pip3 install flash-attn --no-build-isolation --no-cache-dir
 
 pip install -r requirements.txt
 ```
+
+> Before installing `flash-attn`, you might need to install `psutil` first.
 
 ## Running Experiments
 
