@@ -43,6 +43,7 @@ dist
 *.tex
 *.nfs*
 *.txt
+*.pickle
 
 */log
 */data/train

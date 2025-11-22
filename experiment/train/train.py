@@ -25,7 +25,7 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
 from experiment.data.get_train_dataset import get_training_dataset
 from experiment.data.get_val_dataset import get_dataset
 
-from compress_gradient import (
+from compress_gradient_v2 import (
     GradientHook,
     CompGradTrainer,
     setup_model_compressors,
@@ -143,6 +143,12 @@ def main():
     get_data_statistics(train_dataset)
 
     # Load model - NO CUSTOM LAYER REPLACEMENT!
+    # Auto-derive model dtype from training precision if not explicitly set
+    # This ensures model dtype matches training precision (critical for flash attention)
+    if model_args.torch_dtype is None and (training_args.bf16 or training_args.fp16):
+        model_args.torch_dtype = "bfloat16" if training_args.bf16 else "float16"
+        logger.info(f"Auto-setting model dtype to {model_args.torch_dtype} to match training precision")
+
     model_kwargs = {"torch_dtype": model_args.torch_dtype}
     if model_args.use_flash_attention:
         model_kwargs["attn_implementation"] = "flash_attention_2"
@@ -334,7 +340,7 @@ def main():
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=data_collator,
         grad_hook=grad_hook,
     )

@@ -18,7 +18,7 @@
 #   bash benchmark.sh --aggregate             # Aggregate existing results only
 #
 # Environment variables:
-#   OUTPUT_DIR          Directory for results (default: experiment/benchmark/results)
+#   OUTPUT_DIR          Directory for results (default: experiment/benchmark_v2/results)
 #   PYTHON              Python interpreter (default: $HOME/miniconda3/envs/IF/bin/python)
 
 cd $HOME/Project/Efficient-Fine-Tuning
@@ -45,9 +45,9 @@ elif [ "$1" = "--compare" ] || [ "$1" = "--meso-galore" ]; then
 fi
 
 # Configuration
-OUTPUT_DIR="${OUTPUT_DIR:-experiment/benchmark/results}"
+OUTPUT_DIR="${OUTPUT_DIR:-experiment/benchmark_v2/results}"
 PYTHON="${PYTHON:-$HOME/miniconda3/envs/IF/bin/python}"
-BENCHMARK_SCRIPT="experiment/benchmark/benchmark.py"
+BENCHMARK_SCRIPT="experiment/benchmark_v2/benchmark.py"
 
 # Colors for output
 RED='\033[0;31m'
@@ -120,12 +120,8 @@ else
     # Determine which methods to run
     if [ "$COMPARE_MODE" = true ]; then
         # MeSO vs GaLore comparison: run only these 4 methods
-        METHODS_TO_RUN="4 6 8"
-        print_info "COMPARISON MODE: Running MeSO vs GaLore (methods 6, 7, 8, 9)"
-        echo "  6: Full + MeSO"
-        echo "  7: Full + MeSO + GC"
-        echo "  8: Full + GaLore"
-        echo "  9: Full + GaLore + GC"
+        METHODS_TO_RUN="16 17 20 21"
+        print_info "COMPARISON MODE: Running MeSO vs GaLore (methods $METHODS_TO_RUN)"
     elif [ $# -eq 0 ]; then
         print_info "No method indices specified, will run ALL methods"
         # Extract method indices from --list output (lines like " 0: Method Name" or "10: Method Name")
@@ -174,14 +170,15 @@ if [ "$AGGREGATE_ONLY" = false ]; then
 
     if [ $PYTHON_EXIT_CODE -eq 0 ]; then
         # Python finished successfully. Verify the result file exists in the output dir
-        FOUND_FILE=$(find "$OUTPUT_DIR" -name "result_$(printf '%02d' ${METHOD_IDX}).json" -print -quit)
+        # Look for any JSON file starting with the method index (e.g., 01_Full_SGD_GC.json)
+        FOUND_FILE=$(find "$OUTPUT_DIR" -name "$(printf '%02d' ${METHOD_IDX})_*.json" -print -quit)
 
         if [ -n "$FOUND_FILE" ]; then
             print_success "Method $METHOD_IDX completed successfully"
             SUCCESSFUL_RUNS=$((SUCCESSFUL_RUNS + 1))
         else
             print_error "Method $METHOD_IDX finished but output file could not be verified"
-            print_info "Expected pattern: result_$(printf '%02d' ${METHOD_IDX}).json"
+            print_info "Expected pattern: $(printf '%02d' ${METHOD_IDX})_*.json"
             FAILED_RUNS=$((FAILED_RUNS + 1))
             FAILED_METHODS="$FAILED_METHODS $METHOD_IDX"
         fi

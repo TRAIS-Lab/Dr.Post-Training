@@ -215,6 +215,10 @@ class CompGradTrainer(Trainer):
         batch_train = self._prepare_inputs(batch_train)
 
         # Step 1: Compute validation gradients
+
+        # IMPORTANT: Disable gradient aggregation for GREATS (needs per-sample gradients)
+        self.grad_hook.aggregate_grads = False
+
         model.zero_grad()
 
         with self.compute_loss_context_manager():

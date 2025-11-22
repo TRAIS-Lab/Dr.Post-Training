@@ -43,7 +43,7 @@ export base_training_args="--do_train=True \
 --seed=0 \
 --percentage=1.0 \
 --selection_frac=0.5 \
---use_flash_attention=False"
+--use_flash_attention=True"
 
 # Default values
 data_selection="NA"  # NA, GREATS, or GradNorm
@@ -62,7 +62,7 @@ task="mmlu"
 subject="world_religions"
 compression=""  # Will be auto-set based on data_selection/use_compressed_optimizer
 use_lora=false
-use_flash_attention=false  # Enable Flash Attention 2 (requires flash-attn installed)
+use_flash_attention=true
 
 # LoRA-specific defaults (only used if --lora is passed)
 lora_alpha=1
@@ -214,19 +214,19 @@ if [[ -n "$compression" ]]; then
         GraSS)
 			# if lora is used, use smaller sketch sizes
 			if [ "$use_lora" = true ]; then
-				sparsification="random_mask-128*128"
-				projection="sjlt-4096"
+				sparsification="random_mask-512*512"
+				projection="sjlt-16384"
 			else
 				sparsification="random_mask-1024*1024"
-				projection="sjlt-16384"
+				projection="sjlt-65536"
 			fi
 			;;
         LoGra)
 			if [ "$use_lora" = true ]; then
-				sparsification="normal-64*64"
+				sparsification="normal-128*128"
 				projection=""
 			else
-				sparsification="normal-128*128"
+				sparsification="normal-256*256"
 				projection=""
 			fi
             ;;

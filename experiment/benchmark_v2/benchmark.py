@@ -20,12 +20,12 @@ from dataclasses import dataclass, asdict
 # Suppress dynamo warnings about custom CUDA kernels (sjlt)
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
 
-from compress_gradient.hook import GradientHook
-from compress_gradient.compressor import setup_model_compressors
-from compress_gradient.optimizer import MeSOAdamW
-from compress_gradient.utils import greedy_selection
+from compress_gradient_v2.hook import GradientHook
+from compress_gradient_v2.compressor import setup_model_compressors
+from compress_gradient_v2.optimizer import MeSOAdamW
+from compress_gradient_v2.utils import greedy_selection
 
-from experiment.benchmark.GaLore.galore_torch import GaLoreAdamW
+from experiment.benchmark_v2.GaLore.galore_torch import GaLoreAdamW
 from experiment.train.train import find_trainable_layers
 
 
@@ -58,9 +58,9 @@ class TeeLogger:
 
 # Configuration
 device = 'cuda'
-batch_size = 128
+batch_size = 16
 val_batch_size = 4
-seq_length = 4
+seq_length = 512
 num_warmup_iterations = 10  # Warmup iterations (not timed)
 num_timed_iterations = 10   # Timed iterations for throughput measurement
 num_iterations = num_warmup_iterations + num_timed_iterations  # Total: 20
@@ -77,34 +77,17 @@ ENABLE_MEMORY_SNAPSHOT = True  # Set to True to capture memory snapshots for vis
 MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT = 100000  # Max memory events to capture
 
 # ============================================================================
-# MeSO Compression Configuration (Centralized)
+# Compression Configuration
 # ============================================================================
-# FAIR COMPRESSION CONFIG (Option 1): Match GaLore's average compression
-# - GaLore average: ~739,164 elements per layer (varies: 262K for attn, 1M for MLP)
-# - MeSO target: ~740,000 elements per layer (fixed across all layers)
-# - Sparsifier: 860 per component → Kronecker: 860² = 739,600 → Identity projection
-# - This eliminates 4x intermediate overhead (was: 1,048,576 → 262,144 wasteful projection)
-
-MESO_SPARSIFIER_DIM = 860  # Each component dimension (sqrt of target compression)
-MESO_PROJECTOR_DIM = 739600  # Final dimension after Kronecker (860² = 739,600)
-MESO_PROJECTOR_TYPE = "identity"  # "identity" = no projection, "sjlt" = sparse JLT
-
-# Alternative configurations (uncomment to use):
-# Option 2: Keep current aggressive compression (262K), eliminate overhead
-# MESO_SPARSIFIER_DIM = 512
-# MESO_PROJECTOR_DIM = 262144  # 512² = 262,144
-# MESO_PROJECTOR_TYPE = "identity"
-
-# Option 3: Match GaLore MLP layers (1M)
-# MESO_SPARSIFIER_DIM = 1024
-# MESO_PROJECTOR_DIM = 1048576  # 1024² = 1,048,576
-# MESO_PROJECTOR_TYPE = "identity"
 
 # Shared compression parameters
-MESO_COMPRESSION_SEED = 42
-MESO_COMPRESSION_MAX_BATCH_SIZE = 64
-MESO_SPARSIFIER_TYPE = "random_mask"
-MESO_UPDATE_FREQ = 200  # Update compressors every N steps (like GaLore)
+COMPRESSION_SEED = 42
+COMPRESSION_MAX_BATCH_SIZE = 128
+SPARSIFIER_TYPE = "random_mask"
+SPARSIFIER_DIM = 860
+PROJECTOR_DIM = 739600
+PROJECTOR_TYPE = "identity"
+UPDATE_FREQ = 200
 
 @dataclass
 class IterationProfile:
@@ -131,7 +114,6 @@ class IterationProfile:
     selection_train_backward_time: float = 0.0
     selection_grad_comp_time: float = 0.0  # Total gradient computation (val+train fwd/bwd + dot product)
     selection_dotprod_compute_time: float = 0.0  # Just the actual dot product calculation
-    selection_greedy_time: float = 0.0
     compressor_refresh_time: float = 0.0
 
     # Additional timing breakdowns for throughput analysis
@@ -181,164 +163,59 @@ def cuda_timer_sync():
         torch.cuda.synchronize()
 
 
-def _profile_data_selection(model, train_batch, val_batch, grad_hook, profile: IterationProfile,
-                            return_compressed_grads: bool = False):
-    """
-    Profile data selection (GREATS/GradNorm) with detailed timing breakdown.
+class CUDATimer:
+    """CUDA event-based timer for accurate GPU timing without synchronization overhead."""
 
-    Uses separate forward/backward passes for validation and training batches
-    to ensure correct per-sample gradient computation.
+    def __init__(self):
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
+
+    def start(self):
+        """Record start event."""
+        self.start_event.record()
+
+    def stop(self):
+        """Record end event and return elapsed time in seconds."""
+        self.end_event.record()
+        torch.cuda.synchronize()
+        return self.start_event.elapsed_time(self.end_event) / 1000.0  # Convert ms to seconds
+
+
+def _merge_batches(batch_train, batch_val):
+    """
+    Merge training and validation batches along batch dimension.
 
     Args:
-        model: The model
-        train_batch: Training batch
-        val_batch: Validation batch
-        grad_hook: GradientHook instance
-        profile: IterationProfile to record timing
-        return_compressed_grads: Whether to return compressed gradients for reuse (True for MeSO)
+        batch_train: Training batch
+        batch_val: Validation batch
 
     Returns:
-        Tuple of (grad_dot_scores, similarity_matrix, compressed_grads, train_loss)
-        compressed_grads will be None if return_compressed_grads=False
-        train_loss is the loss from the training forward pass
+        Merged batch with train samples first, then val samples
     """
-    device = train_batch['input_ids'].device
-    val_batch = {k: v.to(device) for k, v in val_batch.items()}
-
-    train_batch_size = train_batch['input_ids'].shape[0]
-
-    # === STEP 1: Validation Forward/Backward Pass ===
-    cuda_timer_sync()
-    val_forward_start = time.time()
-
-    model.zero_grad()
-    val_outputs = model(**val_batch)
-    val_loss = val_outputs.loss
-
-    cuda_timer_sync()
-    val_backward_start = time.time()
-
-    val_loss.backward()
-
-    cuda_timer_sync()
-    val_extract_start = time.time()
-
-    # Get validation gradients from hooks (per-sample)
-    val_grads = grad_hook.get_compressed_grads()
-
-    cuda_timer_sync()
-    profile.selection_val_forward_time = val_backward_start - val_forward_start
-    profile.selection_val_backward_time = val_extract_start - val_backward_start
-
-    # === STEP 2: Training Forward/Backward Pass ===
-    cuda_timer_sync()
-    train_forward_start = time.time()
-
-    model.zero_grad()
-    train_outputs = model(**train_batch)
-    train_loss = train_outputs.loss
-
-    cuda_timer_sync()
-    train_backward_start = time.time()
-
-    train_loss.backward()
-
-    cuda_timer_sync()
-    train_extract_start = time.time()
-
-    # Get training gradients from hooks (per-sample)
-    train_grads = grad_hook.get_compressed_grads()
-
-    cuda_timer_sync()
-    profile.selection_train_forward_time = train_backward_start - train_forward_start
-    profile.selection_train_backward_time = train_extract_start - train_backward_start
-
-    # === STEP 3: Gradient Dot Product Computation ===
-    cuda_timer_sync()
-    dotprod_start = time.time()
-
-    # Infer dtype from gradients (important for bfloat16/float16 support)
-    grad_dtype = None
-    for g in train_grads:
-        if g is not None:
-            grad_dtype = g.dtype
-            break
-    if grad_dtype is None:
-        grad_dtype = torch.float32  # Fallback to float32 if no gradients found
-
-    # Initialize accumulators on device with correct dtype
-    grad_dot_scores = torch.zeros(train_batch_size, device=device, dtype=grad_dtype)
-    similarity_matrix = torch.zeros(train_batch_size, train_batch_size, device=device, dtype=grad_dtype)
-
-    # Accumulate dot products layer by layer
-    for train_g, val_g in zip(train_grads, val_grads):
-        if train_g is None or val_g is None:
-            continue
-
-        # Average validation gradient for this layer: [layer_dim]
-        val_g_avg = val_g.mean(dim=0)
-
-        # Gradient dot product for this layer
-        torch.addmv(grad_dot_scores, train_g, val_g_avg, out=grad_dot_scores)
-
-        # Similarity matrix for this layer
-        torch.addmm(similarity_matrix, train_g, train_g.t(), out=similarity_matrix)
-
-    # Detach from computation graph
-    grad_dot_scores = grad_dot_scores.detach()
-    similarity_matrix = similarity_matrix.detach()
-
-    cuda_timer_sync()
-    profile.selection_dotprod_compute_time = time.time() - dotprod_start
-
-    # === STEP 4: Return compressed gradients if requested ===
-    compressed_grads = None
-    if return_compressed_grads:
-        # Deep copy to avoid being overwritten by subsequent operations
-        compressed_grads = [g.clone() if g is not None else None for g in train_grads]
-
-    # Total time for gradient computation phase (includes all sub-steps)
-    profile.selection_grad_comp_time = (
-        profile.selection_val_forward_time +
-        profile.selection_val_backward_time +
-        profile.selection_train_forward_time +
-        profile.selection_train_backward_time +
-        profile.selection_dotprod_compute_time
-    )
-
-    return grad_dot_scores, similarity_matrix, compressed_grads, train_loss
-
-
-def _select_compressed_grads(compressed_grads, selected_indices):
-    """
-    Select compressed gradients for chosen samples.
-
-    This keeps the selection logic consistent with trainer.py - the optimizer doesn't
-    need to know about data selection at all. The optimizer will then aggregate
-    these selected gradients.
-
-    Args:
-        compressed_grads: List of per-sample compressed gradients [batch_size, k_l] for each layer
-        selected_indices: Indices of selected samples (list or tensor)
-
-    Returns:
-        List of selected compressed gradients [num_selected, k_l] for each layer
-    """
-    selected_grads = []
-    for grad in compressed_grads:
-        if grad is None:
-            selected_grads.append(None)
+    merged_batch = {}
+    for key in batch_train.keys():
+        if key in batch_val:
+            # Concatenate along batch dimension (dim=0)
+            merged_batch[key] = torch.cat([batch_train[key], batch_val[key]], dim=0)
         else:
-            # Select samples only - optimizer will average them
-            selected_grad = grad[selected_indices]  # [num_selected, k_l]
-            selected_grads.append(selected_grad)
-    return selected_grads
+            # If key not in val batch, just use train batch value
+            merged_batch[key] = batch_train[key]
+    return merged_batch
 
+
+"""
+New _run_single_iteration function for compress_gradient_v2 architecture.
+
+This implements the three training modes:
+1. MeSO without GREATS: Standard forward/backward with compressed gradients
+2. GREATS without MeSO: Merged batch → scores → second forward/backward with full gradients
+3. GREATS with MeSO: Merged batch → on-the-fly selection and aggregation of compressed gradients
+"""
 
 def _run_single_iteration(model, optimizer, tokenizer, grad_hook, val_batch, selection_method,
                           enable_profiling=False, iter_num=0, is_warmup=False):
     """
-    Run a single training iteration with optional profiling.
+    Run a single training iteration with v2 architecture and CUDA event-based timing.
 
     This function is used by both warmup and timed phases to ensure they execute identical operations.
 
@@ -348,7 +225,7 @@ def _run_single_iteration(model, optimizer, tokenizer, grad_hook, val_batch, sel
         tokenizer: The tokenizer
         grad_hook: GradientHook instance (or None)
         val_batch: Validation batch for data selection (or None)
-        selection_method: Data selection method ('GREATS', 'GradNorm', 'MaxLoss', None)
+        selection_method: Data selection method ('GREATS', 'GradNorm', None)
         enable_profiling: If True, collect detailed timing and memory stats
         iter_num: Iteration number for display
         is_warmup: If True, this is a warmup iteration (for display only)
@@ -372,10 +249,17 @@ def _run_single_iteration(model, optimizer, tokenizer, grad_hook, val_batch, sel
             total_samples=batch_size
         )
 
-    # BATCH PREPARATION (detailed profiling)
+    # Create CUDA timers
+    timer_batch_prep = CUDATimer() if enable_profiling else None
+    timer_data_transfer = CUDATimer() if enable_profiling else None
+    timer_selection = CUDATimer() if enable_profiling else None
+    timer_forward = CUDATimer() if enable_profiling else None
+    timer_backward = CUDATimer() if enable_profiling else None
+    timer_optimizer = CUDATimer() if enable_profiling else None
+
+    # BATCH PREPARATION
     if enable_profiling and ENABLE_DETAILED_PROFILING:
-        cuda_timer_sync()
-        batch_prep_start = time.time()
+        timer_batch_prep.start()
 
     batch = tokenizer(
         ["This is a test sentence for memory profiling."] * batch_size,
@@ -386,272 +270,306 @@ def _run_single_iteration(model, optimizer, tokenizer, grad_hook, val_batch, sel
     )
 
     if enable_profiling and ENABLE_DETAILED_PROFILING:
-        profile.batch_prep_time = time.time() - batch_prep_start
+        profile.batch_prep_time = timer_batch_prep.stop()
 
         # Data transfer to GPU
-        cuda_timer_sync()
-        transfer_start = time.time()
+        timer_data_transfer.start()
 
     batch = batch.to(device)
     batch['labels'] = batch['input_ids'].clone()
 
     if enable_profiling and ENABLE_DETAILED_PROFILING:
-        cuda_timer_sync()
-        profile.data_transfer_time = time.time() - transfer_start
-
-    # DATA SELECTION PHASE (if selection method specified)
-    selected_indices = None
-    saved_compressed_grads = None
-    saved_loss = None
+        profile.data_transfer_time = timer_data_transfer.stop()
 
     # Detect if using compressed optimizer (MeSO)
     using_compressed_optimizer = isinstance(optimizer, MeSOAdamW)
-
-    if selection_method and grad_hook and val_batch:
-        selection_start = time.time()
-
-        if selection_method == 'GREATS':
-            scores, similarity_matrix, saved_compressed_grads, saved_loss = _profile_data_selection(
-                model, batch, val_batch, grad_hook, profile if enable_profiling else IterationProfile(
-                    iteration=0, current_after_optimizer=0.0, max_ever=0.0,
-                    max_during_forward=0.0, max_during_backward=0.0, max_during_optimizer=0.0,
-                    forward_time=0.0, backward_time=0.0, optimizer_time=0.0
-                ),
-                return_compressed_grads=using_compressed_optimizer
-            )
-            lr = optimizer.param_groups[0].get("lr", 5e-5)
-
-            if enable_profiling:
-                cuda_timer_sync()
-            greedy_start = time.time()
-            selected_indices = greedy_selection(
-                scores * lr,
-                similarity_matrix * (lr ** 2),
-                int(len(scores) * 0.5)  # 50% selection
-            )
-            if enable_profiling:
-                cuda_timer_sync()
-                profile.selection_greedy_time = time.time() - greedy_start
-
-        elif selection_method == 'GradNorm':
-            _, similarity_matrix, saved_compressed_grads, saved_loss = _profile_data_selection(
-                model, batch, val_batch, grad_hook, profile if enable_profiling else IterationProfile(
-                    iteration=0, current_after_optimizer=0.0, max_ever=0.0,
-                    max_during_forward=0.0, max_during_backward=0.0, max_during_optimizer=0.0,
-                    forward_time=0.0, backward_time=0.0, optimizer_time=0.0
-                ),
-                return_compressed_grads=using_compressed_optimizer
-            )
-
-            if enable_profiling:
-                cuda_timer_sync()
-            greedy_start = time.time()
-            scores = torch.diag(similarity_matrix)
-            selected_indices = greedy_selection(
-                scores,
-                similarity_matrix * 0,
-                int(len(scores) * 0.5)
-            )
-            if enable_profiling:
-                cuda_timer_sync()
-                profile.selection_greedy_time = time.time() - greedy_start
-
-        elif selection_method == 'MaxLoss':
-            if enable_profiling:
-                cuda_timer_sync()
-            selection_forward_start = time.time()
-            with torch.no_grad():
-                losses = []
-                for idx in range(batch_size):
-                    single_batch = {k: v[[idx]] for k, v in batch.items()}
-                    outputs = model(**single_batch)
-                    losses.append(outputs.loss.item())
-            if enable_profiling:
-                cuda_timer_sync()
-                profile.selection_train_forward_time = time.time() - selection_forward_start
-
-                cuda_timer_sync()
-            greedy_start = time.time()
-            selected_indices = greedy_selection(
-                torch.tensor(losses),
-                torch.zeros((len(losses), len(losses))),
-                int(len(losses) * 0.5)
-            )
-            if enable_profiling:
-                cuda_timer_sync()
-                profile.selection_greedy_time = time.time() - greedy_start
-
-        if enable_profiling:
-            profile.selection_total_time = time.time() - selection_start
-            profile.selected_samples = len(selected_indices) if selected_indices is not None else batch_size
-
-        # Filter batch if selection was performed
-        if selected_indices is not None:
-            batch = {k: v[selected_indices] for k, v in batch.items()}
-
-    # Check if we can reuse gradients from selection phase (MeSO + GREATS optimization)
-    can_reuse_grads = (
-        using_compressed_optimizer and
-        saved_compressed_grads is not None and
-        selected_indices is not None and
-        saved_loss is not None
-    )
 
     mem_before_forward = get_mem() if enable_profiling else 0.0
     max_before_forward = get_max_mem() if enable_profiling else 0.0
     if enable_profiling:
         profile.mem_before_forward = mem_before_forward
 
-    if can_reuse_grads:
-        # === OPTIMIZED PATH: Reuse compressed gradients from selection ===
-        if not is_warmup and enable_profiling:
-            print(f"  → Reusing compressed gradients from selection (MeSO optimization)")
+    # DETERMINE TRAINING MODE
+    if selection_method in ['GREATS', 'GradNorm'] and grad_hook and val_batch:
+        # ============================================================================
+        # DATA SELECTION MODE (Case 2 or Case 3)
+        # ============================================================================
 
-        # Select compressed gradients for chosen samples BEFORE injecting
-        # This matches the trainer.py design where selection happens before optimizer
-        grad_hook.compressed_grads = _select_compressed_grads(
-            saved_compressed_grads,
-            selected_indices
+        # Get learning rate for score scaling
+        lr = optimizer.param_groups[0].get("lr", 5e-5)
+
+        # Get batch sizes
+        train_batch_size = batch['input_ids'].shape[0]
+        val_batch_size_actual = val_batch['input_ids'].shape[0]
+
+        # Merge training and validation batches
+        merged_batch = _merge_batches(batch, val_batch)
+
+        if using_compressed_optimizer:
+            # ========================================================================
+            # CASE 3: GREATS with MeSO
+            # On-the-fly selection and aggregation of compressed gradients
+            # ALL work (fwd/bwd on merged batch + selection) goes into Sel(ms)
+            # Fwd(ms) and Bwd(ms) are 0 since we don't do separate training passes
+            # ========================================================================
+
+            if enable_profiling:
+                timer_selection.start()
+
+            if not is_warmup and enable_profiling:
+                print(f"  → Case 3: GREATS + MeSO (on-the-fly selection)")
+
+            # Setup selection state with aggregation enabled
+            grad_hook.setup_selection(
+                train_batch_size=train_batch_size,
+                selection_method=selection_method,
+                selection_frac=0.5,  # 50% selection
+                lr=lr,
+                compute_scores_only=False  # Aggregate compressed gradients on-the-fly
+            )
+
+            # Forward pass on merged batch (part of selection overhead)
+            model.zero_grad()
+            outputs = model(**merged_batch)
+            loss = outputs.loss
+
+            if enable_profiling:
+                mem_after_forward = get_mem()
+                max_after_forward = get_max_mem()
+                profile.max_during_forward = max_after_forward - max_before_forward
+                profile.mem_after_forward = mem_after_forward
+                profile.mem_delta_forward = mem_after_forward - mem_before_forward
+
+            # Backward pass - hook computes scores and aggregates gradients on-the-fly
+            # (part of selection overhead)
+            loss.backward()
+
+            if enable_profiling:
+                mem_after_backward = get_mem()
+                max_after_backward = get_max_mem()
+                profile.max_during_backward = max_after_backward - max_after_forward
+                profile.mem_after_backward = mem_after_backward
+                profile.mem_delta_backward = mem_after_backward - mem_after_forward
+
+            # Clear selection state
+            grad_hook.clear_selection()
+
+            # Gradients are already aggregated in hook.compressed_grads
+            # Optimizer will use them directly
+
+            # ALL time goes into selection (includes merged batch fwd/bwd + all overhead)
+            # Fwd and Bwd are 0 because we don't do separate training passes
+            if enable_profiling:
+                profile.selection_total_time = timer_selection.stop()
+                profile.forward_time = 0.0
+                profile.backward_time = 0.0
+                profile.selected_samples = int(train_batch_size * 0.5)
+
+        else:
+            # ========================================================================
+            # CASE 2: GREATS without MeSO
+            # Compute scores on-the-fly, then second forward/backward with full gradients
+            # ========================================================================
+
+            if enable_profiling:
+                timer_selection.start()
+
+            if not is_warmup and enable_profiling:
+                print(f"  → Case 2: GREATS without MeSO (on-the-fly scoring + full gradients)")
+
+            # Setup selection state with score computation only
+            grad_hook.setup_selection(
+                train_batch_size=train_batch_size,
+                selection_method=selection_method,
+                selection_frac=0.5,  # 50% selection
+                lr=lr,
+                compute_scores_only=True  # Only maintain running scores
+            )
+
+            # First forward/backward on merged batch to compute scores
+            model.zero_grad()
+            outputs = model(**merged_batch)
+            loss_for_scoring = outputs.loss
+            loss_for_scoring.backward()
+
+            # Get selected indices based on final accumulated scores
+            selected_indices = grad_hook.selection_state.get_selected_indices()
+
+            # Clear selection state
+            grad_hook.clear_selection()
+
+            # Stop selection timer BEFORE second pass to avoid double-counting
+            if enable_profiling:
+                profile.selection_total_time = timer_selection.stop()
+                profile.selected_samples = len(selected_indices)
+
+            # Filter batch to selected samples
+            filtered_batch = {k: v[selected_indices] for k, v in batch.items()}
+
+            # Disable hooks for standard gradient computation
+            grad_hook.disable_hooks()
+
+            # Second forward/backward on selected samples with FULL gradients
+            if enable_profiling:
+                timer_forward.start()
+
+            model.zero_grad()
+            outputs = model(**filtered_batch)
+            loss = outputs.loss
+
+            if enable_profiling:
+                profile.forward_time = timer_forward.stop()
+                mem_after_forward = get_mem()
+                max_after_forward = get_max_mem()
+                profile.max_during_forward = max_after_forward - max_before_forward
+                profile.mem_after_forward = mem_after_forward
+                profile.mem_delta_forward = mem_after_forward - mem_before_forward
+
+            if enable_profiling:
+                timer_backward.start()
+
+            loss.backward()
+
+            if enable_profiling:
+                profile.backward_time = timer_backward.stop()
+                mem_after_backward = get_mem()
+                max_after_backward = get_max_mem()
+                profile.max_during_backward = max_after_backward - max_after_forward
+                profile.mem_after_backward = mem_after_backward
+                profile.mem_delta_backward = mem_after_backward - mem_after_forward
+
+            # Re-enable hooks
+            grad_hook.enable_hooks()
+
+            # Selection timing already recorded above (before second pass)
+
+    elif selection_method == 'MaxLoss' and grad_hook:
+        # ============================================================================
+        # MAXLOSS SELECTION (fallback method)
+        # ============================================================================
+
+        if enable_profiling:
+            timer_selection.start()
+
+        # Compute per-sample losses
+        with torch.no_grad():
+            losses = []
+            for idx in range(batch_size):
+                single_batch = {k: v[[idx]] for k, v in batch.items()}
+                outputs = model(**single_batch)
+                losses.append(outputs.loss.item())
+
+        # Select highest loss samples
+        selected_indices = greedy_selection(
+            torch.tensor(losses),
+            torch.zeros((len(losses), len(losses))),
+            int(len(losses) * 0.5)
         )
 
-        # Reuse loss from data selection phase (no additional forward pass needed!)
-        loss = saved_loss
+        # Filter to selected samples
+        filtered_batch = {k: v[selected_indices] for k, v in batch.items()}
 
-        # Forward and backward time are essentially zero (no additional computation)
         if enable_profiling:
-            profile.forward_time = 0.0
-            profile.backward_time = 0.0
-            profile.model_forward_compute_time = 0.0
-            profile.loss_computation_time = 0.0
-            profile.backward_compute_time = 0.0
+            profile.selection_total_time = timer_selection.stop()
+            profile.selected_samples = len(selected_indices)
 
-            # Memory doesn't change (no actual computation)
-            mem_after_forward = mem_before_forward
-            max_after_forward = max_before_forward
-            profile.max_during_forward = 0.0
-            profile.mem_after_forward = mem_after_forward
-            profile.mem_delta_forward = 0.0
+        # Disable hooks if not using compressed optimizer
+        if not using_compressed_optimizer and grad_hook.hooks_registered:
+            grad_hook.disable_hooks()
 
-            mem_after_backward = mem_after_forward
-            max_after_backward = max_after_forward
-            profile.max_during_backward = 0.0
-            profile.mem_after_backward = mem_after_backward
-            profile.mem_delta_backward = 0.0
-
-            if ENABLE_DETAILED_PROFILING:
-                print(f"  Forward:   SKIPPED (reusing gradients from selection)")
-                print(f"  Backward:  SKIPPED (reusing gradients from selection)")
-            else:
-                print(f"  Forward:   SKIPPED (using cached gradients)")
-                print(f"  Backward:  SKIPPED (using cached gradients)")
-
-    else:
-        # === STANDARD PATH: Regular forward/backward pass ===
-
-        # FORWARD PASS WITH DETAILED BREAKDOWN
+        # Standard forward/backward on selected samples
         if enable_profiling:
-            cuda_timer_sync()
-        forward_start = time.time()
+            timer_forward.start()
 
-        # Model forward computation
-        if enable_profiling and ENABLE_DETAILED_PROFILING:
-            cuda_timer_sync()
-            model_forward_start = time.time()
-
-        outputs = model(**batch)
-
-        if enable_profiling and ENABLE_DETAILED_PROFILING:
-            cuda_timer_sync()
-            profile.model_forward_compute_time = time.time() - model_forward_start
-
-            # Loss computation
-            cuda_timer_sync()
-            loss_start = time.time()
-
+        model.zero_grad()
+        outputs = model(**filtered_batch)
         loss = outputs.loss
 
-        if enable_profiling and ENABLE_DETAILED_PROFILING:
-            cuda_timer_sync()
-            profile.loss_computation_time = time.time() - loss_start
-
         if enable_profiling:
-            cuda_timer_sync()
-            profile.forward_time = time.time() - forward_start
-
+            profile.forward_time = timer_forward.stop()
             mem_after_forward = get_mem()
             max_after_forward = get_max_mem()
             profile.max_during_forward = max_after_forward - max_before_forward
             profile.mem_after_forward = mem_after_forward
             profile.mem_delta_forward = mem_after_forward - mem_before_forward
 
-            if ENABLE_DETAILED_PROFILING:
-                breakdown = f"model: {profile.model_forward_compute_time*1000:.1f}ms, loss: {profile.loss_computation_time*1000:.1f}ms"
-                print(f"  Forward:   Current = {mem_after_forward:6.3f} GB, Max = {max_after_forward:6.3f} GB (peak: +{profile.max_during_forward:.3f} GB, delta: {profile.mem_delta_forward:+.3f} GB, time: {profile.forward_time*1000:.1f}ms, {breakdown})")
-            else:
-                print(f"  Forward:   Current = {mem_after_forward:6.3f} GB, Max = {max_after_forward:6.3f} GB (time: {profile.forward_time:.3f}s)")
-
-        # BACKWARD PASS WITH DETAILED BREAKDOWN
         if enable_profiling:
-            cuda_timer_sync()
-        backward_start = time.time()
-
-        # Backward computation
-        if enable_profiling and ENABLE_DETAILED_PROFILING:
-            cuda_timer_sync()
-            backward_compute_start = time.time()
+            timer_backward.start()
 
         loss.backward()
 
-        if enable_profiling and ENABLE_DETAILED_PROFILING:
-            cuda_timer_sync()
-            profile.backward_compute_time = time.time() - backward_compute_start
-
         if enable_profiling:
-            cuda_timer_sync()
-            profile.backward_time = time.time() - backward_start
-
+            profile.backward_time = timer_backward.stop()
             mem_after_backward = get_mem()
             max_after_backward = get_max_mem()
             profile.max_during_backward = max_after_backward - max_after_forward
             profile.mem_after_backward = mem_after_backward
             profile.mem_delta_backward = mem_after_backward - mem_after_forward
 
-            if ENABLE_DETAILED_PROFILING:
-                print(f"  Backward:  Current = {mem_after_backward:6.3f} GB, Max = {max_after_backward:6.3f} GB (peak: +{profile.max_during_backward:.3f} GB, delta: {profile.mem_delta_backward:+.3f} GB, time: {profile.backward_time*1000:.1f}ms, compute: {profile.backward_compute_time*1000:.1f}ms)")
+        # Re-enable hooks
+        if not using_compressed_optimizer and grad_hook.hooks_registered:
+            grad_hook.enable_hooks()
+
+    else:
+        # ============================================================================
+        # STANDARD MODE (Case 1 or no compression)
+        # Case 1: MeSO without GREATS - compressed gradients, no selection
+        # OR: Standard AdamW - full gradients, no compression
+        # ============================================================================
+
+        if not is_warmup and enable_profiling:
+            if using_compressed_optimizer:
+                print(f"  → Case 1: MeSO without GREATS (compressed gradients)")
             else:
-                print(f"  Backward:  Current = {mem_after_backward:6.3f} GB, Max = {max_after_backward:6.3f} GB (time: {profile.backward_time:.3f}s)")
+                print(f"  → Standard training (full gradients)")
 
-    # OPTIMIZER STEP WITH DETAILED BREAKDOWN
+        # Disable hooks if NOT using compressed optimizer
+        if not using_compressed_optimizer and grad_hook and grad_hook.hooks_registered:
+            grad_hook.disable_hooks()
+
+        # Standard forward pass
+        if enable_profiling:
+            timer_forward.start()
+
+        model.zero_grad()
+        outputs = model(**batch)
+        loss = outputs.loss
+
+        if enable_profiling:
+            profile.forward_time = timer_forward.stop()
+            mem_after_forward = get_mem()
+            max_after_forward = get_max_mem()
+            profile.max_during_forward = max_after_forward - max_before_forward
+            profile.mem_after_forward = mem_after_forward
+            profile.mem_delta_forward = mem_after_forward - mem_before_forward
+
+        # Standard backward pass
+        if enable_profiling:
+            timer_backward.start()
+
+        loss.backward()
+
+        if enable_profiling:
+            profile.backward_time = timer_backward.stop()
+            mem_after_backward = get_mem()
+            max_after_backward = get_max_mem()
+            profile.max_during_backward = max_after_backward - max_after_forward
+            profile.mem_after_backward = mem_after_backward
+            profile.mem_delta_backward = mem_after_backward - mem_after_forward
+
+        # Re-enable hooks if needed
+        if not using_compressed_optimizer and grad_hook and grad_hook.hooks_registered:
+            grad_hook.enable_hooks()
+
+    # OPTIMIZER STEP
     if enable_profiling:
-        cuda_timer_sync()
-    optimizer_start = time.time()
+        timer_optimizer.start()
 
-    # Optimizer step
-    if enable_profiling and ENABLE_DETAILED_PROFILING:
-        cuda_timer_sync()
-        opt_step_start = time.time()
-
-    # Optimizer step (gradients already filtered if reusing from selection)
     optimizer.step()
-
-    if enable_profiling and ENABLE_DETAILED_PROFILING:
-        cuda_timer_sync()
-        profile.optimizer_step_time = time.time() - opt_step_start
-
-        # Zero grad
-        cuda_timer_sync()
-        zero_grad_start = time.time()
-
     optimizer.zero_grad()
 
-    if enable_profiling and ENABLE_DETAILED_PROFILING:
-        cuda_timer_sync()
-        profile.optimizer_zero_grad_time = time.time() - zero_grad_start
-
     if enable_profiling:
-        cuda_timer_sync()
-        profile.optimizer_time = time.time() - optimizer_start
-
+        profile.optimizer_time = timer_optimizer.stop()
         mem_after_optimizer = get_mem()
         max_after_optimizer = get_max_mem()
         profile.max_during_optimizer = max_after_optimizer - max_after_backward
@@ -660,20 +578,23 @@ def _run_single_iteration(model, optimizer, tokenizer, grad_hook, val_batch, sel
         profile.mem_delta_optimizer = mem_after_optimizer - mem_after_backward
         profile.max_ever = max_after_optimizer
 
-        if ENABLE_DETAILED_PROFILING:
-            opt_breakdown = f"step: {profile.optimizer_step_time*1000:.1f}ms, zero_grad: {profile.optimizer_zero_grad_time*1000:.1f}ms"
-            print(f"  Optimizer: Current = {mem_after_optimizer:6.3f} GB, Max = {max_after_optimizer:6.3f} GB (peak: +{profile.max_during_optimizer:.3f} GB, delta: {profile.mem_delta_optimizer:+.3f} GB, time: {profile.optimizer_time*1000:.1f}ms, {opt_breakdown})")
+        # Print profiling info
+        if ENABLE_DETAILED_PROFILING and not is_warmup:
+            print(f"  Forward:   Current = {mem_after_forward:6.3f} GB, Max = {max_after_forward:6.3f} GB (peak: +{profile.max_during_forward:.3f} GB, delta: {profile.mem_delta_forward:+.3f} GB, time: {profile.forward_time*1000:.1f}ms)")
+            print(f"  Backward:  Current = {mem_after_backward:6.3f} GB, Max = {max_after_backward:6.3f} GB (peak: +{profile.max_during_backward:.3f} GB, delta: {profile.mem_delta_backward:+.3f} GB, time: {profile.backward_time*1000:.1f}ms)")
+            print(f"  Optimizer: Current = {mem_after_optimizer:6.3f} GB, Max = {max_after_optimizer:6.3f} GB (peak: +{profile.max_during_optimizer:.3f} GB, delta: {profile.mem_delta_optimizer:+.3f} GB, time: {profile.optimizer_time*1000:.1f}ms)")
             if profile.selection_total_time > 0:
-                print(f"  Selection: Time = {profile.selection_total_time*1000:.1f}ms (grad_comp: {profile.selection_grad_comp_time*1000:.1f}ms, greedy: {profile.selection_greedy_time*1000:.1f}ms, selected: {profile.selected_samples}/{profile.total_samples})")
+                print(f"  Selection: Time = {profile.selection_total_time*1000:.1f}ms (selected: {profile.selected_samples}/{profile.total_samples})")
             if profile.batch_prep_time > 0 or profile.data_transfer_time > 0:
-                print(f"  Overhead:  Batch prep: {profile.batch_prep_time*1000:.1f}ms, Data transfer: {profile.data_transfer_time*1000:.1f}ms")
-        else:
+                print(f"  Overhead:  Batch prep: {profile.batch_prep_time*1000:.1f}ms, Data transfer: {profile.data_transfer_time*1000:.1f}ms)")
+        elif enable_profiling and not is_warmup:
+            print(f"  Forward:   Current = {mem_after_forward:6.3f} GB, Max = {max_after_forward:6.3f} GB (time: {profile.forward_time:.3f}s)")
+            print(f"  Backward:  Current = {mem_after_backward:6.3f} GB, Max = {max_after_backward:6.3f} GB (time: {profile.backward_time:.3f}s)")
             print(f"  Optimizer: Current = {mem_after_optimizer:6.3f} GB, Max = {max_after_optimizer:6.3f} GB (time: {profile.optimizer_time:.3f}s)")
 
     return profile
 
-
-def run_method(method_name, setup_fn, selection_method: Optional[str] = None):
+def run_method(method_name, setup_fn, selection_method: Optional[str] = None, method_idx: Optional[int] = None, output_dir: Optional[str] = None):
     """
     Run a method for multiple iterations with comprehensive profiling.
 
@@ -681,6 +602,8 @@ def run_method(method_name, setup_fn, selection_method: Optional[str] = None):
         method_name: Name of the method being tested
         setup_fn: Function that returns (model, optimizer, tokenizer, grad_hook)
         selection_method: Optional data selection method ('GREATS', 'GradNorm', 'MaxLoss', None)
+        method_idx: Optional method index for filename prefixing
+        output_dir: Optional output directory for saving results (including memory snapshots)
     """
     print("="*80)
     print(f"Testing: {method_name}")
@@ -779,8 +702,20 @@ def run_method(method_name, setup_fn, selection_method: Optional[str] = None):
     # Save memory snapshot if enabled
     if ENABLE_MEMORY_SNAPSHOT:
         import os
-        os.makedirs('memory_snapshots', exist_ok=True)
-        snapshot_file = f"memory_snapshots/{re.sub(r'[^a-zA-Z0-9]+', '_', method_name).strip('_')}.pickle"
+
+        # Determine the directory for memory snapshots
+        if output_dir:
+            snapshot_dir = output_dir
+        else:
+            snapshot_dir = 'memory_snapshots'
+            os.makedirs(snapshot_dir, exist_ok=True)
+
+        # Create filename with method index prefix if available
+        clean_name = re.sub(r'[^a-zA-Z0-9]+', '_', method_name).strip('_')
+        if method_idx is not None:
+            snapshot_file = f"{snapshot_dir}/{method_idx:02d}_{clean_name}.pickle"
+        else:
+            snapshot_file = f"{snapshot_dir}/{clean_name}.pickle"
 
         print(f"\n📸 Saving memory snapshot...")
         try:
@@ -908,7 +843,6 @@ def run_method(method_name, setup_fn, selection_method: Optional[str] = None):
             if stats_with_selection:
                 avg_selection_total = sum(s['selection_total_time'] for s in stats_with_selection) / len(stats_with_selection)
                 avg_selection_grad_comp = sum(s.get('selection_grad_comp_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-                avg_selection_greedy = sum(s.get('selection_greedy_time', 0) for s in stats_with_selection) / len(stats_with_selection)
 
                 # Detailed sub-components
                 avg_val_fwd = sum(s.get('selection_val_forward_time', 0) for s in stats_with_selection) / len(stats_with_selection)
@@ -927,8 +861,6 @@ def run_method(method_name, setup_fn, selection_method: Optional[str] = None):
                     print(f"       ├─ Train forward:     {avg_train_fwd:6.3f}s ({avg_train_fwd*1000:6.1f}ms, {avg_train_fwd/avg_iteration*100:5.1f}%)")
                     print(f"       ├─ Train backward:    {avg_train_bwd:6.3f}s ({avg_train_bwd*1000:6.1f}ms, {avg_train_bwd/avg_iteration*100:5.1f}%)")
                     print(f"       └─ Dot product calc:  {avg_dotprod_compute:6.3f}s ({avg_dotprod_compute*1000:6.1f}ms, {avg_dotprod_compute/avg_iteration*100:5.1f}%)")
-
-                print(f"    2) Greedy selection:     {avg_selection_greedy:6.3f}s ({avg_selection_greedy*1000:6.1f}ms, {avg_selection_greedy/avg_iteration*100:5.1f}%)")
 
         # MeSO-specific operations note
         if 'MeSO' in method_name or 'meso' in method_name.lower():
@@ -1004,7 +936,6 @@ def run_method(method_name, setup_fn, selection_method: Optional[str] = None):
         if stats_with_selection:
             result['avg_selection_total_time'] = sum(s['selection_total_time'] for s in stats_with_selection) / len(stats_with_selection)
             result['avg_selection_grad_comp_time'] = sum(s.get('selection_grad_comp_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-            result['avg_selection_greedy_time'] = sum(s.get('selection_greedy_time', 0) for s in stats_with_selection) / len(stats_with_selection)
 
             # Detailed selection breakdown
             result['avg_selection_val_forward_time'] = sum(s.get('selection_val_forward_time', 0) for s in stats_with_selection) / len(stats_with_selection)
@@ -1066,7 +997,7 @@ def setup_full_meso():
     )
     model.train()
 
-    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    layer_names = find_trainable_layers(model, lora_only=False)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.pad_token = tokenizer.eos_token
@@ -1076,19 +1007,19 @@ def setup_full_meso():
 
     # Setup compression (using centralized configuration)
     sparsifier_kwargs = {
-        "proj_dim": MESO_SPARSIFIER_DIM,
-        "proj_max_batch_size": MESO_COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": MESO_COMPRESSION_SEED,
+        "proj_dim": SPARSIFIER_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": MESO_SPARSIFIER_TYPE,
+        "proj_type": SPARSIFIER_TYPE,
     }
 
     projector_kwargs = {
-        "proj_dim": MESO_PROJECTOR_DIM,
-        "proj_max_batch_size": MESO_COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": MESO_COMPRESSION_SEED,
+        "proj_dim": PROJECTOR_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": MESO_PROJECTOR_TYPE,
+        "proj_type": PROJECTOR_TYPE,
     }
 
     compressors = setup_model_compressors(
@@ -1098,7 +1029,7 @@ def setup_full_meso():
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(device),
-        update_freq=MESO_UPDATE_FREQ
+        update_freq=UPDATE_FREQ
     )
 
     grad_hook = GradientHook(
@@ -1397,7 +1328,7 @@ def setup_full_meso_gradient_checkpointing():
     model.gradient_checkpointing_enable()
     model.train()
 
-    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    layer_names = find_trainable_layers(model, lora_only=False)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.pad_token = tokenizer.eos_token
@@ -1407,19 +1338,19 @@ def setup_full_meso_gradient_checkpointing():
 
     # Setup compression (using centralized configuration)
     sparsifier_kwargs = {
-        "proj_dim": MESO_SPARSIFIER_DIM,
-        "proj_max_batch_size": MESO_COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": MESO_COMPRESSION_SEED,
+        "proj_dim": SPARSIFIER_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": MESO_SPARSIFIER_TYPE,
+        "proj_type": SPARSIFIER_TYPE,
     }
 
     projector_kwargs = {
-        "proj_dim": MESO_PROJECTOR_DIM,
-        "proj_max_batch_size": MESO_COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": MESO_COMPRESSION_SEED,
+        "proj_dim": PROJECTOR_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": MESO_PROJECTOR_TYPE,
+        "proj_type": PROJECTOR_TYPE,
     }
 
     compressors = setup_model_compressors(
@@ -1429,7 +1360,7 @@ def setup_full_meso_gradient_checkpointing():
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(device),
-        update_freq=MESO_UPDATE_FREQ
+        update_freq=UPDATE_FREQ
     )
 
     grad_hook = GradientHook(
@@ -1611,7 +1542,7 @@ def setup_full_greats():
     )
     model.train()
 
-    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    layer_names = find_trainable_layers(model, lora_only=False)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.pad_token = tokenizer.eos_token
@@ -1621,19 +1552,19 @@ def setup_full_greats():
 
     # Setup compression (needed for GREATS gradient computation)
     sparsifier_kwargs = {
-        "proj_dim": 1024,
-        "proj_max_batch_size": 64,
-        "proj_seed": 42,
+        "proj_dim": SPARSIFIER_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": "random_mask",
+        "proj_type": SPARSIFIER_TYPE,
     }
 
     projector_kwargs = {
-        "proj_dim": 262144,
-        "proj_max_batch_size": 64,
-        "proj_seed": 42,
+        "proj_dim": PROJECTOR_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": "sjlt",
+        "proj_type": PROJECTOR_TYPE,
     }
 
     compressors = setup_model_compressors(
@@ -1643,7 +1574,7 @@ def setup_full_greats():
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(device),
-        update_freq=200
+        update_freq=UPDATE_FREQ
     )
 
     grad_hook = GradientHook(
@@ -1697,19 +1628,19 @@ def setup_lora_greats():
 
     # Setup compression (needed for GREATS gradient computation)
     sparsifier_kwargs = {
-        "proj_dim": 1024,
-        "proj_max_batch_size": 64,
-        "proj_seed": 42,
+        "proj_dim": SPARSIFIER_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": "random_mask",
+        "proj_type": SPARSIFIER_TYPE,
     }
 
     projector_kwargs = {
-        "proj_dim": 262144,
-        "proj_max_batch_size": 64,
-        "proj_seed": 42,
+        "proj_dim": PROJECTOR_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": "sjlt",
+        "proj_type": PROJECTOR_TYPE,
     }
 
     compressors = setup_model_compressors(
@@ -1719,7 +1650,7 @@ def setup_lora_greats():
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(device),
-        update_freq=200
+        update_freq=UPDATE_FREQ
     )
 
     grad_hook = GradientHook(
@@ -1753,7 +1684,7 @@ def setup_full_greats_gradient_checkpointing():
     model.gradient_checkpointing_enable()
     model.train()
 
-    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    layer_names = find_trainable_layers(model, lora_only=False)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.pad_token = tokenizer.eos_token
@@ -1763,19 +1694,19 @@ def setup_full_greats_gradient_checkpointing():
 
     # Setup compression (needed for GREATS gradient computation)
     sparsifier_kwargs = {
-        "proj_dim": 1024,
-        "proj_max_batch_size": 64,
-        "proj_seed": 42,
+        "proj_dim": SPARSIFIER_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": "random_mask",
+        "proj_type": SPARSIFIER_TYPE,
     }
 
     projector_kwargs = {
-        "proj_dim": 262144,
-        "proj_max_batch_size": 64,
-        "proj_seed": 42,
+        "proj_dim": PROJECTOR_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": "sjlt",
+        "proj_type": PROJECTOR_TYPE,
     }
 
     compressors = setup_model_compressors(
@@ -1785,7 +1716,7 @@ def setup_full_greats_gradient_checkpointing():
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(device),
-        update_freq=200
+        update_freq=UPDATE_FREQ
     )
 
     grad_hook = GradientHook(
@@ -1842,19 +1773,19 @@ def setup_lora_greats_gradient_checkpointing():
 
     # Setup compression (needed for GREATS gradient computation)
     sparsifier_kwargs = {
-        "proj_dim": 1024,
-        "proj_max_batch_size": 64,
-        "proj_seed": 42,
+        "proj_dim": SPARSIFIER_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": "random_mask",
+        "proj_type": SPARSIFIER_TYPE,
     }
 
     projector_kwargs = {
-        "proj_dim": 262144,
-        "proj_max_batch_size": 64,
-        "proj_seed": 42,
+        "proj_dim": PROJECTOR_DIM,
+        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
+        "proj_seed": COMPRESSION_SEED,
         "device": str(device),
-        "proj_type": "sjlt",
+        "proj_type": PROJECTOR_TYPE,
     }
 
     compressors = setup_model_compressors(
@@ -1864,7 +1795,7 @@ def setup_lora_greats_gradient_checkpointing():
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(device),
-        update_freq=200
+        update_freq=UPDATE_FREQ
     )
 
     grad_hook = GradientHook(
@@ -2004,7 +1935,10 @@ def aggregate_results(results_dir='results'):
             subfolder_results = []
 
             for filename in sorted(os.listdir(subfolder_path)):
-                if filename.startswith('result_') and filename.endswith('.json'):
+                # Support both old (result_*.json) and new ({idx:02d}_*.json) patterns
+                is_result_file = (filename.startswith('result_') and filename.endswith('.json')) or \
+                                 (filename.endswith('.json') and len(filename) > 2 and filename[:2].isdigit() and filename[2] == '_')
+                if is_result_file:
                     filepath = os.path.join(subfolder_path, filename)
                     with open(filepath, 'r') as f:
                         result = json.load(f)
@@ -2021,7 +1955,10 @@ def aggregate_results(results_dir='results'):
     else:
         # Old structure or direct files: results/*.json (backwards compatibility)
         for filename in sorted(os.listdir(results_dir)):
-            if filename.startswith('result_') and filename.endswith('.json'):
+            # Support both old (result_*.json) and new ({idx:02d}_*.json) patterns
+            is_result_file = (filename.startswith('result_') and filename.endswith('.json')) or \
+                             (filename.endswith('.json') and len(filename) > 2 and filename[:2].isdigit() and filename[2] == '_')
+            if is_result_file:
                 filepath = os.path.join(results_dir, filename)
                 with open(filepath, 'r') as f:
                     result = json.load(f)
@@ -2060,10 +1997,16 @@ def aggregate_results(results_dir='results'):
 
     # Single comprehensive table
     if has_multiple_configs:
-        print(f"{'Config':<12} {'Method':<28} {'Peak Mem':<10} {'Sel(ms)':<9} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
+        if has_selection:
+            print(f"{'Config':<12} {'Method':<28} {'Peak Mem':<10} {'Sel(ms)':<9} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
+        else:
+            print(f"{'Config':<12} {'Method':<28} {'Peak Mem':<10} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
         print("-" * print_length)
     else:
-        print(f"{'Method':<28} {'Peak Mem':<10} {'Sel(ms)':<9} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
+        if has_selection:
+            print(f"{'Method':<28} {'Peak Mem':<10} {'Sel(ms)':<9} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
+        else:
+            print(f"{'Method':<28} {'Peak Mem':<10} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
         print("-" * print_length)
 
     prev_config = None
@@ -2123,9 +2066,9 @@ def aggregate_results(results_dir='results'):
             print("DETAILED SELECTION BREAKDOWN")
             print("="*print_length)
             if has_multiple_configs:
-                print(f"{'Config':<12} {'Method':<28} {'Val Fwd':<10} {'Val Bwd':<10} {'Train Fwd':<11} {'Train Bwd':<11} {'Dot Prod':<11} {'Greedy':<10}")
+                print(f"{'Config':<12} {'Method':<28} {'Val Fwd':<10} {'Val Bwd':<10} {'Train Fwd':<11} {'Train Bwd':<11} {'Dot Prod':<11}")
             else:
-                print(f"{'Method':<28} {'Val Fwd':<10} {'Val Bwd':<10} {'Train Fwd':<11} {'Train Bwd':<11} {'Dot Prod':<11} {'Greedy':<10}")
+                print(f"{'Method':<28} {'Val Fwd':<10} {'Val Bwd':<10} {'Train Fwd':<11} {'Train Bwd':<11} {'Dot Prod':<11}")
             print("-" * print_length)
 
             for r in results:
@@ -2137,19 +2080,17 @@ def aggregate_results(results_dir='results'):
                     train_fwd = f"{r.get('avg_selection_train_forward_time', 0)*1000:.1f}ms" if 'avg_selection_train_forward_time' in r else "-"
                     train_bwd = f"{r.get('avg_selection_train_backward_time', 0)*1000:.1f}ms" if 'avg_selection_train_backward_time' in r else "-"
                     dotprod = f"{r.get('avg_selection_dotprod_compute_time', 0)*1000:.1f}ms" if 'avg_selection_dotprod_compute_time' in r else "-"
-                    greedy = f"{r.get('avg_selection_greedy_time', 0)*1000:.1f}ms" if 'avg_selection_greedy_time' in r else "-"
 
                     if has_multiple_configs:
-                        print(f"{config_display:<12} {r['method']:<28} {val_fwd:<10} {val_bwd:<10} {train_fwd:<11} {train_bwd:<11} {dotprod:<11} {greedy:<10}")
+                        print(f"{config_display:<12} {r['method']:<28} {val_fwd:<10} {val_bwd:<10} {train_fwd:<11} {train_bwd:<11} {dotprod:<11}")
                     else:
-                        print(f"{r['method']:<28} {val_fwd:<10} {val_bwd:<10} {train_fwd:<11} {train_bwd:<11} {dotprod:<11} {greedy:<10}")
+                        print(f"{r['method']:<28} {val_fwd:<10} {val_bwd:<10} {train_fwd:<11} {train_bwd:<11} {dotprod:<11}")
 
             print("="*print_length)
             print("Selection Components:")
             print("  Val Fwd/Bwd:    Validation forward/backward pass (small batch)")
             print("  Train Fwd/Bwd:  Training forward/backward pass (per-sample gradients)")
             print("  Dot Prod:       Gradient similarity computation (layer-by-layer)")
-            print("  Greedy:         Greedy selection algorithm (choose top samples)")
             print("="*print_length)
 
     # Save aggregated results
@@ -2216,32 +2157,38 @@ if __name__ == "__main__":
     # Create output directory with configuration subfolder if running individual tests
     tee_logger = None
     if args.method is not None:
-        config_subfolder = get_config_subfolder_name()
-        output_dir = os.path.join(args.output_dir, config_subfolder)
-        os.makedirs(output_dir, exist_ok=True)
-        print(f"Results will be saved to: {output_dir}\n")
-
-        # Start logging to file in the config subfolder
-        log_file = os.path.join(output_dir, f'log_{args.method:02d}.txt')
-        tee_logger = TeeLogger(log_file)
-        tee_logger.start()
-        print(f"Logging to: {log_file}\n")
-
-    if args.method is not None:
-        # Run single method
+        # Validate method index first
         if args.method < 0 or args.method >= len(methods):
             print(f"Error: Method index {args.method} is out of range (0-{len(methods)-1})")
             print("Use --list to see available methods")
             sys.exit(1)
 
+        # Get method details
         method_name, setup_fn, selection_method = methods[args.method]
+
+        # Create clean method name for filenames
+        clean_method_name = re.sub(r'[^a-zA-Z0-9]+', '_', method_name).strip('_')
+
+        # Create output directory
+        config_subfolder = get_config_subfolder_name()
+        output_dir = os.path.join(args.output_dir, config_subfolder)
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Results will be saved to: {output_dir}\n")
+
+        # Start logging to file in the config subfolder with consistent naming
+        log_file = os.path.join(output_dir, f'{args.method:02d}_{clean_method_name}.log')
+        tee_logger = TeeLogger(log_file)
+        tee_logger.start()
+        print(f"Logging to: {log_file}\n")
+
+        # Run the method
         print(f"Running method {args.method}: {method_name}\n")
         if selection_method:
             print(f"Data selection enabled: {selection_method}\n")
-        result = run_method(method_name, setup_fn, selection_method)
+        result = run_method(method_name, setup_fn, selection_method, method_idx=args.method, output_dir=output_dir)
 
-        # Save individual result to config subfolder
-        result_file = os.path.join(output_dir, f'result_{args.method:02d}.json')
+        # Save individual result to config subfolder with consistent naming
+        result_file = os.path.join(output_dir, f'{args.method:02d}_{clean_method_name}.json')
         with open(result_file, 'w') as f:
             json.dump(result, f, indent=2)
         print(f"\nResult saved to: {result_file}")
