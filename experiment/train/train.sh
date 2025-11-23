@@ -55,6 +55,7 @@ n_val=5
 n_eval=500
 model="llama3-1b"
 batch_size=4
+val_batch_size=""  # Defaults to batch_size if not specified
 lr=5e-05
 seed=42
 gradient_accumulation_steps=1
@@ -88,6 +89,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --batch_size)
             batch_size="$2"
+            shift 2
+            ;;
+        --val_batch_size)
+            val_batch_size="$2"
             shift 2
             ;;
         --percentage)
@@ -165,7 +170,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --data_selection <method>              Data selection method: NA, GREATS, GradNorm (default: NA)"
             echo "  --optim <optimizer>                    Optimizer: adamw_torch, adamw_hf, etc. (default: adamw_torch)"
             echo "  --MeSO                                 Use MeSO compressed optimizer for memory efficiency"
-            echo "  --batch_size <size>                    Batch size (default: 2)"
+            echo "  --batch_size <size>                    Training batch size (also used for evaluation) (default: 4)"
+            echo "  --val_batch_size <size>  Validation batch size for data selection (default: same as batch_size)"
             echo "  --percentage <pct>                     Data sampling percentage (default: 0.05)"
             echo "  --n_val <n>                            Number of validation examples (default: 5)"
             echo "  --n_eval <n>                           Number of evaluation examples (default: 500)"
@@ -278,7 +284,8 @@ echo "Data selection: $data_selection"
 echo "MeSO: $MeSO"
 echo "Compression: ${compression:-None}"
 echo "Flash Attention: $([ "$use_flash_attention" = true ] && echo "ENABLED" || echo "DISABLED")"
-echo "Batch size: $batch_size"
+echo "Batch size (train/eval): $batch_size"
+echo "Batch size (val for selection): ${val_batch_size:-$batch_size (same as train)}"
 echo "Data percentage: $percentage"
 echo "Validation examples: $n_val"
 echo "Evaluation examples: $n_eval"
@@ -334,6 +341,11 @@ training_args="$base_training_args \
 --gradient_accumulation_steps $gradient_accumulation_steps \
 --seed $seed \
 --optim $optim"
+
+# Add val_batch_size if specified (defaults to train batch size if not specified)
+if [[ -n "$val_batch_size" ]]; then
+    training_args="$training_args --val_batch_size_for_selection $val_batch_size"
+fi
 
 # Add LoRA arguments if using LoRA
 if [ "$use_lora" = true ]; then

@@ -1,5 +1,5 @@
 """
-Hook-based trainer.
+Hook-based trainer with on-the-fly data selection.
 """
 
 import json
@@ -19,14 +19,16 @@ from transformers import Trainer
 
 from .optimizer import MeSOAdamW
 from .hook import GradientHook
-from .utils import greedy_selection
 
 logger = logging.getLogger(__name__)
 
 
 class CompGradTrainer(Trainer):
     """
-    Trainer with gradient hook manager for per-sample gradient computations.
+    Trainer with on-the-fly data selection and gradient compression.
+    - Single merged forward/backward pass (train + val batches)
+    - Selection scores computed incrementally during backward
+    - Gradients aggregated on-the-fly for memory efficiency
     """
 
     def __init__(self, grad_hook: GradientHook, val_dataset, *args, **kwargs):
@@ -40,12 +42,11 @@ class CompGradTrainer(Trainer):
                 - Must include eval_dataset: Evaluation dataset (for generalization testing, large)
         """
         # Extract eval_dataset from kwargs before passing to parent
-        # The parent Trainer expects eval_dataset for its evaluation strategy
         eval_dataset = kwargs.get('eval_dataset', None)
         if eval_dataset is None:
-            raise ValueError("HookTrainer requires an eval_dataset to be passed in kwargs")
+            raise ValueError("CompGradTrainer requires an eval_dataset to be passed in kwargs")
 
-        # Pass eval_dataset to parent Trainer (it will use it for triggering evaluation)
+        # Pass eval_dataset to parent Trainer
         super().__init__(*args, **kwargs)
 
         # Store our custom datasets
@@ -53,40 +54,73 @@ class CompGradTrainer(Trainer):
         self.val_dataset = val_dataset
         self.eval_dataset_custom = eval_dataset
 
-        # Note: self.eval_dataset (from parent) will also point to eval_dataset
-        # but we override the evaluate() method anyway
+        # Set selection_frac to 1.0 when no selection method is specified (consistency)
+        # This means we "select" all samples when not doing data selection
+        if not hasattr(self.args, 'selection_frac') or self.args.selection_frac is None:
+            if self.args.method not in ['GREATS', 'GradNorm', 'MaxLoss']:
+                self.args.selection_frac = 1.0
 
         # Initialize results tracking
         self.evaluation_results = []
 
+        # Track wall time using CUDA events for accurate GPU timing
+        if torch.cuda.is_available():
+            self.training_start_event = torch.cuda.Event(enable_timing=True)
+            self.training_start_event.record()
+        else:
+            self.training_start_event = None
+            self.training_start_time = time.time()  # Fallback for CPU
+
+        # Determine validation batch size for data selection
+        # Use val_batch_size_for_selection if provided, otherwise default to per_device_train_batch_size
+        self.val_batch_size_for_selection = (
+            self.args.val_batch_size_for_selection
+            if hasattr(self.args, 'val_batch_size_for_selection') and self.args.val_batch_size_for_selection is not None
+            else self.args.per_device_train_batch_size
+        )
+
         # Create validation dataloader iterator for efficient batch sampling during training
-        self.val_dataloader_iter = iter(self.get_val_dataloader(self.val_dataset, batch_size=self.args.per_device_train_batch_size, shuffle=True))
+        # Only needed if we're doing data selection (GREATS/GradNorm)
+        if val_dataset is not None:
+            self.val_dataloader_iter = iter(
+                self.get_val_dataloader(self.val_dataset, batch_size=self.val_batch_size_for_selection, shuffle=True)
+            )
+        else:
+            self.val_dataloader_iter = None
 
         logger.info("="*60)
-        logger.info("Initialized HookTrainer")
-        logger.info(f"  Selection method: {self.args.method} (fraction: {self.args.selection_frac})")
-        logger.info(f"  Validation set size: {len(val_dataset)}")
-        logger.info(f"  Evaluation set size: {len(eval_dataset)}")
+        logger.info("Initialized CompGradTrainer (v2 - On-the-fly selection)")
+        selection_frac = getattr(self.args, 'selection_frac', None)
+        logger.info(f"  Selection method: {self.args.method} (fraction: {selection_frac})")
+        logger.info(f"  Validation set size: {len(val_dataset) if val_dataset is not None else 0}")
+        logger.info(f"  Evaluation set size: {len(eval_dataset) if eval_dataset is not None else 0}")
+        logger.info(f"  Training batch size: {self.args.per_device_train_batch_size}")
+        logger.info(f"  Validation batch size (for data selection): {self.val_batch_size_for_selection}")
+        logger.info(f"  Evaluation batch size (for perplexity): {self.args.per_device_train_batch_size}")
         logger.info(f"  Compressed optimizer: {self.args.use_compressed_optimizer}")
-        if self.args.use_compressed_optimizer and self.args.method in ['GREATS', 'GradNorm']:
-            logger.info(f"  Optimization: Reusing compressed gradients (no second forward/backward)")
-        elif self.args.method in ['GREATS', 'GradNorm'] and not self.args.use_compressed_optimizer:
-            logger.info(f"  Note: Hooks will be toggled per step (enabled for selection, disabled for optimization)")
+
+        # Log the training mode based on configuration
+        if val_dataset is not None and self.args.method in ['GREATS', 'GradNorm']:
+            if self.args.use_compressed_optimizer:
+                logger.info(f"  Mode: Case 3 - GREATS with MeSO (on-the-fly selection + compressed gradients)")
+            else:
+                logger.info(f"  Mode: Case 2 - GREATS without MeSO (on-the-fly scoring + full gradients)")
+        elif self.args.use_compressed_optimizer:
+            logger.info(f"  Mode: Case 1 - MeSO without GREATS (compressed gradients, no selection)")
+        else:
+            logger.info(f"  Mode: Standard training (full gradients, no selection)")
+
         logger.info("="*60)
 
     def _get_unwrapped_optimizer(self):
         """
         Get the underlying optimizer, unwrapping AcceleratedOptimizer if present.
 
-        HuggingFace's Accelerate library wraps optimizers with AcceleratedOptimizer,
-        which breaks isinstance() checks. This helper unwraps it.
-
         Returns:
             The underlying optimizer (e.g., MeSOAdamW or AdamW)
         """
         optimizer = self.optimizer
         if hasattr(optimizer, 'optimizer'):
-            # Unwrap AcceleratedOptimizer
             optimizer = optimizer.optimizer
         return optimizer
 
@@ -136,31 +170,6 @@ class CompGradTrainer(Trainer):
 
         return self.optimizer
 
-    def _select_compressed_grads(self, compressed_grads, selected_indices):
-        """
-        Select compressed gradients for chosen samples.
-
-        This keeps all selection logic within the trainer - the optimizer doesn't
-        need to know about data selection at all. The optimizer will then aggregate
-        these selected gradients.
-
-        Args:
-            compressed_grads: List of per-sample compressed gradients [batch_size, k_l] for each layer
-            selected_indices: Indices of selected samples (list or tensor)
-
-        Returns:
-            List of selected compressed gradients [num_selected, k_l] for each layer
-        """
-        selected_grads = []
-        for grad in compressed_grads:
-            if grad is None:
-                selected_grads.append(None)
-            else:
-                # Select samples only - optimizer will average them
-                selected_grad = grad[selected_indices]  # [num_selected, k_l]
-                selected_grads.append(selected_grad)
-        return selected_grads
-
     def get_val_dataloader(self, val_dataset, batch_size=4, shuffle=True):
         """Create validation dataloader for data selection."""
         if shuffle:
@@ -178,141 +187,86 @@ class CompGradTrainer(Trainer):
             pin_memory=self.args.dataloader_pin_memory,
         )
 
-    def compute_grad_dotprod(
-        self,
-        model: nn.Module,
-        batch_train: Dict[str, Tensor],
-        batch_val: Dict[str, Tensor],
-        return_similarity: bool = True,
-        return_compressed_grads: bool = False
-    ):
+    def _merge_batches(self, batch_train: Dict[str, Tensor], batch_val: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """
-        Compute gradient dot products using layer-by-layer accumulation.
+        Merge training and validation batches along batch dimension.
 
-        This implementation accumulates dot products layer-by-layer instead of
-        concatenating all gradients first, which is more memory efficient and
-        provides better cache locality.
-
-        Uses the same loss computation approach as training (with context manager,
-        loss computation, multi-GPU handling, and gradient accumulation scaling)
-        to ensure consistency between gradients used for selection and optimization.
+        Handles the case where batches have different sequence lengths by padding
+        to the maximum length across both batches.
 
         Args:
-            model: The model
-            batch_train: Training batch of size [batch_size]
-            batch_val: Validation batch of size [batch_size]
-            return_similarity: Whether to return similarity matrix
-            return_compressed_grads: Whether to return per-sample compressed gradients for reuse
+            batch_train: Training batch
+            batch_val: Validation batch
 
         Returns:
-            - grad_dot_scores: [batch_size] gradient similarity with validation
-            - similarity_matrix: [batch_size, batch_size] if return_similarity else None
-            - train_compressed_grads: List of per-sample compressed gradients if return_compressed_grads else None
-            - train_loss: Training loss (already scaled for multi-GPU and gradient accumulation)
+            Merged batch with train samples first, then val samples
         """
-        # Prepare inputs using trainer's method (handles device placement and preprocessing)
-        batch_val = self._prepare_inputs(batch_val)
-        batch_train = self._prepare_inputs(batch_train)
+        merged_batch = {}
 
-        # Step 1: Compute validation gradients
+        # Find max sequence length for padding
+        max_seq_len = max(
+            batch_train.get('input_ids', batch_train.get('attention_mask')).shape[1],
+            batch_val.get('input_ids', batch_val.get('attention_mask')).shape[1]
+        )
 
-        # IMPORTANT: Disable gradient aggregation for GREATS (needs per-sample gradients)
-        self.grad_hook.aggregate_grads = False
-
-        model.zero_grad()
-
-        with self.compute_loss_context_manager():
-            val_loss = self.compute_loss(model, batch_val)
-
-        # Apply multi-GPU averaging
-        if self.args.n_gpu > 1:
-            val_loss = val_loss.mean()
-
-        # Apply gradient accumulation scaling for consistency with training
-        if self.args.gradient_accumulation_steps > 1:
-            val_loss = val_loss / self.args.gradient_accumulation_steps
-
-        val_loss.backward()
-
-        # Get validation gradients from hooks and immediately average them
-        # We only need the mean validation gradient for dot product computation
-        val_grads_per_sample = self.grad_hook.get_compressed_grads()
-        val_grads = [g.mean(dim=0) if g is not None else None for g in val_grads_per_sample]
-
-        # Step 2: Compute training gradients (per-sample)
-        model.zero_grad()
-
-        with self.compute_loss_context_manager():
-            train_loss = self.compute_loss(model, batch_train)
-
-        # Apply multi-GPU averaging
-        if self.args.n_gpu > 1:
-            train_loss = train_loss.mean()
-
-        # Apply gradient accumulation scaling for consistency with training
-        if self.args.gradient_accumulation_steps > 1:
-            train_loss = train_loss / self.args.gradient_accumulation_steps
-
-        train_loss.backward()
-
-        # Get training gradients from hooks
-        train_grads = self.grad_hook.get_compressed_grads()
-
-        # Step 3: Compute dot products layer-by-layer
-        # Determine batch size from first non-None gradient
-        batch_size = None
-        for g in train_grads:
-            if g is not None:
-                batch_size = g.shape[0]
-                break
-
-        if batch_size is None:
-            raise ValueError("No valid gradients found in train_grads")
-
-        # Get device from the prepared batch
-        device = batch_train['input_ids'].device
-
-        # Initialize accumulators on device
-        grad_dot_scores = torch.zeros(batch_size, device=device)
-        similarity_matrix = None
-        if return_similarity:
-            similarity_matrix = torch.zeros(batch_size, batch_size, device=device)
-
-        # Accumulate dot products layer by layer
-        for train_g, val_g in zip(train_grads, val_grads):
-            # val_g is already averaged: [layer_dim]
-            # train_g is per-sample: [batch_size, layer_dim]
-            if train_g is None or val_g is None:
+        for key in batch_train.keys():
+            if key not in batch_val:
+                # If key not in val batch, just use train batch value
+                merged_batch[key] = batch_train[key]
                 continue
 
-            # Gradient dot product for this layer using fused matrix-vector multiply
-            # torch.addmv(input, mat, vec) computes: input + mat @ vec
-            # [batch_size, layer_dim] @ [layer_dim] -> [batch_size]
-            torch.addmv(grad_dot_scores, train_g, val_g, out=grad_dot_scores)
+            train_tensor = batch_train[key]
+            val_tensor = batch_val[key]
 
-            # Similarity matrix for this layer if requested using fused matrix-matrix multiply
-            # torch.addmm(input, mat1, mat2) computes: input + mat1 @ mat2
-            # [batch_size, layer_dim] @ [layer_dim, batch_size] -> [batch_size, batch_size]
-            if return_similarity:
-                torch.addmm(similarity_matrix, train_g, train_g.t(), out=similarity_matrix)
+            # Pad to max sequence length if needed (for 2D tensors like input_ids, attention_mask, labels)
+            if train_tensor.dim() == 2:
+                train_seq_len = train_tensor.shape[1]
+                val_seq_len = val_tensor.shape[1]
 
-        # Detach from computation graph (keep on GPU for efficiency)
-        grad_dot_scores = grad_dot_scores.detach()
-        if similarity_matrix is not None:
-            similarity_matrix = similarity_matrix.detach()
+                # Determine padding value based on key
+                if key == 'attention_mask':
+                    pad_value = 0
+                elif key == 'labels':
+                    pad_value = -100  # Standard ignore index for CrossEntropyLoss
+                else:  # input_ids and other token-based fields
+                    # Use processing_class's pad_token_id if available, otherwise 0
+                    processing_class = getattr(self, 'processing_class', None)
+                    pad_value = processing_class.pad_token_id if processing_class is not None and hasattr(processing_class, 'pad_token_id') and processing_class.pad_token_id is not None else 0
 
-        # Step 4: Return per-sample compressed gradients if requested
-        # These can be reused for optimization to avoid recomputing gradients
-        train_compressed_grads = None
-        if return_compressed_grads:
-            # Deep copy to avoid being overwritten by subsequent operations
-            train_compressed_grads = [g.clone() if g is not None else None for g in train_grads]
+                # Pad train batch if needed
+                if train_seq_len < max_seq_len:
+                    padding = torch.full(
+                        (train_tensor.shape[0], max_seq_len - train_seq_len),
+                        pad_value,
+                        dtype=train_tensor.dtype,
+                        device=train_tensor.device
+                    )
+                    train_tensor = torch.cat([train_tensor, padding], dim=1)
 
-        return grad_dot_scores, similarity_matrix, train_compressed_grads, train_loss.detach()
+                # Pad val batch if needed
+                if val_seq_len < max_seq_len:
+                    padding = torch.full(
+                        (val_tensor.shape[0], max_seq_len - val_seq_len),
+                        pad_value,
+                        dtype=val_tensor.dtype,
+                        device=val_tensor.device
+                    )
+                    val_tensor = torch.cat([val_tensor, padding], dim=1)
+
+            # Concatenate along batch dimension (dim=0)
+            merged_batch[key] = torch.cat([train_tensor, val_tensor], dim=0)
+
+        return merged_batch
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """
-        Training step with GREATS selection using simple hook approach.
+        Training step with on-the-fly data selection.
+            1. Merge validation with training batch
+            2. Setup selection state in hook
+            3. Single forward/backward pass on merged batch
+            4. Hook computes scores and aggregates gradients during backward
+            5. Retrieve aggregated gradients from hook
+            6. Return loss
         """
         model.train()
         args = self.args
@@ -322,127 +276,227 @@ class CompGradTrainer(Trainer):
         using_compressed_optimizer = isinstance(unwrapped_optimizer, MeSOAdamW)
 
         if using_compressed_optimizer:
-            # Note: We call this on the unwrapped optimizer because refresh_compressors_if_needed()
-            # is a custom MeSOAdamW method that AcceleratedOptimizer doesn't know about.
             unwrapped_optimizer.refresh_compressors_if_needed()
 
-        try:
-            val_batch = next(self.val_dataloader_iter)
-        except StopIteration:
-            # Restart iterator when exhausted
-            self.val_dataloader_iter = iter(self.get_val_dataloader(self.val_dataset, batch_size=4, shuffle=True))
-            val_batch = next(self.val_dataloader_iter)
-
-
         # Perform selection based on method
-        if args.method == 'GREATS':
-            # Compute gradients and scores using simple backward
-            # If using MeSO, also return compressed gradients to reuse them
-            scores, similarity_matrix, saved_compressed_grads, train_loss = self.compute_grad_dotprod(
-                model=model,
-                batch_train=inputs,
-                batch_val=val_batch,
-                return_similarity=True,
-                return_compressed_grads=using_compressed_optimizer
-            )
+        if args.method in ['GREATS', 'GradNorm']:
+            # Get validation batch for selection
+            try:
+                val_batch = next(self.val_dataloader_iter)
+            except StopIteration:
+                # Restart iterator when exhausted
+                self.val_dataloader_iter = iter(
+                    self.get_val_dataloader(self.val_dataset, batch_size=self.val_batch_size_for_selection, shuffle=True)
+                )
+                val_batch = next(self.val_dataloader_iter)
 
-            # Select samples
-            lr = self.optimizer.param_groups[0]["lr"]
-            selected_ind = greedy_selection(
-                scores * lr,
-                similarity_matrix * (lr ** 2),
-                int(len(scores) * args.selection_frac)
-            )
+            # Prepare inputs
+            batch_train = self._prepare_inputs(inputs)
+            batch_val = self._prepare_inputs(val_batch)
 
-        elif args.method == "GradNorm":
-            # Use diagonal of similarity matrix as gradient norm
-            _, similarity_matrix, saved_compressed_grads, train_loss = self.compute_grad_dotprod(
-                model=model,
-                batch_train=inputs,
-                batch_val=val_batch,
-                return_similarity=True,
-                return_compressed_grads=using_compressed_optimizer
-            )
+            # Get batch sizes
+            train_batch_size = batch_train['input_ids'].shape[0]
 
-            scores = torch.diag(similarity_matrix)
-            selected_ind = greedy_selection(
-                scores,
-                similarity_matrix * 0,
-                int(len(scores) * args.selection_frac)
-            )
+            # Merge batches: [train_samples, val_samples]
+            merged_batch = self._merge_batches(batch_train, batch_val)
+
+            # Get current learning rate from optimizer (handles scheduling)
+            if hasattr(self, 'optimizer') and self.optimizer is not None:
+                lr = self.optimizer.param_groups[0]["lr"]
+                # Handle case where lr might be None (e.g., warmup with 0 initial lr)
+                if lr is None or lr == 0:
+                    lr = args.learning_rate  # Fall back to base learning rate
+            else:
+                # Optimizer not created yet, use base learning rate
+                lr = args.learning_rate
+
+            if using_compressed_optimizer:
+                # On-the-fly selection and aggregation during backward
+                # Reuse compressed gradients for optimization
+
+                # Setup selection state in hook with aggregation enabled
+                self.grad_hook.setup_selection(
+                    train_batch_size=train_batch_size,
+                    selection_method=args.method,
+                    selection_frac=args.selection_frac,
+                    lr=lr,
+                    compute_scores_only=False
+                )
+
+                # Zero gradients before merged forward/backward
+                model.zero_grad()
+
+                # Single forward/backward pass on merged batch
+                with self.compute_loss_context_manager():
+                    outputs = model(**merged_batch)
+                    loss = outputs.loss
+
+                # Apply multi-GPU averaging
+                if args.n_gpu > 1:
+                    loss = loss.mean()
+
+                # Apply gradient accumulation scaling
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+
+                # Backward pass - hook will compute scores and aggregate gradients
+                loss.backward()
+
+                # Clear selection state
+                self.grad_hook.clear_selection()
+                return loss.detach()
+
+            else:
+                # Only data selection
+                # Compute scores on-the-fly, then do second forward/backward with full gradients
+
+                # Setup selection state in hook with score computation only
+                self.grad_hook.setup_selection(
+                    train_batch_size=train_batch_size,
+                    selection_method=args.method,
+                    selection_frac=args.selection_frac,
+                    lr=lr,
+                    compute_scores_only=True
+                )
+
+                # Zero gradients before merged forward/backward
+                model.zero_grad()
+
+                # First forward/backward pass on merged batch to compute scores
+                with self.compute_loss_context_manager():
+                    outputs = model(**merged_batch)
+                    loss_for_scoring = outputs.loss
+
+                # Apply multi-GPU averaging
+                if args.n_gpu > 1:
+                    loss_for_scoring = loss_for_scoring.mean()
+
+                # Apply gradient accumulation scaling
+                if args.gradient_accumulation_steps > 1:
+                    loss_for_scoring = loss_for_scoring / args.gradient_accumulation_steps
+
+                # Backward pass - hook will maintain running scores (no aggregation)
+                loss_for_scoring.backward()
+
+                # Get selected indices based on final accumulated scores
+                selected_indices = self.grad_hook.selection_state.get_selected_indices()
+
+                # Clear selection state
+                self.grad_hook.clear_selection()
+
+                # Filter inputs to selected samples
+                filtered_inputs = {
+                    'input_ids': batch_train['input_ids'][selected_indices],
+                    'attention_mask': batch_train['attention_mask'][selected_indices],
+                    'labels': batch_train['labels'][selected_indices]
+                }
+
+                # Zero gradients before optimization forward/backward
+                model.zero_grad()
+
+                # Disable hooks for standard gradient computation
+                self.grad_hook.disable_hooks()
+
+                # Second forward/backward pass on selected samples with FULL gradients
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, filtered_inputs)
+
+                if args.n_gpu > 1:
+                    loss = loss.mean()
+
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+
+                loss.backward()
+
+                # Re-enable hooks
+                self.grad_hook.enable_hooks()
+
+                return loss.detach()
 
         elif args.method == "MaxLoss":
-            # Select highest loss samples
-            # No compressed gradients to save for MaxLoss
-            saved_compressed_grads = None
-            train_loss = None  # Will compute in standard path
+            # MaxLoss doesn't use gradient-based selection
+            # Fall back to standard selection (select highest loss samples)
+
+            # Prepare inputs
+            batch_train = self._prepare_inputs(inputs)
+
+            # Compute per-sample losses
             with torch.no_grad():
                 losses = []
-                for i in range(len(inputs['input_ids'])):
-                    single_input = {k: v[[i]] for k, v in inputs.items()}
+                for i in range(len(batch_train['input_ids'])):
+                    single_input = {k: v[[i]] for k, v in batch_train.items()}
                     outputs = model(**single_input)
                     losses.append(outputs.loss.item())
 
+            # Select highest loss samples
+            from .utils import greedy_selection
             selected_ind = greedy_selection(
                 torch.tensor(losses),
                 torch.zeros((len(losses), len(losses))),
                 int(len(losses) * args.selection_frac)
             )
-        else:
-            selected_ind = None
-            saved_compressed_grads = None
-            train_loss = None  # Will compute in standard path
 
-        # Reuse compressed gradients for MeSO optimizer
-        # If we have saved compressed gradients and using MeSO, skip second forward/backward
-        can_reuse_grads = (
-            using_compressed_optimizer and
-            saved_compressed_grads is not None and
-            selected_ind is not None
-        )
+            # Filter to selected samples
+            filtered_inputs = {
+                'input_ids': batch_train['input_ids'][selected_ind],
+                'attention_mask': batch_train['attention_mask'][selected_ind],
+                'labels': batch_train['labels'][selected_ind]
+            }
 
-        if can_reuse_grads:
-            # Select compressed gradients for chosen samples
-            self.grad_hook.compressed_grads = self._select_compressed_grads(
-                saved_compressed_grads,
-                selected_ind
-            )
-            return train_loss
-
-        else:
-            if selected_ind is not None:
-                inputs = {
-                    'input_ids': inputs['input_ids'][selected_ind],
-                    'attention_mask': inputs['attention_mask'][selected_ind],
-                    'labels': inputs['labels'][selected_ind]
-                }
-
-            # IMPORTANT: Zero gradients before optimization backward pass
-            # This ensures we compute fresh gradients for the selected samples
-            # without any residual state from the selection phase
+            # Standard forward/backward on selected samples
             model.zero_grad()
 
-            # Disable hooks for standard optimizer (allows full gradient computation)
-            # MeSOAdamW uses compressed gradients, standard optimizers need full gradients
+            # Disable hooks for standard optimizer
             if not using_compressed_optimizer and self.grad_hook.hooks_registered:
                 self.grad_hook.disable_hooks()
 
-            # Regular training step on selected batch
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, filtered_inputs)
+
+            if args.n_gpu > 1:
+                loss = loss.mean()
+
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+
+            loss.backward()
+
+            # Re-enable hooks
+            if not using_compressed_optimizer and self.grad_hook.hooks_registered:
+                self.grad_hook.enable_hooks()
+
+            return loss.detach()
+
+        else:
+            # No selection, two cases:
+            # 1. MeSO without selection: hooks enabled, use compressed gradients
+            # 2. Standard AdamW: hooks disabled, use full gradients
+
+            model.zero_grad()
+
+            # Only disable hooks if NOT using compressed optimizer
+            # If using MeSO without selection, we still want compressed gradients
+            hooks_were_enabled = self.grad_hook.hooks_enabled if self.grad_hook.hooks_registered else False
+
+            if not using_compressed_optimizer and self.grad_hook.hooks_registered:
+                self.grad_hook.disable_hooks()
+
             inputs = self._prepare_inputs(inputs)
 
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
 
-            if self.args.n_gpu > 1:
+            if args.n_gpu > 1:
                 loss = loss.mean()
 
-            if self.args.gradient_accumulation_steps > 1:
-                loss = loss / self.args.gradient_accumulation_steps
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
 
             loss.backward()
 
-            # Re-enable hooks for next selection phase
-            if not using_compressed_optimizer and self.grad_hook.hooks_registered:
+            # Restore hooks state
+            if not using_compressed_optimizer and hooks_were_enabled:
                 self.grad_hook.enable_hooks()
 
             return loss.detach()
@@ -475,12 +529,24 @@ class CompGradTrainer(Trainer):
             description="Evaluation"
         )
 
+        # Calculate elapsed wall time
+        if self.training_start_event is not None:
+            # Use CUDA event timing for accurate GPU time measurement
+            eval_event = torch.cuda.Event(enable_timing=True)
+            eval_event.record()
+            torch.cuda.synchronize()
+            wall_time = self.training_start_event.elapsed_time(eval_event) / 1000.0  # Convert ms to seconds
+        else:
+            # Fallback to CPU timing
+            wall_time = time.time() - self.training_start_time
+
         # Create metrics dictionary
         eval_metrics = {
             f"{metric_key_prefix}_loss": eval_loss,
             f"{metric_key_prefix}_perplexity": eval_perplexity,
             "val_loss": val_loss,
             "val_perplexity": val_perplexity,
+            "wall_time": wall_time,
         }
 
         # Save results
@@ -491,6 +557,7 @@ class CompGradTrainer(Trainer):
             "val_perplexity": val_perplexity,
             "eval_loss": eval_loss,
             "eval_perplexity": eval_perplexity,
+            "wall_time": wall_time,
         }
         self.evaluation_results.append(result_entry)
         self._save_evaluation_results()
@@ -498,7 +565,8 @@ class CompGradTrainer(Trainer):
         logger.info(
             f"Step {self.state.global_step}: "
             f"val_perplexity={val_perplexity:.4f}, "
-            f"eval_perplexity={eval_perplexity:.4f}"
+            f"eval_perplexity={eval_perplexity:.4f}, "
+            f"wall_time={wall_time:.2f}s"
         )
 
         return eval_metrics
@@ -517,10 +585,13 @@ class CompGradTrainer(Trainer):
         model = self.model
         model.eval()
 
+        # Debug: Check dataset size
+        logger.info(f"{description}: Dataset size = {len(dataset)}, Batch size = {self.args.per_device_train_batch_size}")
+
         # Create dataloader
         dataloader = DataLoader(
             dataset,
-            batch_size=self.args.per_device_eval_batch_size,
+            batch_size=self.args.per_device_train_batch_size,
             collate_fn=self.data_collator,
             shuffle=False,
             num_workers=self.args.dataloader_num_workers,
@@ -529,6 +600,7 @@ class CompGradTrainer(Trainer):
 
         total_loss = 0.0
         total_samples = 0
+        num_batches = 0
 
         with torch.no_grad():
             for batch in dataloader:
@@ -539,14 +611,42 @@ class CompGradTrainer(Trainer):
                 outputs = model(**batch)
                 loss = outputs.loss
 
+                # Debug: Check for NaN in loss
+                if torch.isnan(loss):
+                    logger.warning(f"{description}: NaN loss detected in batch {num_batches}!")
+                    logger.warning(f"  Batch size: {batch['input_ids'].shape[0]}")
+                    logger.warning(f"  Input shape: {batch['input_ids'].shape}")
+                    # Check labels
+                    if 'labels' in batch:
+                        labels = batch['labels']
+                        non_ignore_mask = (labels != -100)
+                        num_valid_tokens = non_ignore_mask.sum().item()
+                        logger.warning(f"  Labels shape: {labels.shape}")
+                        logger.warning(f"  Valid tokens (not -100): {num_valid_tokens}")
+                        logger.warning(f"  All labels ignored: {num_valid_tokens == 0}")
+                        if num_valid_tokens > 0:
+                            logger.warning(f"  Sample label values: {labels[non_ignore_mask][:10].tolist()}")
+                    # Check outputs
+                    logger.warning(f"  Model output loss: {loss}")
+                    if hasattr(outputs, 'logits'):
+                        logits = outputs.logits
+                        logger.warning(f"  Logits shape: {logits.shape}")
+                        logger.warning(f"  Logits contains NaN: {torch.isnan(logits).any().item()}")
+                        logger.warning(f"  Logits contains Inf: {torch.isinf(logits).any().item()}")
+
                 # Accumulate loss
                 batch_size = batch["input_ids"].shape[0]
                 total_loss += loss.item() * batch_size
                 total_samples += batch_size
+                num_batches += 1
+
+        logger.info(f"{description}: Processed {num_batches} batches, {total_samples} samples")
 
         # Compute average loss and perplexity
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
         perplexity = math.exp(avg_loss) if avg_loss != float("inf") else float("inf")
+
+        logger.info(f"{description}: avg_loss={avg_loss:.4f}, perplexity={perplexity:.4f}")
 
         model.train()
 

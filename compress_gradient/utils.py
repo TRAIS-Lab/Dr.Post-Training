@@ -322,26 +322,35 @@ def create_sample_inputs(
 
     return sample_inputs
 
-
 def greedy_selection(scores, interaction_matrix, k: int):
     """
     Select k data points based on the highest scores, dynamically updating scores
     by subtracting interactions with previously selected data points.
 
-    Parameters:
-    - scores: A numpy array of initial scores for each data point.
-    - interaction_matrix: A numpy matrix of pairwise interactions between data points.
+    Arguments:
+    - scores: A tensor of initial scores for each data point.
+    - interaction_matrix: A tensor of pairwise interactions between data points.
     - k: The number of data points to select.
 
     Returns:
-    - selected_indices: Indices of the selected data points.
+    - selected_indices: List of indices of the selected data points.
     """
-    # Ensure scores is a mutable numpy array to update it in-place
+    # Fast path: if no interaction, just use topk
+    # Check if interaction matrix is effectively zero (sum of absolute values < threshold)
+    if interaction_matrix.abs().sum() < 1e-6:
+        # No interaction: simple top-k selection
+        # torch.topk is O(n + k log k) which is much faster than O(k*n)
+        _, selected_indices = torch.topk(scores, k, largest=True, sorted=False)
+        return selected_indices.tolist()
+
+    # Slow path: greedy selection with interactions
+    # This is O(k*n) but necessary when interactions matter
     selected_indices = []
+    scores = scores.clone()
 
     for _ in range(k):
-        idx_max = torch.argmax(scores).item()
-        selected_indices.append(idx_max)
+        idx_max = torch.argmax(scores)
+        selected_indices.append(idx_max.item())  # Convert to Python int
 
         # Update scores by subtracting interactions with the selected data point
         scores -= interaction_matrix[idx_max, :]

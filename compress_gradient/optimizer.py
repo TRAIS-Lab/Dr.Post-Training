@@ -110,34 +110,6 @@ class MeSOAdamW(Optimizer):
             if hasattr(module, 'bias') and module.bias is not None:
                 self._param_to_layer_name[id(module.bias)] = (layer_name, 'bias')
 
-    def _aggregate_compressed_grads(self) -> Dict[str, torch.Tensor]:
-        """
-        Aggregate compressed gradients by averaging.
-
-        This extracts compressed gradients from the hook and averages them.
-
-        Returns:
-            Dictionary mapping layer names to aggregated compressed gradients [1, k_l]
-        """
-        compressed_grads_dict = {}
-
-        for idx, layer_name in enumerate(self.grad_hook.layer_names):
-            compressed_grad = self.grad_hook.compressed_grads[idx]
-
-            if compressed_grad is None:
-                continue
-
-            # Check if gradients are already aggregated (shape [1, k]) or per-sample (shape [batch, k])
-            if compressed_grad.size(0) == 1:
-                # Already aggregated in hook (aggregate_grads=True)
-                compressed_grads_dict[layer_name] = compressed_grad  # [1, k_l]
-            else:
-                # Per-sample gradients (aggregate_grads=False, used for GREATS)
-                # Average across batch dimension
-                compressed_grads_dict[layer_name] = compressed_grad.mean(dim=0, keepdim=True)  # [1, k_l]
-
-            self.grad_hook.compressed_grads[idx] = None  # Free memory in hook
-        return compressed_grads_dict
 
     def _get_layer_info(self, param):
         """
@@ -724,10 +696,6 @@ class MeSOAdamW(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # Aggregate compressed gradients
-        # Note: If trainer pre-filtered gradients to selected samples, we average only those
-        compressed_grads_dict = self._aggregate_compressed_grads()
-
         # Update each parameter group
         for group in self.param_groups:
             for p in group['params']:
@@ -735,16 +703,21 @@ class MeSOAdamW(Optimizer):
                 layer_name, param_type = self._get_layer_info(p)
 
                 # Check if this parameter should use compressed optimization
-                if layer_name is not None and layer_name in compressed_grads_dict:
-                    # Use compressed gradient pathway
-                    # Note: p.grad will be None for hooked layers (intentional)
-                    self._step_compressed(p, compressed_grads_dict[layer_name], group, layer_name)
-                else:
-                    # Use standard gradient pathway (for non-compressed layers)
-                    # Skip if gradient is None
-                    if p.grad is None:
-                        continue
-                    self._step_standard(p, group)
+                if layer_name is not None:
+                    layer_idx = self.grad_hook.layer_name_to_idx.get(layer_name)
+                    if layer_idx is not None:
+                        compressed_grad = self.grad_hook.compressed_grads[layer_idx]
+                        if compressed_grad is not None:
+                            # Use compressed gradient pathway
+                            # Note: p.grad will be None for hooked layers (intentional)
+                            self._step_compressed(p, compressed_grad, group, layer_name)
+                            continue
+
+                # Use standard gradient pathway (for non-compressed layers)
+                # Skip if gradient is None
+                if p.grad is None:
+                    continue
+                self._step_standard(p, group)
         return loss
 
     def _step_compressed(self, param, compressed_grad, group, layer_name):
@@ -762,7 +735,7 @@ class MeSOAdamW(Optimizer):
         """
         state = self.state[param]
 
-        # Get compressor for this layer (unified API)
+        # Get compressor for this layer
         layer_idx = self.grad_hook.layer_name_to_idx[layer_name]
         compressor = self.grad_hook.compressors[layer_idx] if layer_idx < len(self.grad_hook.compressors) else None
 
@@ -950,32 +923,6 @@ class MeSOSGD(Optimizer):
         param_id = id(param)
         return self._param_to_layer_name.get(param_id, (None, None))
 
-    def _aggregate_compressed_grads(self) -> Dict[str, torch.Tensor]:
-        """
-        Aggregate compressed gradients by averaging.
-
-        This extracts compressed gradients from the hook and averages them.
-        Note: If the trainer has pre-filtered to selected samples, we just average
-        those. The optimizer doesn't need to know about sample selection.
-
-        Returns:
-            Dictionary mapping layer names to aggregated compressed gradients [1, k_l]
-        """
-        compressed_grads_dict = {}
-
-        for idx, layer_name in enumerate(self.grad_hook.layer_names):
-            compressed_grad = self.grad_hook.compressed_grads[idx]
-
-            if compressed_grad is None:
-                continue
-
-            # Average all provided gradients
-            # If trainer pre-filtered to selected samples, we're averaging only those
-            aggregated_compressed = compressed_grad.mean(dim=0, keepdim=True)  # [1, k_l]
-
-            compressed_grads_dict[layer_name] = aggregated_compressed
-
-        return compressed_grads_dict
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None):
@@ -997,9 +944,6 @@ class MeSOSGD(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # Aggregate compressed gradients
-        compressed_grads_dict = self._aggregate_compressed_grads()
-
         # Update each parameter group
         for group in self.param_groups:
             for p in group['params']:
@@ -1007,14 +951,21 @@ class MeSOSGD(Optimizer):
                 layer_name, param_type = self._get_layer_info(p)
 
                 # Check if this parameter should use compressed optimization
-                if layer_name is not None and layer_name in compressed_grads_dict:
-                    # Use compressed gradient pathway (layer-by-layer decompression)
-                    self._step_compressed(p, compressed_grads_dict[layer_name], group, layer_name)
-                else:
-                    # Use standard gradient pathway (for non-compressed layers)
-                    if p.grad is None:
-                        continue
-                    self._step_standard(p, group)
+                if layer_name is not None:
+                    layer_idx = self.grad_hook.layer_name_to_idx.get(layer_name)
+                    if layer_idx is not None:
+                        compressed_grad = self.grad_hook.compressed_grads[layer_idx]
+                        if compressed_grad is not None:
+                            # Free memory immediately after retrieval
+                            self.grad_hook.compressed_grads[layer_idx] = None
+                            # Use compressed gradient pathway (layer-by-layer decompression)
+                            self._step_compressed(p, compressed_grad, group, layer_name)
+                            continue
+
+                # Use standard gradient pathway (for non-compressed layers)
+                if p.grad is None:
+                    continue
+                self._step_standard(p, group)
 
         return loss
 

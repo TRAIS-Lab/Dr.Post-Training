@@ -85,6 +85,16 @@ class TrainingArguments(TA):
     subject: str = field(default='abstract_algebra', metadata={"help": "subject for evaluation"})
     n_val: int = field(default=5, metadata={"help": "number of validation data (for data selection)"})
     n_eval: int = field(default=500, metadata={"help": "number of evaluation data (for generalization testing)"})
+    val_batch_size_for_selection: int = field(
+        default=None,
+        metadata={
+            "help": (
+                "Batch size for validation data used during training for data selection. "
+                "If None, defaults to per_device_train_batch_size. "
+                "This allows independent control of batch size for data selection during training."
+            )
+        },
+    )
 
     ### Gradient compression arguments ###
     sparsification: str = field(

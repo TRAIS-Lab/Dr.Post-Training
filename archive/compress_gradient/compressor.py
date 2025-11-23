@@ -470,7 +470,7 @@ class Compressor(ProjectionContainer):
         self.base_seed = None
         self.current_step = 0
 
-    @torch.compile
+    # @torch.compile
     def forward(self, input: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]) -> torch.Tensor:
         """
         Apply full compression pipeline: input → sparsifier → Kronecker product → projector → output
@@ -554,7 +554,7 @@ class Compressor(ProjectionContainer):
             output = self.projector.forward(intermediate)
         return output
 
-    @torch.compile
+    # @torch.compile
     def transpose(self, input: torch.Tensor) -> torch.Tensor:
         """
         Apply full decompression pipeline: input → projector^T → sparsifier^T → output
@@ -575,7 +575,7 @@ class Compressor(ProjectionContainer):
 
         return output
 
-    @torch.compile
+    # @torch.compile
     def refresh(self, step: int) -> Compressor:
         """
         Refresh both sparsifier and projector if needed.
