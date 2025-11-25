@@ -2,7 +2,6 @@ import json
 import os
 from typing import List, Tuple
 
-import pandas as pd
 import torch
 from torch import Tensor
 from datasets import Dataset
@@ -51,473 +50,106 @@ def tokenize(
     return full_input_ids, labels, attention_mask
 
 
+def load_unified_jsonl(
+        data_dir: str,
+        task: str,
+        validation: bool,
+        k: int = 5,
+        subject: str = None
+    ) -> List[dict]:
+    """
+    Load examples from unified JSONL format.
+
+    File naming convention:
+    - Validation: {data_dir}/eval/{task}/{task}_validation_data.jsonl
+    - Test: {data_dir}/eval/{task}/{task}_test_data.jsonl
+
+    Args:
+        data_dir: Base data directory
+        task: Task name (mmlu, bbh, tydiqa, gsm8k, math500, samsum)
+        validation: If True, load validation split; otherwise load test split
+        k: Number of examples to load
+        subject: Optional subject filter (for MMLU and BBH with multiple subtasks)
+
+    Returns:
+        List of example dictionaries with 'messages' field
+    """
+    split = "validation" if validation else "test"
+    file_path = os.path.join(data_dir, "eval", task, f"{task}_{split}_data.jsonl")
+
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(
+            f"Dataset file not found: {file_path}\n"
+            f"Please run: python experiment/data/prepare_datasets.py --datasets {task}"
+        )
+
+    examples = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            example = json.loads(line.strip())
+            # Filter by subject/task if specified (for BBH and MMLU)
+            if subject is not None:
+                # Check 'task' field (BBH) or 'subject' field (MMLU)
+                example_subject = example.get('task') or example.get('subject')
+                if example_subject != subject:
+                    continue
+            examples.append(example)
+            if len(examples) >= k:
+                break
+
+    return examples
+
+
 def get_bbh_dataset(
         data_dir: str,
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
         use_chat_format: bool = True,
         chat_format: str = "tulu",
-        validation=False,
-        k = 5,
+        validation: bool = False,
+        k: int = 5,
+        subject: str = None,
         **kwargs
     ) -> Dataset:
     """
-    Get the bbh dataset in the instruction tuning format. Each example is formatted as follows:
-
-    Query:
-    <|user|>
-    <Task Prompt>
-    <Ex1>
-    <Ex2>
-    <Question of Ex3>
-    <|assistant|>
-    A:
-
-    Completion:
-    <Answer of Ex3>
+    Get the BBH dataset in unified JSONL format.
 
     Args:
-        data_dir (str): The main data directory.
-        tokenizer (Tokenizer): The tokenizer used to tokenize the input text.
-        max_length (int): The maximum length of the input sequence.
-        use_chat_format (bool, optional): Whether to use chat format for the input. Defaults to True.
-        chat_format (str, optional): The chat format to use. Defaults to "tulu".
-        n_shot (int, optional): The number of shots for few-shot learning. Defaults to 3 for bbh.
+        data_dir: The main data directory.
+        tokenizer: The tokenizer used to tokenize the input text.
+        max_length: The maximum length of the input sequence.
+        use_chat_format: Whether to use chat format for the input.
+        chat_format: The chat format to use ("tulu" or "llama2").
+        validation: If True, load validation split; otherwise load test split.
+        k: Number of examples to load.
+        subject: Optional BBH task name to filter by (e.g., "boolean_expressions").
 
     Returns:
         Dataset: The BBH dataset containing input_ids, attention_mask, and labels.
     """
-    file = f"{data_dir}/eval/bbh/bbh-three-shot.json"
-
-    bbh_few_shot_examples = json.load(open(file, "r"))
-    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
-
-    # there are multiple tasks in the bbh dataset
-    # each task has 3 examples
-    for task in bbh_few_shot_examples:
-        few_shot_exs = bbh_few_shot_examples[task]
-
-        stuff = few_shot_exs.split("\n\n")
-        exes = stuff[-3:]
-        task_prompt = "\n\n".join(stuff[:-3])
-
-        def form_icl(exs):
-            string = ""
-            for ex in exs:
-                question, answer = ex.split("\nA:")
-                string += question + "\nA:" + answer
-                string += "\n\n"
-            return string
-
-        for i in range(k):
-            target_ex = exes[i]
-            other_exes = exes[:i] + exes[i+1:]
-            icl = form_icl(other_exes)
-            question, answer = target_ex.split("\nA:")
-
-            if use_chat_format:
-                if chat_format == "tulu":  # we follow the tulu instruction tuning format
-                    question = "<|user|>\n" + task_prompt.strip() + "\n\n" + icl + \
-                        f"{question}" + "\n<|assistant|>\nA:"
-                else:
-                    question = f"<s> {B_INST} {task_prompt.strip()} {question} {E_INST} A:"
-            else:
-                question = task_prompt.strip() + "\n\n" + \
-                    f"{question}" + "\nA:"
-            full_input_ids, labels, attention_mask = tokenize(
-                tokenizer, question, answer, max_length, print_ex=True if i == 0 else False)
-            dataset["input_ids"].append(full_input_ids)
-            dataset["labels"].append(labels)
-            dataset["attention_mask"].append(attention_mask)
-
-    dataset = Dataset.from_dict(dataset)
-    return dataset
-
-def get_tydiqa_dataset_df(
-        data_dir: str,
-        use_chat_format: bool = True,
-        chat_format: str = "tulu",
-        zh: bool = False,
-        validation=False,
-        k = 5
-    ) -> List[Tuple[str, str, str]]:
-    encoding_templates_with_context = {
-        "english": ("Answer the following question based on the information in the given passage.", "Passage:", "Question:", "Answer:"),
-        "arabic": ("أجب على السؤال التالي بناءً على المعلومات في المقطع المعطى.", "المقطع:", "السؤال:", "الإجابة:"),
-        "bengali": ("প্রদত্ত অধ্যায়ের তথ্যের উপর ভিত্তি করে নিম্নলিখিত প্রশ্নের উত্তর দিন।", "অধ্যায়:", "প্রশ্ন:", "উত্তর:"),
-        "finnish": ("Vastaa seuraavaan kysymykseen annetun kappaleen tiedon perusteella.", "Kappale:", "Kysymys:", "Vastaus:"),
-        "indonesian": ("Jawab pertanyaan berikut berdasarkan informasi di bagian yang diberikan.", "Bagian:", "Pertanyaan:", "Jawaban:"),
-        "korean": ("주어진 문단의 정보에 기반하여 다음 질문에 답하십시오.", "문단:", "질문:", "답변:"),
-        "russian": ("Ответьте на следующий вопрос на основе информации в данном отрывке.", "Отрывок:", "Вопрос:", "Ответ:"),
-        "swahili": ("Jibu swali lifuatalo kulingana na habari kwenye kifungu kilichotolewa.", "Kifungu:", "Swali:", "Jibu:"),
-        "telugu": ("ఇచ్చిన పేరాలోని సమాచారం ఆధారంగా కింది ప్రశ్నకు సమాధానం ఇవ్వండి.", "పేరా:", "ప్రశ్న:", "సమాధానం:")
-    }
-
-    # Chinese validation examples
-    if zh:
-        for lang in encoding_templates_with_context:
-            encoding_templates_with_context[lang] = (
-                "根据所给文章中的信息回答以下问题。", "文章:", "问题:", "答案:")
-
-    file_name = "tydiqa-one-shot-zh.json" if zh else "tydiqa-goldp-v1.1-dev.json"
-    # experiment/core/data/eval/tydiqa/dev/tydiqa-goldp-v1.1-dev.json
-    if validation:
-        file = os.path.join(f"{data_dir}/eval/tydiqa/dev", file_name)
-    else:
-        file = os.path.join(f"{data_dir}/eval/tydiqa/test", file_name)
-
-    examples = json.load(open(file, "r"))
-    # shuffle(examples["data"])
-    import random
-    random.seed(42)
-    examples_data = examples["data"]
-    random.shuffle(examples_data)
-
-    dataset = []
-
-    for i, example in enumerate(examples_data):
-        if i == k:
-            break
-        ID = example["paragraphs"][0]["qas"][0]['id']
-        lang = ID.split("-")[0]
-
-        context = example["paragraphs"][0]["context"]
-        question = example["paragraphs"][0]["qas"][0]["question"]
-        answer = example["paragraphs"][0]["qas"][0]["answers"][0]["text"]
-
-        prompt, p_template, q_template, a_template = encoding_templates_with_context[lang]
-        prompt += p_template + " " + \
-            context + "\n" + q_template + \
-            " " + question + "\n"
-        answer = " " + answer
-        if use_chat_format:
-            if chat_format == "tulu":
-                prompt = "<|user|>\n" + prompt + "<|assistant|>\n" + a_template
-            else:
-                prompt = f"<s> {B_INST} {prompt} {E_INST} {a_template}"
-        else:
-            prompt = prompt + a_template
-        if validation:
-            print("########## Example {} ##########".format(i))
-            print(prompt)
-            print(answer)
-            dataset.append((prompt, answer, lang))
-        else:
-            dataset.append((prompt, answer, lang))
-
-    return dataset
-
-
-def get_tydiqa_dataset(
-        data_dir: str,
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int,
-        use_chat_format: bool = True,
-        chat_format: str = "tulu",
-        zh: bool = False,
-        validation=False,
-        k = 5,
-        **kwargs
-    ) -> Dataset:
-    """
-    Get the tydiqa dataset in the instruction tuning format. Each example is formatted as follows:
-
-    Query:
-    <|user|>
-    <Task Prompt>
-    <Passage>
-    <Question>
-    <|assistant|>
-    Answer:
-
-    Completion:
-    <Answer>
-
-    Args:
-        data_dir (str): The main data directory.
-        tokenizer (PreTrainedTokenizerBase): The tokenizer to use for tokenization.
-        max_length (int): The maximum length of the input sequence.
-        use_chat_format (bool, optional): Whether to use chat format. Defaults to True.
-        chat_format (str, optional): The chat format to use. Defaults to "tulu".
-        zh (bool, optional): Whether to use the Chinese validation examples. Defaults to False.
-
-
-    Returns:
-        Dataset: The tokenized TydiQA dataset.
-    """
-
-    # Same template as https://github.com/allenai/open-instruct/blob/main/eval/tydiqa/run_eval.py#L17
-    encoding_templates_with_context = {
-        "english": ("Answer the following question based on the information in the given passage.", "Passage:", "Question:", "Answer:"),
-        "arabic": ("أجب على السؤال التالي بناءً على المعلومات في المقطع المعطى.", "المقطع:", "السؤال:", "الإجابة:"),
-        "bengali": ("প্রদত্ত অধ্যায়ের তথ্যের উপর ভিত্তি করে নিম্নলিখিত প্রশ্নের উত্তর দিন।", "অধ্যায়:", "প্রশ্ন:", "উত্তর:"),
-        "finnish": ("Vastaa seuraavaan kysymykseen annetun kappaleen tiedon perusteella.", "Kappale:", "Kysymys:", "Vastaus:"),
-        "indonesian": ("Jawab pertanyaan berikut berdasarkan informasi di bagian yang diberikan.", "Bagian:", "Pertanyaan:", "Jawaban:"),
-        "korean": ("주어진 문단의 정보에 기반하여 다음 질문에 답하십시오.", "문단:", "질문:", "답변:"),
-        "russian": ("Ответьте на следующий вопрос на основе информации в данном отрывке.", "Отрывок:", "Вопрос:", "Ответ:"),
-        "swahili": ("Jibu swali lifuatalo kulingana na habari kwenye kifungu kilichotolewa.", "Kifungu:", "Swali:", "Jibu:"),
-        "telugu": ("ఇచ్చిన పేరాలోని సమాచారం ఆధారంగా కింది ప్రశ్నకు సమాధానం ఇవ్వండి.", "పేరా:", "ప్రశ్న:", "సమాధానం:")
-    }
-
-    # Chinese validation examples
-    if zh:
-        for lang in encoding_templates_with_context:
-            encoding_templates_with_context[lang] = (
-                "根据所给文章中的信息回答以下问题。", "文章:", "问题:", "答案:")
-
-    file_name = "tydiqa-one-shot-zh.json" if zh else "tydiqa-goldp-v1.1-dev.json"
-    # experiment/core/data/eval/tydiqa/dev/tydiqa-goldp-v1.1-dev.json
-    if validation:
-        file = os.path.join(f"{data_dir}/eval/tydiqa/dev", file_name)
-    else:
-        file = os.path.join(f"{data_dir}/eval/tydiqa/test", file_name)
-
-    examples = json.load(open(file, "r"))
-    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
-
-    import random
-    random.seed(42)
-
-
-    examples_data = examples["data"]
-    random.shuffle(examples_data)
-
-
-
-
-    for i, example in enumerate(examples_data):
-        if i == k:
-            break
-        ID = example["paragraphs"][0]["qas"][0]['id']
-        lang = ID.split("-")[0]
-
-        context = example["paragraphs"][0]["context"]
-        question = example["paragraphs"][0]["qas"][0]["question"]
-        answer = example["paragraphs"][0]["qas"][0]["answers"][0]["text"]
-
-        prompt, p_template, q_template, a_template = encoding_templates_with_context[lang]
-        prompt += p_template + " " + \
-            context + "\n" + q_template + \
-            " " + question + "\n"
-        answer = " " + answer
-        if use_chat_format:
-            if chat_format == "tulu":
-                prompt = "<|user|>\n" + prompt + "<|assistant|>\n" + a_template
-            else:
-                prompt = f"<s> {B_INST} {prompt} {E_INST} {a_template}"
-        else:
-            prompt = prompt + a_template
-        if validation:
-            print("########## Example {} ##########".format(i))
-            print(prompt)
-            print(answer)
-            full_input_ids, labels, attention_mask = tokenize(
-                tokenizer, prompt, answer, max_length, print_ex=False)
-            print(len(full_input_ids))
-
-            print("################################")
-        else:
-            full_input_ids, labels, attention_mask = tokenize(
-                tokenizer, prompt, answer, max_length, print_ex=False)
-        dataset["input_ids"].append(full_input_ids)
-        dataset["labels"].append(labels)
-        dataset["attention_mask"].append(attention_mask)
-
-    dataset = Dataset.from_dict(dataset)
-    return dataset
-
-
-
-def get_mmlu_dataset_df(
-        data_dir: str,
-        validation=False,
-        k = 5,
-        subject = 'abstract_algebra'
-    ) -> pd.DataFrame:
-    """
-    Get the MMLU dataset in the instruction tuning format. Each example is formatted as follows:
-
-    Query:
-    <|user|>
-    <Task Prompt>
-    <Question>
-    <|assistant|>
-    The answer is:
-
-    Completion:
-    <Answer>
-
-    Args:
-        data_dir (str): The main data directory.
-        tokenizer (Tokenizer): The tokenizer used to tokenize the input text.
-        max_length (int): The maximum length of the input sequence.
-        use_chat_format (bool, optional): Whether to use chat format for the prompts. Defaults to True.
-        chat_format (str, optional): The chat format to use for the prompts. Defaults to "tulu".
-
-    Returns:
-        Dataset: The tokenized dataset containing input_ids, attention_mask, and labels.
-    """
-    mmlu_data_dir = os.path.join(data_dir, "eval", "mmlu")
-    subjects = [subject]
-    for subject in subjects:
-        if validation:
-            df = pd.read_csv(os.path.join(mmlu_data_dir, "dev", subject + "_dev.csv"), header=None)[:k]
-            df = df[:min(k, len(df))]
-        else:
-            df = pd.read_csv(os.path.join(mmlu_data_dir, "test", subject + "_test.csv"), header=None)
-            df = df[:min(k, len(df))]
-    return df
-
-
-def get_mmlu_dataset(
-        data_dir: str,
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int,
-        use_chat_format=True,
-        chat_format="tulu",
-        validation=False,
-        k = 5,
-        subject = 'abstract_algebra',
-        **kwargs
-    ) -> Dataset:
-    """
-    Get the MMLU dataset in the instruction tuning format. Each example is formatted as follows:
-
-    Query:
-    <|user|>
-    <Task Prompt>
-    <Question>
-    <|assistant|>
-    The answer is:
-
-    Completion:
-    <Answer>
-
-    Args:
-        data_dir (str): The main data directory.
-        tokenizer (Tokenizer): The tokenizer used to tokenize the input text.
-        max_length (int): The maximum length of the input sequence.
-        use_chat_format (bool, optional): Whether to use chat format for the prompts. Defaults to True.
-        chat_format (str, optional): The chat format to use for the prompts. Defaults to "tulu".
-
-    Returns:
-        Dataset: The tokenized dataset containing input_ids, attention_mask, and labels.
-    """
-    mmlu_data_dir = os.path.join(data_dir, "eval", "mmlu")
-    # subjects = sorted(
-    #     [
-    #         f.split("_test.csv")[0]
-    #         for f in os.listdir(os.path.join(mmlu_data_dir, "test"))
-    #         if "_test.csv" in f
-    #     ]
-    # )
-    subjects = [subject]
-
-    def format_subject(subject):
-        l = subject.split("_")
-        s = ""
-        for entry in l:
-            s += " " + entry
-        return s
-
-    def gen_prompt(train_df, subject, i=0):
-        prompt = "The following are multiple choice questions (with answers) about {}.\n\n".format(
-            format_subject(subject)
-        )
-        prompt += format_example(train_df, i, include_answer=False)
-        return prompt
-
-    def format_example(df, idx, include_answer=True):
-        choices = ["A", "B", "C", "D"]
-        prompt = df.iloc[idx, 0]
-        k = df.shape[1] - 2
-        for j in range(k):
-            prompt += "\n{}. {}".format(choices[j], df.iloc[idx, j + 1])
-        prompt += "\nAnswer:"
-        return prompt
+    examples = load_unified_jsonl(data_dir, "bbh", validation, k, subject)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
-    for subject in subjects:
-
-        if validation:
-            dev_df = pd.read_csv(os.path.join(mmlu_data_dir, "dev", subject + "_dev.csv"), header=None)[:k]
-            dev_df = dev_df[:min(k, len(dev_df))]
-        else:
-            dev_df = pd.read_csv(os.path.join(mmlu_data_dir, "test", subject + "_test.csv"), header=None)
-            dev_df = dev_df[:min(k, len(dev_df))]
-            k = min(k, len(dev_df))
-
-        for i in range(k):
-            prompt = gen_prompt(dev_df, subject, i)
-            answer = " " + dev_df.iloc[i, dev_df.shape[1] - 2 + 1]
-
-            if use_chat_format:
-                if chat_format == "tulu":
-                    prompt = "<|user|>\n" + prompt + "\n<|assistant|>\nThe answer is:"
-                else:
-                    # f"<s> {B_INST} {task_prompt.strip()} {question} {E_INST} A:"
-                    prompt = f"<s> {B_INST} {prompt} {E_INST} The answer is:"
-            else:
-                prompt = prompt
-            full_input_ids, labels, attention_mask = tokenize(tokenizer, prompt, answer, max_length, print_ex=True if i == 0 else False)
-            dataset["input_ids"].append(full_input_ids)
-            dataset["labels"].append(labels)
-            dataset["attention_mask"].append(attention_mask)
-    dataset = Dataset.from_dict(dataset)
-    return dataset
-
-
-def get_samsum_dataset(
-        data_dir: str,
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int,
-        validation=False,
-        k=5,
-        **kwargs
-    ) -> Dataset:
-    """
-    Get the SAMSUM dataset for dialogue summarization evaluation.
-
-    The dataset is formatted with user/assistant messages:
-    User: "Summarize the following dialogue:\n\n<dialogue>"
-    Assistant: "<summary>"
-
-    Args:
-        data_dir (str): The main data directory.
-        tokenizer (PreTrainedTokenizerBase): The tokenizer used to tokenize the input text.
-        max_length (int): The maximum length of the input sequence.
-        validation (bool, optional): Whether to use validation set or test set. Defaults to False (test).
-        k (int, optional): Number of examples to use. Defaults to 5.
-
-    Returns:
-        Dataset: The SAMSUM dataset containing input_ids, attention_mask, and labels.
-    """
-    # Determine which split to use
-    if validation:
-        file_path = f"{data_dir}/eval/samsum/samsum_validation_data.jsonl"
-    else:
-        file_path = f"{data_dir}/eval/samsum/samsum_test_data.jsonl"
-
-    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
-
-    # Read the JSONL file
-    with open(file_path, 'r', encoding='utf-8') as f:
-        examples = [json.loads(line) for line in f]
-
-    # Limit to k examples
-    examples = examples[:k]
 
     for i, example in enumerate(examples):
-        # Extract user prompt and assistant response from messages
-        messages = example['messages']
-        user_content = messages[0]['content']  # "Summarize the following dialogue:\n\n..."
-        assistant_content = messages[1]['content']  # The summary
+        messages = example.get('messages', [])
+        if len(messages) < 2:
+            continue
 
-        # Format as chat with <|user|> and <|assistant|> tags
-        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+        user_content = messages[0]['content']
+        assistant_content = messages[1]['content']
+
+        # Format the prompt
+        if use_chat_format:
+            if chat_format == "tulu":
+                prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+            else:
+                prompt = f"<s> {B_INST} {user_content} {E_INST} "
+        else:
+            prompt = f"{user_content}\nAnswer: "
+
         answer = assistant_content + tokenizer.eos_token
 
-        # Tokenize
         full_input_ids, labels, attention_mask = tokenize(
             tokenizer, prompt, answer, max_length,
             print_ex=True if i == 0 else False
@@ -531,36 +163,335 @@ def get_samsum_dataset(
     return dataset
 
 
-def get_dataset(task, **kwargs):
+def get_tydiqa_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        use_chat_format: bool = True,
+        chat_format: str = "tulu",
+        validation: bool = False,
+        k: int = 5,
+        **kwargs
+    ) -> Dataset:
+    """
+    Get the TyDiQA dataset in unified JSONL format.
+
+    Args:
+        data_dir: The main data directory.
+        tokenizer: The tokenizer used to tokenize the input text.
+        max_length: The maximum length of the input sequence.
+        use_chat_format: Whether to use chat format for the input.
+        chat_format: The chat format to use.
+        validation: If True, load validation split; otherwise load test split.
+        k: Number of examples to load.
+
+    Returns:
+        Dataset: The TyDiQA dataset containing input_ids, attention_mask, and labels.
+    """
+    examples = load_unified_jsonl(data_dir, "tydiqa", validation, k)
+
+    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+
+    for i, example in enumerate(examples):
+        messages = example.get('messages', [])
+        if len(messages) < 2:
+            continue
+
+        user_content = messages[0]['content']
+        assistant_content = messages[1]['content']
+
+        # Format the prompt
+        if use_chat_format:
+            if chat_format == "tulu":
+                prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+            else:
+                prompt = f"<s> {B_INST} {user_content} {E_INST} "
+        else:
+            prompt = f"{user_content}\nAnswer: "
+
+        answer = assistant_content + tokenizer.eos_token
+
+        full_input_ids, labels, attention_mask = tokenize(
+            tokenizer, prompt, answer, max_length,
+            print_ex=True if i == 0 else False
+        )
+
+        dataset["input_ids"].append(full_input_ids)
+        dataset["labels"].append(labels)
+        dataset["attention_mask"].append(attention_mask)
+
+    dataset = Dataset.from_dict(dataset)
+    return dataset
+
+
+def get_gsm8k_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        validation: bool = False,
+        k: int = 5,
+        **kwargs
+    ) -> Dataset:
+    """
+    Get the GSM8K dataset in unified JSONL format.
+
+    Args:
+        data_dir: The main data directory.
+        tokenizer: The tokenizer used to tokenize the input text.
+        max_length: The maximum length of the input sequence.
+        validation: If True, load validation split; otherwise load test split.
+        k: Number of examples to use.
+
+    Returns:
+        Dataset: The GSM8K dataset containing input_ids, attention_mask, and labels.
+    """
+    examples = load_unified_jsonl(data_dir, "gsm8k", validation, k)
+
+    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+
+    for i, example in enumerate(examples):
+        messages = example.get('messages', [])
+        if len(messages) < 2:
+            continue
+
+        user_content = messages[0]['content']
+        assistant_content = messages[1]['content']
+
+        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+        answer = assistant_content + tokenizer.eos_token
+
+        full_input_ids, labels, attention_mask = tokenize(
+            tokenizer, prompt, answer, max_length,
+            print_ex=True if i == 0 else False
+        )
+
+        dataset["input_ids"].append(full_input_ids)
+        dataset["labels"].append(labels)
+        dataset["attention_mask"].append(attention_mask)
+
+    dataset = Dataset.from_dict(dataset)
+    return dataset
+
+
+def get_math500_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        validation: bool = False,
+        k: int = 5,
+        **kwargs
+    ) -> Dataset:
+    """
+    Get the MATH500 dataset in unified JSONL format.
+
+    Args:
+        data_dir: The main data directory.
+        tokenizer: The tokenizer used to tokenize the input text.
+        max_length: The maximum length of the input sequence.
+        validation: If True, load validation split; otherwise load test split.
+        k: Number of examples to use.
+
+    Returns:
+        Dataset: The MATH500 dataset containing input_ids, attention_mask, and labels.
+    """
+    examples = load_unified_jsonl(data_dir, "math500", validation, k)
+
+    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+
+    for i, example in enumerate(examples):
+        messages = example.get('messages', [])
+        if len(messages) < 2:
+            continue
+
+        user_content = messages[0]['content']
+        assistant_content = messages[1]['content']
+
+        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+        answer = assistant_content + tokenizer.eos_token
+
+        full_input_ids, labels, attention_mask = tokenize(
+            tokenizer, prompt, answer, max_length,
+            print_ex=True if i == 0 else False
+        )
+
+        dataset["input_ids"].append(full_input_ids)
+        dataset["labels"].append(labels)
+        dataset["attention_mask"].append(attention_mask)
+
+    dataset = Dataset.from_dict(dataset)
+    return dataset
+
+
+def get_samsum_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        validation: bool = False,
+        k: int = 5,
+        **kwargs
+    ) -> Dataset:
+    """
+    Get the SAMSum dataset in unified JSONL format.
+
+    Args:
+        data_dir: The main data directory.
+        tokenizer: The tokenizer used to tokenize the input text.
+        max_length: The maximum length of the input sequence.
+        validation: If True, load validation split; otherwise load test split.
+        k: Number of examples to use.
+
+    Returns:
+        Dataset: The SAMSum dataset containing input_ids, attention_mask, and labels.
+    """
+    examples = load_unified_jsonl(data_dir, "samsum", validation, k)
+
+    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+
+    for i, example in enumerate(examples):
+        messages = example.get('messages', [])
+        if len(messages) < 2:
+            continue
+
+        user_content = messages[0]['content']
+        assistant_content = messages[1]['content']
+
+        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+        answer = assistant_content + tokenizer.eos_token
+
+        full_input_ids, labels, attention_mask = tokenize(
+            tokenizer, prompt, answer, max_length,
+            print_ex=True if i == 0 else False
+        )
+
+        dataset["input_ids"].append(full_input_ids)
+        dataset["labels"].append(labels)
+        dataset["attention_mask"].append(attention_mask)
+
+    dataset = Dataset.from_dict(dataset)
+    return dataset
+
+
+# =============================================================================
+# MMLU Dataset (uses unified JSONL format)
+# =============================================================================
+
+def get_mmlu_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        use_chat_format: bool = True,
+        chat_format: str = "tulu",
+        validation: bool = False,
+        k: int = 5,
+        subject: str = None,
+        **kwargs
+    ) -> Dataset:
+    """
+    Get the MMLU dataset in unified JSONL format.
+
+    Args:
+        data_dir: The main data directory.
+        tokenizer: The tokenizer used to tokenize the input text.
+        max_length: The maximum length of the input sequence.
+        use_chat_format: Whether to use chat format for the prompts.
+        chat_format: The chat format to use.
+        validation: If True, load validation split; otherwise load test split.
+        k: Number of examples to load.
+        subject: Optional MMLU subject to filter by (e.g., "sociology").
+
+    Returns:
+        Dataset: The MMLU dataset containing input_ids, attention_mask, and labels.
+    """
+    examples = load_unified_jsonl(data_dir, "mmlu", validation, k, subject)
+
+    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+
+    for i, example in enumerate(examples):
+        messages = example.get('messages', [])
+        if len(messages) < 2:
+            continue
+
+        user_content = messages[0]['content']
+        assistant_content = messages[1]['content']
+
+        # Format the prompt
+        if use_chat_format:
+            if chat_format == "tulu":
+                prompt = f"<|user|>\n{user_content}\n<|assistant|>\nThe answer is:"
+            else:
+                prompt = f"<s> {B_INST} {user_content} {E_INST} The answer is:"
+        else:
+            prompt = f"{user_content} The answer is:"
+
+        answer = " " + assistant_content + tokenizer.eos_token
+
+        full_input_ids, labels, attention_mask = tokenize(
+            tokenizer, prompt, answer, max_length,
+            print_ex=True if i == 0 else False
+        )
+
+        dataset["input_ids"].append(full_input_ids)
+        dataset["labels"].append(labels)
+        dataset["attention_mask"].append(attention_mask)
+
+    dataset = Dataset.from_dict(dataset)
+    return dataset
+
+
+# =============================================================================
+# Main Interface
+# =============================================================================
+
+def get_dataset(task: str, **kwargs) -> Dataset:
     """
     Get the dataset for the given task.
 
     Args:
-        task_name (str): The name of the task.
+        task: The name of the task (bbh, tydiqa, mmlu, samsum, gsm8k, math500).
+        **kwargs: Additional arguments passed to the task-specific function.
+
+    Returns:
+        Dataset: The dataset for the task.
 
     Raises:
         ValueError: If the task name is not valid.
+    """
+    task_functions = {
+        "bbh": get_bbh_dataset,
+        "tydiqa": get_tydiqa_dataset,
+        "mmlu": get_mmlu_dataset,
+        "samsum": get_samsum_dataset,
+        "gsm8k": get_gsm8k_dataset,
+        "math500": get_math500_dataset,
+    }
+
+    if task not in task_functions:
+        raise ValueError(f"Invalid task name: {task}. Valid tasks: {list(task_functions.keys())}")
+
+    return task_functions[task](**kwargs)
+
+
+def get_dataloader(dataset: Dataset, tokenizer: PreTrainedTokenizerBase, batch_size: int = 1) -> DataLoader:
+    """
+    Create a DataLoader for the given dataset.
+
+    Args:
+        dataset: The dataset to create a DataLoader for.
+        tokenizer: The tokenizer to use for padding.
+        batch_size: The batch size.
 
     Returns:
-        Dataset: The dataset.
+        DataLoader: The DataLoader for the dataset.
     """
-    if task == "bbh":
-        return get_bbh_dataset(**kwargs)
-    elif task == "tydiqa":
-        return get_tydiqa_dataset(**kwargs)
-    elif task == "mmlu":
-        return get_mmlu_dataset(**kwargs)
-    elif task == "samsum":
-        return get_samsum_dataset(**kwargs)
-    else:
-        raise ValueError("Invalid task name")
-
-
-def get_dataloader(dataset, tokenizer, batch_size=1):
     data_collator = DataCollatorForSeq2Seq(
-            tokenizer=tokenizer, padding="longest")
-    dataloader = DataLoader(dataset,
-                            batch_size=batch_size,  # When getting gradients, we only do this single batch process
-                            collate_fn=data_collator)
-    print("There are {} examples in the dataset".format(len(dataset)))
+        tokenizer=tokenizer, padding="longest"
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=data_collator
+    )
+    print(f"There are {len(dataset)} examples in the dataset")
     return dataloader
+
+

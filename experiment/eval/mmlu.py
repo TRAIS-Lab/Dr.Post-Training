@@ -1,8 +1,81 @@
 import torch
+import pandas as pd
 
-from core.data.get_validation_dataset import get_mmlu_dataset_df
-
+from experiment.data.get_val_dataset import load_unified_jsonl
 from utils import get_next_word_predictions, create_prompt_with_tulu_chat_format
+
+
+def get_mmlu_dataset_df(data_dir: str, validation: bool = False, k: int = 5, subject: str = None):
+    """
+    Get MMLU dataset as a pandas DataFrame for evaluation.
+
+    This function returns data in the format expected by the MMLU evaluation:
+    - Columns: [question, A, B, C, D, answer]
+
+    Args:
+        data_dir: The main data directory.
+        validation: If True, load validation split; otherwise load test split.
+        k: Number of examples to load.
+        subject: Optional MMLU subject to filter by.
+
+    Returns:
+        pandas DataFrame with columns [question, A, B, C, D, answer]
+    """
+    examples = load_unified_jsonl(data_dir, "mmlu", validation, k, subject)
+
+    rows = []
+    for example in examples:
+        messages = example.get('messages', [])
+        if len(messages) < 2:
+            continue
+
+        user_content = messages[0]['content']
+        answer = messages[1]['content']  # Single letter: A, B, C, or D
+
+        # Parse the question and choices from the formatted prompt
+        # Format: "The following is a multiple choice question...\n\n{question}\nA. {choice_a}\nB. {choice_b}\nC. {choice_c}\nD. {choice_d}\n\nAnswer:"
+        lines = user_content.split('\n')
+
+        # Find question and choices
+        question = ""
+        choices = {"A": "", "B": "", "C": "", "D": ""}
+        in_question = False
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Check for choice lines
+            if line.startswith("A. "):
+                choices["A"] = line[3:]
+            elif line.startswith("B. "):
+                choices["B"] = line[3:]
+            elif line.startswith("C. "):
+                choices["C"] = line[3:]
+            elif line.startswith("D. "):
+                choices["D"] = line[3:]
+            elif line.startswith("Answer:"):
+                continue
+            elif "multiple choice question" in line.lower():
+                in_question = True
+            elif in_question and not line.startswith(("A.", "B.", "C.", "D.")):
+                if question:
+                    question += " " + line
+                else:
+                    question = line
+
+        rows.append({
+            "question": question,
+            "A": choices["A"],
+            "B": choices["B"],
+            "C": choices["C"],
+            "D": choices["D"],
+            "answer": answer
+        })
+
+    df = pd.DataFrame(rows)
+    return df
 
 choices = ["A", "B", "C", "D"]
 

@@ -60,6 +60,7 @@ lr=5e-05
 seed=42
 gradient_accumulation_steps=1
 task="mmlu"
+train_dataset=""  # Training dataset (if empty, uses task-based default)
 subject="world_religions"
 compression=""  # Will be auto-set based on data_selection/use_compressed_optimizer
 use_lora=false
@@ -127,6 +128,10 @@ while [[ $# -gt 0 ]]; do
             task="$2"
             shift 2
             ;;
+        --train)
+            train_dataset="$2"
+            shift 2
+            ;;
         --subject)
             subject="$2"
             shift 2
@@ -179,7 +184,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --lr <lr>                              Learning rate (default: 5e-05)"
             echo "  --seed <seed>                          Random seed (default: 42)"
             echo "  --gradient_accumulation_steps <steps>  Gradient accumulation (default: 1)"
-            echo "  --task <task>                          Task name: mmlu, samsum, tydiqa, bbh (default: mmlu)"
+            echo "  --task <task>                          Evaluation task: mmlu, samsum, tydiqa, bbh, gsm8k, math500 (default: mmlu)"
+            echo "  --train <dataset>                      Training dataset: alpaca, dolly, flan_v2, cot, oasst1, gsm8k, vicuna, wizardlm, openhermes, tulu3 (default: task-based)"
             echo "  --subject <subject>                    MMLU/BBH subject (default: world_religions)"
             echo "  --compression <method>                 Compression: GraSS, LoGra (auto-set if data_selection!=NA or optimizer=MeSO)"
             echo "  --update_compressor_freq <steps>              Projector refresh interval (default: 200)"
@@ -220,11 +226,11 @@ if [[ -n "$compression" ]]; then
         GraSS)
 			# if lora is used, use smaller sketch sizes
 			if [ "$use_lora" = true ]; then
-				sparsification="random_mask-512*512"
+				sparsification="random_mask-256*256"
 				projection="sjlt-16384"
 			else
 				sparsification="random_mask-1024*1024"
-				projection="sjlt-65536"
+				projection="sjlt-262144"
 			fi
 			;;
         LoGra)
@@ -232,7 +238,7 @@ if [[ -n "$compression" ]]; then
 				sparsification="normal-128*128"
 				projection=""
 			else
-				sparsification="normal-256*256"
+				sparsification="normal-512*512"
 				projection=""
 			fi
             ;;
@@ -262,11 +268,14 @@ fi
 # Build method string for job name (data_selection-optimizer-compression)
 method_str="${data_selection}-${optimizer_str}-${compression:-NA}"
 
+# Build train string for job name
+train_str="${train_dataset:-default}"
+
 # For MMLU/BBH, include subject in job name
 if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
-    JOB_NAME="${task}_${subject}-${method_str}-${model}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
+    JOB_NAME="${train_str}_${task}_${subject}-${method_str}-${model}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
 else
-    JOB_NAME="${task}-${method_str}-${model}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
+    JOB_NAME="${train_str}_${task}-${method_str}-${model}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
 fi
 
 output_dir=/scratch/pbb/Project/Efficient-Fine-Tuning/${JOB_NAME}
@@ -278,6 +287,7 @@ echo "=== Unified Training Script ==="
 echo "Training mode: $([ "$use_lora" = true ] && echo "LoRA (LoRA alpha: $lora_alpha, LoRA rank: $lora_r)" || echo "Full Model")"
 echo "Model: $model"
 echo "Task: $task"
+echo "Training data: ${train_dataset:-default for $task}"
 echo "Optimizer: $optim"
 echo "Learning rate: $lr"
 echo "Data selection: $data_selection"
@@ -341,6 +351,11 @@ training_args="$base_training_args \
 --gradient_accumulation_steps $gradient_accumulation_steps \
 --seed $seed \
 --optim $optim"
+
+# Add train_dataset_names if specified
+if [[ -n "$train_dataset" ]]; then
+    training_args="$training_args --train_dataset_names $train_dataset"
+fi
 
 # Add val_batch_size if specified (defaults to train batch size if not specified)
 if [[ -n "$val_batch_size" ]]; then

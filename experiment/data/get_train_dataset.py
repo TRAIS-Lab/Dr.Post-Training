@@ -21,37 +21,100 @@ def temp_seed(seed):
             torch.cuda.set_rng_state_all(cuda_state)
 
 
-def get_training_dataset(data_dir: str, task: str, tokenizer, max_seq_length, sample_percentage=1.0, seed=0, train_files: List[str] = None):
+def get_train_files_for_dataset(data_dir: str, dataset_name: str) -> List[str]:
+    """
+    Map a training dataset name to its file path(s).
+
+    Args:
+        data_dir: Base directory containing training data
+        dataset_name: Name of the training dataset
+
+    Returns:
+        List of file paths for the training dataset
+    """
+    dataset_mapping = {
+        # Single dataset files
+        "alpaca": [f"{data_dir}/train/alpaca/alpaca_data.jsonl"],
+        "dolly": [f"{data_dir}/train/dolly/dolly_data.jsonl"],
+        "flan_v2": [f"{data_dir}/train/flan_v2/flan_v2_data.jsonl"],
+        "cot": [f"{data_dir}/train/cot/cot_data.jsonl"],
+        "oasst1": [f"{data_dir}/train/oasst1/oasst1_data.jsonl"],
+        "gsm8k": [f"{data_dir}/train/gsm8k/gsm8k_train_data.jsonl"],
+        "vicuna": [f"{data_dir}/train/vicuna/vicuna_data.jsonl"],
+        "wizardlm": [f"{data_dir}/train/wizardlm/wizardlm_data.jsonl"],
+        "openhermes": [f"{data_dir}/train/openhermes/openhermes_data.jsonl"],
+        "tulu3": [f"{data_dir}/train/tulu3/tulu3_data.jsonl"],
+        "samsum": [f"{data_dir}/train/samsum/samsum_train_data.jsonl"],
+    }
+
+    if dataset_name not in dataset_mapping:
+        raise ValueError(f"Unknown training dataset: {dataset_name}. "
+                        f"Available: {list(dataset_mapping.keys())}")
+
+    return dataset_mapping[dataset_name]
+
+
+def _get_default_train_files(data_dir: str, task: str) -> List[str]:
+    """
+    Get default training files based on task.
+
+    Args:
+        data_dir: Base directory containing training data
+        task: Evaluation task name
+
+    Returns:
+        List of default training file paths for the task
+    """
+    # LESS mixture for general instruction tuning evaluation tasks
+    less_mixture = [
+        f"{data_dir}/train/flan_v2/flan_v2_data.jsonl",
+        f"{data_dir}/train/cot/cot_data.jsonl",
+        f"{data_dir}/train/dolly/dolly_data.jsonl",
+        f"{data_dir}/train/oasst1/oasst1_data.jsonl"
+    ]
+
+    task_defaults = {
+        "samsum": [f"{data_dir}/train/alpaca/alpaca_data.jsonl"],
+        "gsm8k": [f"{data_dir}/train/gsm8k/gsm8k_train_data.jsonl"],
+        # Test-only tasks use LESS mixture by default
+        "mmlu": less_mixture,
+        "bbh": less_mixture,
+        "tydiqa": less_mixture,
+        "math500": less_mixture,
+    }
+
+    return task_defaults.get(task, less_mixture)
+
+
+def get_training_dataset(data_dir: str, task: str, tokenizer, max_seq_length,
+                         sample_percentage=1.0, seed=0, train_files: List[str] = None,
+                         train_dataset_names: List[str] = None):
     """
     Get training dataset with a specified seed.
 
     Args:
         data_dir: Base directory containing training data
-        task: Task name (samsum, mmlu, tydiqa, bbh, etc.)
+        task: Evaluation task name (mmlu, samsum, tydiqa, bbh, gsm8k, math500)
         tokenizer: Tokenizer to use for encoding
         max_seq_length: Maximum sequence length
         sample_percentage: Percentage of data to sample
         seed: Random seed for sampling
-        train_files: Optional explicit list of training files (overrides task-based selection)
+        train_files: Optional explicit list of training files (overrides all other selection)
+        train_dataset_names: Optional list of training dataset names (e.g., ['wizardlm', 'alpaca'])
 
     Returns:
         Encoded training dataset
     """
-    # If train_files not provided, construct them based on task
+    # Priority: train_files > train_dataset_names > task-based default
     if train_files is None:
-        if task == "samsum":
-            # ALPACA training data for SAMSUM evaluation
-            train_files = [
-                f"{data_dir}/train/alpaca/alpaca_data.jsonl"
-            ]
+        if train_dataset_names is not None:
+            # Use explicitly specified training datasets
+            train_files = []
+            for name in train_dataset_names:
+                train_files.extend(get_train_files_for_dataset(data_dir, name))
         else:
-            # LESS (FLAN-v2+CoT+Dolly+OASST1) for testing with MMLU/TydiQA/BBH
-            train_files = [
-                f"{data_dir}/train/flan_v2/flan_v2_data.jsonl",
-                f"{data_dir}/train/cot/cot_data.jsonl",
-                f"{data_dir}/train/dolly/dolly_data.jsonl",
-                f"{data_dir}/train/oasst1/oasst1_data.jsonl"
-            ]
+            # Fall back to task-based defaults
+            train_files = _get_default_train_files(data_dir, task)
 
     raw_datasets = load_raw_dataset(
         train_files, sample_percentage=sample_percentage, seed=seed)

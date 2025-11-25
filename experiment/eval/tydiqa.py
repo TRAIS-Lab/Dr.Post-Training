@@ -1,9 +1,62 @@
+from typing import List, Tuple
+
 import evaluate
 metric = evaluate.load("squad")
 
-from core.data.get_validation_dataset import get_tydiqa_dataset_df
-
+from experiment.data.get_val_dataset import load_unified_jsonl
 from utils import generate_completions
+
+# llama-chat model's instruction format
+B_INST, E_INST = "[INST]", "[/INST]"
+
+
+def get_tydiqa_dataset_df(
+        data_dir: str,
+        validation: bool = False,
+        use_chat_format: bool = True,
+        chat_format: str = "tulu",
+        k: int = 100
+    ) -> List[Tuple[str, str, str]]:
+    """
+    Get TyDiQA dataset as a list of tuples for evaluation.
+
+    This function returns data in the format expected by the TyDiQA evaluation:
+    - List of (formatted_prompt, answer, language) tuples
+
+    Args:
+        data_dir: The main data directory.
+        validation: If True, load validation split; otherwise load test split.
+        use_chat_format: Whether to format prompts with chat template.
+        chat_format: The chat format to use ("tulu" or "llama2").
+        k: Number of examples to load.
+
+    Returns:
+        List of (formatted_prompt, answer, language) tuples
+    """
+    examples = load_unified_jsonl(data_dir, "tydiqa", validation, k)
+
+    results = []
+    for example in examples:
+        messages = example.get('messages', [])
+        if len(messages) < 2:
+            continue
+
+        user_content = messages[0]['content']
+        answer = messages[1]['content']
+        language = example.get('metadata', {}).get('language', 'unknown')
+
+        # Format the prompt
+        if use_chat_format:
+            if chat_format == "tulu":
+                prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+            else:
+                prompt = f"<s> {B_INST} {user_content} {E_INST} "
+        else:
+            prompt = f"{user_content}\nAnswer: "
+
+        results.append((prompt, answer, language))
+
+    return results
 
 def compute_accuracy(args, model, tokenizer):
     """
