@@ -346,6 +346,10 @@ def main():
         grad_hook=grad_hook,
     )
 
+    # Initial evaluation before training (step 0)
+    logger.info("*** Running initial evaluation before training ***")
+    trainer.evaluate()
+
     # Train
     logger.info("*** Starting training with hook-based gradient computation ***")
     train_result = trainer.train()

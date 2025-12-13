@@ -45,6 +45,13 @@ def get_train_files_for_dataset(data_dir: str, dataset_name: str) -> List[str]:
         "openhermes": [f"{data_dir}/train/openhermes/openhermes_data.jsonl"],
         "tulu3": [f"{data_dir}/train/tulu3/tulu3_data.jsonl"],
         "samsum": [f"{data_dir}/train/samsum/samsum_train_data.jsonl"],
+        # LESS mixture (flan_v2 + cot + dolly + oasst1)
+        "less": [
+            f"{data_dir}/train/flan_v2/flan_v2_data.jsonl",
+            f"{data_dir}/train/cot/cot_data.jsonl",
+            f"{data_dir}/train/dolly/dolly_data.jsonl",
+            f"{data_dir}/train/oasst1/oasst1_data.jsonl",
+        ],
     }
 
     if dataset_name not in dataset_mapping:

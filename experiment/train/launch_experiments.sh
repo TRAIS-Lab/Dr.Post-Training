@@ -122,7 +122,10 @@ while [[ $# -gt 0 ]]; do
             echo "  3. GREATS Data Selection (Full + LoRA) with GraSS"
             echo "  4. GREATS Data Selection (Full + LoRA) with LoGra"
             echo "  5. MeSO Compressed Optimizer (Full) with GraSS/LoGra"
-            echo "  6. MeSO + GREATS (Full) with GraSS/LoGra"
+            echo "  6. MeSO + GREATS (Full, global selection) with GraSS/LoGra"
+            echo "  7. MeSO + GREATS Per-layer (Full) with GraSS/LoGra"
+            echo "  8. MeSO + GREATS + Second-Order (Full, global selection) with GraSS/LoGra"
+            echo "  9. MeSO + GREATS Per-layer + Second-Order (Full) with GraSS/LoGra"
             exit 0
             ;;
         *)
@@ -255,25 +258,64 @@ run_cmd "4b. MeSO Compressed Optimizer - Full Fine-tuning (LoGra)" \
     "$FULL_ARGS --MeSO --compression $COMPRESSION_LOGRA"
 
 # ============================================
-# 5. MeSO + GREATS (Both optimizations)
+# 5. MeSO + GREATS (Global Selection - default)
 # ============================================
 
-# 5a. MeSO + GREATS + Full Fine-tuning + GraSS
+# 5a. MeSO + GREATS + Full Fine-tuning + GraSS (global selection)
 run_cmd "5a. MeSO + GREATS - Full Fine-tuning (GraSS)" \
     "$FULL_ARGS --MeSO --data_selection GREATS --compression $COMPRESSION_GRASS"
 
-# 5b. MeSO + GREATS + Full Fine-tuning + LoGra
+# 5b. MeSO + GREATS + Full Fine-tuning + LoGra (global selection)
 run_cmd "5b. MeSO + GREATS - Full Fine-tuning (LoGra)" \
     "$FULL_ARGS --MeSO --data_selection GREATS --compression $COMPRESSION_LOGRA"
+
+# ============================================
+# 6. MeSO + GREATS with Per-layer Selection
+# ============================================
+
+# 6a. MeSO + GREATS + Full Fine-tuning + GraSS (per-layer selection)
+run_cmd "6a. MeSO + GREATS Per-layer - Full Fine-tuning (GraSS)" \
+    "$FULL_ARGS --MeSO --data_selection GREATS --compression $COMPRESSION_GRASS --selection_mode per_layer"
+
+# 6b. MeSO + GREATS + Full Fine-tuning + LoGra (per-layer selection)
+run_cmd "6b. MeSO + GREATS Per-layer - Full Fine-tuning (LoGra)" \
+    "$FULL_ARGS --MeSO --data_selection GREATS --compression $COMPRESSION_LOGRA --selection_mode per_layer"
+
+# ============================================
+# 7. MeSO + GREATS with Second-Order Selection (Global)
+# ============================================
+
+# 7a. MeSO + GREATS + Second-Order + Full Fine-tuning + GraSS (global selection)
+run_cmd "7a. MeSO + GREATS + Second-Order - Full Fine-tuning (GraSS)" \
+    "$FULL_ARGS --MeSO --data_selection GREATS --compression $COMPRESSION_GRASS --use_second_order"
+
+# 7b. MeSO + GREATS + Second-Order + Full Fine-tuning + LoGra (global selection)
+run_cmd "7b. MeSO + GREATS + Second-Order - Full Fine-tuning (LoGra)" \
+    "$FULL_ARGS --MeSO --data_selection GREATS --compression $COMPRESSION_LOGRA --use_second_order"
+
+# ============================================
+# 8. MeSO + GREATS with Second-Order Selection (Per-layer)
+# ============================================
+
+# 8a. MeSO + GREATS + Second-Order + Full Fine-tuning + GraSS (per-layer selection)
+run_cmd "8a. MeSO + GREATS Per-layer + Second-Order - Full Fine-tuning (GraSS)" \
+    "$FULL_ARGS --MeSO --data_selection GREATS --compression $COMPRESSION_GRASS --selection_mode per_layer --use_second_order"
+
+# 8b. MeSO + GREATS + Second-Order + Full Fine-tuning + LoGra (per-layer selection)
+run_cmd "8b. MeSO + GREATS Per-layer + Second-Order - Full Fine-tuning (LoGra)" \
+    "$FULL_ARGS --MeSO --data_selection GREATS --compression $COMPRESSION_LOGRA --selection_mode per_layer --use_second_order"
 
 echo ""
 echo "========================================================"
 echo "  All experiments launched!"
 echo "========================================================"
 echo ""
-echo "Total configurations: 10"
+echo "Total configurations: 16"
 echo "  - 2 Baseline (Full + LoRA)"
 echo "  - 4 GREATS Data Selection (Full/LoRA × GraSS/LoGra)"
 echo "  - 2 MeSO Optimizer (Full × GraSS/LoGra)"
-echo "  - 2 MeSO + GREATS (Full × GraSS/LoGra)"
+echo "  - 2 MeSO + GREATS (Full × GraSS/LoGra) - global selection"
+echo "  - 2 MeSO + GREATS Per-layer (Full × GraSS/LoGra)"
+echo "  - 2 MeSO + GREATS + Second-Order (Full × GraSS/LoGra) - global selection"
+echo "  - 2 MeSO + GREATS Per-layer + Second-Order (Full × GraSS/LoGra)"
 echo ""

@@ -1,10 +1,22 @@
 #!/usr/bin/env python
 """
-Memory and Performance Benchmark
+Simplified Memory and Performance Benchmark
+
+Key metrics:
+1. Peak GPU memory (GB)
+2. Throughput (samples/sec)
+3. Avg time per iteration (ms)
+
+Design principles:
+- Uses actual training code (no re-implementation)
+- Black-box timing (just wraps training step)
+- Warm-up phase before measurement
+- Minimal custom code
 """
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, TaskType
 import sys
@@ -12,12 +24,10 @@ import json
 import argparse
 import os
 import time
-import re
 import warnings
-from typing import Optional
+from typing import Optional, Callable, Any, List, Dict, Tuple
 from dataclasses import dataclass, asdict
 
-# Suppress dynamo warnings about custom CUDA kernels (sjlt)
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
 
 from compress_gradient.hook import GradientHook
@@ -26,2216 +36,1528 @@ from compress_gradient.optimizer import MeSOAdamW
 from compress_gradient.utils import greedy_selection
 
 from experiment.benchmark.GaLore.galore_torch import GaLoreAdamW
-from experiment.train.train import find_trainable_layers
 
 
-class TeeLogger:
-    """Tee stdout/stderr to both console and file."""
-
-    def __init__(self, log_path: str):
-        self.log_file = open(log_path, 'w')
-        self.stdout = sys.stdout
-        self.stderr = sys.stderr
-
-    def write(self, message):
-        self.stdout.write(message)
-        self.log_file.write(message)
-        self.log_file.flush()
-
-    def flush(self):
-        self.stdout.flush()
-        self.log_file.flush()
-
-    def start(self):
-        sys.stdout = self
-        sys.stderr = self
-
-    def stop(self):
-        sys.stdout = self.stdout
-        sys.stderr = self.stderr
-        self.log_file.close()
-
-
+# =============================================================================
 # Configuration
-device = 'cuda'
-batch_size = 16
-val_batch_size = 4
-seq_length = 512
-num_warmup_iterations = 10  # Warmup iterations (not timed)
-num_timed_iterations = 10   # Timed iterations for throughput measurement
-num_iterations = num_warmup_iterations + num_timed_iterations  # Total: 20
-
-# Model configuration
-MODEL_NAME = 'meta-llama/Llama-3.2-1B'  # Options: 'meta-llama/Llama-3.2-1B', 'meta-llama/Llama-3.2-3B', 'meta-llama/Llama-3.1-8B'
-USE_FLASH_ATTENTION = True  # Set to True to enable Flash Attention 2
-MODEL_DTYPE = torch.bfloat16  # Options: torch.float32, torch.bfloat16, torch.float16
-# Note: Flash Attention requires bfloat16 or float16 (not float32)
-
-# Profiling flags
-ENABLE_DETAILED_PROFILING = True  # Set to False for basic benchmark only
-ENABLE_MEMORY_SNAPSHOT = True  # Set to True to capture memory snapshots for visualization
-MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT = 100000  # Max memory events to capture
-
-# ============================================================================
-# Compression Configuration
-# ============================================================================
-
-# Shared compression parameters
-COMPRESSION_SEED = 42
-COMPRESSION_MAX_BATCH_SIZE = 128
-SPARSIFIER_TYPE = "random_mask"
-SPARSIFIER_DIM = 860
-PROJECTOR_DIM = 739600
-PROJECTOR_TYPE = "identity"
-UPDATE_FREQ = 200
+# =============================================================================
 
 @dataclass
-class IterationProfile:
-    """Detailed profiling data for a single iteration."""
-    iteration: int
-
-    # Memory (GB)
-    current_after_optimizer: float
-    max_ever: float
-    max_during_forward: float
-    max_during_backward: float
-    max_during_optimizer: float
-
-    # Basic timing (seconds)
-    forward_time: float
-    backward_time: float
-    optimizer_time: float
-
-    # Detailed timing (seconds) - only populated if ENABLE_DETAILED_PROFILING
-    selection_total_time: float = 0.0
-    selection_val_forward_time: float = 0.0
-    selection_val_backward_time: float = 0.0
-    selection_train_forward_time: float = 0.0
-    selection_train_backward_time: float = 0.0
-    selection_grad_comp_time: float = 0.0  # Total gradient computation (val+train fwd/bwd + dot product)
-    selection_dotprod_compute_time: float = 0.0  # Just the actual dot product calculation
-    compressor_refresh_time: float = 0.0
-
-    # Additional timing breakdowns for throughput analysis
-    batch_prep_time: float = 0.0  # Time to prepare batch data
-    data_transfer_time: float = 0.0  # Time to move data to GPU
-    model_forward_compute_time: float = 0.0  # Pure forward computation
-    loss_computation_time: float = 0.0  # Loss calculation
-    backward_compute_time: float = 0.0  # Pure backward computation
-    gradient_sync_time: float = 0.0  # Gradient synchronization (if applicable)
-    optimizer_step_time: float = 0.0  # Pure optimizer step
-    optimizer_zero_grad_time: float = 0.0  # Zeroing gradients
-    cuda_sync_overhead: float = 0.0  # CUDA synchronization overhead
-
-    # Enhanced memory profiling
-    mem_before_forward: float = 0.0
-    mem_after_forward: float = 0.0
-    mem_after_backward: float = 0.0
-    mem_after_optimizer: float = 0.0
-    mem_delta_forward: float = 0.0
-    mem_delta_backward: float = 0.0
-    mem_delta_optimizer: float = 0.0
-
-    # Additional metadata
-    selected_samples: int = 0
-    total_samples: int = 0
-
-
-def get_mem():
-    """Get current GPU memory in GB."""
-    return torch.cuda.memory_allocated() / 1024**3
-
-
-def get_max_mem():
-    """Get peak GPU memory in GB."""
-    return torch.cuda.max_memory_allocated() / 1024**3
-
-
-def reset():
-    """Reset CUDA cache and peak memory stats."""
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-
-
-def cuda_timer_sync():
-    """Synchronize CUDA for accurate timing."""
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
-class CUDATimer:
-    """CUDA event-based timer for accurate GPU timing without synchronization overhead."""
-
-    def __init__(self):
-        self.start_event = torch.cuda.Event(enable_timing=True)
-        self.end_event = torch.cuda.Event(enable_timing=True)
-
-    def start(self):
-        """Record start event."""
-        self.start_event.record()
-
-    def stop(self):
-        """Record end event and return elapsed time in seconds."""
-        self.end_event.record()
-        torch.cuda.synchronize()
-        return self.start_event.elapsed_time(self.end_event) / 1000.0  # Convert ms to seconds
-
-
-def _merge_batches(batch_train, batch_val):
-    """
-    Merge training and validation batches along batch dimension.
-
-    Args:
-        batch_train: Training batch
-        batch_val: Validation batch
-
-    Returns:
-        Merged batch with train samples first, then val samples
-    """
-    merged_batch = {}
-    for key in batch_train.keys():
-        if key in batch_val:
-            # Concatenate along batch dimension (dim=0)
-            merged_batch[key] = torch.cat([batch_train[key], batch_val[key]], dim=0)
-        else:
-            # If key not in val batch, just use train batch value
-            merged_batch[key] = batch_train[key]
-    return merged_batch
-
-
-"""
-New _run_single_iteration function for compress_gradient architecture.
-
-This implements the three training modes:
-1. MeSO without GREATS: Standard forward/backward with compressed gradients
-2. GREATS without MeSO: Merged batch → scores → second forward/backward with full gradients
-3. GREATS with MeSO: Merged batch → on-the-fly selection and aggregation of compressed gradients
-"""
-
-def _run_single_iteration(model, optimizer, tokenizer, grad_hook, val_batch, selection_method,
-                          enable_profiling=False, iter_num=0, is_warmup=False):
-    """
-    Run a single training iteration with v2 architecture and CUDA event-based timing.
-
-    This function is used by both warmup and timed phases to ensure they execute identical operations.
-
-    Args:
-        model: The model
-        optimizer: The optimizer
-        tokenizer: The tokenizer
-        grad_hook: GradientHook instance (or None)
-        val_batch: Validation batch for data selection (or None)
-        selection_method: Data selection method ('GREATS', 'GradNorm', None)
-        enable_profiling: If True, collect detailed timing and memory stats
-        iter_num: Iteration number for display
-        is_warmup: If True, this is a warmup iteration (for display only)
-
-    Returns:
-        IterationProfile if enable_profiling=True, None otherwise
-    """
-    # Initialize iteration profile
-    profile = None
-    if enable_profiling:
-        profile = IterationProfile(
-            iteration=iter_num,
-            current_after_optimizer=0.0,
-            max_ever=0.0,
-            max_during_forward=0.0,
-            max_during_backward=0.0,
-            max_during_optimizer=0.0,
-            forward_time=0.0,
-            backward_time=0.0,
-            optimizer_time=0.0,
-            total_samples=batch_size
-        )
-
-    # Create CUDA timers
-    timer_batch_prep = CUDATimer() if enable_profiling else None
-    timer_data_transfer = CUDATimer() if enable_profiling else None
-    timer_selection = CUDATimer() if enable_profiling else None
-    timer_forward = CUDATimer() if enable_profiling else None
-    timer_backward = CUDATimer() if enable_profiling else None
-    timer_optimizer = CUDATimer() if enable_profiling else None
-
-    # BATCH PREPARATION
-    if enable_profiling and ENABLE_DETAILED_PROFILING:
-        timer_batch_prep.start()
-
-    batch = tokenizer(
-        ["This is a test sentence for memory profiling."] * batch_size,
-        return_tensors='pt',
-        padding='max_length',
-        max_length=seq_length,
-        truncation=True
-    )
-
-    if enable_profiling and ENABLE_DETAILED_PROFILING:
-        profile.batch_prep_time = timer_batch_prep.stop()
-
-        # Data transfer to GPU
-        timer_data_transfer.start()
-
-    batch = batch.to(device)
-    batch['labels'] = batch['input_ids'].clone()
-
-    if enable_profiling and ENABLE_DETAILED_PROFILING:
-        profile.data_transfer_time = timer_data_transfer.stop()
-
-    # Detect if using compressed optimizer (MeSO)
-    using_compressed_optimizer = isinstance(optimizer, MeSOAdamW)
-
-    mem_before_forward = get_mem() if enable_profiling else 0.0
-    max_before_forward = get_max_mem() if enable_profiling else 0.0
-    if enable_profiling:
-        profile.mem_before_forward = mem_before_forward
-
-    # DETERMINE TRAINING MODE
-    if selection_method in ['GREATS', 'GradNorm'] and grad_hook and val_batch:
-        # ============================================================================
-        # DATA SELECTION MODE (Case 2 or Case 3)
-        # ============================================================================
-
-        # Get learning rate for score scaling
-        lr = optimizer.param_groups[0].get("lr", 5e-5)
-
-        # Get batch sizes
-        train_batch_size = batch['input_ids'].shape[0]
-        val_batch_size_actual = val_batch['input_ids'].shape[0]
-
-        # Merge training and validation batches
-        merged_batch = _merge_batches(batch, val_batch)
-
-        if using_compressed_optimizer:
-            # ========================================================================
-            # CASE 3: GREATS with MeSO
-            # On-the-fly selection and aggregation of compressed gradients
-            # ALL work (fwd/bwd on merged batch + selection) goes into Sel(ms)
-            # Fwd(ms) and Bwd(ms) are 0 since we don't do separate training passes
-            # ========================================================================
-
-            if enable_profiling:
-                timer_selection.start()
-
-            if not is_warmup and enable_profiling:
-                print(f"  → Case 3: GREATS + MeSO (on-the-fly selection)")
-
-            # Setup selection state with aggregation enabled
-            grad_hook.setup_selection(
-                train_batch_size=train_batch_size,
-                selection_method=selection_method,
-                selection_frac=0.5,  # 50% selection
-                lr=lr,
-                compute_scores_only=False  # Aggregate compressed gradients on-the-fly
-            )
-
-            # Forward pass on merged batch (part of selection overhead)
-            model.zero_grad()
-            outputs = model(**merged_batch)
-            loss = outputs.loss
-
-            if enable_profiling:
-                mem_after_forward = get_mem()
-                max_after_forward = get_max_mem()
-                profile.max_during_forward = max_after_forward - max_before_forward
-                profile.mem_after_forward = mem_after_forward
-                profile.mem_delta_forward = mem_after_forward - mem_before_forward
-
-            # Backward pass - hook computes scores and aggregates gradients on-the-fly
-            # (part of selection overhead)
-            loss.backward()
-
-            if enable_profiling:
-                mem_after_backward = get_mem()
-                max_after_backward = get_max_mem()
-                profile.max_during_backward = max_after_backward - max_after_forward
-                profile.mem_after_backward = mem_after_backward
-                profile.mem_delta_backward = mem_after_backward - mem_after_forward
-
-            # Clear selection state
-            grad_hook.clear_selection()
-
-            # Gradients are already aggregated in hook.compressed_grads
-            # Optimizer will use them directly
-
-            # ALL time goes into selection (includes merged batch fwd/bwd + all overhead)
-            # Fwd and Bwd are 0 because we don't do separate training passes
-            if enable_profiling:
-                profile.selection_total_time = timer_selection.stop()
-                profile.forward_time = 0.0
-                profile.backward_time = 0.0
-                profile.selected_samples = int(train_batch_size * 0.5)
-
-        else:
-            # ========================================================================
-            # CASE 2: GREATS without MeSO
-            # Compute scores on-the-fly, then second forward/backward with full gradients
-            # ========================================================================
-
-            if enable_profiling:
-                timer_selection.start()
-
-            if not is_warmup and enable_profiling:
-                print(f"  → Case 2: GREATS without MeSO (on-the-fly scoring + full gradients)")
-
-            # Setup selection state with score computation only
-            grad_hook.setup_selection(
-                train_batch_size=train_batch_size,
-                selection_method=selection_method,
-                selection_frac=0.5,  # 50% selection
-                lr=lr,
-                compute_scores_only=True  # Only maintain running scores
-            )
-
-            # First forward/backward on merged batch to compute scores
-            model.zero_grad()
-            outputs = model(**merged_batch)
-            loss_for_scoring = outputs.loss
-            loss_for_scoring.backward()
-
-            # Get selected indices based on final accumulated scores
-            selected_indices = grad_hook.selection_state.get_selected_indices()
-
-            # Clear selection state
-            grad_hook.clear_selection()
-
-            # Stop selection timer BEFORE second pass to avoid double-counting
-            if enable_profiling:
-                profile.selection_total_time = timer_selection.stop()
-                profile.selected_samples = len(selected_indices)
-
-            # Filter batch to selected samples
-            filtered_batch = {k: v[selected_indices] for k, v in batch.items()}
-
-            # Disable hooks for standard gradient computation
-            grad_hook.disable_hooks()
-
-            # Second forward/backward on selected samples with FULL gradients
-            if enable_profiling:
-                timer_forward.start()
-
-            model.zero_grad()
-            outputs = model(**filtered_batch)
-            loss = outputs.loss
-
-            if enable_profiling:
-                profile.forward_time = timer_forward.stop()
-                mem_after_forward = get_mem()
-                max_after_forward = get_max_mem()
-                profile.max_during_forward = max_after_forward - max_before_forward
-                profile.mem_after_forward = mem_after_forward
-                profile.mem_delta_forward = mem_after_forward - mem_before_forward
-
-            if enable_profiling:
-                timer_backward.start()
-
-            loss.backward()
-
-            if enable_profiling:
-                profile.backward_time = timer_backward.stop()
-                mem_after_backward = get_mem()
-                max_after_backward = get_max_mem()
-                profile.max_during_backward = max_after_backward - max_after_forward
-                profile.mem_after_backward = mem_after_backward
-                profile.mem_delta_backward = mem_after_backward - mem_after_forward
-
-            # Re-enable hooks
-            grad_hook.enable_hooks()
-
-            # Selection timing already recorded above (before second pass)
-
-    elif selection_method == 'MaxLoss' and grad_hook:
-        # ============================================================================
-        # MAXLOSS SELECTION (fallback method)
-        # ============================================================================
-
-        if enable_profiling:
-            timer_selection.start()
-
-        # Compute per-sample losses
-        with torch.no_grad():
-            losses = []
-            for idx in range(batch_size):
-                single_batch = {k: v[[idx]] for k, v in batch.items()}
-                outputs = model(**single_batch)
-                losses.append(outputs.loss.item())
-
-        # Select highest loss samples
-        selected_indices = greedy_selection(
-            torch.tensor(losses),
-            torch.zeros((len(losses), len(losses))),
-            int(len(losses) * 0.5)
-        )
-
-        # Filter to selected samples
-        filtered_batch = {k: v[selected_indices] for k, v in batch.items()}
-
-        if enable_profiling:
-            profile.selection_total_time = timer_selection.stop()
-            profile.selected_samples = len(selected_indices)
-
-        # Disable hooks if not using compressed optimizer
-        if not using_compressed_optimizer and grad_hook.hooks_registered:
-            grad_hook.disable_hooks()
-
-        # Standard forward/backward on selected samples
-        if enable_profiling:
-            timer_forward.start()
-
-        model.zero_grad()
-        outputs = model(**filtered_batch)
-        loss = outputs.loss
-
-        if enable_profiling:
-            profile.forward_time = timer_forward.stop()
-            mem_after_forward = get_mem()
-            max_after_forward = get_max_mem()
-            profile.max_during_forward = max_after_forward - max_before_forward
-            profile.mem_after_forward = mem_after_forward
-            profile.mem_delta_forward = mem_after_forward - mem_before_forward
-
-        if enable_profiling:
-            timer_backward.start()
-
-        loss.backward()
-
-        if enable_profiling:
-            profile.backward_time = timer_backward.stop()
-            mem_after_backward = get_mem()
-            max_after_backward = get_max_mem()
-            profile.max_during_backward = max_after_backward - max_after_forward
-            profile.mem_after_backward = mem_after_backward
-            profile.mem_delta_backward = mem_after_backward - mem_after_forward
-
-        # Re-enable hooks
-        if not using_compressed_optimizer and grad_hook.hooks_registered:
-            grad_hook.enable_hooks()
-
-    else:
-        # ============================================================================
-        # STANDARD MODE (Case 1 or no compression)
-        # Case 1: MeSO without GREATS - compressed gradients, no selection
-        # OR: Standard AdamW - full gradients, no compression
-        # ============================================================================
-
-        if not is_warmup and enable_profiling:
-            if using_compressed_optimizer:
-                print(f"  → Case 1: MeSO without GREATS (compressed gradients)")
-            else:
-                print(f"  → Standard training (full gradients)")
-
-        # Disable hooks if NOT using compressed optimizer
-        if not using_compressed_optimizer and grad_hook and grad_hook.hooks_registered:
-            grad_hook.disable_hooks()
-
-        # Standard forward pass
-        if enable_profiling:
-            timer_forward.start()
-
-        model.zero_grad()
-        outputs = model(**batch)
-        loss = outputs.loss
-
-        if enable_profiling:
-            profile.forward_time = timer_forward.stop()
-            mem_after_forward = get_mem()
-            max_after_forward = get_max_mem()
-            profile.max_during_forward = max_after_forward - max_before_forward
-            profile.mem_after_forward = mem_after_forward
-            profile.mem_delta_forward = mem_after_forward - mem_before_forward
-
-        # Standard backward pass
-        if enable_profiling:
-            timer_backward.start()
-
-        loss.backward()
-
-        if enable_profiling:
-            profile.backward_time = timer_backward.stop()
-            mem_after_backward = get_mem()
-            max_after_backward = get_max_mem()
-            profile.max_during_backward = max_after_backward - max_after_forward
-            profile.mem_after_backward = mem_after_backward
-            profile.mem_delta_backward = mem_after_backward - mem_after_forward
-
-        # Re-enable hooks if needed
-        if not using_compressed_optimizer and grad_hook and grad_hook.hooks_registered:
-            grad_hook.enable_hooks()
-
-    # OPTIMIZER STEP
-    if enable_profiling:
-        timer_optimizer.start()
-
-    optimizer.step()
-    optimizer.zero_grad()
-
-    if enable_profiling:
-        profile.optimizer_time = timer_optimizer.stop()
-        mem_after_optimizer = get_mem()
-        max_after_optimizer = get_max_mem()
-        profile.max_during_optimizer = max_after_optimizer - max_after_backward
-        profile.current_after_optimizer = mem_after_optimizer
-        profile.mem_after_optimizer = mem_after_optimizer
-        profile.mem_delta_optimizer = mem_after_optimizer - mem_after_backward
-        profile.max_ever = max_after_optimizer
-
-        # Print profiling info
-        if ENABLE_DETAILED_PROFILING and not is_warmup:
-            print(f"  Forward:   Current = {mem_after_forward:6.3f} GB, Max = {max_after_forward:6.3f} GB (peak: +{profile.max_during_forward:.3f} GB, delta: {profile.mem_delta_forward:+.3f} GB, time: {profile.forward_time*1000:.1f}ms)")
-            print(f"  Backward:  Current = {mem_after_backward:6.3f} GB, Max = {max_after_backward:6.3f} GB (peak: +{profile.max_during_backward:.3f} GB, delta: {profile.mem_delta_backward:+.3f} GB, time: {profile.backward_time*1000:.1f}ms)")
-            print(f"  Optimizer: Current = {mem_after_optimizer:6.3f} GB, Max = {max_after_optimizer:6.3f} GB (peak: +{profile.max_during_optimizer:.3f} GB, delta: {profile.mem_delta_optimizer:+.3f} GB, time: {profile.optimizer_time*1000:.1f}ms)")
-            if profile.selection_total_time > 0:
-                print(f"  Selection: Time = {profile.selection_total_time*1000:.1f}ms (selected: {profile.selected_samples}/{profile.total_samples})")
-            if profile.batch_prep_time > 0 or profile.data_transfer_time > 0:
-                print(f"  Overhead:  Batch prep: {profile.batch_prep_time*1000:.1f}ms, Data transfer: {profile.data_transfer_time*1000:.1f}ms)")
-        elif enable_profiling and not is_warmup:
-            print(f"  Forward:   Current = {mem_after_forward:6.3f} GB, Max = {max_after_forward:6.3f} GB (time: {profile.forward_time:.3f}s)")
-            print(f"  Backward:  Current = {mem_after_backward:6.3f} GB, Max = {max_after_backward:6.3f} GB (time: {profile.backward_time:.3f}s)")
-            print(f"  Optimizer: Current = {mem_after_optimizer:6.3f} GB, Max = {max_after_optimizer:6.3f} GB (time: {profile.optimizer_time:.3f}s)")
-
-    return profile
-
-def run_method(method_name, setup_fn, selection_method: Optional[str] = None, method_idx: Optional[int] = None, output_dir: Optional[str] = None):
-    """
-    Run a method for multiple iterations with comprehensive profiling.
-
-    Args:
-        method_name: Name of the method being tested
-        setup_fn: Function that returns (model, optimizer, tokenizer, grad_hook)
-        selection_method: Optional data selection method ('GREATS', 'GradNorm', 'MaxLoss', None)
-        method_idx: Optional method index for filename prefixing
-        output_dir: Optional output directory for saving results (including memory snapshots)
-    """
-    print("="*80)
-    print(f"Testing: {method_name}")
-    if selection_method:
-        print(f"Data Selection: {selection_method}")
-    print("="*80)
-
-    reset()
-
-    # Setup model and optimizer
-    print("Setting up model and optimizer...")
-    cuda_timer_sync()
-    setup_start = time.time()
-    setup_result = setup_fn()
-
-    # Handle different return types
-    if len(setup_result) == 3:
-        model, optimizer, tokenizer = setup_result
-        grad_hook = None
-    elif len(setup_result) == 4:
-        model, optimizer, tokenizer, grad_hook = setup_result
-    else:
-        raise ValueError(f"setup_fn must return (model, optimizer, tokenizer) or (model, optimizer, tokenizer, grad_hook)")
-
-    cuda_timer_sync()
-    setup_time = time.time() - setup_start
-    print(f"Setup time: {setup_time:.2f}s")
-
-    mem_after_setup = get_mem()
-    max_after_setup = get_max_mem()
-    print(f"After setup - Current: {mem_after_setup:.3f} GB, Max so far: {max_after_setup:.3f} GB")
-
-    # Prepare validation batch for data selection (if selection method specified)
-    val_batch = None
-    if selection_method and grad_hook:
-        val_batch = tokenizer(
-            ["Validation sentence for data selection."] * val_batch_size,  # Small val batch
+class BenchmarkConfig:
+    """Benchmark configuration."""
+    # Model
+    model_name: str = 'meta-llama/Llama-3.2-1B'
+    dtype: str = 'bfloat16'
+    use_flash_attention: bool = True
+
+    # Training
+    batch_size: int = 128
+    seq_length: int = 256
+    val_batch_size: int = 1
+
+    # Benchmark
+    num_warmup: int = 10
+    num_iterations: int = 10
+
+    # MeSO config
+    meso_sparsifier_dim: int = 860
+    meso_projector_dim: int = 739600
+    meso_projector_type: str = "identity"
+    meso_update_freq: int = 200
+
+    # LoRA config
+    lora_rank: int = 256
+    lora_alpha: int = 1
+
+    # GaLore config
+    galore_rank: int = 128
+
+    # GREATS config
+    use_second_order: bool = False  # If True, use greedy selection with O(k*n) complexity
+
+    # Device
+    device: str = 'cuda'
+
+    def get_torch_dtype(self):
+        return {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[self.dtype]
+
+
+@dataclass
+class BenchmarkResult:
+    """Results from a benchmark run."""
+    method_name: str
+    peak_memory_gb: float
+    avg_iteration_time_ms: float
+    throughput_samples_per_sec: float
+    total_time_sec: float
+    num_iterations: int
+    batch_size: int
+    seq_length: int
+    model_name: str
+    # Memory breakdown
+    memory_after_setup_gb: float = 0.0
+
+
+# =============================================================================
+# Dummy Dataset for Benchmarking
+# =============================================================================
+
+class DummyDataset(Dataset):
+    """Dummy dataset that generates random tokens for benchmarking."""
+
+    def __init__(self, tokenizer, seq_length: int, size: int = 10000):
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+        self.size = size
+        # Pre-tokenize a dummy sentence
+        self.dummy_text = "This is a test sentence for memory and performance benchmarking. " * 20
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        tokens = self.tokenizer(
+            self.dummy_text,
             return_tensors='pt',
             padding='max_length',
-            max_length=seq_length,
+            max_length=self.seq_length,
             truncation=True
-        ).to(device)
-        val_batch['labels'] = val_batch['input_ids'].clone()
+        )
+        return {
+            'input_ids': tokens['input_ids'].squeeze(0),
+            'attention_mask': tokens['attention_mask'].squeeze(0),
+            'labels': tokens['input_ids'].squeeze(0).clone(),
+        }
 
-    # Track memory per iteration and timing
-    iteration_stats = []
 
-    # WARMUP PHASE (not timed, not profiled)
-    print(f"\n{'='*80}")
-    print(f"WARMUP PHASE - {num_warmup_iterations} iterations (not timed)")
-    print(f"{'='*80}")
-    for i in range(num_warmup_iterations):
-        print(f"Warmup {i+1}/{num_warmup_iterations}...", end=' ')
+# =============================================================================
+# Benchmark Class
+# =============================================================================
 
-        # Run the same iteration logic as timed phase, but without profiling
-        _run_single_iteration(
-            model, optimizer, tokenizer, grad_hook, val_batch, selection_method,
-            enable_profiling=False, iter_num=i+1, is_warmup=True
+class Benchmark:
+    """
+    Simple benchmark wrapper for training methods.
+
+    Usage:
+        config = BenchmarkConfig(batch_size=64, num_warmup=10, num_iterations=20)
+        bench = Benchmark(config)
+
+        result = bench.run(
+            method_name="Full+AdamW",
+            setup_fn=setup_full_adamw,
+            step_fn=step_standard,
+        )
+    """
+
+    def __init__(self, config: BenchmarkConfig):
+        self.config = config
+
+    def _reset_memory(self):
+        """Reset CUDA cache and peak memory stats."""
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+    def _get_peak_memory_gb(self) -> float:
+        """Get peak GPU memory in GB."""
+        return torch.cuda.max_memory_allocated() / 1024**3
+
+    def _get_current_memory_gb(self) -> float:
+        """Get current GPU memory in GB."""
+        return torch.cuda.memory_allocated() / 1024**3
+
+    def _sync(self):
+        """Synchronize CUDA for accurate timing."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def run(
+        self,
+        method_name: str,
+        setup_fn: Callable[['BenchmarkConfig'], Tuple],
+        step_fn: Callable,
+    ) -> BenchmarkResult:
+        """
+        Run the benchmark for a single method.
+
+        Args:
+            method_name: Name of the method being benchmarked
+            setup_fn: Function that takes config and returns (model, optimizer, tokenizer, *extras)
+            step_fn: Function that performs one training step: step_fn(model, optimizer, batch, *extras)
+
+        Returns:
+            BenchmarkResult with timing and memory metrics
+        """
+        print("=" * 80)
+        print(f"Benchmarking: {method_name}")
+        print("=" * 80)
+
+        self._reset_memory()
+
+        # Setup
+        print("Setting up model and optimizer...")
+        self._sync()
+        setup_start = time.time()
+
+        setup_result = setup_fn(self.config)
+        model, optimizer, tokenizer = setup_result[:3]
+        extras = setup_result[3:] if len(setup_result) > 3 else ()
+
+        self._sync()
+        setup_time = time.time() - setup_start
+        print(f"Setup time: {setup_time:.2f}s")
+
+        memory_after_setup = self._get_current_memory_gb()
+        print(f"Memory after setup: {memory_after_setup:.3f} GB")
+
+        # Create dataloader
+        dataset = DummyDataset(tokenizer, self.config.seq_length)
+        dataloader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
+        data_iter = iter(dataloader)
+
+        # Reset memory stats before training
+        self._reset_memory()
+
+        # Warmup phase
+        print(f"\nWarmup: {self.config.num_warmup} iterations...")
+        for i in range(self.config.num_warmup):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+
+            batch = {k: v.to(self.config.device) for k, v in batch.items()}
+            step_fn(model, optimizer, batch, *extras)
+
+            if (i + 1) % 5 == 0:
+                print(f"  Warmup {i + 1}/{self.config.num_warmup} done")
+
+        # Reset memory stats after warmup
+        self._sync()
+        self._reset_memory()
+
+        # Timed phase
+        print(f"\nTiming: {self.config.num_iterations} iterations...")
+        self._sync()
+        start_time = time.time()
+
+        for i in range(self.config.num_iterations):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+
+            batch = {k: v.to(self.config.device) for k, v in batch.items()}
+            step_fn(model, optimizer, batch, *extras)
+
+            if (i + 1) % 5 == 0:
+                print(f"  Iteration {i + 1}/{self.config.num_iterations} done")
+
+        self._sync()
+        total_time = time.time() - start_time
+        peak_memory = self._get_peak_memory_gb()
+
+        # Calculate metrics
+        avg_iteration_time_ms = (total_time / self.config.num_iterations) * 1000
+        throughput = (self.config.num_iterations * self.config.batch_size) / total_time
+
+        # Print results
+        print(f"\n{'=' * 80}")
+        print(f"Results: {method_name}")
+        print(f"{'=' * 80}")
+        print(f"Peak Memory:     {peak_memory:.3f} GB")
+        print(f"Avg Time/Iter:   {avg_iteration_time_ms:.1f} ms")
+        print(f"Throughput:      {throughput:.2f} samples/sec")
+        print(f"Total Time:      {total_time:.2f}s ({self.config.num_iterations} iterations)")
+        print(f"{'=' * 80}\n")
+
+        # Cleanup
+        del model, optimizer
+        torch.cuda.empty_cache()
+
+        return BenchmarkResult(
+            method_name=method_name,
+            peak_memory_gb=peak_memory,
+            avg_iteration_time_ms=avg_iteration_time_ms,
+            throughput_samples_per_sec=throughput,
+            total_time_sec=total_time,
+            num_iterations=self.config.num_iterations,
+            batch_size=self.config.batch_size,
+            seq_length=self.config.seq_length,
+            model_name=self.config.model_name,
+            memory_after_setup_gb=memory_after_setup,
         )
 
-        print("done")
 
-    print(f"\n{'='*80}")
-    print(f"TIMED PHASE - {num_timed_iterations} iterations (measured for throughput)")
-    print(f"{'='*80}")
+# =============================================================================
+# Step Functions (Training Logic)
+# =============================================================================
 
-    # Start memory snapshot recording if enabled
-    snapshot_file = None
-    if ENABLE_MEMORY_SNAPSHOT:
-        print(f"\n📸 Memory snapshot recording ENABLED")
-        print(f"   Max events: {MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT:,}")
-        torch.cuda.memory._record_memory_history(
-            max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
-        )
+def step_standard(model, optimizer, batch):
+    """Standard training step for AdamW, SGD, GaLore, etc."""
+    model.train()
+    optimizer.zero_grad()
+    # Use autocast to keep loss computation in bfloat16 (avoids OOM from logits.float())
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        outputs = model(**batch)
+        loss = outputs.loss
+    loss.backward()
+    optimizer.step()
+    return loss.item()
 
-    # Start timing for timed iterations only
-    cuda_timer_sync()
-    total_start = time.time()
 
-    for i in range(num_timed_iterations):
-        iter_num = num_warmup_iterations + i + 1
-        print(f"\n--- Iteration {iter_num}/{num_iterations} (Timed {i+1}/{num_timed_iterations}) ---")
+def step_meso(model, optimizer, batch, grad_hook):
+    """Training step for MeSO (without data selection)."""
+    model.train()
+    optimizer.zero_grad()
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        outputs = model(**batch)
+        loss = outputs.loss
+    loss.backward()
+    optimizer.step()
+    return loss.item()
 
-        # Run the same iteration logic as warmup, but WITH profiling enabled
-        profile = _run_single_iteration(
-            model, optimizer, tokenizer, grad_hook, val_batch, selection_method,
-            enable_profiling=True, iter_num=i+1, is_warmup=False
-        )
 
-        iteration_stats.append(asdict(profile))
+class SelectionStepHelper:
+    """
+    Helper class for step functions that need data selection.
 
-    # Total training time
-    cuda_timer_sync()
-    total_time = time.time() - total_start
+    This creates and manages a validation dataloader for selection.
+    """
 
-    # Save memory snapshot if enabled
-    if ENABLE_MEMORY_SNAPSHOT:
-        import os
+    def __init__(self, tokenizer, seq_length: int, batch_size: int, device: str):
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+        self.batch_size = batch_size
+        self.device = device
+        self._val_iter = None
+        self._val_dataloader = None
 
-        # Determine the directory for memory snapshots
-        if output_dir:
-            snapshot_dir = output_dir
-        else:
-            snapshot_dir = 'memory_snapshots'
-            os.makedirs(snapshot_dir, exist_ok=True)
+    def _create_val_dataloader(self):
+        """Create validation dataloader for selection."""
+        dataset = DummyDataset(self.tokenizer, self.seq_length, size=1000)
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        # Create filename with method index prefix if available
-        clean_name = re.sub(r'[^a-zA-Z0-9]+', '_', method_name).strip('_')
-        if method_idx is not None:
-            snapshot_file = f"{snapshot_dir}/{method_idx:02d}_{clean_name}.pickle"
-        else:
-            snapshot_file = f"{snapshot_dir}/{clean_name}.pickle"
+    def get_val_batch(self) -> Dict[str, torch.Tensor]:
+        """Get a validation batch for selection."""
+        if self._val_dataloader is None:
+            self._val_dataloader = self._create_val_dataloader()
+            self._val_iter = iter(self._val_dataloader)
 
-        print(f"\n📸 Saving memory snapshot...")
         try:
-            torch.cuda.memory._dump_snapshot(snapshot_file)
-            print(f"   ✓ Snapshot saved to: {snapshot_file}")
-            print(f"   💡 To visualize: python -m torch.utils.viz_memory {snapshot_file}")
-        except Exception as e:
-            print(f"   ✗ Failed to capture memory snapshot: {e}")
-            snapshot_file = None
-        finally:
-            # Stop recording memory snapshot history
-            torch.cuda.memory._record_memory_history(enabled=None)
+            batch = next(self._val_iter)
+        except StopIteration:
+            self._val_iter = iter(self._val_dataloader)
+            batch = next(self._val_iter)
 
-    # Final summary
-    absolute_max = get_max_mem()
-    final_current = get_mem()
+        return {k: v.to(self.device) for k, v in batch.items()}
 
-    print(f"\n{'='*80}")
-    print(f"{method_name} - FINAL SUMMARY")
-    print(f"{'='*80}")
-    print(f"Absolute maximum memory EVER reached: {absolute_max:.3f} GB")
-    print(f"Current memory at end:                {final_current:.3f} GB")
-    print(f"Peak occurred during:                 ", end="")
 
-    # Find when peak occurred
-    max_forward = max(s['max_during_forward'] for s in iteration_stats)
-    max_backward = max(s['max_during_backward'] for s in iteration_stats)
-    max_optimizer = max(s['max_during_optimizer'] for s in iteration_stats)
-
-    if max_forward > max_backward and max_forward > max_optimizer:
-        print("FORWARD pass")
-    elif max_backward > max_optimizer:
-        print("BACKWARD pass")
-    else:
-        print("OPTIMIZER step")
-
-    # Check memory growth (only looking at timed iterations)
-    first_iter_max = iteration_stats[0]['max_ever']
-    last_iter_max = iteration_stats[-1]['max_ever']
-    growth = last_iter_max - first_iter_max
-
-    print(f"\nMemory growth during timed iterations (iter 1 to {num_timed_iterations}):")
-    print(f"  Iter 1 max:  {first_iter_max:.3f} GB")
-    print(f"  Iter {num_timed_iterations} max:  {last_iter_max:.3f} GB")
-    print(f"  Growth:      {growth:+.3f} GB")
-
-    if abs(growth) < 0.1:
-        print(f"  Status:      ✓ STABLE")
-    elif growth > 0:
-        print(f"  Status:      ⚠ GROWING")
-    else:
-        print(f"  Status:      ✓ DECREASING")
-
-    # Timing statistics
-    avg_forward = sum(s['forward_time'] for s in iteration_stats) / len(iteration_stats)
-    avg_backward = sum(s['backward_time'] for s in iteration_stats) / len(iteration_stats)
-    avg_optimizer = sum(s['optimizer_time'] for s in iteration_stats) / len(iteration_stats)
-
-    # Calculate average iteration time including ALL components
-    # This ensures Total(ms) matches what's actually included in throughput calculation
-    avg_selection = sum(s.get('selection_total_time', 0) for s in iteration_stats) / len(iteration_stats)
-    avg_batch_prep = sum(s.get('batch_prep_time', 0) for s in iteration_stats) / len(iteration_stats)
-    avg_data_transfer = sum(s.get('data_transfer_time', 0) for s in iteration_stats) / len(iteration_stats)
-
-    # Total iteration time = sum of all components
-    avg_iteration = avg_forward + avg_backward + avg_optimizer + avg_selection + avg_batch_prep + avg_data_transfer
-
-    print(f"\nTiming (average per iteration):")
-    print(f"  Setup time:     {setup_time:6.3f}s")
-    if avg_selection > 0:
-        print(f"  Selection:      {avg_selection:6.3f}s ({avg_selection*1000:6.1f}ms)")
-    print(f"  Forward:        {avg_forward:6.3f}s ({avg_forward*1000:6.1f}ms)")
-    print(f"  Backward:       {avg_backward:6.3f}s ({avg_backward*1000:6.1f}ms)")
-    print(f"  Optimizer:      {avg_optimizer:6.3f}s ({avg_optimizer*1000:6.1f}ms)")
-    if avg_batch_prep > 0 or avg_data_transfer > 0:
-        print(f"  Batch prep:     {avg_batch_prep:6.3f}s ({avg_batch_prep*1000:6.1f}ms)")
-        print(f"  Data transfer:  {avg_data_transfer:6.3f}s ({avg_data_transfer*1000:6.1f}ms)")
-
-    # Detailed profiling breakdown (if enabled)
-    if ENABLE_DETAILED_PROFILING:
-        # Check if we have detailed timing data
-        if any(s.get('batch_prep_time', 0) > 0 for s in iteration_stats):
-            avg_batch_prep = sum(s.get('batch_prep_time', 0) for s in iteration_stats) / len(iteration_stats)
-            avg_data_transfer = sum(s.get('data_transfer_time', 0) for s in iteration_stats) / len(iteration_stats)
-            avg_model_forward = sum(s.get('model_forward_compute_time', 0) for s in iteration_stats) / len(iteration_stats)
-            avg_loss_comp = sum(s.get('loss_computation_time', 0) for s in iteration_stats) / len(iteration_stats)
-            avg_backward_comp = sum(s.get('backward_compute_time', 0) for s in iteration_stats) / len(iteration_stats)
-            avg_opt_step = sum(s.get('optimizer_step_time', 0) for s in iteration_stats) / len(iteration_stats)
-            avg_opt_zero = sum(s.get('optimizer_zero_grad_time', 0) for s in iteration_stats) / len(iteration_stats)
-
-            print(f"\n{'='*80}")
-            print(f"DETAILED BREAKDOWN - Bottleneck Analysis")
-            print(f"{'='*80}")
-            print(f"\nOverhead (non-compute):")
-            print(f"  Batch preparation:     {avg_batch_prep*1000:6.1f}ms ({avg_batch_prep/avg_iteration*100:5.1f}%)")
-            print(f"  Data transfer to GPU:  {avg_data_transfer*1000:6.1f}ms ({avg_data_transfer/avg_iteration*100:5.1f}%)")
-
-            print(f"\nForward Pass Breakdown:")
-            print(f"  Model computation:     {avg_model_forward*1000:6.1f}ms ({avg_model_forward/avg_iteration*100:5.1f}%)")
-            print(f"  Loss computation:      {avg_loss_comp*1000:6.1f}ms ({avg_loss_comp/avg_iteration*100:5.1f}%)")
-
-            print(f"\nBackward Pass Breakdown:")
-            print(f"  Gradient computation:  {avg_backward_comp*1000:6.1f}ms ({avg_backward_comp/avg_iteration*100:5.1f}%)")
-
-            print(f"\nOptimizer Breakdown:")
-            print(f"  Parameter update:      {avg_opt_step*1000:6.1f}ms ({avg_opt_step/avg_iteration*100:5.1f}%)")
-            print(f"  Zeroing gradients:     {avg_opt_zero*1000:6.1f}ms ({avg_opt_zero/avg_iteration*100:5.1f}%)")
-
-            # Find the biggest bottleneck
-            components = {
-                "Batch preparation": avg_batch_prep,
-                "Data transfer": avg_data_transfer,
-                "Model forward": avg_model_forward,
-                "Loss computation": avg_loss_comp,
-                "Backward computation": avg_backward_comp,
-                "Optimizer step": avg_opt_step,
-                "Optimizer zero_grad": avg_opt_zero
-            }
-            max_component = max(components.items(), key=lambda x: x[1])
-            print(f"\n🔍 BIGGEST BOTTLENECK: {max_component[0]} ({max_component[1]*1000:.1f}ms, {max_component[1]/avg_iteration*100:.1f}%)")
-
-        # Data selection breakdown
-        if any(s.get('selection_total_time', 0) > 0 for s in iteration_stats):
-            stats_with_selection = [s for s in iteration_stats if s.get('selection_total_time', 0) > 0]
-            if stats_with_selection:
-                avg_selection_total = sum(s['selection_total_time'] for s in stats_with_selection) / len(stats_with_selection)
-                avg_selection_grad_comp = sum(s.get('selection_grad_comp_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-
-                # Detailed sub-components
-                avg_val_fwd = sum(s.get('selection_val_forward_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-                avg_val_bwd = sum(s.get('selection_val_backward_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-                avg_train_fwd = sum(s.get('selection_train_forward_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-                avg_train_bwd = sum(s.get('selection_train_backward_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-                avg_dotprod_compute = sum(s.get('selection_dotprod_compute_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-
-                print(f"\nData Selection Breakdown (GREATS/GradNorm):")
-                print(f"  Total selection:           {avg_selection_total:6.3f}s ({avg_selection_total*1000:6.1f}ms, {avg_selection_total/avg_iteration*100:5.1f}%)")
-                print(f"    1) Gradient computation: {avg_selection_grad_comp:6.3f}s ({avg_selection_grad_comp*1000:6.1f}ms, {avg_selection_grad_comp/avg_iteration*100:5.1f}%)")
-
-                if avg_val_fwd > 0:
-                    print(f"       ├─ Val forward:       {avg_val_fwd:6.3f}s ({avg_val_fwd*1000:6.1f}ms, {avg_val_fwd/avg_iteration*100:5.1f}%)")
-                    print(f"       ├─ Val backward:      {avg_val_bwd:6.3f}s ({avg_val_bwd*1000:6.1f}ms, {avg_val_bwd/avg_iteration*100:5.1f}%)")
-                    print(f"       ├─ Train forward:     {avg_train_fwd:6.3f}s ({avg_train_fwd*1000:6.1f}ms, {avg_train_fwd/avg_iteration*100:5.1f}%)")
-                    print(f"       ├─ Train backward:    {avg_train_bwd:6.3f}s ({avg_train_bwd*1000:6.1f}ms, {avg_train_bwd/avg_iteration*100:5.1f}%)")
-                    print(f"       └─ Dot product calc:  {avg_dotprod_compute:6.3f}s ({avg_dotprod_compute*1000:6.1f}ms, {avg_dotprod_compute/avg_iteration*100:5.1f}%)")
-
-        # MeSO-specific operations note
-        if 'MeSO' in method_name or 'meso' in method_name.lower():
-            print(f"\nMeSO-Specific Operations:")
-            if selection_method in ['GREATS', 'GradNorm']:
-                print(f"  Optimization:           ✓ GRADIENT REUSE ENABLED")
-                print(f"    - Compressed gradients computed during selection")
-                print(f"    - Forward/backward SKIPPED for selected samples")
-                print(f"    - Optimizer aggregates cached compressed gradients")
-                print(f"    - This matches real trainer.py behavior (33% speedup!)")
-            else:
-                print(f"  Gradient compression:   Included in backward time (via hooks)")
-                print(f"  Gradient decompression: Included in optimizer time (during step)")
-            print(f"  Compressor refresh:     Not triggered (update_freq=200, iterations={num_timed_iterations})")
-
-    print(f"\n{'='*80}")
-    print(f"Total/iter:     {avg_iteration:6.3f}s ({avg_iteration*1000:.1f}ms)")
-    print(f"Total ({num_timed_iterations} timed iters): {total_time:6.3f}s")
-    print(f"Throughput:     {num_timed_iterations * batch_size / total_time:.2f} samples/s")
-
-    # Sanity check: verify our component sum matches wall-clock time
-    expected_total = avg_iteration * num_timed_iterations
-    actual_total = total_time
-    timing_discrepancy = abs(expected_total - actual_total)
-    timing_discrepancy_pct = (timing_discrepancy / actual_total) * 100
-
-    if timing_discrepancy_pct > 5.0:  # More than 5% discrepancy
-        print(f"\n⚠ TIMING DISCREPANCY DETECTED:")
-        print(f"  Expected total (sum of components): {expected_total:.3f}s")
-        print(f"  Actual wall-clock total:            {actual_total:.3f}s")
-        print(f"  Unaccounted time:                   {timing_discrepancy:.3f}s ({timing_discrepancy_pct:.1f}%)")
-        print(f"  This suggests some operations are not being timed!")
-    else:
-        print(f"✓ Timing verification: Components sum to {expected_total:.3f}s vs wall-clock {actual_total:.3f}s (discrepancy: {timing_discrepancy_pct:.1f}%)")
-
-    print(f"\nNote: Throughput measured from {num_timed_iterations} iterations after {num_warmup_iterations} warmup iterations")
-    print(f"{'='*80}")
-
-    del model, optimizer
-    if grad_hook:
-        del grad_hook
-    torch.cuda.empty_cache()
-
-    result = {
-        'method': method_name,
-        # Configuration info
-        'model_name': MODEL_NAME,
-        'batch_size': batch_size,
-        'seq_length': seq_length,
-        'dtype': str(MODEL_DTYPE),
-        'flash_attention': USE_FLASH_ATTENTION,
-        # Results
-        'absolute_max': absolute_max,
-        'final_current': final_current,
-        'iterations': iteration_stats,
-        'growth': growth,
-        'setup_time': setup_time,
-        'total_time': total_time,
-        'num_warmup_iterations': num_warmup_iterations,
-        'num_timed_iterations': num_timed_iterations,
-        'avg_iteration_time': avg_iteration,
-        'avg_forward_time': avg_forward,
-        'avg_backward_time': avg_backward,
-        'avg_optimizer_time': avg_optimizer,
-        'throughput': num_timed_iterations * batch_size / total_time,
-        'memory_snapshot_file': snapshot_file if ENABLE_MEMORY_SNAPSHOT else None,
-    }
-
-    # Add detailed profiling stats if available
-    if ENABLE_DETAILED_PROFILING:
-        # Data selection stats
-        stats_with_selection = [s for s in iteration_stats if s.get('selection_total_time', 0) > 0]
-        if stats_with_selection:
-            result['avg_selection_total_time'] = sum(s['selection_total_time'] for s in stats_with_selection) / len(stats_with_selection)
-            result['avg_selection_grad_comp_time'] = sum(s.get('selection_grad_comp_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-
-            # Detailed selection breakdown
-            result['avg_selection_val_forward_time'] = sum(s.get('selection_val_forward_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-            result['avg_selection_val_backward_time'] = sum(s.get('selection_val_backward_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-            result['avg_selection_train_forward_time'] = sum(s.get('selection_train_forward_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-            result['avg_selection_train_backward_time'] = sum(s.get('selection_train_backward_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-            result['avg_selection_dotprod_compute_time'] = sum(s.get('selection_dotprod_compute_time', 0) for s in stats_with_selection) / len(stats_with_selection)
-
-        # Detailed component timings
-        if any(s.get('batch_prep_time', 0) > 0 for s in iteration_stats):
-            result['avg_batch_prep_time'] = sum(s.get('batch_prep_time', 0) for s in iteration_stats) / len(iteration_stats)
-            result['avg_data_transfer_time'] = sum(s.get('data_transfer_time', 0) for s in iteration_stats) / len(iteration_stats)
-            result['avg_model_forward_compute_time'] = sum(s.get('model_forward_compute_time', 0) for s in iteration_stats) / len(iteration_stats)
-            result['avg_loss_computation_time'] = sum(s.get('loss_computation_time', 0) for s in iteration_stats) / len(iteration_stats)
-            result['avg_backward_compute_time'] = sum(s.get('backward_compute_time', 0) for s in iteration_stats) / len(iteration_stats)
-            result['avg_optimizer_step_time'] = sum(s.get('optimizer_step_time', 0) for s in iteration_stats) / len(iteration_stats)
-            result['avg_optimizer_zero_grad_time'] = sum(s.get('optimizer_zero_grad_time', 0) for s in iteration_stats) / len(iteration_stats)
-
-    return result
-
-# =============================================================================
-# Setup functions for each method
-# =============================================================================
-
-def setup_full_adamw():
-    """Full fine-tuning with standard AdamW"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-    model.train()
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_full_meso():
-    """Full fine-tuning with MeSO (MeSOAdamW)"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-    model.train()
-
-    layer_names = find_trainable_layers(model, lora_only=False)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-    sample_inputs = {k: v.to(device) for k, v in
-                     tokenizer('test', return_tensors='pt', max_length=seq_length, truncation=True).items()
-                     if k != 'labels'}
-
-    # Setup compression (using centralized configuration)
-    sparsifier_kwargs = {
-        "proj_dim": SPARSIFIER_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": SPARSIFIER_TYPE,
-    }
-
-    projector_kwargs = {
-        "proj_dim": PROJECTOR_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": PROJECTOR_TYPE,
-    }
-
-    compressors = setup_model_compressors(
-        model=model,
-        layer_names=layer_names,
-        sparsifier_kwargs=sparsifier_kwargs,
-        projector_kwargs=projector_kwargs,
-        sample_inputs=sample_inputs,
-        device=str(device),
-        update_freq=UPDATE_FREQ
-    )
-
-    grad_hook = GradientHook(
-        model=model,
-        layer_names=layer_names,
-        device=str(device),
-        register_hooks=True
-    )
-    grad_hook.set_compressors(compressors)
-
-    optimizer = MeSOAdamW(
-        model.parameters(),
-        grad_hook=grad_hook,
-        lr=5e-5,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0.0
-    )
-
-    return model, optimizer, tokenizer, grad_hook
-
-def setup_full_galore():
-    """Full fine-tuning with GaLore"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-    model.train()
-
-    # Separate parameters for GaLore
-    galore_params = []
-    regular_params = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if param.ndim == 2 and min(param.shape) >= 128:
-                galore_params.append(param)
-            else:
-                regular_params.append(param)
-
-    param_groups = [
-        {'params': regular_params},
-        {'params': galore_params, 'rank': 128, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
-    ]
-
-    optimizer = GaLoreAdamW(param_groups, lr=5e-5)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_full_sgd():
-    """Full fine-tuning with vanilla SGD (no momentum)"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-    model.train()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_full_sgd_momentum():
-    """Full fine-tuning with SGD + momentum"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-    model.train()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_lora_sgd():
-    """LoRA with SGD (no momentum)"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=256,
-        lora_alpha=1,
-        lora_dropout=0.1,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
-    )
-    model = get_peft_model(model, lora_config)
-    model.train()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_lora_sgd_momentum():
-    """LoRA with SGD + momentum"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=256,
-        lora_alpha=1,
-        lora_dropout=0.1,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
-    )
-    model = get_peft_model(model, lora_config)
-    model.train()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_lora_adamw():
-    """LoRA with AdamW"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=256,
-        lora_alpha=1,
-        lora_dropout=0.1,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
-    )
-    model = get_peft_model(model, lora_config)
-    model.train()
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_full_adamw_gradient_checkpointing():
-    """Full fine-tuning with AdamW + gradient checkpointing"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-    model.train()
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_full_sgd_gradient_checkpointing():
-    """Full fine-tuning with vanilla SGD (no momentum) + gradient checkpointing"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-    model.train()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_full_sgd_momentum_gradient_checkpointing():
-    """Full fine-tuning with SGD + momentum + gradient checkpointing"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-    model.train()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_full_meso_gradient_checkpointing():
+def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: float = 0.5, use_second_order: bool = False):
     """
-    Full fine-tuning with MeSO (MeSOAdamW) + gradient checkpointing.
-
-    UPDATED: Now uses the optimized hook.py with Solution 1 built-in!
-    - Eliminates pre_activations storage (never used in gradient computation)
-    - ~50% reduction in activation memory
-    - No special configuration needed - optimization is automatic
-    """
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-    model.train()
-
-    layer_names = find_trainable_layers(model, lora_only=False)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-    sample_inputs = {k: v.to(device) for k, v in
-                     tokenizer('test', return_tensors='pt', max_length=seq_length, truncation=True).items()
-                     if k != 'labels'}
-
-    # Setup compression (using centralized configuration)
-    sparsifier_kwargs = {
-        "proj_dim": SPARSIFIER_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": SPARSIFIER_TYPE,
-    }
-
-    projector_kwargs = {
-        "proj_dim": PROJECTOR_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": PROJECTOR_TYPE,
-    }
-
-    compressors = setup_model_compressors(
-        model=model,
-        layer_names=layer_names,
-        sparsifier_kwargs=sparsifier_kwargs,
-        projector_kwargs=projector_kwargs,
-        sample_inputs=sample_inputs,
-        device=str(device),
-        update_freq=UPDATE_FREQ
-    )
-
-    grad_hook = GradientHook(
-        model=model,
-        layer_names=layer_names,
-        device=str(device),
-        register_hooks=True
-    )
-    grad_hook.set_compressors(compressors)
-
-    optimizer = MeSOAdamW(
-        model.parameters(),
-        grad_hook=grad_hook,
-        lr=5e-5,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0.0
-    )
-
-    return model, optimizer, tokenizer, grad_hook
-
-def setup_full_galore_gradient_checkpointing():
-    """Full fine-tuning with GaLore + gradient checkpointing"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-    model.train()
-
-    # Separate parameters for GaLore
-    galore_params = []
-    regular_params = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if param.ndim == 2 and min(param.shape) >= 128:
-                galore_params.append(param)
-            else:
-                regular_params.append(param)
-
-    param_groups = [
-        {'params': regular_params},
-        {'params': galore_params, 'rank': 128, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
-    ]
-
-    optimizer = GaLoreAdamW(param_groups, lr=5e-5)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_lora_sgd_gradient_checkpointing():
-    """LoRA with SGD (no momentum) + gradient checkpointing"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=256,
-        lora_alpha=1,
-        lora_dropout=0.1,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
-    )
-    model = get_peft_model(model, lora_config)
-    model.train()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_lora_sgd_momentum_gradient_checkpointing():
-    """LoRA with SGD + momentum + gradient checkpointing"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=256,
-        lora_alpha=1,
-        lora_dropout=0.1,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
-    )
-    model = get_peft_model(model, lora_config)
-    model.train()
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_lora_adamw_gradient_checkpointing():
-    """LoRA with AdamW + gradient checkpointing"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=256,
-        lora_alpha=1,
-        lora_dropout=0.1,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
-    )
-    model = get_peft_model(model, lora_config)
-    model.train()
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-def setup_full_greats():
-    """Full fine-tuning with GREATS data selection (requires compression for gradient computation)"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-    model.train()
-
-    layer_names = find_trainable_layers(model, lora_only=False)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-    sample_inputs = {k: v.to(device) for k, v in
-                     tokenizer('test', return_tensors='pt', max_length=seq_length, truncation=True).items()
-                     if k != 'labels'}
-
-    # Setup compression (needed for GREATS gradient computation)
-    sparsifier_kwargs = {
-        "proj_dim": SPARSIFIER_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": SPARSIFIER_TYPE,
-    }
-
-    projector_kwargs = {
-        "proj_dim": PROJECTOR_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": PROJECTOR_TYPE,
-    }
-
-    compressors = setup_model_compressors(
-        model=model,
-        layer_names=layer_names,
-        sparsifier_kwargs=sparsifier_kwargs,
-        projector_kwargs=projector_kwargs,
-        sample_inputs=sample_inputs,
-        device=str(device),
-        update_freq=UPDATE_FREQ
-    )
-
-    grad_hook = GradientHook(
-        model=model,
-        layer_names=layer_names,
-        device=str(device),
-        register_hooks=True
-    )
-    grad_hook.set_compressors(compressors)
-
-    # Use regular AdamW (not MeSOAdamW) since this is GREATS, not MeSO
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
-    return model, optimizer, tokenizer, grad_hook
-
-def setup_lora_greats():
-    """LoRA fine-tuning with GREATS data selection (requires compression for gradient computation)"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=256,
-        lora_alpha=1,
-        lora_dropout=0.1,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
-    )
-    model = get_peft_model(model, lora_config)
-    # Ensure LoRA adapters match base model dtype (critical for gradient compression)
-    model = model.to(MODEL_DTYPE)
-    model.train()
-
-    # Get layer names - for LoRA we only compress gradients for adapter layers (lora_A and lora_B)
-    layer_names = find_trainable_layers(model, lora_only=True)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-    sample_inputs = {k: v.to(device) for k, v in
-                     tokenizer('test', return_tensors='pt', max_length=seq_length, truncation=True).items()
-                     if k != 'labels'}
-
-    # Setup compression (needed for GREATS gradient computation)
-    sparsifier_kwargs = {
-        "proj_dim": SPARSIFIER_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": SPARSIFIER_TYPE,
-    }
-
-    projector_kwargs = {
-        "proj_dim": PROJECTOR_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": PROJECTOR_TYPE,
-    }
-
-    compressors = setup_model_compressors(
-        model=model,
-        layer_names=layer_names,
-        sparsifier_kwargs=sparsifier_kwargs,
-        projector_kwargs=projector_kwargs,
-        sample_inputs=sample_inputs,
-        device=str(device),
-        update_freq=UPDATE_FREQ
-    )
-
-    grad_hook = GradientHook(
-        model=model,
-        layer_names=layer_names,
-        device=str(device),
-        register_hooks=True
-    )
-    grad_hook.set_compressors(compressors)
-
-    # Use regular AdamW (not MeSOAdamW) since this is GREATS, not MeSO
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
-    return model, optimizer, tokenizer, grad_hook
-
-def setup_full_greats_gradient_checkpointing():
-    """Full fine-tuning with GREATS data selection + gradient checkpointing"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-    model.train()
-
-    layer_names = find_trainable_layers(model, lora_only=False)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-    sample_inputs = {k: v.to(device) for k, v in
-                     tokenizer('test', return_tensors='pt', max_length=seq_length, truncation=True).items()
-                     if k != 'labels'}
-
-    # Setup compression (needed for GREATS gradient computation)
-    sparsifier_kwargs = {
-        "proj_dim": SPARSIFIER_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": SPARSIFIER_TYPE,
-    }
-
-    projector_kwargs = {
-        "proj_dim": PROJECTOR_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": PROJECTOR_TYPE,
-    }
-
-    compressors = setup_model_compressors(
-        model=model,
-        layer_names=layer_names,
-        sparsifier_kwargs=sparsifier_kwargs,
-        projector_kwargs=projector_kwargs,
-        sample_inputs=sample_inputs,
-        device=str(device),
-        update_freq=UPDATE_FREQ
-    )
-
-    grad_hook = GradientHook(
-        model=model,
-        layer_names=layer_names,
-        device=str(device),
-        register_hooks=True
-    )
-    grad_hook.set_compressors(compressors)
-
-    # Use regular AdamW (not MeSOAdamW) since this is GREATS, not MeSO
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
-    return model, optimizer, tokenizer, grad_hook
-
-def setup_lora_greats_gradient_checkpointing():
-    """LoRA fine-tuning with GREATS data selection + gradient checkpointing"""
-    model_kwargs = {
-        'dtype': MODEL_DTYPE,
-        'device_map': device
-    }
-    if USE_FLASH_ATTENTION:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        **model_kwargs
-    )
-
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=256,
-        lora_alpha=1,
-        lora_dropout=0.1,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
-    )
-    model = get_peft_model(model, lora_config)
-    # Ensure LoRA adapters match base model dtype (critical for gradient compression)
-    model = model.to(MODEL_DTYPE)
-    model.train()
-
-    # Get layer names - for LoRA we only compress gradients for adapter layers (lora_A and lora_B)
-    layer_names = find_trainable_layers(model, lora_only=True)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-    sample_inputs = {k: v.to(device) for k, v in
-                     tokenizer('test', return_tensors='pt', max_length=seq_length, truncation=True).items()
-                     if k != 'labels'}
-
-    # Setup compression (needed for GREATS gradient computation)
-    sparsifier_kwargs = {
-        "proj_dim": SPARSIFIER_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": SPARSIFIER_TYPE,
-    }
-
-    projector_kwargs = {
-        "proj_dim": PROJECTOR_DIM,
-        "proj_max_batch_size": COMPRESSION_MAX_BATCH_SIZE,
-        "proj_seed": COMPRESSION_SEED,
-        "device": str(device),
-        "proj_type": PROJECTOR_TYPE,
-    }
-
-    compressors = setup_model_compressors(
-        model=model,
-        layer_names=layer_names,
-        sparsifier_kwargs=sparsifier_kwargs,
-        projector_kwargs=projector_kwargs,
-        sample_inputs=sample_inputs,
-        device=str(device),
-        update_freq=UPDATE_FREQ
-    )
-
-    grad_hook = GradientHook(
-        model=model,
-        layer_names=layer_names,
-        device=str(device),
-        register_hooks=True
-    )
-    grad_hook.set_compressors(compressors)
-
-    # Use regular AdamW (not MeSOAdamW) since this is GREATS, not MeSO
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
-    return model, optimizer, tokenizer, grad_hook
-
-# =============================================================================
-# Configuration and utility functions
-# =============================================================================
-
-def get_config_subfolder_name():
-    """
-    Generate a subfolder name based on current configuration (full name for directories).
-
-    Returns:
-        str: Subfolder name describing the configuration (e.g., "llama-3-2-1b_bf16_flashattn")
-    """
-    # Extract model short name from MODEL_NAME (e.g., "meta-llama/Llama-3.2-1B" -> "llama-3-2-1b")
-    model_short = MODEL_NAME.split('/')[-1].lower().replace('.', '-')
-
-    dtype_map = {
-        torch.float32: "fp32",
-        torch.bfloat16: "bf16",
-        torch.float16: "fp16"
-    }
-    dtype_str = dtype_map.get(MODEL_DTYPE, "unknown")
-
-    if USE_FLASH_ATTENTION:
-        return f"{model_short}_{dtype_str}_flashattn"
-    else:
-        return f"{model_short}_{dtype_str}"
-
-
-def get_config_short_name(config_folder: str) -> str:
-    """
-    Generate a short display name from a config folder name (for table printing).
+    Create a step function for pure GREATS selection (with standard optimizer).
+
+    This is a two-pass approach:
+    1. First pass: Compute per-sample gradient scores using compression
+    2. Second pass: Standard training on selected samples
 
     Args:
-        config_folder: Full config folder name (e.g., "llama-3-2-1b_bf16_flashattn")
+        selection_helper: SelectionStepHelper instance for validation batches
+        selection_frac: Fraction of samples to select
+        use_second_order: If True, use greedy selection with second-order interactions.
 
     Returns:
-        str: Short name for display (e.g., "1b_bf16_fa")
+        Step function for GREATS + standard optimizer
     """
-    import re
-    # Extract model size (e.g., "1b", "3b", "8b")
-    size_match = re.search(r'(\d+)b', config_folder)
-    model_short = size_match.group(0) if size_match else config_folder.split('_')[0]
+    def step_fn(model, optimizer, batch, grad_hook):
+        model.train()
 
-    # Extract dtype
-    dtype = "bf16" if "bf16" in config_folder else "fp16" if "fp16" in config_folder else "fp32"
+        # Get validation batch
+        val_batch = selection_helper.get_val_batch()
+        train_batch_size = batch['input_ids'].shape[0]
 
-    # Extract flash attention
-    fa = "_fa" if "flashattn" in config_folder else ""
+        # Merge batches: [train_samples, val_samples]
+        merged_batch = {}
+        for key in batch.keys():
+            if key in val_batch:
+                merged_batch[key] = torch.cat([batch[key], val_batch[key]], dim=0)
+            else:
+                merged_batch[key] = batch[key]
 
-    return f"{model_short}_{dtype}{fa}"
+        lr = optimizer.param_groups[0].get("lr", 5e-5)
+
+        # Pass 1: Compute selection scores using compressed gradients
+        grad_hook.setup_selection(
+            train_batch_size=train_batch_size,
+            selection_method='GREATS',
+            selection_frac=selection_frac,
+            lr=lr,
+            compute_scores_only=True,
+            use_second_order=use_second_order
+        )
+
+        optimizer.zero_grad()
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            outputs = model(**merged_batch)
+            loss_for_scoring = outputs.loss
+        loss_for_scoring.backward()
+
+        # Get selected indices
+        selected_indices = grad_hook.selection_state.get_selected_indices()
+        grad_hook.clear_selection()
+
+        # Pass 2: Standard training on selected samples
+        filtered_batch = {
+            'input_ids': batch['input_ids'][selected_indices],
+            'attention_mask': batch['attention_mask'][selected_indices],
+            'labels': batch['labels'][selected_indices]
+        }
+
+        optimizer.zero_grad()
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            outputs = model(**filtered_batch)
+            loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+
+        return loss.item()
+
+    return step_fn
+
+
+def make_step_meso_greats(selection_helper: SelectionStepHelper, selection_frac: float = 0.5, use_second_order: bool = False, selection_mode: str = 'per_layer'):
+    """
+    Create a step function for MeSO + GREATS selection.
+
+    Args:
+        selection_helper: SelectionStepHelper instance for validation batches
+        selection_frac: Fraction of samples to select
+        use_second_order: If True, use greedy selection with second-order interactions.
+                         If False (default), use simple top-k selection (~200x faster).
+        selection_mode: 'per_layer' (default) or 'full'.
+                       per_layer: Each layer independently selects samples (single pass).
+                       full: Accumulates scores across all layers, selects globally,
+                             then does second pass for compressed gradient computation.
+
+    Returns:
+        Step function for MeSO + GREATS
+    """
+    def step_fn(model, optimizer, batch, grad_hook):
+        model.train()
+
+        # Get validation batch
+        val_batch = selection_helper.get_val_batch()
+        train_batch_size = batch['input_ids'].shape[0]
+
+        # Merge batches: [train_samples, val_samples]
+        merged_batch = {}
+        for key in batch.keys():
+            if key in val_batch:
+                merged_batch[key] = torch.cat([batch[key], val_batch[key]], dim=0)
+            else:
+                merged_batch[key] = batch[key]
+
+        # Get learning rate
+        lr = optimizer.param_groups[0].get("lr", 5e-5)
+
+        if selection_mode == 'per_layer':
+            # Per-layer selection: single pass with on-the-fly selection and aggregation
+            # Each layer independently selects samples based on that layer's gradient alignment
+            grad_hook.setup_selection(
+                train_batch_size=train_batch_size,
+                selection_method='GREATS',
+                selection_frac=selection_frac,
+                lr=lr,
+                compute_scores_only=False,
+                use_second_order=use_second_order
+            )
+
+            # Forward + backward on merged batch
+            optimizer.zero_grad()
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = model(**merged_batch)
+                loss = outputs.loss
+            loss.backward()
+
+            # Clear selection state
+            grad_hook.clear_selection()
+
+        else:
+            # Full sample-level selection: two passes
+            # This approach doesn't use the block-diagonal approximation
+
+            # Pass 1: Accumulate scores across all layers
+            grad_hook.setup_selection(
+                train_batch_size=train_batch_size,
+                selection_method='GREATS',
+                selection_frac=selection_frac,
+                lr=lr,
+                compute_scores_only=True,  # Only accumulate scores
+                use_second_order=use_second_order
+            )
+
+            optimizer.zero_grad()
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = model(**merged_batch)
+                loss_for_scoring = outputs.loss
+            loss_for_scoring.backward()
+
+            # Get globally selected indices based on accumulated scores
+            selected_indices = grad_hook.selection_state.get_selected_indices()
+            grad_hook.clear_selection()
+
+            # Pass 2: Compute compressed gradients on selected samples
+            filtered_batch = {
+                'input_ids': batch['input_ids'][selected_indices],
+                'attention_mask': batch['attention_mask'][selected_indices],
+                'labels': batch['labels'][selected_indices]
+            }
+
+            optimizer.zero_grad()
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = model(**filtered_batch)
+                loss = outputs.loss
+            loss.backward()
+
+        # Optimizer step
+        optimizer.step()
+
+        return loss.item()
+
+    return step_fn
+
 
 # =============================================================================
-# Main execution
+# Setup Functions
 # =============================================================================
 
-def get_all_methods():
-    """
-    Return list of all available test methods.
-    Each entry is a tuple: (name, setup_fn, selection_method)
-    where selection_method can be None (no data selection) or 'GREATS'/'GradNorm'/'MaxLoss'
-    """
-    return [
-        ("Full + SGD", setup_full_sgd, None),
-        ("Full + SGD + GC", setup_full_sgd_gradient_checkpointing, None),
-        ("Full + SGD-momentum", setup_full_sgd_momentum, None),
-        ("Full + SGD-momentum + GC", setup_full_sgd_momentum_gradient_checkpointing, None),
-        ("Full + AdamW", setup_full_adamw, None),
-        ("Full + AdamW + GC", setup_full_adamw_gradient_checkpointing, None),
-        ("Full + MeSO", setup_full_meso, None),
-        ("Full + MeSO + GC", setup_full_meso_gradient_checkpointing, None),
-        ("Full + GaLore", setup_full_galore, None),
-        ("Full + GaLore + GC", setup_full_galore_gradient_checkpointing, None),
-        ("LoRA + SGD", setup_lora_sgd, None),
-        ("LoRA + SGD + GC", setup_lora_sgd_gradient_checkpointing, None),
-        ("LoRA + SGD-momentum", setup_lora_sgd_momentum, None),
-        ("LoRA + SGD-momentum + GC", setup_lora_sgd_momentum_gradient_checkpointing, None),
-        ("LoRA + AdamW", setup_lora_adamw, None),
-        ("LoRA + AdamW + GC", setup_lora_adamw_gradient_checkpointing, None),
-        # GREATS-enabled methods (require compression for gradient computation)
-        ("Full + GREATS", setup_full_greats, 'GREATS'),
-        ("Full + GREATS + GC", setup_full_greats_gradient_checkpointing, 'GREATS'),
-        ("LoRA + GREATS", setup_lora_greats, 'GREATS'),
-        ("LoRA + GREATS + GC", setup_lora_greats_gradient_checkpointing, 'GREATS'),
-        ("MeSO + GREATS", setup_full_meso, 'GREATS'),
-        ("MeSO + GREATS + GC", setup_full_meso_gradient_checkpointing, 'GREATS'),
+def setup_full_adamw(config: BenchmarkConfig):
+    """Full fine-tuning with AdamW."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_full_sgd(config: BenchmarkConfig):
+    """Full fine-tuning with SGD (no momentum)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_full_sgd_momentum(config: BenchmarkConfig):
+    """Full fine-tuning with SGD + momentum."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_full_sgd_gc(config: BenchmarkConfig):
+    """Full fine-tuning with SGD (no momentum) + gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_full_sgd_momentum_gc(config: BenchmarkConfig):
+    """Full fine-tuning with SGD + momentum + gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_full_galore(config: BenchmarkConfig):
+    """Full fine-tuning with GaLore."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    # Separate parameters for GaLore
+    galore_params = []
+    regular_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if param.ndim == 2 and min(param.shape) >= 128:
+                galore_params.append(param)
+            else:
+                regular_params.append(param)
+
+    param_groups = [
+        {'params': regular_params},
+        {'params': galore_params, 'rank': config.galore_rank, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
     ]
 
-def aggregate_results(results_dir='results'):
-    """
-    Aggregate results from individual test runs - simplified output.
+    optimizer = GaLoreAdamW(param_groups, lr=5e-5)
 
-    Looks for results in subfolders (e.g., results/fp32/, results/bf16_flashattn/)
-    or directly in the specified directory for backwards compatibility.
-    """
-    results = []
-    configs_found = []
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
 
-    # Name mapping for cleaner display
-    name_mapping = {
-        'Full + SGD (no momentum)': 'Full + SGD',
-        'Full + SGD (no momentum) + GC': 'Full + SGD + GC',
-        'Full + SGD (momentum=0.9)': 'Full + SGD-momentum',
-        'Full + SGD (momentum=0.9) + GC': 'Full + SGD-momentum + GC',
-        'LoRA + SGD (no momentum)': 'LoRA + SGD',
-        'LoRA + SGD (no momentum) + GC': 'LoRA + SGD + GC',
-        'LoRA + SGD (momentum=0.9)': 'LoRA + SGD-momentum',
-        'LoRA + SGD (momentum=0.9) + GC': 'LoRA + SGD-momentum + GC',
+    return model, optimizer, tokenizer
+
+
+def setup_lora_adamw(config: BenchmarkConfig):
+    """LoRA with AdamW."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=0.1,
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+    )
+    model = get_peft_model(model, lora_config)
+    model.train()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_lora_sgd(config: BenchmarkConfig):
+    """LoRA with SGD (no momentum)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=0.1,
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+    )
+    model = get_peft_model(model, lora_config)
+    model.train()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_lora_sgd_momentum(config: BenchmarkConfig):
+    """LoRA with SGD + momentum."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=0.1,
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+    )
+    model = get_peft_model(model, lora_config)
+    model.train()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_lora_adamw_gc(config: BenchmarkConfig):
+    """LoRA with AdamW + gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=0.1,
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+    )
+    model = get_peft_model(model, lora_config)
+    model.train()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_lora_sgd_gc(config: BenchmarkConfig):
+    """LoRA with SGD (no momentum) + gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=0.1,
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+    )
+    model = get_peft_model(model, lora_config)
+    model.train()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_lora_sgd_momentum_gc(config: BenchmarkConfig):
+    """LoRA with SGD + momentum + gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=0.1,
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+    )
+    model = get_peft_model(model, lora_config)
+    model.train()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_full_meso(config: BenchmarkConfig):
+    """Full fine-tuning with MeSO."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # Sample input for compressor setup
+    sample_inputs = {k: v.to(config.device) for k, v in
+                     tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
+                     if k != 'labels'}
+
+    # Setup compression
+    sparsifier_kwargs = {
+        "proj_dim": config.meso_sparsifier_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": "random_mask",
     }
 
-    if not os.path.exists(results_dir):
-        print(f"Error: Results directory '{results_dir}' not found")
+    projector_kwargs = {
+        "proj_dim": config.meso_projector_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": config.meso_projector_type,
+    }
+
+    compressors = setup_model_compressors(
+        model=model,
+        layer_names=layer_names,
+        sparsifier_kwargs=sparsifier_kwargs,
+        projector_kwargs=projector_kwargs,
+        sample_inputs=sample_inputs,
+        device=str(config.device),
+        update_freq=config.meso_update_freq
+    )
+
+    grad_hook = GradientHook(
+        model=model,
+        layer_names=layer_names,
+        device=str(config.device),
+        register_hooks=True
+    )
+    grad_hook.set_compressors(compressors)
+
+    optimizer = MeSOAdamW(
+        model.parameters(),
+        grad_hook=grad_hook,
+        lr=5e-5,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.0
+    )
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_full_meso_gc(config: BenchmarkConfig):
+    """Full fine-tuning with MeSO + gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    sample_inputs = {k: v.to(config.device) for k, v in
+                     tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
+                     if k != 'labels'}
+
+    sparsifier_kwargs = {
+        "proj_dim": config.meso_sparsifier_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": "random_mask",
+    }
+
+    projector_kwargs = {
+        "proj_dim": config.meso_projector_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": config.meso_projector_type,
+    }
+
+    compressors = setup_model_compressors(
+        model=model,
+        layer_names=layer_names,
+        sparsifier_kwargs=sparsifier_kwargs,
+        projector_kwargs=projector_kwargs,
+        sample_inputs=sample_inputs,
+        device=str(config.device),
+        update_freq=config.meso_update_freq
+    )
+
+    grad_hook = GradientHook(
+        model=model,
+        layer_names=layer_names,
+        device=str(config.device),
+        register_hooks=True
+    )
+    grad_hook.set_compressors(compressors)
+
+    optimizer = MeSOAdamW(
+        model.parameters(),
+        grad_hook=grad_hook,
+        lr=5e-5,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.0
+    )
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_full_adamw_gc(config: BenchmarkConfig):
+    """Full fine-tuning with AdamW + gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_full_galore_gc(config: BenchmarkConfig):
+    """Full fine-tuning with GaLore + gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    galore_params = []
+    regular_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if param.ndim == 2 and min(param.shape) >= 128:
+                galore_params.append(param)
+            else:
+                regular_params.append(param)
+
+    param_groups = [
+        {'params': regular_params},
+        {'params': galore_params, 'rank': config.galore_rank, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
+    ]
+
+    optimizer = GaLoreAdamW(param_groups, lr=5e-5)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    return model, optimizer, tokenizer
+
+
+def setup_full_greats(config: BenchmarkConfig):
+    """Full fine-tuning with GREATS data selection (uses compression for gradient computation, AdamW optimizer)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    sample_inputs = {k: v.to(config.device) for k, v in
+                     tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
+                     if k != 'labels'}
+
+    # Setup compression (needed for GREATS gradient computation)
+    sparsifier_kwargs = {
+        "proj_dim": config.meso_sparsifier_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": "random_mask",
+    }
+
+    projector_kwargs = {
+        "proj_dim": config.meso_projector_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": config.meso_projector_type,
+    }
+
+    compressors = setup_model_compressors(
+        model=model,
+        layer_names=layer_names,
+        sparsifier_kwargs=sparsifier_kwargs,
+        projector_kwargs=projector_kwargs,
+        sample_inputs=sample_inputs,
+        device=str(config.device),
+        update_freq=config.meso_update_freq
+    )
+
+    grad_hook = GradientHook(
+        model=model,
+        layer_names=layer_names,
+        device=str(config.device),
+        register_hooks=True
+    )
+    grad_hook.set_compressors(compressors)
+
+    # Use regular AdamW (not MeSOAdamW) - GREATS is just for data selection
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_full_greats_gc(config: BenchmarkConfig):
+    """Full fine-tuning with GREATS data selection + gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    sample_inputs = {k: v.to(config.device) for k, v in
+                     tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
+                     if k != 'labels'}
+
+    sparsifier_kwargs = {
+        "proj_dim": config.meso_sparsifier_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": "random_mask",
+    }
+
+    projector_kwargs = {
+        "proj_dim": config.meso_projector_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": config.meso_projector_type,
+    }
+
+    compressors = setup_model_compressors(
+        model=model,
+        layer_names=layer_names,
+        sparsifier_kwargs=sparsifier_kwargs,
+        projector_kwargs=projector_kwargs,
+        sample_inputs=sample_inputs,
+        device=str(config.device),
+        update_freq=config.meso_update_freq
+    )
+
+    grad_hook = GradientHook(
+        model=model,
+        layer_names=layer_names,
+        device=str(config.device),
+        register_hooks=True
+    )
+    grad_hook.set_compressors(compressors)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_lora_greats(config: BenchmarkConfig):
+    """LoRA with GREATS data selection."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=0.1,
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+    )
+    model = get_peft_model(model, lora_config)
+    model = model.to(config.get_torch_dtype())
+    model.train()
+
+    # Get layer names for LoRA layers only
+    layer_names = [n for n, m in model.named_modules()
+                   if isinstance(m, nn.Linear) and ('lora_A' in n or 'lora_B' in n)]
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    sample_inputs = {k: v.to(config.device) for k, v in
+                     tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
+                     if k != 'labels'}
+
+    sparsifier_kwargs = {
+        "proj_dim": config.meso_sparsifier_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": "random_mask",
+    }
+
+    projector_kwargs = {
+        "proj_dim": config.meso_projector_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": config.meso_projector_type,
+    }
+
+    compressors = setup_model_compressors(
+        model=model,
+        layer_names=layer_names,
+        sparsifier_kwargs=sparsifier_kwargs,
+        projector_kwargs=projector_kwargs,
+        sample_inputs=sample_inputs,
+        device=str(config.device),
+        update_freq=config.meso_update_freq
+    )
+
+    grad_hook = GradientHook(
+        model=model,
+        layer_names=layer_names,
+        device=str(config.device),
+        register_hooks=True
+    )
+    grad_hook.set_compressors(compressors)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_lora_greats_gc(config: BenchmarkConfig):
+    """LoRA with GREATS data selection + gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=0.1,
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
+    )
+    model = get_peft_model(model, lora_config)
+    model = model.to(config.get_torch_dtype())
+    model.train()
+
+    layer_names = [n for n, m in model.named_modules()
+                   if isinstance(m, nn.Linear) and ('lora_A' in n or 'lora_B' in n)]
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    sample_inputs = {k: v.to(config.device) for k, v in
+                     tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
+                     if k != 'labels'}
+
+    sparsifier_kwargs = {
+        "proj_dim": config.meso_sparsifier_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": "random_mask",
+    }
+
+    projector_kwargs = {
+        "proj_dim": config.meso_projector_dim,
+        "proj_max_batch_size": config.batch_size,
+        "proj_seed": 42,
+        "device": str(config.device),
+        "proj_type": config.meso_projector_type,
+    }
+
+    compressors = setup_model_compressors(
+        model=model,
+        layer_names=layer_names,
+        sparsifier_kwargs=sparsifier_kwargs,
+        projector_kwargs=projector_kwargs,
+        sample_inputs=sample_inputs,
+        device=str(config.device),
+        update_freq=config.meso_update_freq
+    )
+
+    grad_hook = GradientHook(
+        model=model,
+        layer_names=layer_names,
+        device=str(config.device),
+        register_hooks=True
+    )
+    grad_hook.set_compressors(compressors)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+# =============================================================================
+# Method Registry
+# =============================================================================
+
+# Methods that use standard step function
+STANDARD_METHODS = {
+    'full_adamw': setup_full_adamw,
+    'full_sgd': setup_full_sgd,
+    'full_sgd_momentum': setup_full_sgd_momentum,
+    'full_galore': setup_full_galore,
+    'lora_adamw': setup_lora_adamw,
+    'lora_sgd': setup_lora_sgd,
+    'lora_sgd_momentum': setup_lora_sgd_momentum,
+    'full_adamw_gc': setup_full_adamw_gc,
+    'full_sgd_gc': setup_full_sgd_gc,
+    'full_sgd_momentum_gc': setup_full_sgd_momentum_gc,
+    'full_galore_gc': setup_full_galore_gc,
+    'lora_adamw_gc': setup_lora_adamw_gc,
+    'lora_sgd_gc': setup_lora_sgd_gc,
+    'lora_sgd_momentum_gc': setup_lora_sgd_momentum_gc,
+}
+
+# Methods that use MeSO (without selection)
+MESO_METHODS = {
+    'full_meso': setup_full_meso,
+    'full_meso_gc': setup_full_meso_gc,
+}
+
+# Methods that use MeSO with data selection
+# Format: method_name -> (setup_fn, selection_frac, selection_mode)
+MESO_SELECTION_METHODS = {
+    'full_meso_greats': (setup_full_meso, 0.5, 'per_layer'),  # Per-layer selection (default)
+    'full_meso_greats_gc': (setup_full_meso_gc, 0.5, 'per_layer'),
+    # Full sample-level selection variants (two-pass approach)
+    'full_meso_greats_full': (setup_full_meso, 0.5, 'full'),  # Full selection
+    'full_meso_greats_full_gc': (setup_full_meso_gc, 0.5, 'full'),
+}
+
+# Methods that use GREATS selection with standard optimizer (AdamW)
+# These use compression for gradient computation but regular AdamW for optimization
+# Format: method_name -> (setup_fn, selection_frac)
+GREATS_METHODS = {
+    'full_greats': (setup_full_greats, 0.5),
+    'full_greats_gc': (setup_full_greats_gc, 0.5),
+    'lora_greats': (setup_lora_greats, 0.5),
+    'lora_greats_gc': (setup_lora_greats_gc, 0.5),
+}
+
+# Combined list for CLI help
+ALL_METHODS = (list(STANDARD_METHODS.keys()) + list(MESO_METHODS.keys()) +
+               list(MESO_SELECTION_METHODS.keys()) + list(GREATS_METHODS.keys()))
+
+
+# =============================================================================
+# CLI Interface
+# =============================================================================
+
+def run_benchmark(methods: List[str], config: BenchmarkConfig, output_file: Optional[str] = None) -> List[BenchmarkResult]:
+    """Run benchmarks for specified methods."""
+    bench = Benchmark(config)
+    results = []
+
+    for method_name in methods:
+        # Check which category this method belongs to
+        if method_name in STANDARD_METHODS:
+            setup_fn = STANDARD_METHODS[method_name]
+            step_fn = step_standard
+        elif method_name in MESO_METHODS:
+            setup_fn = MESO_METHODS[method_name]
+            step_fn = step_meso
+        elif method_name in MESO_SELECTION_METHODS:
+            # Handle MeSO with GREATS selection - needs special setup
+            base_setup_fn, selection_frac, sel_mode = MESO_SELECTION_METHODS[method_name]
+
+            # We need to wrap this to create the selection helper after setup
+            def make_selection_setup_and_step(base_setup, sel_frac, mode):
+                def wrapped_setup(cfg):
+                    model, optimizer, tokenizer, grad_hook = base_setup(cfg)
+                    # Create selection helper with the tokenizer
+                    helper = SelectionStepHelper(tokenizer, cfg.seq_length, cfg.val_batch_size, cfg.device)
+                    # Create the step function with selection_mode
+                    step = make_step_meso_greats(helper, sel_frac, use_second_order=cfg.use_second_order, selection_mode=mode)
+                    return model, optimizer, tokenizer, grad_hook, step
+                return wrapped_setup
+
+            setup_fn = make_selection_setup_and_step(base_setup_fn, selection_frac, sel_mode)
+
+            # For selection methods, the step function is returned as part of setup
+            def selection_step_wrapper(model, optimizer, batch, grad_hook, step_fn):
+                return step_fn(model, optimizer, batch, grad_hook)
+
+            step_fn = selection_step_wrapper
+        elif method_name in GREATS_METHODS:
+            # Handle pure GREATS with standard optimizer (AdamW)
+            base_setup_fn, selection_frac = GREATS_METHODS[method_name]
+
+            def make_greats_setup_and_step(base_setup, sel_frac):
+                def wrapped_setup(cfg):
+                    model, optimizer, tokenizer, grad_hook = base_setup(cfg)
+                    helper = SelectionStepHelper(tokenizer, cfg.seq_length, cfg.val_batch_size, cfg.device)
+                    step = make_step_greats(helper, sel_frac, use_second_order=cfg.use_second_order)
+                    return model, optimizer, tokenizer, grad_hook, step
+                return wrapped_setup
+
+            setup_fn = make_greats_setup_and_step(base_setup_fn, selection_frac)
+
+            def greats_step_wrapper(model, optimizer, batch, grad_hook, step_fn):
+                return step_fn(model, optimizer, batch, grad_hook)
+
+            step_fn = greats_step_wrapper
+        else:
+            print(f"Unknown method: {method_name}. Available: {ALL_METHODS}")
+            continue
+
+        try:
+            result = bench.run(
+                method_name=method_name,
+                setup_fn=setup_fn,
+                step_fn=step_fn,
+            )
+            results.append(result)
+        except Exception as e:
+            print(f"Error running {method_name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Print summary table
+    if results:
+        print("\n" + "=" * 110)
+        print("BENCHMARK SUMMARY")
+        print(f"Model: {config.model_name} | Batch: {config.batch_size} | Val Batch: {config.val_batch_size} | Seq: {config.seq_length} | Dtype: {config.dtype}")
+        print("=" * 110)
+        print(f"{'Method':<28} {'Peak Mem':<12} {'Setup Mem':<12} {'Time/Iter':<14} {'Throughput':<16} {'Total Time':<12}")
+        print("-" * 110)
+        for r in results:
+            peak_mem = f"{r.peak_memory_gb:.2f} GB"
+            setup_mem = f"{r.memory_after_setup_gb:.2f} GB"
+            time_iter = f"{r.avg_iteration_time_ms:.1f} ms"
+            throughput = f"{r.throughput_samples_per_sec:.2f} samp/s"
+            total_time = f"{r.total_time_sec:.1f} s"
+            print(f"{r.method_name:<28} {peak_mem:<12} {setup_mem:<12} {time_iter:<14} {throughput:<16} {total_time:<12}")
+        print("=" * 110)
+
+    # Save results
+    if output_file:
+        results_dict = {
+            'config': asdict(config),
+            'results': [asdict(r) for r in results],
+        }
+        with open(output_file, 'w') as f:
+            json.dump(results_dict, f, indent=2)
+        print(f"\nResults saved to: {output_file}")
+
+    return results
+
+
+def append_results(results: List[BenchmarkResult], config: BenchmarkConfig, results_file: str):
+    """Append results to a JSONL file (one JSON object per line)."""
+    with open(results_file, 'a') as f:
+        for r in results:
+            entry = {
+                'config': asdict(config),
+                'result': asdict(r),
+            }
+            f.write(json.dumps(entry) + '\n')
+
+
+def print_summary_from_file(results_file: str):
+    """Read results from JSONL file and print a summary table."""
+    if not os.path.exists(results_file):
+        print(f"Results file not found: {results_file}")
         return
 
-    # Look for config subfolders (fp32, bf16, bf16_flashattn, etc.)
-    subfolders = [d for d in os.listdir(results_dir)
-                  if os.path.isdir(os.path.join(results_dir, d))]
-
-    if subfolders:
-        # New structure: results/<config>/*.json
-        print(f"Found configuration folders: {', '.join(subfolders)}")
-        for subfolder in sorted(subfolders):
-            subfolder_path = os.path.join(results_dir, subfolder)
-            subfolder_results = []
-
-            for filename in sorted(os.listdir(subfolder_path)):
-                # Support both old (result_*.json) and new ({idx:02d}_*.json) patterns
-                is_result_file = (filename.startswith('result_') and filename.endswith('.json')) or \
-                                 (filename.endswith('.json') and len(filename) > 2 and filename[:2].isdigit() and filename[2] == '_')
-                if is_result_file:
-                    filepath = os.path.join(subfolder_path, filename)
-                    with open(filepath, 'r') as f:
-                        result = json.load(f)
-                        # Update method name if it's in the mapping
-                        if result['method'] in name_mapping:
-                            result['method'] = name_mapping[result['method']]
-                        # Add config information
-                        result['config'] = subfolder
-                        results.append(result)
-                        subfolder_results.append(result)
-
-            if subfolder_results:
-                configs_found.append((subfolder, len(subfolder_results)))
-    else:
-        # Old structure or direct files: results/*.json (backwards compatibility)
-        for filename in sorted(os.listdir(results_dir)):
-            # Support both old (result_*.json) and new ({idx:02d}_*.json) patterns
-            is_result_file = (filename.startswith('result_') and filename.endswith('.json')) or \
-                             (filename.endswith('.json') and len(filename) > 2 and filename[:2].isdigit() and filename[2] == '_')
-            if is_result_file:
-                filepath = os.path.join(results_dir, filename)
-                with open(filepath, 'r') as f:
-                    result = json.load(f)
-                    # Update method name if it's in the mapping
-                    if result['method'] in name_mapping:
-                        result['method'] = name_mapping[result['method']]
-                    result['config'] = 'default'
-                    results.append(result)
-
-        if results:
-            configs_found.append(('default', len(results)))
+    results = []
+    config = None
+    with open(results_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                entry = json.loads(line)
+                results.append(entry['result'])
+                if config is None:
+                    config = entry['config']
 
     if not results:
-        print(f"No result files found in '{results_dir}' or its subfolders")
+        print("No results found in file.")
         return
 
-    # Display found configurations
-    if configs_found:
-        print(f"\nConfigurations found:")
-        for config, count in configs_found:
-            print(f"  {config}: {count} methods")
-
-    # Check if any results have selection time
-    has_selection = any('avg_selection_total_time' in r for r in results)
-    # Check if we have multiple configs
-    has_multiple_configs = len(set(r.get('config', 'default') for r in results)) > 1
-
-    if has_multiple_configs:
-        print_length = 135
-    else:
-        print_length = 95 if not has_selection else 119
-
-    print("\n" + "="*print_length)
-    print(f"Benchmark Results (Total methods: {len(results)} | Results directory: {results_dir})")
-    print("="*print_length)
-
-    # Single comprehensive table
-    if has_multiple_configs:
-        if has_selection:
-            print(f"{'Config':<12} {'Method':<28} {'Peak Mem':<10} {'Sel(ms)':<9} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
-        else:
-            print(f"{'Config':<12} {'Method':<28} {'Peak Mem':<10} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
-        print("-" * print_length)
-    else:
-        if has_selection:
-            print(f"{'Method':<28} {'Peak Mem':<10} {'Sel(ms)':<9} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
-        else:
-            print(f"{'Method':<28} {'Peak Mem':<10} {'Fwd(ms)':<9} {'Bwd(ms)':<9} {'Opt(ms)':<9} {'Total(ms)':<10} {'Throughput':<12}")
-        print("-" * print_length)
-
-    prev_config = None
-    prev_base_method = None
+    print("\n" + "=" * 110)
+    print("BENCHMARK SUMMARY (Aggregated)")
+    print(f"Model: {config['model_name']} | Batch: {config['batch_size']} | Val Batch: {config['val_batch_size']} | Seq: {config['seq_length']} | Dtype: {config['dtype']}")
+    print("=" * 110)
+    print(f"{'Method':<28} {'Peak Mem':<12} {'Setup Mem':<12} {'Time/Iter':<14} {'Throughput':<16} {'Total Time':<12}")
+    print("-" * 110)
     for r in results:
-        config = r.get('config', 'default')
-        method = r['method']
+        peak_mem = f"{r['peak_memory_gb']:.2f} GB"
+        setup_mem = f"{r['memory_after_setup_gb']:.2f} GB"
+        time_iter = f"{r['avg_iteration_time_ms']:.1f} ms"
+        throughput = f"{r['throughput_samples_per_sec']:.2f} samp/s"
+        total_time = f"{r['total_time_sec']:.1f} s"
+        print(f"{r['method_name']:<28} {peak_mem:<12} {setup_mem:<12} {time_iter:<14} {throughput:<16} {total_time:<12}")
+    print("=" * 110)
 
-        # Extract base method name (remove " + GC" suffix if present)
-        base_method = method.replace(' + GC', '')
 
-        # Add separator line when config changes (only for multiple configs)
-        if has_multiple_configs and config != prev_config and prev_config is not None:
-            print("=" * print_length)
-            prev_base_method = None  # Reset base method when config changes
+def main():
+    parser = argparse.ArgumentParser(description='Simplified Memory and Performance Benchmark')
 
-        # Add separator line when base method changes (group method with its GC variant)
-        if base_method != prev_base_method and prev_base_method is not None:
-            print("-" * print_length)
+    # Method selection
+    parser.add_argument('--methods', nargs='+', default=['full_adamw', 'full_meso'],
+                        help=f'Methods to benchmark. Available: {ALL_METHODS}')
+    parser.add_argument('--all', action='store_true', help='Run all methods')
+    parser.add_argument('--list', action='store_true', help='List all available methods and exit')
 
-        prev_config = config
-        prev_base_method = base_method
+    # Model config
+    parser.add_argument('--model', type=str, default='meta-llama/Llama-3.2-3B',
+                        help='Model name')
+    parser.add_argument('--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument('--no-flash-attention', action='store_true', help='Disable flash attention')
 
-        peak_mem = f"{r['absolute_max']:.2f} GB"
-        sel_ms = f"{r.get('avg_selection_total_time', 0)*1000:.1f}" if 'avg_selection_total_time' in r and r.get('avg_selection_total_time', 0) > 0 else "-"
-        fwd_ms = f"{r.get('avg_forward_time', 0)*1000:.1f}" if 'avg_forward_time' in r else "N/A"
-        bwd_ms = f"{r.get('avg_backward_time', 0)*1000:.1f}" if 'avg_backward_time' in r else "N/A"
-        opt_ms = f"{r.get('avg_optimizer_time', 0)*1000:.1f}" if 'avg_optimizer_time' in r else "N/A"
-        total_ms = f"{r.get('avg_iteration_time', 0)*1000:.1f}" if 'avg_iteration_time' in r else "N/A"
-        throughput = f"{r.get('throughput', 0):.2f} samp/s" if 'throughput' in r else "N/A"
+    # Training config
+    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--seq-length', type=int, default=64)
+    parser.add_argument('--val-batch-size', type=int, default=1,
+                        help='Validation batch size for GREATS selection (default: 1)')
 
-        # Use short config name for display
-        config_display = get_config_short_name(config) if has_multiple_configs else ""
+    # Benchmark config
+    parser.add_argument('--num-warmup', type=int, default=10)
+    parser.add_argument('--num-iterations', type=int, default=10)
 
-        if has_selection:
-            if has_multiple_configs:
-                print(f"{config_display:<12} {method:<28} {peak_mem:<10} {sel_ms:<9} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
-            else:
-                print(f"{method:<28} {peak_mem:<10} {sel_ms:<9} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
-        else:
-            if has_multiple_configs:
-                print(f"{config_display:<12} {method:<28} {peak_mem:<10} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
-            else:
-                print(f"{method:<28} {peak_mem:<10} {fwd_ms:<9} {bwd_ms:<9} {opt_ms:<9} {total_ms:<10} {throughput:<12}")
+    # GREATS config
+    parser.add_argument('--use-second-order', action='store_true',
+                        help='Use second-order interactions in GREATS (greedy selection, slower)')
 
-    print("="*print_length)
-    if has_selection:
-        print("Note: Sel(ms) = Data selection time (GREATS/GradNorm), includes val/train fwd/bwd + dot product")
-
-    # Detailed selection breakdown for methods with selection
-    if has_selection:
-        # Check if any results have detailed selection breakdown
-        has_detailed_selection = any(r.get('avg_selection_val_forward_time', 0) > 0 for r in results)
-
-        if has_detailed_selection:
-            print("\n" + "="*print_length)
-            print("DETAILED SELECTION BREAKDOWN")
-            print("="*print_length)
-            if has_multiple_configs:
-                print(f"{'Config':<12} {'Method':<28} {'Val Fwd':<10} {'Val Bwd':<10} {'Train Fwd':<11} {'Train Bwd':<11} {'Dot Prod':<11}")
-            else:
-                print(f"{'Method':<28} {'Val Fwd':<10} {'Val Bwd':<10} {'Train Fwd':<11} {'Train Bwd':<11} {'Dot Prod':<11}")
-            print("-" * print_length)
-
-            for r in results:
-                if r.get('avg_selection_total_time', 0) > 0:
-                    config = r.get('config', 'unknown')
-                    config_display = get_config_short_name(config) if has_multiple_configs else ""
-                    val_fwd = f"{r.get('avg_selection_val_forward_time', 0)*1000:.1f}ms" if 'avg_selection_val_forward_time' in r else "-"
-                    val_bwd = f"{r.get('avg_selection_val_backward_time', 0)*1000:.1f}ms" if 'avg_selection_val_backward_time' in r else "-"
-                    train_fwd = f"{r.get('avg_selection_train_forward_time', 0)*1000:.1f}ms" if 'avg_selection_train_forward_time' in r else "-"
-                    train_bwd = f"{r.get('avg_selection_train_backward_time', 0)*1000:.1f}ms" if 'avg_selection_train_backward_time' in r else "-"
-                    dotprod = f"{r.get('avg_selection_dotprod_compute_time', 0)*1000:.1f}ms" if 'avg_selection_dotprod_compute_time' in r else "-"
-
-                    if has_multiple_configs:
-                        print(f"{config_display:<12} {r['method']:<28} {val_fwd:<10} {val_bwd:<10} {train_fwd:<11} {train_bwd:<11} {dotprod:<11}")
-                    else:
-                        print(f"{r['method']:<28} {val_fwd:<10} {val_bwd:<10} {train_fwd:<11} {train_bwd:<11} {dotprod:<11}")
-
-            print("="*print_length)
-            print("Selection Components:")
-            print("  Val Fwd/Bwd:    Validation forward/backward pass (small batch)")
-            print("  Train Fwd/Bwd:  Training forward/backward pass (per-sample gradients)")
-            print("  Dot Prod:       Gradient similarity computation (layer-by-layer)")
-            print("="*print_length)
-
-    # Save aggregated results
-    with open('benchmark.json', 'w') as f:
-        json.dump(results, f, indent=2)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Max Memory Benchmark with Timing')
-    parser.add_argument('--method', type=int, default=None,
-                        help='Run specific method by index (0-20). If not specified, runs all methods.')
-    parser.add_argument('--list', action='store_true',
-                        help='List all available methods with their indices')
-    parser.add_argument('--aggregate', action='store_true',
-                        help='Aggregate results from individual runs')
-    parser.add_argument('--output-dir', type=str, default='results',
-                        help='Base directory to save results (default: results). Results will be saved in a subfolder based on configuration.')
-    parser.add_argument('--memory-snapshot', action='store_true',
-                        help='Enable memory snapshot recording for detailed memory profiling')
+    # Output
+    parser.add_argument('--output', type=str, default=None, help='Output JSON file')
+    parser.add_argument('--results-file', type=str, default=None,
+                        help='JSONL file to append results (for aggregating across runs)')
+    parser.add_argument('--print-summary', type=str, metavar='FILE',
+                        help='Print summary table from results file and exit')
 
     args = parser.parse_args()
 
-    # Override ENABLE_MEMORY_SNAPSHOT if --memory-snapshot flag is provided
-    if args.memory_snapshot:
-        globals()['ENABLE_MEMORY_SNAPSHOT'] = True
+    # If --print-summary is specified, just print and exit
+    if args.print_summary:
+        print_summary_from_file(args.print_summary)
+        return
 
-    methods = get_all_methods()
-
+    # If --list is specified, list all methods and exit
     if args.list:
         print("\nAvailable methods:")
-        print("="*80)
-        for i, (name, _, _) in enumerate(methods):
-            print(f"{i:2d}: {name}")
-        print("="*80)
-        sys.exit(0)
+        print("=" * 70)
+        print(f"{'Index':<6} {'Method Name':<35} {'Category'}")
+        print("-" * 70)
+        idx = 0
+        for name in STANDARD_METHODS:
+            print(f"{idx:<6} {name:<35} Standard")
+            idx += 1
+        for name in MESO_METHODS:
+            print(f"{idx:<6} {name:<35} MeSO")
+            idx += 1
+        for name in MESO_SELECTION_METHODS:
+            print(f"{idx:<6} {name:<35} MeSO+Selection")
+            idx += 1
+        for name in GREATS_METHODS:
+            print(f"{idx:<6} {name:<35} GREATS")
+            idx += 1
+        print("=" * 70)
+        print(f"Total: {len(ALL_METHODS)} methods")
+        return
 
-    if args.aggregate:
-        aggregate_results(args.output_dir)
-        sys.exit(0)
+    config = BenchmarkConfig(
+        model_name=args.model,
+        dtype=args.dtype,
+        use_flash_attention=not args.no_flash_attention,
+        batch_size=args.batch_size,
+        seq_length=args.seq_length,
+        val_batch_size=args.val_batch_size,
+        num_warmup=args.num_warmup,
+        num_iterations=args.num_iterations,
+        use_second_order=args.use_second_order,
+    )
 
-    # Validate Flash Attention configuration
-    if USE_FLASH_ATTENTION and MODEL_DTYPE == torch.float32:
-        print("\n" + "="*80)
-        print("⚠ WARNING: Flash Attention requires bfloat16 or float16!")
-        print("="*80)
-        print("Flash Attention is enabled but MODEL_DTYPE is set to float32.")
-        print("Please set MODEL_DTYPE to torch.bfloat16 or torch.float16")
-        print("Example: MODEL_DTYPE = torch.bfloat16")
-        print("="*80 + "\n")
-        sys.exit(1)
+    methods = ALL_METHODS if args.all else args.methods
 
-    print("\n" + "="*80)
-    print("MAX MEMORY BENCHMARK")
-    print("="*80)
-    print(f"Model: {MODEL_NAME}")
-    print(f"Batch size: {batch_size}")
-    print(f"Sequence length: {seq_length}")
-    print(f"Warmup iterations: {num_warmup_iterations} (not timed)")
-    print(f"Timed iterations: {num_timed_iterations} (for throughput)")
-    print(f"Total iterations: {num_iterations}")
-    print(f"Precision: {MODEL_DTYPE}")
-    print(f"Flash Attention: {'ENABLED' if USE_FLASH_ATTENTION else 'DISABLED'}")
-    print("="*80 + "\n")
+    print("Benchmark Configuration:")
+    print(f"  Model: {config.model_name}")
+    print(f"  Dtype: {config.dtype}")
+    print(f"  Flash Attention: {config.use_flash_attention}")
+    print(f"  Batch Size: {config.batch_size}")
+    print(f"  Val Batch Size: {config.val_batch_size}")
+    print(f"  Seq Length: {config.seq_length}")
+    print(f"  Warmup Iterations: {config.num_warmup}")
+    print(f"  Timed Iterations: {config.num_iterations}")
+    print(f"  Use Second Order: {config.use_second_order}")
+    print(f"  Methods: {methods}")
+    print()
 
-    # Create output directory with configuration subfolder if running individual tests
-    tee_logger = None
-    if args.method is not None:
-        # Validate method index first
-        if args.method < 0 or args.method >= len(methods):
-            print(f"Error: Method index {args.method} is out of range (0-{len(methods)-1})")
-            print("Use --list to see available methods")
-            sys.exit(1)
+    results = run_benchmark(methods, config, args.output)
 
-        # Get method details
-        method_name, setup_fn, selection_method = methods[args.method]
+    # Append to results file if specified (for aggregating across shell script runs)
+    if args.results_file and results:
+        append_results(results, config, args.results_file)
+        print(f"Results appended to: {args.results_file}")
 
-        # Create clean method name for filenames
-        clean_method_name = re.sub(r'[^a-zA-Z0-9]+', '_', method_name).strip('_')
 
-        # Create output directory
-        config_subfolder = get_config_subfolder_name()
-        output_dir = os.path.join(args.output_dir, config_subfolder)
-        os.makedirs(output_dir, exist_ok=True)
-        print(f"Results will be saved to: {output_dir}\n")
-
-        # Start logging to file in the config subfolder with consistent naming
-        log_file = os.path.join(output_dir, f'{args.method:02d}_{clean_method_name}.log')
-        tee_logger = TeeLogger(log_file)
-        tee_logger.start()
-        print(f"Logging to: {log_file}\n")
-
-        # Run the method
-        print(f"Running method {args.method}: {method_name}\n")
-        if selection_method:
-            print(f"Data selection enabled: {selection_method}\n")
-        result = run_method(method_name, setup_fn, selection_method, method_idx=args.method, output_dir=output_dir)
-
-        # Save individual result to config subfolder with consistent naming
-        result_file = os.path.join(output_dir, f'{args.method:02d}_{clean_method_name}.json')
-        with open(result_file, 'w') as f:
-            json.dump(result, f, indent=2)
-        print(f"\nResult saved to: {result_file}")
-
-        # Stop logging
-        if tee_logger:
-            tee_logger.stop()
-
-    else:
-        # Run all methods (original behavior)
-        results = []
-        for method_name, setup_fn, selection_method in methods:
-            result = run_method(method_name, setup_fn, selection_method)
-            results.append(result)
-            print()
-
-        # Final comparison - simplified
-        print("\n" + "="*80)
-        print("BENCHMARK RESULTS")
-        print("="*80)
-        print(f"{'Method':<40} {'Absolute Max':<15} {'Throughput':<15}")
-        print("-" * 80)
-        for r in results:
-            throughput_str = f"{r.get('throughput', 0):.2f} samp/s" if 'throughput' in r else "N/A"
-            print(f"{r['method']:<40} {r['absolute_max']:>8.3f} GB     {throughput_str:>13}")
-
-        # Winner analysis
-        print("\n" + "="*80)
-        print("WINNER ANALYSIS")
-        print("="*80)
-
-        min_max = min(r['absolute_max'] for r in results)
-        for r in results:
-            if r['absolute_max'] == min_max:
-                print(f"LOWEST MEMORY:       {r['method']} ({r['absolute_max']:.3f} GB)")
-                break
-
-        if any('total_time' in r for r in results):
-            results_with_timing = [r for r in results if 'total_time' in r]
-            if results_with_timing:
-                highest_throughput = max(results_with_timing, key=lambda x: x.get('throughput', 0))
-                print(f"HIGHEST THROUGHPUT:  {highest_throughput['method']} ({highest_throughput.get('throughput', 0):.2f} samples/s)")
-
-        print("="*80 + "\n")
-
-        # Save detailed results
-        with open('benchmark_max_memory_results.json', 'w') as f:
-            json.dump(results, f, indent=2)
-
-        print("Detailed results saved to: benchmark_max_memory_results.json")
+if __name__ == '__main__':
+    main()

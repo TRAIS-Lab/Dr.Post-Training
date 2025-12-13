@@ -206,11 +206,11 @@ python experiment/eval/eval.py --task tydiqa --model_path <path_to_model> \
 ## Current Experiments
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task samsum --train openhermes --lr 5e-06 --lora_lora 1e-04 --batch_size 8 --val_batch_size 4 --n_val 16 --percentage 0.05 --seed 42
+CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task samsum --train openhermes --lr 5e-06 --lr_lora 1e-04 --batch_size 8 --val_batch_size 1 --n_val 16 --percentage 0.05 --seed 42
 
-CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task tydiqa --train vicuna --lr 5e-06 --lora_lora 1e-04 --batch_size 8 --val_batch_size 4 --n_val 16 --percentage 0.05 --seed 42
+CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task tydiqa --train vicuna --lr 5e-06 --lr_lora 1e-04 --batch_size 8 --val_batch_size 1 --n_val 16 --percentage 0.5 --seed 42
 
-CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task math500 --train tulu3 --lr 5e-06 --lora_lora 1e-04 --batch_size 8 --val_batch_size 4 --n_val 16 --percentage 0.05 --seed 42
+CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task math500 --train less --lr 5e-06 --lr_lora 1e-04 --batch_size 8 --val_batch_size 1 --n_val 16 --percentage 0.05 --seed 42
 
-CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task gsm8k --train wizardlm --lr 5e-06 --lora_lora 1e-04 --batch_size 8 --val_batch_size 4 --n_val 16 --percentage 0.05 --seed 42
+CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task gsm8k --train wizardlm --lr 5e-06 --lr_lora 1e-04 --batch_size 8 --val_batch_size 1 --n_val 16 --percentage 0.3 --seed 42
 ```

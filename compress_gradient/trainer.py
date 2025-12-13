@@ -102,7 +102,12 @@ class CompGradTrainer(Trainer):
         # Log the training mode based on configuration
         if val_dataset is not None and self.args.method in ['GREATS', 'GradNorm']:
             if self.args.use_compressed_optimizer:
-                logger.info(f"  Mode: Case 3 - GREATS with MeSO (on-the-fly selection + compressed gradients)")
+                selection_mode = getattr(self.args, 'selection_mode', 'global')
+                if selection_mode == 'global':
+                    logger.info(f"  Mode: Case 3a - GREATS with MeSO (global selection + compressed gradients)")
+                    logger.info(f"         Two-pass approach: score accumulation → global selection → compressed grad computation")
+                else:
+                    logger.info(f"  Mode: Case 3b - GREATS with MeSO (per-layer selection + compressed gradients)")
             else:
                 logger.info(f"  Mode: Case 2 - GREATS without MeSO (on-the-fly scoring + full gradients)")
         elif self.args.use_compressed_optimizer:
@@ -311,40 +316,114 @@ class CompGradTrainer(Trainer):
                 lr = args.learning_rate
 
             if using_compressed_optimizer:
-                # On-the-fly selection and aggregation during backward
-                # Reuse compressed gradients for optimization
+                # Check whether to use global or per-layer selection
+                selection_mode = getattr(args, 'selection_mode', 'global')
 
-                # Setup selection state in hook with aggregation enabled
-                self.grad_hook.setup_selection(
-                    train_batch_size=train_batch_size,
-                    selection_method=args.method,
-                    selection_frac=args.selection_frac,
-                    lr=lr,
-                    compute_scores_only=False
-                )
+                if selection_mode == 'global':
+                    # Global selection with MeSO:
+                    # 1. First pass: accumulate scores across all layers
+                    # 2. Select samples globally based on accumulated scores
+                    # 3. Second pass: forward/backward on selected samples with hooks capturing compressed gradients
+                    # This approach doesn't use the block-diagonal approximation but requires two passes
 
-                # Zero gradients before merged forward/backward
-                model.zero_grad()
+                    # === First Pass: Compute selection scores ===
+                    self.grad_hook.setup_selection(
+                        train_batch_size=train_batch_size,
+                        selection_method=args.method,
+                        selection_frac=args.selection_frac,
+                        lr=lr,
+                        compute_scores_only=True,  # Only accumulate scores, no per-layer aggregation
+                        use_second_order=getattr(args, 'use_second_order', False)
+                    )
 
-                # Single forward/backward pass on merged batch
-                with self.compute_loss_context_manager():
-                    outputs = model(**merged_batch)
-                    loss = outputs.loss
+                    # Zero gradients before scoring pass
+                    model.zero_grad()
 
-                # Apply multi-GPU averaging
-                if args.n_gpu > 1:
-                    loss = loss.mean()
+                    # Forward/backward on merged batch to compute scores
+                    with self.compute_loss_context_manager():
+                        outputs = model(**merged_batch)
+                        loss_for_scoring = outputs.loss
 
-                # Apply gradient accumulation scaling
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
+                    if args.n_gpu > 1:
+                        loss_for_scoring = loss_for_scoring.mean()
 
-                # Backward pass - hook will compute scores and aggregate gradients
-                loss.backward()
+                    if args.gradient_accumulation_steps > 1:
+                        loss_for_scoring = loss_for_scoring / args.gradient_accumulation_steps
 
-                # Clear selection state
-                self.grad_hook.clear_selection()
-                return loss.detach()
+                    # Backward pass - hook accumulates scores across all layers
+                    loss_for_scoring.backward()
+
+                    # Get selected indices based on accumulated scores
+                    selected_indices = self.grad_hook.selection_state.get_selected_indices()
+
+                    # Clear selection state
+                    self.grad_hook.clear_selection()
+
+                    # === Second Pass: Compute compressed gradients on selected samples ===
+                    # Filter inputs to selected samples
+                    filtered_inputs = {
+                        'input_ids': batch_train['input_ids'][selected_indices],
+                        'attention_mask': batch_train['attention_mask'][selected_indices],
+                        'labels': batch_train['labels'][selected_indices]
+                    }
+
+                    # Zero gradients before optimization pass
+                    model.zero_grad()
+
+                    # Forward/backward on selected samples with hooks enabled
+                    # No selection state means hooks will just capture compressed gradients (average over batch)
+                    with self.compute_loss_context_manager():
+                        outputs = model(**filtered_inputs)
+                        loss = outputs.loss
+
+                    if args.n_gpu > 1:
+                        loss = loss.mean()
+
+                    if args.gradient_accumulation_steps > 1:
+                        loss = loss / args.gradient_accumulation_steps
+
+                    # Backward pass - hooks capture compressed gradients for MeSO
+                    loss.backward()
+
+                    return loss.detach()
+
+                else:
+                    # Per-layer selection: On-the-fly selection and aggregation during backward
+                    # Each layer independently selects samples based on that layer's gradient alignment
+                    # Reuse compressed gradients for optimization
+
+                    # Setup selection state in hook with aggregation enabled
+                    self.grad_hook.setup_selection(
+                        train_batch_size=train_batch_size,
+                        selection_method=args.method,
+                        selection_frac=args.selection_frac,
+                        lr=lr,
+                        compute_scores_only=False,
+                        use_second_order=getattr(args, 'use_second_order', False)
+                    )
+
+                    # Zero gradients before merged forward/backward
+                    model.zero_grad()
+
+                    # Single forward/backward pass on merged batch
+                    with self.compute_loss_context_manager():
+                        outputs = model(**merged_batch)
+                        loss = outputs.loss
+
+                    # Apply multi-GPU averaging
+                    if args.n_gpu > 1:
+                        loss = loss.mean()
+
+                    # Apply gradient accumulation scaling
+                    if args.gradient_accumulation_steps > 1:
+                        loss = loss / args.gradient_accumulation_steps
+
+                    # Backward pass - hook will compute scores and aggregate gradients
+                    loss.backward()
+
+                    # Clear selection state
+                    self.grad_hook.clear_selection()
+                    return loss.detach()
 
             else:
                 # Only data selection
@@ -356,7 +435,8 @@ class CompGradTrainer(Trainer):
                     selection_method=args.method,
                     selection_frac=args.selection_frac,
                     lr=lr,
-                    compute_scores_only=True
+                    compute_scores_only=True,
+                    use_second_order=getattr(args, 'use_second_order', False)
                 )
 
                 # Zero gradients before merged forward/backward

@@ -134,6 +134,27 @@ class TrainingArguments(TA):
             )
         },
     )
+    selection_mode: str = field(
+        default="global",
+        metadata={
+            "help": (
+                "Data selection granularity for GREATS/GradNorm with MeSO. "
+                "Options: 'global' (default) or 'per_layer'. "
+                "global: Accumulates scores across all layers, selects globally, then does second pass for gradients. "
+                "per_layer: Each layer independently selects samples (single pass, uses block-diagonal approximation)."
+            )
+        },
+    )
+    use_second_order: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to use second-order interactions for data selection. "
+                "If True, uses greedy selection considering sample similarities (O(k*n) complexity). "
+                "If False (default), uses simple top-k selection based on scores (~200x faster)."
+            )
+        },
+    )
 
     def __post_init__(self):
         if isinstance(self.fsdp_config, str):

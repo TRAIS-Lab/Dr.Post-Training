@@ -63,6 +63,8 @@ task="mmlu"
 train_dataset=""  # Training dataset (if empty, uses task-based default)
 subject="world_religions"
 compression=""  # Will be auto-set based on data_selection/use_compressed_optimizer
+selection_mode="global"  # global (default) or per_layer - for MeSO+GREATS
+use_second_order=false  # If true, use greedy selection with second-order interactions
 use_lora=false
 use_flash_attention=true
 
@@ -140,6 +142,14 @@ while [[ $# -gt 0 ]]; do
             compression="$2"
             shift 2
             ;;
+        --selection_mode)
+            selection_mode="$2"
+            shift 2
+            ;;
+        --use_second_order)
+            use_second_order=true
+            shift 1
+            ;;
         --update_compressor_freq)
             update_compressor_freq="$2"
             shift 2
@@ -188,7 +198,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --train <dataset>                      Training dataset: alpaca, dolly, flan_v2, cot, oasst1, gsm8k, vicuna, wizardlm, openhermes, tulu3 (default: task-based)"
             echo "  --subject <subject>                    MMLU/BBH subject (default: world_religions)"
             echo "  --compression <method>                 Compression: GraSS, LoGra (auto-set if data_selection!=NA or optimizer=MeSO)"
-            echo "  --update_compressor_freq <steps>              Projector refresh interval (default: 200)"
+            echo "  --selection_mode <mode>                Selection mode for MeSO+GREATS: global, per_layer (default: global)"
+            echo "  --use_second_order                     Use greedy selection with second-order interactions (slower but may be better)"
+            echo "  --update_compressor_freq <steps>       Projector refresh interval (default: 200)"
             echo "  --lora                                 Use LoRA fine-tuning (default: off - full fine-tuning)"
             echo "  --lora_alpha <alpha>                   LoRA alpha (default: 1, only used if --lora)"
             echo "  --lora_r <r>                           LoRA rank (default: 256, only used if --lora)"
@@ -265,8 +277,18 @@ else
     optimizer_str="Regular"
 fi
 
-# Build method string for job name (data_selection-optimizer-compression)
+# Build method string for job name (data_selection-optimizer-compression[-selection_mode][-2nd])
 method_str="${data_selection}-${optimizer_str}-${compression:-NA}"
+
+# Add selection_mode suffix for MeSO+GREATS experiments (only if not default global)
+if [ "$MeSO" = true ] && [[ "$data_selection" != "NA" ]] && [[ "$selection_mode" == "per_layer" ]]; then
+    method_str="${method_str}-per_layer"
+fi
+
+# Add second-order suffix for data selection experiments
+if [[ "$data_selection" != "NA" ]] && [ "$use_second_order" = true ]; then
+    method_str="${method_str}-2nd"
+fi
 
 # Build train string for job name
 train_str="${train_dataset:-default}"
@@ -292,6 +314,12 @@ echo "Optimizer: $optim"
 echo "Learning rate: $lr"
 echo "Data selection: $data_selection"
 echo "MeSO: $MeSO"
+if [ "$MeSO" = true ] && [[ "$data_selection" != "NA" ]]; then
+    echo "Selection mode: $selection_mode"
+fi
+if [[ "$data_selection" != "NA" ]]; then
+    echo "Second-order selection: $([ "$use_second_order" = true ] && echo "ENABLED" || echo "DISABLED")"
+fi
 echo "Compression: ${compression:-None}"
 echo "Flash Attention: $([ "$use_flash_attention" = true ] && echo "ENABLED" || echo "DISABLED")"
 echo "Batch size (train/eval): $batch_size"
@@ -383,6 +411,16 @@ fi
 # Add MeSO compressed optimizer flag if enabled
 if [ "$MeSO" = true ]; then
     training_args="$training_args --use_compressed_optimizer True"
+fi
+
+# Add selection_mode for MeSO + data selection
+if [ "$MeSO" = true ] && [[ "$data_selection" != "NA" ]]; then
+    training_args="$training_args --selection_mode $selection_mode"
+fi
+
+# Add use_second_order for data selection
+if [[ "$data_selection" != "NA" ]] && [ "$use_second_order" = true ]; then
+    training_args="$training_args --use_second_order True"
 fi
 
 training_args="$training_args 2>&1 | tee $output_dir/train.log"

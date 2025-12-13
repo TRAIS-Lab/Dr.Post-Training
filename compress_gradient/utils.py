@@ -322,10 +322,31 @@ def create_sample_inputs(
 
     return sample_inputs
 
+def topk_selection(scores, k: int):
+    """
+    Select k data points with the highest scores using simple top-k.
+
+    This is O(n + k log k) and much faster than greedy_selection.
+    Use this when second-order interactions are not needed.
+
+    Arguments:
+    - scores: A tensor of scores for each data point.
+    - k: The number of data points to select.
+
+    Returns:
+    - selected_indices: Tensor of indices of the selected data points (on same device as scores).
+    """
+    _, selected_indices = torch.topk(scores, k, largest=True, sorted=False)
+    return selected_indices
+
+
 def greedy_selection(scores, interaction_matrix, k: int):
     """
     Select k data points based on the highest scores, dynamically updating scores
     by subtracting interactions with previously selected data points.
+
+    This is O(k*n) and accounts for second-order interactions between samples.
+    For faster selection without interactions, use topk_selection instead.
 
     Arguments:
     - scores: A tensor of initial scores for each data point.
@@ -333,24 +354,14 @@ def greedy_selection(scores, interaction_matrix, k: int):
     - k: The number of data points to select.
 
     Returns:
-    - selected_indices: List of indices of the selected data points.
+    - selected_indices: Tensor of indices of the selected data points (on same device as scores).
     """
-    # Fast path: if no interaction, just use topk
-    # Check if interaction matrix is effectively zero (sum of absolute values < threshold)
-    if interaction_matrix.abs().sum() < 1e-6:
-        # No interaction: simple top-k selection
-        # torch.topk is O(n + k log k) which is much faster than O(k*n)
-        _, selected_indices = torch.topk(scores, k, largest=True, sorted=False)
-        return selected_indices.tolist()
-
-    # Slow path: greedy selection with interactions
-    # This is O(k*n) but necessary when interactions matter
-    selected_indices = []
+    selected_indices = torch.empty(k, dtype=torch.long, device=scores.device)
     scores = scores.clone()
 
-    for _ in range(k):
+    for i in range(k):
         idx_max = torch.argmax(scores)
-        selected_indices.append(idx_max.item())  # Convert to Python int
+        selected_indices[i] = idx_max
 
         # Update scores by subtracting interactions with the selected data point
         scores -= interaction_matrix[idx_max, :]

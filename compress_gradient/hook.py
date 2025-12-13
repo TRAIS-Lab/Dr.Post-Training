@@ -23,7 +23,7 @@ import functools
 import logging
 
 from .compressor import Compressor
-from .utils import greedy_selection
+from .utils import greedy_selection, topk_selection
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +36,9 @@ class SelectionState:
     """
     State manager for on-the-fly data selection during backward pass.
 
-    This class maintains running statistics (grad_dot_scores, similarity_matrix)
-    that are updated layer-by-layer during backward. This avoids materializing
-    per-sample gradients for all layers at once, preventing OOM for large batches.
+    Uses per-layer selection: each layer independently selects samples based on
+    that layer's gradient alignment with validation gradients. This is simpler
+    and faster than running score accumulation.
     """
 
     def __init__(
@@ -50,7 +50,8 @@ class SelectionState:
         lr: float,
         device: str = 'cpu',
         compute_scores_only: bool = False,
-        dtype: torch.dtype = torch.float32
+        dtype: torch.dtype = torch.float32,
+        use_second_order: bool = False
     ):
         """
         Initialize selection state.
@@ -60,12 +61,15 @@ class SelectionState:
             num_layers: Total number of layers (for tracking backward progress)
             selection_method: Selection method (GREATS, GradNorm, etc.)
             selection_frac: Fraction of samples to select
-            lr: Learning rate for score scaling
+            lr: Learning rate for score scaling (unused in per-layer mode)
             device: Device for tensors
             compute_scores_only: If True, only maintain running scores without aggregating gradients.
                                 This is used for GREATS without MeSO (Case 2), where we compute
                                 scores on-the-fly and then do a second forward/backward with full gradients.
             dtype: Data type for score tensors (should match model dtype for efficiency)
+            use_second_order: If True, compute similarity matrix and use greedy selection with
+                            second-order interactions. If False, use simple top-k selection
+                            which is ~200x faster. Default False for efficiency.
         """
         self.train_batch_size = train_batch_size
         self.num_layers = num_layers
@@ -75,16 +79,19 @@ class SelectionState:
         self.device = device
         self.compute_scores_only = compute_scores_only
         self.dtype = dtype
-
-        # Running statistics (updated layer-by-layer during backward)
-        # Use model dtype for efficiency (bfloat16/float16 on modern GPUs)
-        self.grad_dot_scores = torch.zeros(train_batch_size, device=device, dtype=dtype)
-        self.similarity_matrix = None
-        if selection_method in ['GREATS', 'GradNorm']:
-            self.similarity_matrix = torch.zeros(train_batch_size, train_batch_size, device=device, dtype=dtype)
+        self.use_second_order = use_second_order
 
         # Number of samples to select
         self.num_selected = int(train_batch_size * selection_frac)
+
+        # Running scores only needed for compute_scores_only mode (GREATS without MeSO)
+        # For per-layer selection with MeSO, we compute scores directly in select_and_reduce
+        self.grad_dot_scores = None
+        self.similarity_matrix = None
+        if compute_scores_only:
+            self.grad_dot_scores = torch.zeros(train_batch_size, device=device, dtype=dtype)
+            if use_second_order and selection_method in ['GREATS', 'GradNorm']:
+                self.similarity_matrix = torch.zeros(train_batch_size, train_batch_size, device=device, dtype=dtype)
 
     def _update_scores(
         self,
@@ -94,69 +101,85 @@ class SelectionState:
         """
         Update running scores with gradients from current layer.
 
-        This is called during backward for each layer.
+        Only used when compute_scores_only=True (GREATS without MeSO).
 
         Args:
             train_grads: Per-sample compressed gradients [train_batch_size, k_l]
             val_grad: Mean compressed validation gradient [k_l]
-            layer_idx: Current layer index
         """
-        # Cast to score dtype if needed (typically matches model dtype for efficiency)
-        # For bfloat16/float16, this keeps computation in lower precision
-        # For float32, this is a no-op
+        if self.grad_dot_scores is None:
+            return  # Per-layer mode: scores computed in select_and_reduce
+
+        # Cast to score dtype if needed
         if train_grads.dtype != self.dtype:
             train_grads = train_grads.to(self.dtype)
         if val_grad.dtype != self.dtype:
             val_grad = val_grad.to(self.dtype)
 
-        # Update grad_dot_scores: scores += train_grads @ val_grad
-        # [train_batch_size, k_l] @ [k_l] -> [train_batch_size]
-        torch.addmv(self.grad_dot_scores, train_grads, val_grad, out=self.grad_dot_scores)
+        if self.selection_method == 'GradNorm' and not self.use_second_order:
+            self.grad_dot_scores.add_((train_grads ** 2).sum(dim=1))
+        else:
+            torch.addmv(self.grad_dot_scores, train_grads, val_grad, out=self.grad_dot_scores)
 
-        # Update similarity matrix if needed
         if self.similarity_matrix is not None:
-            # similarity += train_grads @ train_grads.T
-            # [train_batch_size, k_l] @ [k_l, train_batch_size] -> [train_batch_size, train_batch_size]
             torch.addmm(self.similarity_matrix, train_grads, train_grads.t(), out=self.similarity_matrix)
 
     def get_selected_indices(self) -> Tensor:
         """
-        Get selected sample indices based on final accumulated scores.
+        Get selected sample indices based on accumulated scores.
 
-        This is called after the full forward/backward pass when compute_scores_only=True
-        (Case 2: GREATS without MeSO). The scores have been accumulated across all layers
-        during the backward pass.
+        Only used when compute_scores_only=True (GREATS without MeSO).
 
         Returns:
             Tensor of selected training sample indices
         """
+        if self.grad_dot_scores is None:
+            raise RuntimeError("get_selected_indices called but running scores not enabled")
+
         if self.selection_method == 'GREATS':
             scores = self.grad_dot_scores * self.lr
-            similarity = self.similarity_matrix * (self.lr ** 2)
-            selected_indices = greedy_selection(scores, similarity, self.num_selected)
-
+            if self.use_second_order:
+                similarity = self.similarity_matrix * (self.lr ** 2)
+                selected_indices = greedy_selection(scores, similarity, self.num_selected)
+            else:
+                selected_indices = topk_selection(scores, self.num_selected)
         elif self.selection_method == 'GradNorm':
-            scores = torch.diag(self.similarity_matrix)
-            selected_indices = greedy_selection(scores, self.similarity_matrix * 0, self.num_selected)
-
+            if self.use_second_order:
+                scores = torch.diag(self.similarity_matrix)
+                selected_indices = greedy_selection(scores, self.similarity_matrix * 0, self.num_selected)
+            else:
+                selected_indices = topk_selection(self.grad_dot_scores, self.num_selected)
         else:
-            # Default: select all (no selection)
             selected_indices = torch.arange(self.train_batch_size, device=self.device)
 
         return selected_indices
 
-    def select_and_reduce(self, train_grads: Tensor) -> Tensor:
+    def select_and_reduce(self, train_grads: Tensor, val_grad: Tensor) -> Tensor:
         """
-        Progressive selection: select samples based on current scores and reduce.
+        Per-layer selection: select samples based on this layer's scores and reduce.
+
+        Each layer independently selects based on gradient alignment with validation.
 
         Args:
             train_grads: Per-sample compressed gradients [train_batch_size, k_l]
-            layer_idx: Current layer index
+            val_grad: Mean compressed validation gradient [k_l]
 
         Returns:
-            Reduced gradient [k_l] for selected samples
+            Reduced gradient [1, k_l] for selected samples
         """
-        selected_indices = self.get_selected_indices()
+        if self.selection_method == 'GREATS':
+            # Per-layer scores: dot product of each sample's gradient with val_grad
+            # [train_batch_size, k_l] @ [k_l] -> [train_batch_size]
+            scores = train_grads @ val_grad
+            selected_indices = topk_selection(scores, self.num_selected)
+        elif self.selection_method == 'GradNorm':
+            # Per-layer gradient norms
+            scores = (train_grads ** 2).sum(dim=1)
+            selected_indices = topk_selection(scores, self.num_selected)
+        else:
+            # No selection
+            selected_indices = torch.arange(self.train_batch_size, device=self.device)
+
         selected_grads = train_grads[selected_indices]  # [num_selected, k_l]
         reduced = selected_grads.mean(dim=0, keepdim=True)  # [1, k_l]
         return reduced
@@ -235,13 +258,13 @@ class CompressedLinearBackward(Function):
                 # Compute mean validation gradient
                 val_grad = val_grads.mean(dim=0)  # [k_l]
 
-                # Step 1: Update running scores
+                # Update running scores (only for compute_scores_only mode)
                 selection_state._update_scores(train_grads, val_grad)
 
                 # Check whether aggregation is needed
                 if not selection_state.compute_scores_only:
-                    # Select and reduce based on current scores
-                    reduced_grad = selection_state.select_and_reduce(train_grads)
+                    # Per-layer selection and reduce
+                    reduced_grad = selection_state.select_and_reduce(train_grads, val_grad)
 
                     # Store reduced gradient
                     hook_manager.compressed_grads[layer_idx] = reduced_grad
@@ -390,7 +413,8 @@ class GradientHook:
         selection_method: str,
         selection_frac: float,
         lr: float,
-        compute_scores_only: bool = False
+        compute_scores_only: bool = False,
+        use_second_order: bool = False
     ) -> None:
         """
         Set up selection state for on-the-fly data selection.
@@ -405,6 +429,9 @@ class GradientHook:
             lr: Learning rate for score scaling
             compute_scores_only: If True, only compute scores without aggregating gradients.
                                 Used for GREATS without MeSO (Case 2).
+            use_second_order: If True, compute similarity matrix and use greedy selection
+                            with second-order interactions. If False (default), use simple
+                            top-k selection which is ~200x faster.
         """
         # Infer dtype from model parameters (use first parameter's dtype)
         dtype = next(self.model.parameters()).dtype
@@ -418,9 +445,10 @@ class GradientHook:
             lr=lr,
             device=self.device,
             compute_scores_only=compute_scores_only,
-            dtype=dtype
+            dtype=dtype,
+            use_second_order=use_second_order
         )
-        logger.debug(f"Set up selection state: {train_batch_size} train, scores_only={compute_scores_only}, dtype={dtype}")
+        logger.debug(f"Set up selection state: {train_batch_size} train, scores_only={compute_scores_only}, use_second_order={use_second_order}, dtype={dtype}")
 
     def clear_selection(self) -> None:
         """Clear selection state after forward/backward."""
