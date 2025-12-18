@@ -49,6 +49,8 @@ dist
 */data/train
 */data/eval
 */out
+*/outputs
+LDA-ORL-main
 
 # debug
 *debug*

@@ -214,6 +214,11 @@ class CompressedLinearBackward(Function):
     def backward(ctx, grad_output: Tensor) -> Tuple[Tensor, None, None, None, None]:
         """
         Backward pass with progressive (approximate online) selection.
+
+        Supports three modes:
+        1. "standard": Original SFT mode - merged batch [train, val], selection during backward
+        2. "capture_val": RLHF Phase 1 - capture and store val gradients in buffer
+        3. "train_select": RLHF Phase 2 - use cached val gradients for selection
         """
         input, weight, bias = ctx.saved_tensors
         hook_manager_id: int = ctx.hook_manager_id
@@ -247,41 +252,72 @@ class CompressedLinearBackward(Function):
             # Delegate to compressor: it handles component-based compression
             compressed_grad = hook_manager.compressors[layer_idx].forward((grad_output, input))
 
-            # Check if we have selection state (data selection mode)
-            selection_state = hook_manager.selection_state
+            # === RLHF MODE: capture_val ===
+            if hook_manager.mode == "capture_val":
+                # Phase 1: Just capture and store mean validation gradient
+                # All samples are validation samples in this mode
+                val_grad_mean = compressed_grad.mean(dim=0)  # [k_l]
+                hook_manager.val_grad_buffer[layer_idx] = val_grad_mean.detach()
+                # Don't store for optimizer - this is just reference for later selection
 
-            if selection_state is not None:
-                # Assumes merged batch is [train_samples, val_samples] in that order
-                train_grads = compressed_grad[:selection_state.train_batch_size]  # [train_batch_size, k_l]
-                val_grads = compressed_grad[selection_state.train_batch_size:]  # [val_batch_size, k_l]
+            # === RLHF MODE: train_select ===
+            elif hook_manager.mode == "train_select":
+                # Phase 2: Use cached val gradients for selection
+                # All samples are training samples in this mode
+                val_grad = hook_manager.val_grad_buffer.get(layer_idx)
+                selection_state = hook_manager.selection_state
 
-                # Compute mean validation gradient
-                val_grad = val_grads.mean(dim=0)  # [k_l]
+                if val_grad is not None and selection_state is not None:
+                    train_grads = compressed_grad  # [batch, k_l]
 
-                # Update running scores (only for compute_scores_only mode)
-                selection_state._update_scores(train_grads, val_grad)
+                    # Update running scores (only for compute_scores_only mode)
+                    selection_state._update_scores(train_grads, val_grad)
 
-                # Check whether aggregation is needed
-                if not selection_state.compute_scores_only:
-                    # Per-layer selection and reduce
-                    reduced_grad = selection_state.select_and_reduce(train_grads, val_grad)
-
-                    # Store reduced gradient
-                    hook_manager.compressed_grads[layer_idx] = reduced_grad
-
+                    # Check whether aggregation is needed
+                    if not selection_state.compute_scores_only:
+                        # Per-layer selection and reduce
+                        reduced_grad = selection_state.select_and_reduce(train_grads, val_grad)
+                        hook_manager.compressed_grads[layer_idx] = reduced_grad
                 else:
-                    # We only maintain running scores without aggregating gradients.
-                    # After the full backward pass, the trainer will:
-                    # 1. Get selected indices from selection_state.get_selected_indices()
-                    # 2. Do a second forward/backward with full gradients on selected samples
-                    pass
-            else:
-                # No data selection
-                # Average compressed gradients across batch dimension
-                compressed_grad = compressed_grad.mean(dim=0, keepdim=True) # [1, k_l]
+                    # No cached val grad or no selection state - average all
+                    hook_manager.compressed_grads[layer_idx] = compressed_grad.mean(dim=0, keepdim=True)
 
-                # Store reduced compressed gradient
-                hook_manager.compressed_grads[layer_idx] = compressed_grad
+            # === STANDARD MODE (SFT with merged batch) ===
+            else:
+                selection_state = hook_manager.selection_state
+
+                if selection_state is not None:
+                    # Assumes merged batch is [train_samples, val_samples] in that order
+                    train_grads = compressed_grad[:selection_state.train_batch_size]  # [train_batch_size, k_l]
+                    val_grads = compressed_grad[selection_state.train_batch_size:]  # [val_batch_size, k_l]
+
+                    # Compute mean validation gradient
+                    val_grad = val_grads.mean(dim=0)  # [k_l]
+
+                    # Update running scores (only for compute_scores_only mode)
+                    selection_state._update_scores(train_grads, val_grad)
+
+                    # Check whether aggregation is needed
+                    if not selection_state.compute_scores_only:
+                        # Per-layer selection and reduce
+                        reduced_grad = selection_state.select_and_reduce(train_grads, val_grad)
+
+                        # Store reduced gradient
+                        hook_manager.compressed_grads[layer_idx] = reduced_grad
+
+                    else:
+                        # We only maintain running scores without aggregating gradients.
+                        # After the full backward pass, the trainer will:
+                        # 1. Get selected indices from selection_state.get_selected_indices()
+                        # 2. Do a second forward/backward with full gradients on selected samples
+                        pass
+                else:
+                    # No data selection
+                    # Average compressed gradients across batch dimension
+                    compressed_grad = compressed_grad.mean(dim=0, keepdim=True)  # [1, k_l]
+
+                    # Store reduced compressed gradient
+                    hook_manager.compressed_grads[layer_idx] = compressed_grad
 
         # Return gradients
         return grad_input, None, None, None, None
@@ -291,10 +327,16 @@ class GradientHook:
     """
     Hook manager with on-the-fly data selection support.
 
-    New features:
+    Features:
     1. SelectionState for managing selection during backward
     2. On-the-fly score computation and gradient aggregation
     3. Memory-efficient processing without materializing all per-sample grads
+    4. RLHF support via dual-mode operation (capture_val / train_select)
+
+    Modes:
+    - "standard": Original SFT mode with merged train+val batch
+    - "capture_val": Capture validation gradients and store in buffer (RLHF Phase 1)
+    - "train_select": Use cached val gradients for selection during training (RLHF Phase 2)
     """
 
     def __init__(
@@ -336,6 +378,12 @@ class GradientHook:
 
         # Selection state (set by trainer before forward/backward)
         self.selection_state: Optional[SelectionState] = None
+
+        # === RLHF Support: Dual-mode operation ===
+        # Mode: "standard" (SFT merged batch), "capture_val", or "train_select"
+        self.mode: str = "standard"
+        # Buffer to store validation gradients per layer (used in RLHF)
+        self.val_grad_buffer: Dict[int, Tensor] = {}
 
         # Register in global registry
         self._hook_manager_id: int = id(self)
@@ -453,6 +501,41 @@ class GradientHook:
     def clear_selection(self) -> None:
         """Clear selection state after forward/backward."""
         self.selection_state = None
+
+    def set_mode(self, mode: str) -> None:
+        """
+        Set operation mode for RLHF support.
+
+        Args:
+            mode: One of:
+                - "standard": Original SFT mode with merged train+val batch
+                - "capture_val": Capture validation gradients and store in buffer
+                - "train_select": Use cached val gradients for selection during training
+
+        The RLHF workflow is:
+        1. set_mode("capture_val") -> forward/backward on val data -> gradients stored in val_grad_buffer
+        2. set_mode("train_select") + setup_selection() -> forward/backward on train data -> selection uses val_grad_buffer
+        """
+        if mode not in ("standard", "capture_val", "train_select"):
+            raise ValueError(f"Invalid mode: {mode}. Must be 'standard', 'capture_val', or 'train_select'")
+
+        self.mode = mode
+
+        # Clear val_grad_buffer when switching to capture mode
+        if mode == "capture_val":
+            self.val_grad_buffer = {}
+            logger.debug("Switched to capture_val mode, cleared val_grad_buffer")
+        elif mode == "train_select":
+            if not self.val_grad_buffer:
+                logger.warning("Switched to train_select mode but val_grad_buffer is empty. "
+                             "Did you forget to run capture_val phase first?")
+            logger.debug(f"Switched to train_select mode, {len(self.val_grad_buffer)} layers in buffer")
+        else:
+            logger.debug("Switched to standard mode")
+
+    def clear_val_grad_buffer(self) -> None:
+        """Clear the validation gradient buffer."""
+        self.val_grad_buffer = {}
 
     def get_compressed_grads(self) -> List[Optional[Tensor]]:
         """Get all captured compressed gradients."""

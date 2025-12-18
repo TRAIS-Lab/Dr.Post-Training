@@ -1,11 +1,47 @@
-# Efficient Fine-Tuning
+# Efficient Fine-Tuning with Layer-wise Data Selection
 
-This repository implements memory-efficient fine-tuning with **compressed optimizer** support, enabling full model fine-tuning on limited GPU memory.
+This repository implements **memory-efficient fine-tuning** with layer-wise data selection and compressed optimizer support, enabling full model fine-tuning on limited GPU memory.
+
+## Key Features
+
+- **Layer-wise Data Selection**: Select beneficial training samples independently at each layer during backward pass
+- **Streaming Paradigm**: Joint data selection and model update using a single gradient computation stream
+- **Memory Efficient**: MeSO optimizer maintains optimizer states in compressed space
+- **Flexible Compression**: Support for GraSS (gradient sparsification + sketching) and LoGra (low-rank gradients)
+
+## Experiments
+
+| Experiment | Description | README |
+|------------|-------------|--------|
+| **SFT** | Supervised Fine-Tuning | [experiment/README.md](experiment/README.md) |
+| **RLHF** | Reinforcement Learning from Human Feedback | [experiment_rlhf/README.md](experiment_rlhf/README.md) |
 
 ## Quick Start
 
 ```bash
 pip install -r requirements.txt
+```
+
+### SFT Quick Start
+
+```bash
+# Run all SFT experiments
+bash experiment/train/launch_experiments.sh --task mmlu --subject sociology
+
+# Single SFT experiment with layer-wise selection
+bash experiment/train/train.sh --task mmlu --model llama3-1b \
+    --data_selection GREATS --compression GraSS --MeSO
+```
+
+### RLHF Quick Start
+
+```bash
+# Run all RLHF experiments
+bash experiment_rlhf/launch_experiments.sh
+
+# Single RLHF experiment with layer-wise selection
+bash experiment_rlhf/train.sh --model llama3-1b --lora \
+    --selection_method GREATS --compression GraSS
 ```
 
 ## Data Preparation
@@ -16,42 +52,12 @@ Download and prepare datasets using the unified data preparation script:
 # See available datasets and options
 python experiment/data/prepare_datasets.py -h
 
-# Download specific datasets
-python experiment/data/prepare_datasets.py --datasets mmlu bbh tydiqa
-
-# Download all evaluation datasets
+# Download evaluation datasets
 python experiment/data/prepare_datasets.py --datasets mmlu bbh tydiqa gsm8k math500 samsum
 
 # Download training datasets
 python experiment/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
 ```
-
-### Available Datasets
-
-#### Evaluation Datasets
-
-| Dataset   | Task Type          | Description                                              |
-| --------- | ------------------ | -------------------------------------------------------- |
-| `mmlu`    | Multiple Choice    | Massive Multitask Language Understanding (57 subjects)   |
-| `bbh`     | Reasoning          | BIG-Bench Hard (23 challenging reasoning tasks with CoT) |
-| `tydiqa`  | Question Answering | Typologically Diverse QA (9 languages)                   |
-| `gsm8k`   | Math               | Grade School Math (8K problems)                          |
-| `math500` | Math               | MATH benchmark (500 competition problems)                |
-| `samsum`  | Summarization      | SAMSum dialogue summarization                            |
-
-#### Training Datasets
-
-| Dataset      | Size | Description                           |
-| ------------ | ---- | ------------------------------------- |
-| `alpaca`     | 52K  | Stanford Alpaca instruction-following |
-| `dolly`      | 15K  | Databricks Dolly 2.0                  |
-| `flan_v2`    | 100K | FLAN v2 instruction tuning mixture    |
-| `cot`        | 100K | Chain-of-Thought reasoning examples   |
-| `oasst1`     | 88K  | OpenAssistant conversations           |
-| `vicuna`     | 125K | ShareGPT-based conversations          |
-| `wizardlm`   | 196K | WizardLM evolved instructions         |
-| `openhermes` | 1M   | OpenHermes 2.5 diverse instructions   |
-| `tulu3`      | 939K | Tulu-3 SFT mixture                    |
 
 ### Recommended Environment Setup
 
@@ -74,143 +80,55 @@ pip3 install -r requirements.txt
 
 > Before installing `flash-attn`, you might need to install `psutil` first.
 
-## Running Experiments
+## Core Modules
 
-### Launch All Experiments
+### `compress_gradient/`
 
-To run all experimental configurations (baselines + data selection + MeSO) for a given task:
+The core library for gradient compression and layer-wise selection:
 
-```bash
-# Dry run - see all commands without executing
-bash experiment/train/launch_experiments.sh --task mmlu --subject sociology --dry-run
+- **`hook.py`**: `GradientHook` - Hooks for capturing compressed gradients with selection support
+- **`compressor.py`**: `Compressor` - Two-stage compression (sparsification + projection)
+- **`optimizer.py`**: `MeSOAdamW` - Memory-efficient optimizer in compressed space
+- **`trainer.py`**: `CompGradTrainer` - SFT trainer with data selection
 
-# Run all experiments locally
-bash experiment/train/launch_experiments.sh --task mmlu --subject sociology
+### Key Concepts
 
-# Submit all experiments to SLURM
-bash experiment/train/launch_experiments.sh --task mmlu --subject sociology --sbatch
-```
+1. **Layer-wise Selection**: Each layer independently selects beneficial samples based on gradient alignment with validation gradients
+2. **Two-Stage Compression**:
+   - Stage 1: Sparsification (random mask or low-rank)
+   - Stage 2: Projection (SJLT sketching or identity)
+3. **Streaming Update**: Selection and model update happen during the same backward pass
 
-This launches **10 configurations**:
-- 2 Baselines (Full + LoRA fine-tuning)
-- 4 GREATS Data Selection (Full/LoRA × GraSS/LoGra)
-- 2 MeSO Compressed Optimizer (Full × GraSS/LoGra)
-- 2 MeSO + GREATS (Full × GraSS/LoGra)
+## Available Datasets
 
-### Single Experiment
+### Evaluation Datasets
 
-For running individual experiments with specific configurations:
+| Dataset   | Task Type          | Description                                              |
+| --------- | ------------------ | -------------------------------------------------------- |
+| `mmlu`    | Multiple Choice    | Massive Multitask Language Understanding (57 subjects)   |
+| `bbh`     | Reasoning          | BIG-Bench Hard (23 challenging reasoning tasks with CoT) |
+| `tydiqa`  | Question Answering | Typologically Diverse QA (9 languages)                   |
+| `gsm8k`   | Math               | Grade School Math (8K problems)                          |
+| `math500` | Math               | MATH benchmark (500 competition problems)                |
+| `samsum`  | Summarization      | SAMSum dialogue summarization                            |
 
-```bash
-# From project root
-bash experiment/train/train.sh [options]
+### Training Datasets
 
-# Or with SLURM
-sbatch experiment/train/train.sh [options]
-```
+| Dataset      | Size | Description                           |
+| ------------ | ---- | ------------------------------------- |
+| `alpaca`     | 52K  | Stanford Alpaca instruction-following |
+| `dolly`      | 15K  | Databricks Dolly 2.0                  |
+| `flan_v2`    | 100K | FLAN v2 instruction tuning mixture    |
+| `cot`        | 100K | Chain-of-Thought reasoning examples   |
+| `oasst1`     | 88K  | OpenAssistant conversations           |
+| `vicuna`     | 125K | ShareGPT-based conversations          |
+| `wizardlm`   | 196K | WizardLM evolved instructions         |
+| `openhermes` | 1M   | OpenHermes 2.5 diverse instructions   |
+| `tulu3`      | 939K | Tulu-3 SFT mixture                    |
 
-#### Examples
+## Detailed Documentation
 
-```bash
-# Baseline: Full fine-tuning
-bash experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b
+For detailed experiment-specific documentation, see:
 
-# Baseline: LoRA fine-tuning
-bash experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b --lora
-
-# Data Selection: GREATS with GraSS compression
-bash experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --data_selection GREATS --compression GraSS
-
-# Data Selection: GREATS + LoRA with LoGra compression
-bash experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b --lora \
-    --data_selection GREATS --compression LoGra
-
-# MeSO: Compressed optimizer without data selection
-bash experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --MeSO --compression GraSS
-
-# MeSO + Data Selection: Both optimizations combined
-bash experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --MeSO --data_selection GREATS --compression GraSS
-
-# Custom training dataset (instead of task-based default)
-bash experiment/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --train wizardlm --data_selection GREATS --compression GraSS
-```
-
-#### Parameters
-
-The unified training script accepts the following arguments:
-
-##### Task Arguments
-
-- `--task <task>` - Evaluation task: `mmlu`, `bbh`, `tydiqa`, `gsm8k`, `math500`, `samsum`
-- `--subject <subject>` - Subject for MMLU/BBH (default: `world_religions`)
-- `--train <dataset>` - Training dataset (optional, overrides task-based default):
-  - `alpaca`, `dolly`, `flan_v2`, `cot`, `oasst1` - Instruction tuning
-  - `gsm8k` - Math training data
-  - `vicuna`, `wizardlm`, `openhermes`, `tulu3` - Large-scale instruction data
-
-##### Core Training Arguments
-
-- `--data_selection <method>` - Data selection: `NA`, `GREATS`, `GradNorm` (default: `NA`)
-- `--MeSO` - Enable MeSO compressed optimizer for memory efficiency
-- `--model <model>` - Model: `llama3-1b`, `llama2-7b`, `llama2-13b`, `mistral-7b` (default: `llama3-1b`)
-- `--lr <lr>` - Learning rate (default: `5e-05`)
-- `--batch_size <size>` - Batch size (default: `4`)
-- `--seed <seed>` - Random seed (default: `42`)
-- `--gradient_accumulation_steps <steps>` - Gradient accumulation (default: `1`)
-
-##### Data Arguments
-
-- `--percentage <pct>` - Data sampling, e.g., `0.05` for 5% (default: `0.05`)
-- `--n_val <n>` - Validation examples for data selection (default: `5`)
-- `--n_eval <n>` - Evaluation examples (default: `500`)
-- `--val_batch_size <size>` - Validation batch size for data selection (default: same as `batch_size`)
-- `--data_dir <dir>` - Data directory (default: `experiment/data`)
-
-##### Compression Arguments
-
-- `--compression <method>` - Gradient compression method (auto-enabled when needed)
-  - `GraSS` - Gradient Sparsification with Sketching [default]
-  - `LoGra` - Low-rank Gradient compression
-  - Auto-enabled when `--data_selection` is not `NA` or `--MeSO` is set
-- `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
-
-##### LoRA Arguments
-
-- `--lora` - Enable LoRA fine-tuning (flag, omit for full fine-tuning)
-- `--lora_alpha <alpha>` - LoRA alpha (default: `1`)
-- `--lora_r <r>` - LoRA rank (default: `8`)
-- `--lora_dropout <dropout>` - LoRA dropout (default: `0.1`)
-
-## Evaluation
-
-Trained models are automatically evaluated after training. Results are saved in the output directory.
-
-### Manual Evaluation
-
-For standalone evaluation of trained models:
-
-```bash
-# MMLU evaluation
-python experiment/eval/eval.py --task mmlu --model_path <path_to_model> \
-    --subject sociology --n_val 5 --n_eval 500
-
-# TyDiQA evaluation
-python experiment/eval/eval.py --task tydiqa --model_path <path_to_model> \
-    --n_test 100
-```
-
-## Current Experiments
-
-```bash
-CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task samsum --train openhermes --lr 5e-06 --lr_lora 1e-04 --batch_size 8 --val_batch_size 1 --n_val 16 --percentage 0.05 --seed 42
-
-CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task tydiqa --train vicuna --lr 5e-06 --lr_lora 1e-04 --batch_size 8 --val_batch_size 1 --n_val 16 --percentage 0.5 --seed 42
-
-CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task math500 --train less --lr 5e-06 --lr_lora 1e-04 --batch_size 8 --val_batch_size 1 --n_val 16 --percentage 0.05 --seed 42
-
-CUDA_VISIBLE_DEVICES=0 ./launch_experiments.sh --task gsm8k --train wizardlm --lr 5e-06 --lr_lora 1e-04 --batch_size 8 --val_batch_size 1 --n_val 16 --percentage 0.3 --seed 42
-```
+- **SFT Experiments**: [experiment/README.md](experiment/README.md)
+- **RLHF Experiments**: [experiment_rlhf/README.md](experiment_rlhf/README.md)
