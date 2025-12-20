@@ -182,22 +182,3 @@ full_sgd_momentum_gc         19.93 GB     5.98 GB      868.6 ms       4.61 samp/
 lora_sgd_gc                  10.32 GB     6.53 GB      746.6 ms       5.36 samp/s      7.5 s
 lora_sgd_momentum_gc         10.87 GB     6.53 GB      753.3 ms       5.31 samp/s      7.5 s
 ```
-
-## Key Features
-
-### 1. MeSO + Selection Optimization
-When using compression (`LoGra`), the MeSO optimizer reuses compressed gradients:
-- Gradients computed during selection are reused for optimization
-- Avoids redundant forward/backward pass
-- Memory-efficient stateful optimization
-
-### 2. Selection Methods
-- **Streaming**: Per-layer selection (single-pass, lower overhead)
-- **GREATS**: Global selection (two-pass, better selection quality)
-- **Second-order**: Greedy selection with pairwise similarity (slower but more accurate)
-
-### 3. Comparison with Baselines
-External baselines (SGD variants) are included for comprehensive comparison:
-- Memory usage across different optimizers
-- Throughput comparison with/without gradient checkpointing
-- LoRA vs full fine-tuning trade-offs

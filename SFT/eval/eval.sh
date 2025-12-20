@@ -17,6 +17,7 @@ set -e
 MODELS_DIR="/scratch/pbb/Project/Gradient-Streaming/SFT"
 TRAIN=""
 TASK=""
+SUBJECT=""
 N_TEST=-1
 BATCH_SIZE=1
 MAX_NEW_TOKENS=128
@@ -36,6 +37,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --task)
             TASK="$2"
+            shift 2
+            ;;
+        --subject)
+            SUBJECT="$2"
             shift 2
             ;;
         --n_test)
@@ -65,6 +70,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --models_dir DIR     Models directory (default: /scratch/pbb/Project/Gradient-Streaming/SFT)"
             echo "  --train NAME         Filter by training dataset (alpaca, less, tulu3, wizardlm)"
             echo "  --task NAME          Override task (samsum, tydiqa, mmlu, bbh, gsm8k, math500)"
+            echo "  --subject NAME       MMLU subject or BBH task to evaluate on (default: all)"
             echo "  --n_test N           Number of test examples (-1 for all)"
             echo "  --batch_size N       Batch size for generation (default: 1)"
             echo "  --max_new_tokens N   Max tokens to generate (default: 128)"
@@ -91,6 +97,7 @@ echo "======================================"
 echo "Models:     $MODELS_DIR"
 echo "Train:      ${TRAIN:-all}"
 echo "Task:       ${TASK:-auto-detect}"
+echo "Subject:    ${SUBJECT:-all}"
 echo "Batch size: $BATCH_SIZE"
 echo "======================================"
 
@@ -108,6 +115,10 @@ fi
 
 if [[ -n "$TASK" ]]; then
     CMD="$CMD --task $TASK"
+fi
+
+if [[ -n "$SUBJECT" ]]; then
+    CMD="$CMD --subject $SUBJECT"
 fi
 
 if [[ "$SBATCH" == true ]]; then

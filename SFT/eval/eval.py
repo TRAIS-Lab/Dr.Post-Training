@@ -325,6 +325,7 @@ def evaluate_model(
     max_new_tokens: int = 128,
     base_model: Optional[str] = None,
     task_override: Optional[str] = None,
+    subject: Optional[str] = None,
 ) -> Dict:
     """Evaluate a single model. Task is auto-detected from model name."""
     model_name = os.path.basename(model_path)
@@ -354,6 +355,9 @@ def evaluate_model(
     args.n_test = n_test
     args.batch_size = batch_size
     args.max_new_tokens = max_new_tokens
+    args.subject = subject  # For MMLU
+    args.bbh_task = subject  # For BBH (uses same value)
+    args.n_val = 5  # Few-shot examples for MMLU
 
     try:
         if task == "samsum":
@@ -443,6 +447,8 @@ def main():
     parser.add_argument("--task", type=str, default=None,
         choices=["samsum", "tydiqa", "mmlu", "bbh", "gsm8k", "math500"],
         help="Override auto-detected task (optional)")
+    parser.add_argument("--subject", type=str, default=None,
+        help="MMLU subject or BBH task to evaluate on (default: all)")
     parser.add_argument("--data_dir", type=str, default=None,
         help="Data directory (default: auto-detect)")
     parser.add_argument("--n_test", type=int, default=-1,
@@ -475,6 +481,7 @@ def main():
             max_new_tokens=args.max_new_tokens,
             base_model=args.base_model,
             task_override=args.task,
+            subject=args.subject,
         )
         print("\n" + "=" * 60)
         print("Results:")
@@ -505,6 +512,7 @@ def main():
             max_new_tokens=args.max_new_tokens,
             base_model=args.base_model,
             task_override=args.task,
+            subject=args.subject,
         )
         all_results.append(results)
 

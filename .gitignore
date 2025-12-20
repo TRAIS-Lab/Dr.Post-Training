@@ -55,8 +55,7 @@ dist
 
 # all files in result folder
 */result/*
-*/save/*
-*/_save/*
+*/lr_sweep_results/*
 # all files in checkpoints folder
 **/checkpoints*/
 *.json

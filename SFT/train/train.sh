@@ -55,8 +55,12 @@ n_eval=500
 model="llama3-1b"
 batch_size=4
 val_batch_size=""  # Defaults to batch_size if not specified
-lr=5e-05
+lr=""  # Learning rate (looked up from lr_config.json if not specified)
 seed=42
+
+# LR configuration
+lr_config_file="SFT/train/lr_config.json"
+lr_override=""  # Set when --lr is explicitly passed
 gradient_accumulation_steps=1
 task="mmlu"
 train_dataset=""  # Training dataset (if empty, uses task-based default)
@@ -65,6 +69,40 @@ compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer.
 use_second_order=false  # If true, use greedy selection with second-order interactions
 use_lora=false
 use_flash_attention=true
+
+# Multi-experiment mode
+experiments=""  # Comma-separated list of experiments or categories
+dry_run=false
+use_sbatch=false
+
+# Fallback LRs (used only when lr_config.json has no entry)
+fallback_lr_full="5e-05"
+fallback_lr_lora="2e-04"
+
+# Experiment definitions
+# Format: "NAME:data_selection:compression:use_lora:use_second_order"
+declare -A EXPERIMENT_DEFS=(
+    ["NA-NA-full"]="NA::false:false"
+    ["NA-NA-lora"]="NA::true:false"
+    ["Streaming-NA-full"]="Streaming::false:true"
+    ["Streaming-NA-lora"]="Streaming::true:true"
+    ["GREATS-NA-full"]="GREATS::false:true"
+    ["GREATS-NA-lora"]="GREATS::true:true"
+    ["Streaming-LoGra-full"]="Streaming:LoGra:false:true"
+    ["GREATS-LoGra-full"]="GREATS:LoGra:false:true"
+)
+
+# Category mappings
+declare -A CATEGORY_EXPERIMENTS=(
+    ["all"]="NA-NA-full,NA-NA-lora,Streaming-NA-full,Streaming-NA-lora,GREATS-NA-full,GREATS-NA-lora,Streaming-LoGra-full,GREATS-LoGra-full"
+    ["baseline"]="NA-NA-full,NA-NA-lora"
+    ["streaming"]="Streaming-NA-full,Streaming-NA-lora,Streaming-LoGra-full"
+    ["greats"]="GREATS-NA-full,GREATS-NA-lora,GREATS-LoGra-full"
+    ["full"]="NA-NA-full,Streaming-NA-full,GREATS-NA-full,Streaming-LoGra-full,GREATS-LoGra-full"
+    ["lora"]="NA-NA-lora,Streaming-NA-lora,GREATS-NA-lora"
+    ["compression"]="Streaming-LoGra-full,GREATS-LoGra-full"
+    ["no-compression"]="NA-NA-full,NA-NA-lora,Streaming-NA-full,Streaming-NA-lora,GREATS-NA-full,GREATS-NA-lora"
+)
 
 # LoRA-specific defaults (only used if --lora is passed)
 lora_alpha=1
@@ -109,7 +147,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --lr)
-            lr="$2"
+            lr_override="$2"
+            shift 2
+            ;;
+        --lr_config)
+            lr_config_file="$2"
             shift 2
             ;;
         --seed)
@@ -168,13 +210,48 @@ while [[ $# -gt 0 ]]; do
             data_dir="$2"
             shift 2
             ;;
-        *)
-            echo "Unknown argument: $1"
+        --lr_lora)
+            # Deprecated: LRs are now managed via lr_config.json
+            # This sets the fallback LR for LoRA experiments
+            fallback_lr_lora="$2"
+            shift 2
+            ;;
+        --experiments)
+            experiments="$2"
+            shift 2
+            ;;
+        --dry-run)
+            dry_run=true
+            shift
+            ;;
+        --sbatch)
+            use_sbatch=true
+            shift
+            ;;
+        --help|-h)
             echo "Usage: $0 [options]"
             echo ""
-            echo "Options:"
+            echo "Run single or multiple training experiments."
+            echo ""
+            echo "Multi-Experiment Mode:"
+            echo "  --experiments <list>                   Run multiple experiments (see below)"
+            echo "  --dry-run                              Print commands without executing"
+            echo "  --sbatch                               Use sbatch instead of bash"
+            echo ""
+            echo "  Experiment names: NA-NA-full, NA-NA-lora, Streaming-NA-full, Streaming-NA-lora,"
+            echo "                    GREATS-NA-full, GREATS-NA-lora, Streaming-LoGra-full, GREATS-LoGra-full"
+            echo ""
+            echo "  Categories: all, baseline, streaming, greats, full, lora, compression, no-compression"
+            echo ""
+            echo "  Examples:"
+            echo "    --experiments all                    Run all 8 experiments"
+            echo "    --experiments baseline               Run NA-NA-full and NA-NA-lora"
+            echo "    --experiments \"streaming,greats\"     Run all Streaming and GREATS experiments"
+            echo "    --experiments \"NA-NA-full,Streaming-LoGra-full\"  Run specific experiments"
+            echo ""
+            echo "Single Experiment Options:"
             echo "  --data_selection <method>              Data selection: NA, Streaming, GREATS (default: NA)"
-            echo "  --compression <method>                 Compression: LoGra (default), GraSS (implies MeSO optimizer)"
+            echo "  --compression <method>                 Compression: LoGra, GraSS (implies MeSO optimizer)"
             echo "  --use_second_order                     Use greedy selection with second-order interactions"
             echo ""
             echo "  --lora                                 Use LoRA fine-tuning (default: full fine-tuning)"
@@ -182,6 +259,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --lora_r <r>                           LoRA rank (default: 8)"
             echo "  --lora_dropout <dropout>               LoRA dropout (default: 0.1)"
             echo ""
+            echo "Shared Options (apply to all experiments):"
             echo "  --model <model>                        Model: llama3-1b, llama2-7b, etc. (default: llama3-1b)"
             echo "  --task <task>                          Task: mmlu, bbh, tydiqa, samsum, gsm8k (default: mmlu)"
             echo "  --train <dataset>                      Training dataset (default: task-based)"
@@ -189,8 +267,16 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "  --batch_size <size>                    Training batch size (default: 4)"
             echo "  --val_batch_size <size>                Validation batch size for selection (default: same as batch_size)"
-            echo "  --lr <lr>                              Learning rate (default: 5e-05)"
+            echo "  --lr <lr>                              Learning rate override (ignores config file)"
+            echo "  --lr_config <path>                     LR config file (default: SFT/train/lr_config.json)"
             echo "  --percentage <pct>                     Data sampling percentage (default: 0.05)"
+            echo ""
+            echo "Learning Rate Resolution:"
+            echo "  1. If --lr is specified, use that value"
+            echo "  2. Otherwise, look up from lr_config.json based on {train}_{task} + experiment"
+            echo "  3. If not found, use fallback (5e-05 for full, 2e-04 for LoRA)"
+            echo ""
+            echo "  Run lr_sweep.sh first to populate lr_config.json with optimal LRs."
             echo "  --n_val <n>                            Validation examples (default: 5)"
             echo "  --n_eval <n>                           Evaluation examples (default: 500)"
             echo "  --seed <seed>                          Random seed (default: 42)"
@@ -200,22 +286,374 @@ while [[ $# -gt 0 ]]; do
             echo "  --data_dir <dir>                       Data directory (default: SFT/data)"
             echo ""
             echo "Naming convention: {selection}-{compression}-{training_type}"
-            echo "  Examples: Streaming-NA-full, GREATS-GraSS-lora, NA-LoGra-full"
+            echo "  Examples: Streaming-NA-full, GREATS-LoGra-full, NA-NA-lora"
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            echo "Use --help for usage information."
             exit 1
             ;;
     esac
 done
 
 # ========================================
-# Update base_training_args with user-specified Flash Attention setting
+# Resolve experiment names from categories
 # ========================================
-if [ "$use_flash_attention" = true ]; then
-    base_training_args="${base_training_args/--use_flash_attention=False/--use_flash_attention=True}"
-fi
+resolve_experiments() {
+    local input="$1"
+    local resolved=""
+
+    # Split by comma
+    IFS=',' read -ra items <<< "$input"
+    for item in "${items[@]}"; do
+        item=$(echo "$item" | xargs)  # trim whitespace
+
+        # Check if it's a category
+        if [[ -n "${CATEGORY_EXPERIMENTS[$item]}" ]]; then
+            if [[ -n "$resolved" ]]; then
+                resolved="$resolved,${CATEGORY_EXPERIMENTS[$item]}"
+            else
+                resolved="${CATEGORY_EXPERIMENTS[$item]}"
+            fi
+        # Check if it's a valid experiment name
+        elif [[ -n "${EXPERIMENT_DEFS[$item]}" ]]; then
+            if [[ -n "$resolved" ]]; then
+                resolved="$resolved,$item"
+            else
+                resolved="$item"
+            fi
+        else
+            echo "ERROR: Unknown experiment or category: $item"
+            echo "Valid experiments: ${!EXPERIMENT_DEFS[*]}"
+            echo "Valid categories: ${!CATEGORY_EXPERIMENTS[*]}"
+            exit 1
+        fi
+    done
+
+    # Remove duplicates while preserving order
+    echo "$resolved" | tr ',' '\n' | awk '!seen[$0]++' | tr '\n' ',' | sed 's/,$//'
+}
 
 # ========================================
-# Compression Configuration
+# Look up LR from config file
 # ========================================
+lookup_lr() {
+    local config_key="$1"  # e.g., "alpaca_samsum"
+    local exp_name="$2"    # e.g., "NA-NA-full"
+    local is_lora="$3"     # "true" or "false"
+
+    # If lr_override is set, use it
+    if [[ -n "$lr_override" ]]; then
+        echo "$lr_override"
+        return
+    fi
+
+    # Try to look up from config file
+    if [[ -f "$lr_config_file" ]]; then
+        local looked_up_lr
+        looked_up_lr=$(python3 -c "
+import json
+import sys
+try:
+    with open('$lr_config_file', 'r') as f:
+        config = json.load(f)
+    lr_val = config.get('$config_key', {}).get('$exp_name', {}).get('lr')
+    if lr_val is not None:
+        print(f'{lr_val:.0e}' if lr_val < 0.001 else f'{lr_val}')
+    else:
+        sys.exit(1)
+except:
+    sys.exit(1)
+" 2>/dev/null)
+
+        if [[ $? -eq 0 ]] && [[ -n "$looked_up_lr" ]]; then
+            echo "$looked_up_lr"
+            return
+        fi
+    fi
+
+    # Fallback to defaults
+    if [ "$is_lora" = true ]; then
+        echo "$fallback_lr_lora"
+    else
+        echo "$fallback_lr_full"
+    fi
+}
+
+# ========================================
+# Function to run a single experiment
+# ========================================
+run_single_experiment() {
+    local exp_data_selection="$1"
+    local exp_compression="$2"
+    local exp_use_lora="$3"
+    local exp_use_second_order="$4"
+    local exp_lr="$5"
+    local exp_name="$6"
+
+    # ========================================
+    # Update base_training_args with user-specified Flash Attention setting
+    # ========================================
+    local exp_base_training_args="$base_training_args"
+    if [ "$use_flash_attention" = true ]; then
+        exp_base_training_args="${exp_base_training_args/--use_flash_attention=False/--use_flash_attention=True}"
+    fi
+
+    # ========================================
+    # Compression Configuration
+    # ========================================
+    local sparsification=""
+    local projection=""
+    if [[ -n "$exp_compression" ]]; then
+        case "$exp_compression" in
+            LoGra)
+                if [ "$exp_use_lora" = true ]; then
+                    sparsification="normal-128*128"
+                else
+                    sparsification="normal-512*512"
+                fi
+                ;;
+            GraSS)
+                if [ "$exp_use_lora" = true ]; then
+                    sparsification="random_mask-256*256"
+                    projection="sjlt-16384"
+                else
+                    sparsification="random_mask-1024*1024"
+                    projection="sjlt-262144"
+                fi
+                ;;
+            *)
+                echo "ERROR: Invalid compression method: $exp_compression"
+                exit 1
+                ;;
+        esac
+    fi
+
+    # ========================================
+    # Build Job Name
+    # ========================================
+    local job_type
+    if [ "$exp_use_lora" = true ]; then
+        job_type="lora"
+    else
+        job_type="full"
+    fi
+
+    local method_str="${exp_data_selection}-${exp_compression:-NA}"
+    if [[ "$exp_data_selection" != "NA" ]] && [ "$exp_use_second_order" = true ]; then
+        method_str="${method_str}-2nd"
+    fi
+
+    local train_str="${train_dataset:-default}"
+    local JOB_NAME
+    if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
+        JOB_NAME="${train_str}_${task}_${subject}-${method_str}-${model}-${job_type}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
+    else
+        JOB_NAME="${train_str}_${task}-${method_str}-${model}-${job_type}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
+    fi
+
+    local output_dir=/scratch/pbb/Project/Gradient-Streaming/SFT/${JOB_NAME}
+    if [[ ! -d $output_dir ]]; then
+        mkdir -p $output_dir
+    fi
+
+    echo ""
+    echo "=============================================="
+    if [[ -n "$exp_name" ]]; then
+        echo "  Running: $exp_name"
+    fi
+    echo "=============================================="
+    echo "Job name: $JOB_NAME"
+    echo "Method: ${method_str}-${job_type}"
+    echo "Model: $model"
+    echo "Training type: $([ "$exp_use_lora" = true ] && echo "LoRA (alpha=$lora_alpha, r=$lora_r)" || echo "Full")"
+    echo "Task: $task"
+    echo "Training data: ${train_dataset:-default for $task}"
+    echo "Selection: $exp_data_selection"
+    if [[ "$exp_data_selection" != "NA" ]]; then
+        echo "  Second-order: $([ "$exp_use_second_order" = true ] && echo "yes" || echo "no")"
+    fi
+    echo "Compression: ${exp_compression:-None}"
+    echo "Batch size: $batch_size (val: ${val_batch_size:-$batch_size})"
+    echo "Learning rate: $exp_lr"
+    echo "Data percentage: $percentage"
+    echo "Validation examples: $n_val"
+    echo "Output: $output_dir"
+    echo "=============================================="
+
+    local DATA_SEED=$((seed + 1))
+
+    # Map model shorthand to full path
+    local MODEL_PATH
+    case $model in
+        llama3-1b)
+            MODEL_PATH="meta-llama/Llama-3.2-1B"
+            ;;
+        llama2-7b)
+            MODEL_PATH="meta-llama/Llama-2-7b-hf"
+            ;;
+        llama2-13b)
+            MODEL_PATH="meta-llama/Llama-2-13b-hf"
+            exp_base_training_args="$exp_base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config llama2_13b_finetune"
+            ;;
+        mistral-7b)
+            MODEL_PATH="mistralai/Mistral-7B-v0.1"
+            exp_base_training_args="$exp_base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config mistral_7b_finetune"
+            ;;
+        *)
+            MODEL_PATH="$model"
+            ;;
+    esac
+
+    local ID=$RANDOM
+    local PORT=$((29400 + RANDOM % 10000))
+    local header="torchrun --nproc_per_node 1 --nnodes 1 \
+--rdzv-id=$ID --rdzv_backend c10d --rdzv-endpoint=localhost:$PORT \
+-m SFT.train.train"
+
+    # Build training arguments
+    local training_args="$exp_base_training_args \
+--model_name_or_path $MODEL_PATH \
+--output_dir $output_dir \
+--data_dir $data_dir \
+--percentage $percentage \
+--data_seed $DATA_SEED \
+--per_device_train_batch_size $batch_size \
+--method $exp_data_selection \
+--subject $subject \
+--n_val $n_val \
+--n_eval $n_eval \
+--analysis_dataset $task \
+--learning_rate $exp_lr \
+--gradient_accumulation_steps $gradient_accumulation_steps \
+--seed $seed \
+--optim $optim"
+
+    if [[ -n "$train_dataset" ]]; then
+        training_args="$training_args --train_dataset_names $train_dataset"
+    fi
+
+    if [[ -n "$val_batch_size" ]]; then
+        training_args="$training_args --val_batch_size_for_selection $val_batch_size"
+    fi
+
+    if [ "$exp_use_lora" = true ]; then
+        training_args="$training_args --lora True --lora_alpha $lora_alpha --lora_r $lora_r --lora_dropout $lora_dropout --lora_target_modules q_proj k_proj v_proj o_proj"
+    else
+        training_args="$training_args --lora False"
+    fi
+
+    if [[ -n "$sparsification" ]]; then
+        training_args="$training_args --sparsification $sparsification"
+    fi
+    if [[ -n "$projection" ]]; then
+        training_args="$training_args --projection $projection"
+    fi
+    if [[ -n "$exp_compression" ]]; then
+        training_args="$training_args --update_compressor_freq $update_compressor_freq"
+    fi
+
+    if [[ "$exp_data_selection" != "NA" ]] && [ "$exp_use_second_order" = true ]; then
+        training_args="$training_args --use_second_order True"
+    fi
+
+    training_args="$training_args 2>&1 | tee $output_dir/train.log"
+
+    # Execute or print command
+    if [ "$dry_run" = true ]; then
+        echo "[DRY-RUN] Would execute: $header $training_args"
+    elif [ "$use_sbatch" = true ]; then
+        echo "Submitting with sbatch..."
+        # For sbatch, we need to write a temporary script or use sbatch --wrap
+        # For now, we'll use the current script with sbatch
+        echo "sbatch $0 (with current arguments)"
+        # Note: sbatch mode would need the script to be called without --sbatch
+        # This is a simplified version - in practice you might want separate handling
+    else
+        eval "$header" "$training_args"
+    fi
+}
+
+# ========================================
+# Main execution logic
+# ========================================
+if [[ -n "$experiments" ]]; then
+    # Multi-experiment mode
+    resolved_experiments=$(resolve_experiments "$experiments")
+
+    echo ""
+    echo "========================================================"
+    echo "  Multi-Experiment Mode"
+    echo "========================================================"
+    echo "Task: $task"
+    echo "Training data: ${train_dataset:-default}"
+    echo "Model: $model"
+    if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
+        echo "Subject: $subject"
+    fi
+    echo "Percentage: $percentage"
+    echo "Seed: $seed"
+    echo ""
+    echo "Training Settings:"
+    echo "  Batch size: $batch_size"
+    echo "  Val batch size: ${val_batch_size:-same as batch_size}"
+    echo "  Learning rate (full): $lr"
+    echo "  Learning rate (LoRA): $lr_lora"
+    echo "  N_val: $n_val"
+    echo ""
+    echo "Experiments to run: $resolved_experiments"
+    echo "========================================================"
+
+    # Count experiments
+    exp_count=$(echo "$resolved_experiments" | tr ',' '\n' | wc -l)
+    current=0
+
+    # Run each experiment
+    IFS=',' read -ra exp_list <<< "$resolved_experiments"
+    for exp_name in "${exp_list[@]}"; do
+        current=$((current + 1))
+        echo ""
+        echo "========================================================"
+        echo "  [$current/$exp_count] $exp_name"
+        echo "========================================================"
+
+        # Parse experiment definition
+        IFS=':' read -ra exp_parts <<< "${EXPERIMENT_DEFS[$exp_name]}"
+        exp_data_selection="${exp_parts[0]}"
+        exp_compression="${exp_parts[1]}"
+        exp_use_lora="${exp_parts[2]}"
+        exp_use_second_order="${exp_parts[3]}"
+
+        # Build config key for LR lookup
+        local train_str="${train_dataset:-default}"
+        local config_key="${train_str}_${task}"
+
+        # Look up learning rate from config
+        exp_lr=$(lookup_lr "$config_key" "$exp_name" "$exp_use_lora")
+
+        run_single_experiment "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$exp_lr" "$exp_name"
+    done
+
+    echo ""
+    echo "========================================================"
+    echo "  All experiments completed!"
+    echo "========================================================"
+    echo "Total: $exp_count experiments"
+
+else
+    # Single experiment mode (original behavior)
+
+    # ========================================
+    # Update base_training_args with user-specified Flash Attention setting
+    # ========================================
+    if [ "$use_flash_attention" = true ]; then
+        base_training_args="${base_training_args/--use_flash_attention=False/--use_flash_attention=True}"
+    fi
+
+    # ========================================
+    # Compression Configuration
+    # ========================================
 # Compression implies MeSO optimizer. No compression = standard optimizer.
 
 # Validate and configure compression method
@@ -291,6 +729,13 @@ fi
 # Build train string for job name
 train_str="${train_dataset:-default}"
 
+# Build experiment name for LR lookup
+exp_name="${data_selection}-${compression:-NA}-${job_type}"
+
+# Look up learning rate from config
+config_key="${train_str}_${task}"
+lr=$(lookup_lr "$config_key" "$exp_name" "$use_lora")
+
 # For MMLU/BBH, include subject in job name
 if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
     JOB_NAME="${train_str}_${task}_${subject}-${method_str}-${model}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
@@ -323,8 +768,17 @@ else
     echo "  Optimizer: AdamW (standard)"
 fi
 echo ""
+# Indicate LR source
+if [[ -n "$lr_override" ]]; then
+    lr_source="(--lr override)"
+elif [[ -f "$lr_config_file" ]]; then
+    lr_source="(from $lr_config_file)"
+else
+    lr_source="(fallback default)"
+fi
+
 echo "Batch size: $batch_size (val: ${val_batch_size:-$batch_size})"
-echo "Learning rate: $lr"
+echo "Learning rate: $lr $lr_source"
 echo "Data percentage: $percentage"
 echo "Validation examples: $n_val"
 echo "Evaluation examples: $n_eval"
@@ -418,3 +872,5 @@ fi
 training_args="$training_args 2>&1 | tee $output_dir/train.log"
 
 eval "$header" "$training_args"
+
+fi  # End of single/multi experiment mode
