@@ -63,16 +63,16 @@ data_selection="NA"
 optim="adamw_torch"
 data_dir="SFT/data"
 sweep_percentage=0.05  # Use 5% of data for LR sweep
-n_val=5
+n_val=8
 n_eval=100  # Fewer eval examples for speed
 model="llama3-1b"
-batch_size=4
+batch_size=8
 val_batch_size=""
 seed=42
 gradient_accumulation_steps=1
 task="mmlu"
 train_dataset=""
-subject="world_religions"
+subject="sociology"
 compression=""
 use_second_order=false
 use_lora=false
@@ -317,7 +317,7 @@ try:
     if results and len(results) > 0:
         last_val_loss = results[-1].get('val_loss')
         if last_val_loss is not None:
-            print(f'{last_val_loss:.6f}')
+            print(f'{last_val_loss:.10e}')
         else:
             sys.exit(1)
     else:
@@ -348,8 +348,8 @@ except:
 # ========================================
 is_valid_number() {
     local val="$1"
-    # Check if it's a valid floating point number
-    [[ "$val" =~ ^[0-9]+\.?[0-9]*$ ]]
+    # Check if it's a valid floating point number (including scientific notation)
+    [[ "$val" =~ ^[0-9]+\.?[0-9]*([eE][+-]?[0-9]+)?$ ]]
 }
 
 # ========================================
@@ -556,9 +556,13 @@ EOF
 # Main execution
 # ========================================
 
-# Build config key
+# Build config key (includes subject for mmlu/bbh)
 train_str="${train_dataset:-default}"
-config_key="${train_str}_${task}"
+if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
+    config_key="${train_str}_${task}_${subject}"
+else
+    config_key="${train_str}_${task}"
+fi
 
 echo ""
 echo "========================================================"

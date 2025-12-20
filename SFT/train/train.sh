@@ -31,7 +31,7 @@ export base_training_args="--do_train=True \
 --warmup_ratio=0.03 \
 --weight_decay=0.0 \
 --logging_steps=1 \
---eval_steps=100 \
+--eval_steps=50 \
 --eval_strategy=steps \
 --save_strategy=no \
 --num_train_epochs=1 \
@@ -50,10 +50,10 @@ data_selection="NA"  # NA, Streaming (per-layer), or GREATS (global)
 optim="adamw_torch"  # Standard HF optimizer (adamw_torch, adamw_hf, etc.)
 data_dir="SFT/data"
 percentage=0.05
-n_val=5
+n_val=8
 n_eval=500
 model="llama3-1b"
-batch_size=4
+batch_size=8
 val_batch_size=""  # Defaults to batch_size if not specified
 lr=""  # Learning rate (looked up from lr_config.json if not specified)
 seed=42
@@ -64,7 +64,7 @@ lr_override=""  # Set when --lr is explicitly passed
 gradient_accumulation_steps=1
 task="mmlu"
 train_dataset=""  # Training dataset (if empty, uses task-based default)
-subject="world_religions"
+subject="sociology"
 compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer.
 use_second_order=false  # If true, use greedy selection with second-order interactions
 use_lora=false
@@ -625,9 +625,13 @@ if [[ -n "$experiments" ]]; then
         exp_use_lora="${exp_parts[2]}"
         exp_use_second_order="${exp_parts[3]}"
 
-        # Build config key for LR lookup
-        local train_str="${train_dataset:-default}"
-        local config_key="${train_str}_${task}"
+        # Build config key for LR lookup (includes subject for mmlu/bbh)
+        train_str="${train_dataset:-default}"
+        if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
+            config_key="${train_str}_${task}_${subject}"
+        else
+            config_key="${train_str}_${task}"
+        fi
 
         # Look up learning rate from config
         exp_lr=$(lookup_lr "$config_key" "$exp_name" "$exp_use_lora")
@@ -732,8 +736,12 @@ train_str="${train_dataset:-default}"
 # Build experiment name for LR lookup
 exp_name="${data_selection}-${compression:-NA}-${job_type}"
 
-# Look up learning rate from config
-config_key="${train_str}_${task}"
+# Look up learning rate from config (includes subject for mmlu/bbh)
+if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
+    config_key="${train_str}_${task}_${subject}"
+else
+    config_key="${train_str}_${task}"
+fi
 lr=$(lookup_lr "$config_key" "$exp_name" "$use_lora")
 
 # For MMLU/BBH, include subject in job name
