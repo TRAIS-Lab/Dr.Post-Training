@@ -1,301 +1,203 @@
 # Memory and Performance Benchmark
 
-Comprehensive benchmarking suite for comparing memory usage and throughput across different fine-tuning methods on Llama-3.2-1B.
+Comprehensive benchmarking suite for comparing memory usage and throughput across different fine-tuning methods.
 
 ## Overview
 
 This benchmark measures:
 - **Peak memory usage** during training
 - **Training throughput** (samples/second)
-- **Detailed timing breakdown** (forward, backward, optimizer, data selection)
-- **Memory growth analysis** across iterations
+- **Average time per iteration** (milliseconds)
+
+## Naming Convention
+
+Methods follow the pattern: `{selection}_{compression}_{training}`
+
+| Component     | Options                     | Description                                   |
+| ------------- | --------------------------- | --------------------------------------------- |
+| `selection`   | `NA`, `Streaming`, `GREATS` | Data selection method                         |
+| `compression` | `NA`, `LoGra`               | Gradient compression (implies MeSO optimizer) |
+| `training`    | `full`, `lora`              | Full fine-tuning or LoRA                      |
+
+> **Note:** GraSS compression is also available but LoGra is used in default experiments.
 
 ## Methods Tested
 
-### Full Fine-Tuning Methods
-| Index | Method                   | Description                              |
-| ----- | ------------------------ | ---------------------------------------- |
-| 0     | Full + SGD               | Standard SGD optimizer                   |
-| 1     | Full + SGD + GC          | SGD with gradient checkpointing          |
-| 2     | Full + SGD-momentum      | SGD with momentum (0.9)                  |
-| 3     | Full + SGD-momentum + GC | SGD-momentum with gradient checkpointing |
-| 4     | Full + AdamW             | Standard AdamW optimizer                 |
-| 5     | Full + AdamW + GC        | AdamW with gradient checkpointing        |
-| 6     | Full + MeSO              | Memory-efficient Stateful Optimizer      |
-| 7     | Full + MeSO + GC         | MeSO with gradient checkpointing         |
-| 8     | Full + GaLore            | GaLore optimizer (rank=128)              |
-| 9     | Full + GaLore + GC       | GaLore with gradient checkpointing       |
+### Gradient Streaming Methods (10 configurations)
 
-### LoRA Methods
-| Index | Method                   | Description                                       |
-| ----- | ------------------------ | ------------------------------------------------- |
-| 10    | LoRA + SGD               | LoRA (r=256) with SGD                             |
-| 11    | LoRA + SGD + GC          | LoRA with SGD and gradient checkpointing          |
-| 12    | LoRA + SGD-momentum      | LoRA with SGD-momentum                            |
-| 13    | LoRA + SGD-momentum + GC | LoRA with SGD-momentum and gradient checkpointing |
-| 14    | LoRA + AdamW             | LoRA with AdamW                                   |
-| 15    | LoRA + AdamW + GC        | LoRA with AdamW and gradient checkpointing        |
+| #   | Method                       | Description                               |
+| --- | ---------------------------- | ----------------------------------------- |
+| 1a  | `NA_NA_full`                 | Baseline full fine-tuning (AdamW)         |
+| 1b  | `NA_NA_lora`                 | Baseline LoRA fine-tuning (AdamW)         |
+| 2a  | `Streaming_NA_full`          | Per-layer selection, full gradients       |
+| 2b  | `Streaming_NA_lora`          | Per-layer selection, full gradients, LoRA |
+| 3a  | `GREATS_NA_full`             | Global selection, full gradients          |
+| 3b  | `GREATS_NA_lora`             | Global selection, full gradients, LoRA    |
+| 4   | `Streaming_LoGra_full`       | Per-layer selection + MeSO                |
+| 5   | `GREATS_LoGra_full`          | Global selection + MeSO                   |
+| 6a  | `Streaming_LoGra_full` + 2nd | Per-layer + MeSO + second-order selection |
+| 6b  | `GREATS_LoGra_full` + 2nd    | Global + MeSO + second-order selection    |
 
-### Data Selection Methods (GREATS)
-| Index | Method             | Description                                         |
-| ----- | ------------------ | --------------------------------------------------- |
-| 16    | Full + GREATS      | Full fine-tuning with GREATS data selection         |
-| 17    | Full + GREATS + GC | GREATS with gradient checkpointing                  |
-| 18    | LoRA + GREATS      | LoRA with GREATS data selection                     |
-| 19    | LoRA + GREATS + GC | LoRA + GREATS with gradient checkpointing           |
-| 20    | MeSO + GREATS      | MeSO with GREATS (33% speedup from gradient reuse!) |
-| 21    | MeSO + GREATS + GC | MeSO + GREATS with gradient checkpointing           |
+**Key design principles:**
+- **LoRA doesn't need compression** - already low-rank
+- **Compression controls both scoring AND optimizer** - with compression uses MeSO, without uses AdamW
+
+### Gradient Checkpointing Variants
+
+All selection methods have `_gc` variants with gradient checkpointing enabled:
+
+| Method                    | Description                     |
+| ------------------------- | ------------------------------- |
+| `Streaming_NA_full_gc`    | Streaming + full gradients + GC |
+| `Streaming_NA_lora_gc`    | Streaming + LoRA + GC           |
+| `Streaming_LoGra_full_gc` | Streaming + MeSO + GC           |
+| `GREATS_NA_full_gc`       | GREATS + full gradients + GC    |
+| `GREATS_NA_lora_gc`       | GREATS + LoRA + GC              |
+| `GREATS_LoGra_full_gc`    | GREATS + MeSO + GC              |
 
 **Note:** GC = Gradient Checkpointing (reduces memory at cost of ~30% slower training)
 
+### External Baselines (for comparison)
+
+#### Full Fine-Tuning
+| Method                 | Description                                |
+| ---------------------- | ------------------------------------------ |
+| `full_sgd`             | Full fine-tuning with SGD                  |
+| `full_sgd_momentum`    | Full fine-tuning with SGD + momentum (0.9) |
+| `full_sgd_gc`          | SGD with gradient checkpointing            |
+| `full_sgd_momentum_gc` | SGD-momentum with gradient checkpointing   |
+
+#### LoRA
+| Method                 | Description                                     |
+| ---------------------- | ----------------------------------------------- |
+| `lora_sgd`             | LoRA with SGD                                   |
+| `lora_sgd_momentum`    | LoRA with SGD + momentum                        |
+| `lora_sgd_gc`          | LoRA + SGD with gradient checkpointing          |
+| `lora_sgd_momentum_gc` | LoRA + SGD-momentum with gradient checkpointing |
+
 ## Quick Start
 
-### List Available Methods
-```bash
-python benchmark.py --list
-```
+### Using benchmark.sh (Recommended)
 
-### Run Single Method
-```bash
-# Test MeSO (method index 6)
-python benchmark.py --method 6
-
-# Test MeSO + GREATS (method index 20)
-python benchmark.py --method 20
-```
-
-### Run All Methods (Sequential)
-```bash
-# Run all 22 methods sequentially (takes ~2-3 hours on A100)
-python benchmark.py
-```
-
-### Parallel Execution (Recommended)
-For faster results, run methods in parallel across multiple GPUs:
+**IMPORTANT:** Always use `benchmark.sh` instead of running `benchmark.py` directly. The shell script runs each method in a separate Python process and clears GPU memory between runs, ensuring accurate memory measurements.
 
 ```bash
-# GPU 0: Run methods 0-5
-CUDA_VISIBLE_DEVICES=0 python benchmark.py --method 0 &
-CUDA_VISIBLE_DEVICES=0 python benchmark.py --method 1 &
-# ... (repeat for methods 0-5)
+# List available methods
+bash benchmark.sh --list
 
-# GPU 1: Run methods 6-11
-CUDA_VISIBLE_DEVICES=1 python benchmark.py --method 6 &
-CUDA_VISIBLE_DEVICES=1 python benchmark.py --method 7 &
-# ... (repeat for methods 6-11)
-```
-
-Or use the provided script:
-```bash
+# Run default methods (NA_NA_full, Streaming_LoGra_full)
 bash benchmark.sh
+
+# Run specific methods
+bash benchmark.sh --methods NA_NA_full Streaming_LoGra_full GREATS_LoGra_full
+
+# Run all methods
+bash benchmark.sh --all
+
+# Run with custom configuration
+bash benchmark.sh --methods GREATS_LoGra_full --batch-size 32 --num-iterations 20
+
+# Run with second-order selection enabled
+bash benchmark.sh --methods GREATS_LoGra_full --use-second-order
 ```
 
-### Aggregate Results
-After running individual methods, combine results:
+### Why Use benchmark.sh?
+
+Running multiple methods in a single Python process can lead to:
+- **Memory not being fully released** between runs
+- **Inaccurate peak memory measurements** due to cached allocations
+- **Inconsistent timing** due to JIT compilation state
+
+The `benchmark.sh` script solves these issues by:
+1. Running each method in a fresh Python process
+2. Explicitly clearing GPU memory between runs
+3. Aggregating results into a single summary table
+
+### Direct Python Usage (Single Method Only)
+
+For running a single method (where memory cleanup is not an issue):
+
 ```bash
-python benchmark.py --aggregate
+python benchmark.py --methods NA_NA_full --output results.json
 ```
 
-This generates:
-- `benchmark.json`: Aggregated results from all runs
-- Console output: Formatted comparison table
+## Command-Line Arguments
 
-## Results Folder Structure
+### Method Selection
+- `--methods <method1> <method2> ...` - Methods to benchmark (default: `NA_NA_full Streaming_LoGra_full`)
+- `--all` - Run all available methods
+- `--list` - List all available methods and exit
 
-Results are automatically organized by configuration settings:
+### Model Configuration
+- `--model <name>` - Model name (default: `meta-llama/Llama-3.2-3B`)
+- `--dtype <type>` - Data type: `float32`, `bfloat16`, `float16` (default: `bfloat16`)
+- `--no-flash-attention` - Disable flash attention
+
+### Training Configuration
+- `--batch-size <n>` - Training batch size (default: 64)
+- `--seq-length <n>` - Sequence length (default: 64)
+- `--val-batch-size <n>` - Validation batch size for selection (default: 1)
+
+### Benchmark Configuration
+- `--num-warmup <n>` - Warmup iterations (default: 10)
+- `--num-iterations <n>` - Timed iterations (default: 10)
+- `--use-second-order` - Enable second-order selection (greedy, slower)
+
+### Output
+- `--output <file>` - Save results to JSON file
+- `--results-file <file>` - Append results to JSONL file (for aggregation)
+- `--print-summary <file>` - Print summary from results file and exit
+
+## Example Output
 
 ```
-results/
-├── fp32/                    # Float32 precision (default)
-│   ├── result_00.json
-│   ├── result_01.json
-│   └── ...
-├── bf16/                    # BFloat16 precision
-│   ├── result_00.json
-│   └── ...
-└── bf16_flashattn/          # BFloat16 + Flash Attention
-    ├── result_00.json
-    └── ...
-```
-
-**Subfolder naming:**
-- `fp32` - Float32 precision
-- `fp16` - Float16 precision
-- `bf16` - BFloat16 precision
-- `*_flashattn` - Configuration with Flash Attention enabled
-
-**Example workflow:**
-```bash
-# Run with default settings (fp32)
-python benchmark.py --method 6
-# Results saved to: results/fp32/result_06.json
-
-# Switch to Flash Attention + bfloat16
-# Edit benchmark.py:
-#   USE_FLASH_ATTENTION = True
-#   MODEL_DTYPE = torch.bfloat16
-
-python benchmark.py --method 6
-# Results saved to: results/bf16_flashattn/result_06.json
-
-# Aggregate all results (includes all configurations)
-python benchmark.py --aggregate
-# Shows comparison table with Config column
-```
-
-## Configuration
-
-### Model & Training Settings
-Edit constants in `benchmark.py` (lines 75-80):
-```python
-device = 'cuda'
-batch_size = 8              # Training batch size
-seq_length = 512            # Sequence length
-num_warmup_iterations = 10  # Warmup (not timed)
-num_timed_iterations = 10   # Timed iterations for throughput
-```
-
-### Flash Attention & Precision
-Edit model configuration in `benchmark.py` (lines 82-85):
-```python
-USE_FLASH_ATTENTION = False  # Set to True to enable Flash Attention 2
-MODEL_DTYPE = torch.float32  # Options: torch.float32, torch.bfloat16, torch.float16
-# Note: Flash Attention requires bfloat16 or float16 (not float32)
-```
-
-**Examples:**
-```python
-# Default: Standard attention with float32
-USE_FLASH_ATTENTION = False
-MODEL_DTYPE = torch.float32
-
-# Flash Attention with bfloat16 (recommended for A100/H100)
-USE_FLASH_ATTENTION = True
-MODEL_DTYPE = torch.bfloat16
-
-# Flash Attention with float16
-USE_FLASH_ATTENTION = True
-MODEL_DTYPE = torch.float16
-```
-
-### Profiling Flags
-Edit flags in `benchmark.py` (lines 87-90):
-```python
-ENABLE_DETAILED_PROFILING = True   # Show millisecond-level timing
-ENABLE_DATA_SELECTION = False      # Test with GREATS (deprecated, use --method 16-21)
-ENABLE_MEMORY_SNAPSHOT = False     # Capture memory snapshots for visualization
-```
-
-Or use command-line flags:
-```bash
-# Enable memory snapshot recording
-python benchmark.py --method 6 --memory-snapshot
-
-# Visualize memory snapshot
-python -m torch.utils.viz_memory memory_snapshots/Full_MeSO.pickle
-```
-
-## Benchmark Results
-
-After running `--aggregate`, results are displayed with configuration info:
-
-### Single Configuration
-```
-=======================================================================================================================================
-Benchmark Results (Total methods: 22 | Results directory: SFT/benchmark/results)
-=======================================================================================================================================
-Method                       Peak Mem   Sel(ms)   Fwd(ms)   Bwd(ms)   Opt(ms)   Total(ms)  Throughput
------------------------------------------------------------------------------------------------------------------------
-Full + SGD                   15.62 GB   -         154.7     282.4     14.3      454.4      17.55 samp/s
-Full + SGD + GC              9.48 GB    -         152.3     397.0     14.4      567.2      14.07 samp/s
-Full + SGD-momentum          17.92 GB   -         155.4     282.5     37.5      478.4      16.64 samp/s
-Full + SGD-momentum + GC     11.78 GB   -         152.5     397.6     37.3      590.6      13.52 samp/s
-Full + AdamW                 20.22 GB   -         154.5     283.8     91.6      532.9      14.96 samp/s
-Full + AdamW + GC            14.08 GB   -         154.2     400.2     91.7      649.2      12.30 samp/s
-Full + MeSO                  17.03 GB   -         154.5     325.0     41.1      523.6      15.22 samp/s
-Full + MeSO + GC             12.64 GB   -         152.5     439.6     40.6      635.9      12.55 samp/s
-Full + GaLore                15.98 GB   -         156.2     285.5     40.7      485.4      16.41 samp/s
-Full + GaLore + GC           9.84 GB    -         153.2     403.9     40.6      602.0      13.26 samp/s
-LoRA + SGD                   15.01 GB   -         171.6     211.5     1.2       387.4      20.55 samp/s
-LoRA + SGD + GC              9.55 GB    -         170.5     346.3     1.4       521.3      15.31 samp/s
-LoRA + SGD-momentum          15.11 GB   -         172.0     211.3     2.3       388.7      20.47 samp/s
-LoRA + SGD-momentum + GC     9.65 GB    -         172.7     346.1     2.4       524.3      15.22 samp/s
-LoRA + AdamW                 15.21 GB   -         172.7     211.2     5.3       392.1      20.26 samp/s
-LoRA + AdamW + GC            9.75 GB    -         169.8     346.0     4.9       523.6      15.24 samp/s
-Full + GREATS                18.23 GB   712.5     83.8      144.3     20.1      964.4      8.28 samp/s
-Full + GREATS + GC           13.78 GB   888.1     83.4      207.7     20.1      1202.4     6.65 samp/s
-LoRA + GREATS                18.88 GB   797.6     93.0      158.8     0.3       1052.9     7.58 samp/s
-LoRA + GREATS + GC           14.52 GB   1008.1    92.0      235.0     0.4       1338.4     5.97 samp/s
-MeSO + GREATS                17.36 GB   715.7     0.0       0.0       42.5      761.1      9.41 samp/s
-MeSO + GREATS + GC           12.91 GB   887.7     0.0       0.0       40.0      930.8      7.86 samp/s
-=======================================================================================================================
-Note: Sel(ms) = Data selection time (GREATS/GradNorm), includes val/train fwd/bwd + dot product
-
-=======================================================================================================================
-DETAILED SELECTION BREAKDOWN
-=======================================================================================================================
-Method                       Val Fwd    Val Bwd    Train Fwd   Train Bwd   Dot Prod    Greedy
------------------------------------------------------------------------------------------------------------------------
-Full + GREATS                84.6ms     141.4ms    155.0ms     324.9ms     5.4ms       0.4ms
-Full + GREATS + GC           83.8ms     205.0ms    153.7ms     439.6ms     5.4ms       0.4ms
-LoRA + GREATS                94.4ms     158.7ms    172.9ms     359.6ms     10.4ms      0.4ms
-LoRA + GREATS + GC           93.1ms     234.9ms    171.3ms     497.5ms     10.7ms      0.4ms
-MeSO + GREATS                85.1ms     141.8ms    155.7ms     325.0ms     5.4ms       0.4ms
-MeSO + GREATS + GC           82.7ms     204.7ms    153.1ms     439.8ms     4.9ms       0.3ms
-=======================================================================================================================
-Selection Components:
-  Val Fwd/Bwd:    Validation forward/backward pass (small batch)
-  Train Fwd/Bwd:  Training forward/backward pass (per-sample gradients)
-  Dot Prod:       Gradient similarity computation (layer-by-layer)
-  Greedy:         Greedy selection algorithm (choose top samples)
-=======================================================================================================================
-```
-
-### Multiple Configurations (Comparison)
-When aggregating results from multiple configurations (e.g., fp32 vs bf16_flashattn):
-```
-Configurations found:
-  bf16_flashattn: 3 methods
-  fp32: 3 methods
-
-==================================================================================================================================
-Benchmark Results (Total methods: 6 | Results directory: results)
-==================================================================================================================================
-Config           Method                       Peak Mem   Fwd(ms)   Bwd(ms)   Opt(ms)   Total(ms)  Throughput
-----------------------------------------------------------------------------------------------------------------------------------
-bf16_flashattn   Full + AdamW                 18.23 GB   421.3     685.2     108.5     1215.0     6.58 samp/s
-bf16_flashattn   Full + MeSO                  14.92 GB   492.1     656.8     41.7      1190.6     6.72 samp/s
-bf16_flashattn   Full + MeSO + GC             9.87 GB    493.5     1083.6    38.9      1616.0     4.95 samp/s
-fp32             Full + AdamW                 35.13 GB   825.2     1326.8    217.3     2374.6     3.34 samp/s
-fp32             Full + MeSO                  27.88 GB   984.4     1313.2    83.4      2386.3     3.35 samp/s
-fp32             Full + MeSO + GC             18.50 GB   985.5     2167.1    77.8      3235.1     2.47 samp/s
-==================================================================================================================================
-```
-
-**Key observations:**
-- Flash Attention + bfloat16 reduces memory by ~48% (18.23 GB vs 35.13 GB for Full + AdamW)
-- Speed improvement of ~2x (6.58 samp/s vs 3.34 samp/s)
-- Config column allows easy comparison across different precision/attention settings
+==============================================================================================================
+BENCHMARK SUMMARY (Aggregated)
+Model: meta-llama/Llama-3.2-3B | Batch: 4 | Val Batch: 1 | Seq: 512 | Dtype: bfloat16
+==============================================================================================================
+Method                       Peak Mem     Setup Mem    Time/Iter      Throughput       Total Time
+--------------------------------------------------------------------------------------------------------------
+NA_NA_full                   30.65 GB     5.98 GB      842.0 ms       4.75 samp/s      8.4 s
+NA_NA_lora                   18.07 GB     6.53 GB      553.6 ms       7.23 samp/s      5.5 s
+NA_NA_full_gc                30.43 GB     5.98 GB      1010.6 ms      3.96 samp/s      10.1 s
+NA_NA_lora_gc                11.42 GB     6.53 GB      763.4 ms       5.24 samp/s      7.6 s
+Streaming_NA_full            31.24 GB     5.99 GB      1057.5 ms      3.78 samp/s      10.6 s
+Streaming_NA_lora            19.56 GB     6.28 GB      619.3 ms       6.46 samp/s      6.2 s
+Streaming_NA_full_gc         30.55 GB     5.99 GB      1240.1 ms      3.23 samp/s      12.4 s
+Streaming_NA_lora_gc         11.56 GB     6.28 GB      827.4 ms       4.83 samp/s      8.3 s
+Streaming_LoGra_full         21.16 GB     7.58 GB      677.9 ms       5.90 samp/s      6.8 s
+Streaming_LoGra_full_gc      12.63 GB     7.58 GB      861.0 ms       4.65 samp/s      8.6 s
+GREATS_NA_full               33.06 GB     6.00 GB      1174.1 ms      3.41 samp/s      11.7 s
+GREATS_NA_lora               20.09 GB     6.28 GB      899.4 ms       4.45 samp/s      9.0 s
+GREATS_NA_full_gc            31.96 GB     6.00 GB      1440.7 ms      2.78 samp/s      14.4 s
+GREATS_NA_lora_gc            12.13 GB     6.28 GB      1210.2 ms      3.31 samp/s      12.1 s
+GREATS_LoGra_full            21.16 GB     7.58 GB      935.7 ms       4.28 samp/s      9.4 s
+GREATS_LoGra_full_gc         12.63 GB     7.58 GB      1211.2 ms      3.30 samp/s      12.1 s
+full_sgd                     16.58 GB     5.98 GB      648.8 ms       6.17 samp/s      6.5 s
+full_sgd_momentum            22.57 GB     5.98 GB      700.5 ms       5.71 samp/s      7.0 s
+lora_sgd                     16.96 GB     6.53 GB      537.5 ms       7.44 samp/s      5.4 s
+lora_sgd_momentum            17.51 GB     6.53 GB      542.7 ms       7.37 samp/s      5.4 s
+full_sgd_gc                  13.94 GB     5.98 GB      813.3 ms       4.92 samp/s      8.1 s
+full_sgd_momentum_gc         19.93 GB     5.98 GB      868.6 ms       4.61 samp/s      8.7 s
+lora_sgd_gc                  10.32 GB     6.53 GB      746.6 ms       5.36 samp/s      7.5 s
+lora_sgd_momentum_gc         10.87 GB     6.53 GB      753.3 ms       5.31 samp/s      7.5 s
 ```
 
 ## Key Features
 
-### 1. MeSO + GREATS Optimization
-Methods 20-21 implement the **gradient reuse optimization**:
-- Gradients computed during GREATS selection are reused for optimization
-- Avoids redundant forward/backward pass (33% speedup!)
-- Matches real `trainer.py` behavior
+### 1. MeSO + Selection Optimization
+When using compression (`LoGra`), the MeSO optimizer reuses compressed gradients:
+- Gradients computed during selection are reused for optimization
+- Avoids redundant forward/backward pass
+- Memory-efficient stateful optimization
 
-### 2. Memory Snapshots
-Capture detailed memory allocation traces:
-```bash
-python benchmark.py --method 6 --memory-snapshot
-python -m torch.utils.viz_memory memory_snapshots/Full_MeSO.pickle
-```
+### 2. Selection Methods
+- **Streaming**: Per-layer selection (single-pass, lower overhead)
+- **GREATS**: Global selection (two-pass, better selection quality)
+- **Second-order**: Greedy selection with pairwise similarity (slower but more accurate)
 
-### 3. Detailed Profiling
-When `ENABLE_DETAILED_PROFILING = True`:
-- Millisecond-level timing for each component
-- Memory delta tracking (forward/backward/optimizer)
-- Bottleneck analysis (identifies slowest component)
-- Data selection breakdown (val fwd/bwd, train fwd/bwd, dot product, greedy)
+### 3. Comparison with Baselines
+External baselines (SGD variants) are included for comprehensive comparison:
+- Memory usage across different optimizers
+- Throughput comparison with/without gradient checkpointing
+- LoRA vs full fine-tuning trade-offs

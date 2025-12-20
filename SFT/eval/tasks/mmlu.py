@@ -1,8 +1,19 @@
+"""
+MMLU evaluation module for multiple-choice question answering.
+
+Uses accuracy as the primary metric - measures next token prediction
+for answer choices (A, B, C, D).
+"""
+
 import torch
 import pandas as pd
+from tqdm import tqdm
 
 from SFT.data.get_val_dataset import load_unified_jsonl
-from utils import get_next_word_predictions, create_prompt_with_tulu_chat_format
+from ..utils import get_next_word_predictions, create_prompt_with_tulu_chat_format
+
+# Answer choices for MMLU
+CHOICES = ["A", "B", "C", "D"]
 
 
 def get_mmlu_dataset_df(data_dir: str, validation: bool = False, k: int = 5, subject: str = None):
@@ -77,8 +88,6 @@ def get_mmlu_dataset_df(data_dir: str, validation: bool = False, k: int = 5, sub
     df = pd.DataFrame(rows)
     return df
 
-choices = ["A", "B", "C", "D"]
-
 def format_subject(subject):
     l = subject.split("_")
     s = ""
@@ -91,7 +100,7 @@ def format_example(df, idx, include_answer=True):
     prompt = df.iloc[idx, 0]
     k = df.shape[1] - 2
     for j in range(k):
-        prompt += "\n{}. {}".format(choices[j], df.iloc[idx, j + 1])
+        prompt += "\n{}. {}".format(CHOICES[j], df.iloc[idx, j + 1])
     prompt += "\nAnswer:"
     if include_answer:
         prompt += " {}\n\n".format(df.iloc[idx, k + 1])
@@ -158,46 +167,91 @@ def eval_hf_model_generate_ICL_prompts(args, model, tokenizer, dev_df, test_df, 
 
 
 @torch.no_grad()
-def compute_accuracy(args, model, tokenizer, answer_choice_ids, batch_size=1):
+def compute_accuracy(args, model, tokenizer, batch_size=1):
+    """
+    Compute accuracy for MMLU evaluation.
 
-    dev_df = get_mmlu_dataset_df(data_dir='./data',
-                                 validation=True,
-                                 k = args.n_val,
-                                 subject = args.subject)
+    Args:
+        args: Arguments containing data_dir, n_test (or n_eval), n_val, subject
+        model: The model to evaluate
+        tokenizer: The tokenizer for the model
+        batch_size: Batch size for evaluation
 
-    eval_df = get_mmlu_dataset_df(data_dir='./data',
-                                 validation=False,
-                                 k = args.n_eval,
-                                 subject = args.subject)
+    Returns:
+        dict: Dictionary with accuracy, n_test
+    """
+    # Get data_dir from args, default to ./data
+    data_dir = getattr(args, 'data_dir', './data')
+    n_val = getattr(args, 'n_val', 5)  # Number of few-shot examples
+    n_test = getattr(args, 'n_test', -1)
+    if n_test <= 0:
+        n_test = 10000  # Load all available
+    subject = getattr(args, 'subject', None)
 
-    prompts = eval_hf_model_generate_ICL_prompts(args, model, tokenizer, dev_df, eval_df, batch_size=1)
+    # For compatibility with args that use n_eval instead of n_test
+    n_eval = getattr(args, 'n_eval', n_test)
 
-    # for prompt in prompts:
-    #     print('')
-    #     print('*** ICL Prompt Starts ***')
-    #     print(prompt)
-    #     print('*** ICL Prompt Ends ***')
+    # Store original args values for ICL prompt generation
+    args.n_val = n_val
+    args.n_eval = n_eval
+    if subject is None:
+        args.subject = "general"  # Default subject name for prompts
+    else:
+        args.subject = subject
 
-    # # get the answer for all examples
-    # # adding a prefix space here, as that's expected from the prompt
-    # # TODO: should raise a warning if this returns more than one token
-    # answer_choice_ids = [tokenizer.encode(
-    #     " " + answer_choice, add_special_tokens=False)[-1] for answer_choice in choices]
-
-    pred_indices, all_probs = get_next_word_predictions(
-        model, tokenizer, prompts, candidate_token_ids=answer_choice_ids, return_token_predictions=False, batch_size=batch_size
+    # Load validation set for few-shot examples
+    dev_df = get_mmlu_dataset_df(
+        data_dir=data_dir,
+        validation=True,
+        k=n_val,
+        subject=subject
     )
 
-    # get the metrics
-    cors = []
-    groud_truths = eval_df.iloc[:, -1].values
+    # Load test set for evaluation
+    eval_df = get_mmlu_dataset_df(
+        data_dir=data_dir,
+        validation=False,
+        k=n_eval,
+        subject=subject
+    )
+
+    print(f"Loaded {len(eval_df)} MMLU test examples (with {len(dev_df)} few-shot examples)")
+
+    # Generate ICL prompts
+    prompts = eval_hf_model_generate_ICL_prompts(args, model, tokenizer, dev_df, eval_df, batch_size=1)
+
+    # Get answer choice token IDs
+    # Adding a prefix space as expected from the prompt format
+    answer_choice_ids = [
+        tokenizer.encode(" " + choice, add_special_tokens=False)[-1]
+        for choice in CHOICES
+    ]
+
+    # Get predictions
+    pred_indices, _ = get_next_word_predictions(
+        model, tokenizer, prompts,
+        candidate_token_ids=answer_choice_ids,
+        return_token_predictions=False,
+        batch_size=batch_size
+    )
+
+    # Compute accuracy
+    correct = 0
+    ground_truths = eval_df.iloc[:, -1].values
     for i in range(len(pred_indices)):
-        prediction = choices[pred_indices[i]]
-        ground_truth = groud_truths[i]
-        cors.append(prediction == ground_truth)
+        prediction = CHOICES[pred_indices[i]]
+        ground_truth = ground_truths[i]
+        if prediction == ground_truth:
+            correct += 1
 
-    acc = torch.tensor(cors, dtype=torch.float32).mean().item()
-    cors = torch.tensor(cors)
+    accuracy = correct / len(pred_indices) if len(pred_indices) > 0 else 0.0
 
-    all_probs = torch.tensor(all_probs)
-    return cors, acc, all_probs
+    print(f"\nMMLU Evaluation Results:")
+    print(f"  Accuracy: {accuracy:.4f}")
+    print(f"  Examples evaluated: {len(pred_indices)}")
+
+    return {
+        "accuracy": accuracy,
+        "n_test": len(pred_indices),
+        "n_correct": correct,
+    }

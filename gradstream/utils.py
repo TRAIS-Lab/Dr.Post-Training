@@ -336,6 +336,8 @@ def topk_selection(scores, k: int):
     Returns:
     - selected_indices: Tensor of indices of the selected data points (on same device as scores).
     """
+    # Clamp k to avoid selecting more than available samples (e.g., last batch may be smaller)
+    k = min(k, scores.shape[0])
     _, selected_indices = torch.topk(scores, k, largest=True, sorted=False)
     return selected_indices
 
@@ -356,6 +358,8 @@ def greedy_selection(scores, interaction_matrix, k: int):
     Returns:
     - selected_indices: Tensor of indices of the selected data points (on same device as scores).
     """
+    # Clamp k to avoid selecting more than available samples (e.g., last batch may be smaller)
+    k = min(k, scores.shape[0])
     selected_indices = torch.empty(k, dtype=torch.long, device=scores.device)
     scores = scores.clone()
 

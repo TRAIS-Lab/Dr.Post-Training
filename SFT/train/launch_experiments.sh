@@ -15,7 +15,7 @@ set -e
 
 # Default values
 TASK="mmlu"
-TRAIN=""
+TRAIN="less"
 SUBJECT="sociology"
 MODEL="llama3-1b"
 DRY_RUN=false
@@ -24,15 +24,14 @@ PERCENTAGE="0.05"
 SEED="42"
 
 # Training hyperparameters
-BATCH_SIZE="4"
-VAL_BATCH_SIZE=""
+BATCH_SIZE="8"
+N_VAL="8"
+VAL_BATCH_SIZE="1"
 LR="5e-05"           # Learning rate for full fine-tuning
 LR_LORA="2e-04"      # Learning rate for LoRA (typically higher)
-N_VAL="5"
 
-# Compression settings
-COMPRESSION_GRASS="GraSS"
-COMPRESSION_LOGRA="LoGra"
+# Compression settings (using LoGra only)
+COMPRESSION="LoGra"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -217,10 +216,10 @@ run_cmd "1b. NA-NA-lora (Baseline LoRA Fine-tuning)" \
 # ============================================
 
 run_cmd "2a. Streaming-NA-full (Per-layer selection, full gradients)" \
-    "$FULL_ARGS --data_selection Streaming --selection_mode per_layer"
+    "$FULL_ARGS --data_selection Streaming"
 
 run_cmd "2b. Streaming-NA-lora (Per-layer selection, full gradients, LoRA)" \
-    "$LORA_ARGS --data_selection Streaming --selection_mode per_layer"
+    "$LORA_ARGS --data_selection Streaming"
 
 # ============================================
 # 3. GREATS without compression (GREATS-NA)
@@ -228,53 +227,36 @@ run_cmd "2b. Streaming-NA-lora (Per-layer selection, full gradients, LoRA)" \
 # ============================================
 
 run_cmd "3a. GREATS-NA-full (Global selection, full gradients)" \
-    "$FULL_ARGS --data_selection Streaming --selection_mode global"
+    "$FULL_ARGS --data_selection GREATS"
 
 run_cmd "3b. GREATS-NA-lora (Global selection, full gradients, LoRA)" \
-    "$LORA_ARGS --data_selection Streaming --selection_mode global"
+    "$LORA_ARGS --data_selection GREATS"
 
 # ============================================
-# 4. MeSO only (NA-{compression})
-#    No selection, compressed gradients
-# ============================================
-
-run_cmd "4a. NA-GraSS-full (MeSO only, GraSS)" \
-    "$FULL_ARGS --compression $COMPRESSION_GRASS"
-
-run_cmd "4b. NA-LoGra-full (MeSO only, LoGra)" \
-    "$FULL_ARGS --compression $COMPRESSION_LOGRA"
-
-# ============================================
-# 5. Streaming with compression (Streaming-{compression})
+# 4. Streaming with compression (Streaming-LoGra)
 #    Per-layer selection, MeSO
 # ============================================
 
-run_cmd "5a. Streaming-GraSS-full (Per-layer selection, MeSO)" \
-    "$FULL_ARGS --data_selection Streaming --selection_mode per_layer --compression $COMPRESSION_GRASS"
-
-run_cmd "5b. Streaming-LoGra-full (Per-layer selection, MeSO)" \
-    "$FULL_ARGS --data_selection Streaming --selection_mode per_layer --compression $COMPRESSION_LOGRA"
+run_cmd "4. Streaming-LoGra-full (Per-layer selection, MeSO)" \
+    "$FULL_ARGS --data_selection Streaming --compression $COMPRESSION"
 
 # ============================================
-# 6. GREATS with compression (GREATS-{compression})
+# 5. GREATS with compression (GREATS-LoGra)
 #    Global selection, MeSO
 # ============================================
 
-run_cmd "6a. GREATS-GraSS-full (Global selection, MeSO)" \
-    "$FULL_ARGS --data_selection Streaming --selection_mode global --compression $COMPRESSION_GRASS"
-
-run_cmd "6b. GREATS-LoGra-full (Global selection, MeSO)" \
-    "$FULL_ARGS --data_selection Streaming --selection_mode global --compression $COMPRESSION_LOGRA"
+run_cmd "5. GREATS-LoGra-full (Global selection, MeSO)" \
+    "$FULL_ARGS --data_selection GREATS --compression $COMPRESSION"
 
 # ============================================
-# 7. Second-order variants (optional)
+# 6. Second-order variants
 # ============================================
 
-run_cmd "7a. Streaming-GraSS-2nd-full (Per-layer, MeSO, second-order)" \
-    "$FULL_ARGS --data_selection Streaming --selection_mode per_layer --compression $COMPRESSION_GRASS --use_second_order"
+run_cmd "6a. Streaming-LoGra-2nd-full (Per-layer, MeSO, second-order)" \
+    "$FULL_ARGS --data_selection Streaming --compression $COMPRESSION --use_second_order"
 
-run_cmd "7b. GREATS-GraSS-2nd-full (Global, MeSO, second-order)" \
-    "$FULL_ARGS --data_selection Streaming --selection_mode global --compression $COMPRESSION_GRASS --use_second_order"
+run_cmd "6b. GREATS-LoGra-2nd-full (Global, MeSO, second-order)" \
+    "$FULL_ARGS --data_selection GREATS --compression $COMPRESSION --use_second_order"
 
 echo ""
 echo "========================================================"
@@ -283,13 +265,12 @@ echo "========================================================"
 echo ""
 echo "Naming convention: {selection}-{compression}-{training_type}"
 echo "  selection: NA (baseline), Streaming (per-layer), GREATS (global)"
-echo "  compression: NA (standard optimizer), GraSS, LoGra (MeSO optimizer)"
+echo "  compression: NA (standard optimizer), LoGra (MeSO optimizer)"
 echo "  training_type: full, lora"
 echo ""
-echo "Total configurations: 16"
+echo "Total configurations: 10"
 echo "  - 2 Baseline (NA-NA-full/lora)"
 echo "  - 4 Without compression (Streaming-NA, GREATS-NA) x (full, lora)"
-echo "  - 2 MeSO only (NA-GraSS, NA-LoGra) x full"
-echo "  - 4 With compression (Streaming, GREATS) x (GraSS, LoGra) x full"
-echo "  - 2 Second-order variants (Streaming-GraSS-2nd, GREATS-GraSS-2nd) x full"
+echo "  - 2 With compression (Streaming-LoGra, GREATS-LoGra) x full"
+echo "  - 2 Second-order (Streaming-LoGra-2nd, GREATS-LoGra-2nd) x full"
 echo ""

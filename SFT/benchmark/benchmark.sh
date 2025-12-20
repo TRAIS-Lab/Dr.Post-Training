@@ -1,14 +1,17 @@
 #!/bin/bash
-# Simplified benchmark launcher
+# Benchmark launcher with proper memory cleanup between runs
 # Each method runs in a separate Python process with GPU memory cleared between runs
 #
+# IMPORTANT: Always use this script instead of running benchmark.py directly
+# to ensure GPU memory is properly cleaned up between method runs.
+#
 # Usage:
-#   ./run_benchmark.sh [OPTIONS]
+#   bash benchmark.sh [OPTIONS]
 #
 # Examples:
-#   ./run_benchmark.sh --methods full_adamw full_meso
-#   ./run_benchmark.sh --all
-#   ./run_benchmark.sh --methods full_meso --batch-size 32 --num-iterations 20
+#   bash benchmark.sh --methods NA_NA_full Streaming_LoGra_full
+#   bash benchmark.sh --all
+#   bash benchmark.sh --methods GREATS_LoGra_full --batch-size 32 --num-iterations 20
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -44,11 +47,11 @@ for arg in "$@"; do
         CAPTURE_METHODS=true
     elif [ "$arg" = "--all" ]; then
         # Get all methods from --list output (column 2, skip header lines)
-        METHODS=($($PYTHON "$SCRIPT_DIR/benchmark_simple.py" --list 2>&1 | awk 'NR>3 && /^[0-9]/ {print $2}'))
+        METHODS=($($PYTHON "$SCRIPT_DIR/benchmark.py" --list 2>&1 | awk 'NR>3 && /^[0-9]/ {print $2}'))
         CAPTURE_METHODS=false
     elif [ "$arg" = "--list" ]; then
         # Just show the list and exit
-        $PYTHON "$SCRIPT_DIR/benchmark_simple.py" --list
+        $PYTHON "$SCRIPT_DIR/benchmark.py" --list
         exit 0
     elif [ "$CAPTURE_METHODS" = true ] && [[ "$arg" != --* ]]; then
         METHODS+=("$arg")
@@ -60,7 +63,7 @@ done
 
 # If no methods specified, use defaults
 if [ ${#METHODS[@]} -eq 0 ]; then
-    METHODS=("full_adamw" "full_meso")
+    METHODS=("NA_NA_full" "Streaming_LoGra_full")
 fi
 
 # Create a temp file for aggregating results
@@ -87,11 +90,11 @@ for METHOD in "${METHODS[@]}"; do
     $PYTHON -c "import torch; torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(); print(f'GPU cleared: {torch.cuda.memory_allocated()/1024**3:.3f} GB allocated')" 2>/dev/null || true
 
     # Run benchmark for this single method, appending to results file
-    $PYTHON "$SCRIPT_DIR/benchmark_simple.py" --methods "$METHOD" --results-file "$RESULTS_FILE" "${OTHER_ARGS[@]}"
+    $PYTHON "$SCRIPT_DIR/benchmark.py" --methods "$METHOD" --results-file "$RESULTS_FILE" "${OTHER_ARGS[@]}"
 
     echo ""
 done
 
 # Print aggregated summary table
 print_header "ALL BENCHMARKS COMPLETE"
-$PYTHON "$SCRIPT_DIR/benchmark_simple.py" --print-summary "$RESULTS_FILE"
+$PYTHON "$SCRIPT_DIR/benchmark.py" --print-summary "$RESULTS_FILE"

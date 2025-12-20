@@ -80,7 +80,7 @@ class TrainingArguments(TA):
 
 
     ### added ###
-    method: str = field(default='Streaming', metadata={"help": "training method: 'Streaming' (gradient streaming with data selection) or 'Regular' (standard training)"})
+    method: str = field(default='NA', metadata={"help": "Data selection method: 'NA' (no selection), 'Streaming' (per-layer selection), or 'GREATS' (global selection)"})
     selection_frac: float = field(default=1.0, metadata={"help": "training method"})
     subject: str = field(default='abstract_algebra', metadata={"help": "subject for evaluation"})
     n_val: int = field(default=5, metadata={"help": "number of validation data (for data selection)"})
@@ -121,17 +121,6 @@ class TrainingArguments(TA):
             "help": (
                 "Number of steps between projector refreshes. "
                 "Set to a large value (e.g., 1000000) to effectively disable refresh. Default: 200"
-            )
-        },
-    )
-    selection_mode: str = field(
-        default="per_layer",
-        metadata={
-            "help": (
-                "Data selection granularity for gradient streaming. "
-                "Options: 'per_layer' (Streaming) or 'global' (GREATS). "
-                "per_layer: Each layer independently selects samples (single-pass). "
-                "global: Accumulates scores across all layers, selects globally (two-pass)."
             )
         },
     )

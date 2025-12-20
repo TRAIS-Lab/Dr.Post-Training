@@ -81,8 +81,8 @@ class StreamingState:
         self.dtype = dtype
         self.use_second_order = use_second_order
 
-        # Number of samples to select
-        self.num_selected = int(train_batch_size * selection_frac)
+        # Number of samples to select (at least 1 to avoid empty batches)
+        self.num_selected = max(1, int(train_batch_size * selection_frac))
 
         # Running scores only needed for compute_scores_only mode (Streaming without MeSO)
         # For per-layer selection with MeSO, we compute scores directly in select_and_reduce
@@ -90,7 +90,8 @@ class StreamingState:
         self.similarity_matrix = None
         if compute_scores_only:
             self.grad_dot_scores = torch.zeros(train_batch_size, device=device, dtype=dtype)
-            if use_second_order and selection_method == 'Streaming':
+            if use_second_order:
+                # Initialize similarity matrix for both Streaming and GREATS when second-order is enabled
                 self.similarity_matrix = torch.zeros(train_batch_size, train_batch_size, device=device, dtype=dtype)
 
     def _update_scores(
@@ -122,7 +123,7 @@ class StreamingState:
         if self.similarity_matrix is not None:
             torch.addmm(self.similarity_matrix, train_grads, train_grads.t(), out=self.similarity_matrix)
 
-    def _update_scores_direct(self, scores: Tensor):
+    def _update_scores_direct(self, scores: Tensor, similarity: Tensor = None):
         """
         Update running scores directly with pre-computed score values.
 
@@ -130,6 +131,8 @@ class StreamingState:
 
         Args:
             scores: Pre-computed scores [train_batch_size]
+            similarity: Optional pairwise similarity matrix [train_batch_size, train_batch_size]
+                       Required when use_second_order=True
         """
         if self.grad_dot_scores is None:
             return
@@ -139,11 +142,17 @@ class StreamingState:
 
         self.grad_dot_scores += scores
 
+        # Update similarity matrix for second-order selection
+        if self.similarity_matrix is not None and similarity is not None:
+            if similarity.dtype != self.dtype:
+                similarity = similarity.to(self.dtype)
+            self.similarity_matrix += similarity
+
     def get_selected_indices(self) -> Tensor:
         """
         Get selected sample indices based on accumulated scores.
 
-        Only used when compute_scores_only=True (Streaming without MeSO).
+        Only used when compute_scores_only=True (global selection modes).
 
         Returns:
             Tensor of selected training sample indices
@@ -151,9 +160,9 @@ class StreamingState:
         if self.grad_dot_scores is None:
             raise RuntimeError("get_selected_indices called but running scores not enabled")
 
-        if self.selection_method == 'Streaming':
+        if self.selection_method in ('Streaming', 'GREATS'):
             scores = self.grad_dot_scores * self.lr
-            if self.use_second_order:
+            if self.use_second_order and self.similarity_matrix is not None:
                 similarity = self.similarity_matrix * (self.lr ** 2)
                 selected_indices = greedy_selection(scores, similarity, self.num_selected)
             else:
@@ -317,14 +326,38 @@ class StreamingLinearBackward(Function):
                         val_grad_full = torch.einsum('vo,vi->oi', val_grad_output, val_input)
                     val_grad_full = val_grad_full / val_grad_output.shape[0]
 
-                    # Compute per-sample scores: score[i] = <grad[i], val_grad>
+                    # Compute per-sample scores using ghost inner product
+                    # Instead of einsum('bso,bsi,oi->b'), use matmul which is more GPU-efficient
+                    # This computes: scores[b] = <grad_W[b], val_grad> = sum_s sum_o sum_i g[b,s,o]*x[b,s,i]*v[o,i]
+                    similarity = None
                     if train_grad_output.dim() == 3:
-                        scores = torch.einsum('bso,bsi,oi->b', train_grad_output, train_input, val_grad_full)
-                    else:
-                        scores = torch.einsum('bo,bi,oi->b', train_grad_output, train_input, val_grad_full)
+                        # Ghost inner product for train-val scores
+                        temp = train_input @ val_grad_full.T  # [B, S, I] @ [I, O] -> [B, S, O]
+                        scores = (train_grad_output * temp).sum(dim=(1, 2))  # [B]
 
-                    # Update running scores (for global selection mode)
-                    selection_state._update_scores_direct(scores)
+                        # Compute train-train similarity for second-order selection
+                        if selection_state.use_second_order and selection_state.similarity_matrix is not None:
+                            # Ghost inner product for pairwise similarity (GREATS formula)
+                            # contracted_grad[b] = sum_s g[b,s,o] * x[b,s,i] -> [B, O*I]
+                            contracted = torch.bmm(
+                                train_grad_output.permute(0, 2, 1),  # [B, O, S]
+                                train_input  # [B, S, I]
+                            ).flatten(start_dim=1)  # [B, O*I]
+                            similarity = torch.matmul(contracted, contracted.T)  # [B, B]
+                    else:
+                        # 2D case: same pattern but without sequence dimension
+                        temp = train_input @ val_grad_full.T  # [B, I] @ [I, O] -> [B, O]
+                        scores = (train_grad_output * temp).sum(dim=1)  # [B]
+
+                        # Compute train-train similarity for second-order selection
+                        if selection_state.use_second_order and selection_state.similarity_matrix is not None:
+                            # Ghost inner product: <g1 ⊗ x1, g2 ⊗ x2> = <g1, g2> * <x1, x2>
+                            dot_g = torch.matmul(train_grad_output, train_grad_output.T)  # [B, B]
+                            dot_x = torch.matmul(train_input, train_input.T)  # [B, B]
+                            similarity = dot_g * dot_x  # [B, B]
+
+                    # Update running scores (and similarity for second-order)
+                    selection_state._update_scores_direct(scores, similarity)
 
                     if not selection_state.compute_scores_only:
                         # Per-layer selection (Streaming mode)

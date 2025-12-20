@@ -1,11 +1,20 @@
 #!/usr/bin/env python
 """
-Simplified Memory and Performance Benchmark
+Memory and Performance Benchmark for Gradient Streaming
 
 Key metrics:
 1. Peak GPU memory (GB)
 2. Throughput (samples/sec)
 3. Avg time per iteration (ms)
+
+Naming convention follows the experimental configurations:
+  {selection}-{compression}-{training_type}
+
+  selection: NA (baseline), Streaming (per-layer), GREATS (global)
+  compression: NA (standard optimizer), LoGra (MeSO optimizer)
+  training_type: full, lora
+
+Note: GraSS compression is also available but LoGra is used in default experiments.
 
 Design principles:
 - Uses actual training code (no re-implementation)
@@ -19,7 +28,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, TaskType
-import sys
 import json
 import argparse
 import os
@@ -34,8 +42,6 @@ from gradstream.hook import GradientHook
 from gradstream.compressor import setup_model_compressors
 from gradstream.optimizer import MeSOAdamW
 from gradstream.utils import greedy_selection
-
-from SFT.benchmark.GaLore.galore_torch import GaLoreAdamW
 
 
 # =============================================================================
@@ -59,20 +65,11 @@ class BenchmarkConfig:
     num_warmup: int = 10
     num_iterations: int = 10
 
-    # MeSO config
-    meso_sparsifier_dim: int = 860
-    meso_projector_dim: int = 739600
-    meso_projector_type: str = "identity"
-    meso_update_freq: int = 200
-
     # LoRA config
     lora_rank: int = 256
     lora_alpha: int = 1
 
-    # GaLore config
-    galore_rank: int = 128
-
-    # GREATS config
+    # Selection config
     use_second_order: bool = False  # If True, use greedy selection with O(k*n) complexity
 
     # Device
@@ -354,21 +351,22 @@ class SelectionStepHelper:
         return {k: v.to(self.device) for k, v in batch.items()}
 
 
-def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: float = 0.5, use_second_order: bool = False):
+def make_step_streaming(selection_helper: SelectionStepHelper, selection_frac: float = 0.5, use_second_order: bool = False, has_compression: bool = True):
     """
-    Create a step function for pure GREATS selection (with standard optimizer).
+    Create a step function for Streaming (per-layer) selection.
 
-    This is a two-pass approach:
-    1. First pass: Compute per-sample gradient scores using compression
-    2. Second pass: Standard training on selected samples
+    Streaming mode: Single-pass approach with per-layer selection.
+    Each layer independently selects samples based on that layer's gradient alignment.
 
     Args:
         selection_helper: SelectionStepHelper instance for validation batches
         selection_frac: Fraction of samples to select
         use_second_order: If True, use greedy selection with second-order interactions.
+        has_compression: If True, uses MeSO optimizer (compressed gradients stored in hook).
+                        If False, uses standard optimizer (full gradients returned).
 
     Returns:
-        Step function for GREATS + standard optimizer
+        Step function for Streaming selection
     """
     def step_fn(model, optimizer, batch, grad_hook):
         model.train()
@@ -387,7 +385,66 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
 
         lr = optimizer.param_groups[0].get("lr", 5e-5)
 
-        # Pass 1: Compute selection scores using compressed gradients
+        # Streaming mode: single pass with per-layer selection and aggregation
+        grad_hook.setup_selection(
+            train_batch_size=train_batch_size,
+            selection_method='Streaming',
+            selection_frac=selection_frac,
+            lr=lr,
+            compute_scores_only=False,  # Per-layer selection and aggregation
+            use_second_order=use_second_order
+        )
+
+        optimizer.zero_grad()
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            outputs = model(**merged_batch)
+            loss = outputs.loss
+        loss.backward()
+
+        grad_hook.clear_selection()
+        optimizer.step()
+
+        return loss.item()
+
+    return step_fn
+
+
+def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: float = 0.5, use_second_order: bool = False, has_compression: bool = True):
+    """
+    Create a step function for GREATS (global) selection.
+
+    GREATS mode: Two-pass approach with global selection.
+    1. First pass: Accumulate scores across all layers
+    2. Second pass: Compute gradients on globally selected samples
+
+    Args:
+        selection_helper: SelectionStepHelper instance for validation batches
+        selection_frac: Fraction of samples to select
+        use_second_order: If True, use greedy selection with second-order interactions.
+        has_compression: If True, uses MeSO optimizer (compressed gradients stored in hook).
+                        If False, uses standard optimizer (full gradients returned).
+
+    Returns:
+        Step function for GREATS selection
+    """
+    def step_fn(model, optimizer, batch, grad_hook):
+        model.train()
+
+        # Get validation batch
+        val_batch = selection_helper.get_val_batch()
+        train_batch_size = batch['input_ids'].shape[0]
+
+        # Merge batches: [train_samples, val_samples]
+        merged_batch = {}
+        for key in batch.keys():
+            if key in val_batch:
+                merged_batch[key] = torch.cat([batch[key], val_batch[key]], dim=0)
+            else:
+                merged_batch[key] = batch[key]
+
+        lr = optimizer.param_groups[0].get("lr", 5e-5)
+
+        # Pass 1: Compute selection scores (accumulate across all layers)
         grad_hook.setup_selection(
             train_batch_size=train_batch_size,
             selection_method='GREATS',
@@ -403,11 +460,11 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
             loss_for_scoring = outputs.loss
         loss_for_scoring.backward()
 
-        # Get selected indices
+        # Get globally selected indices
         selected_indices = grad_hook.selection_state.get_selected_indices()
         grad_hook.clear_selection()
 
-        # Pass 2: Standard training on selected samples
+        # Pass 2: Compute gradients on selected samples
         filtered_batch = {
             'input_ids': batch['input_ids'][selected_indices],
             'attention_mask': batch['attention_mask'][selected_indices],
@@ -415,112 +472,19 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
         }
 
         optimizer.zero_grad()
+
+        if not has_compression:
+            # GREATS-NA: Disable hooks for full gradient computation
+            grad_hook.disable_hooks()
+
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             outputs = model(**filtered_batch)
             loss = outputs.loss
         loss.backward()
-        optimizer.step()
 
-        return loss.item()
+        if not has_compression:
+            grad_hook.enable_hooks()
 
-    return step_fn
-
-
-def make_step_meso_greats(selection_helper: SelectionStepHelper, selection_frac: float = 0.5, use_second_order: bool = False, selection_mode: str = 'per_layer'):
-    """
-    Create a step function for MeSO + GREATS selection.
-
-    Args:
-        selection_helper: SelectionStepHelper instance for validation batches
-        selection_frac: Fraction of samples to select
-        use_second_order: If True, use greedy selection with second-order interactions.
-                         If False (default), use simple top-k selection (~200x faster).
-        selection_mode: 'per_layer' (default) or 'full'.
-                       per_layer: Each layer independently selects samples (single pass).
-                       full: Accumulates scores across all layers, selects globally,
-                             then does second pass for compressed gradient computation.
-
-    Returns:
-        Step function for MeSO + GREATS
-    """
-    def step_fn(model, optimizer, batch, grad_hook):
-        model.train()
-
-        # Get validation batch
-        val_batch = selection_helper.get_val_batch()
-        train_batch_size = batch['input_ids'].shape[0]
-
-        # Merge batches: [train_samples, val_samples]
-        merged_batch = {}
-        for key in batch.keys():
-            if key in val_batch:
-                merged_batch[key] = torch.cat([batch[key], val_batch[key]], dim=0)
-            else:
-                merged_batch[key] = batch[key]
-
-        # Get learning rate
-        lr = optimizer.param_groups[0].get("lr", 5e-5)
-
-        if selection_mode == 'per_layer':
-            # Per-layer selection: single pass with on-the-fly selection and aggregation
-            # Each layer independently selects samples based on that layer's gradient alignment
-            grad_hook.setup_selection(
-                train_batch_size=train_batch_size,
-                selection_method='GREATS',
-                selection_frac=selection_frac,
-                lr=lr,
-                compute_scores_only=False,
-                use_second_order=use_second_order
-            )
-
-            # Forward + backward on merged batch
-            optimizer.zero_grad()
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                outputs = model(**merged_batch)
-                loss = outputs.loss
-            loss.backward()
-
-            # Clear selection state
-            grad_hook.clear_selection()
-
-        else:
-            # Full sample-level selection: two passes
-            # This approach doesn't use the block-diagonal approximation
-
-            # Pass 1: Accumulate scores across all layers
-            grad_hook.setup_selection(
-                train_batch_size=train_batch_size,
-                selection_method='GREATS',
-                selection_frac=selection_frac,
-                lr=lr,
-                compute_scores_only=True,  # Only accumulate scores
-                use_second_order=use_second_order
-            )
-
-            optimizer.zero_grad()
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                outputs = model(**merged_batch)
-                loss_for_scoring = outputs.loss
-            loss_for_scoring.backward()
-
-            # Get globally selected indices based on accumulated scores
-            selected_indices = grad_hook.selection_state.get_selected_indices()
-            grad_hook.clear_selection()
-
-            # Pass 2: Compute compressed gradients on selected samples
-            filtered_batch = {
-                'input_ids': batch['input_ids'][selected_indices],
-                'attention_mask': batch['attention_mask'][selected_indices],
-                'labels': batch['labels'][selected_indices]
-            }
-
-            optimizer.zero_grad()
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                outputs = model(**filtered_batch)
-                loss = outputs.loss
-            loss.backward()
-
-        # Optimizer step
         optimizer.step()
 
         return loss.item()
@@ -612,38 +576,6 @@ def setup_full_sgd_momentum_gc(config: BenchmarkConfig):
     model.train()
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-
-def setup_full_galore(config: BenchmarkConfig):
-    """Full fine-tuning with GaLore."""
-    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
-    if config.use_flash_attention:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
-    model.train()
-
-    # Separate parameters for GaLore
-    galore_params = []
-    regular_params = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if param.ndim == 2 and min(param.shape) >= 128:
-                galore_params.append(param)
-            else:
-                regular_params.append(param)
-
-    param_groups = [
-        {'params': regular_params},
-        {'params': galore_params, 'rank': config.galore_rank, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
-    ]
-
-    optimizer = GaLoreAdamW(param_groups, lr=5e-5)
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     tokenizer.pad_token = tokenizer.eos_token
@@ -816,40 +748,43 @@ def setup_lora_sgd_momentum_gc(config: BenchmarkConfig):
     return model, optimizer, tokenizer
 
 
-def setup_full_meso(config: BenchmarkConfig):
-    """Full fine-tuning with MeSO."""
-    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
-    if config.use_flash_attention:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
+def _setup_compression(model, config: BenchmarkConfig, use_meso_optimizer: bool = True):
+    """
+    Helper to set up compression (GraSS/LoGra) for a model.
 
-    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
-    model.train()
+    Args:
+        model: The model to set up compression for
+        config: Benchmark configuration
+        use_meso_optimizer: If True, return MeSOAdamW optimizer. If False, return standard AdamW.
 
+    Returns:
+        Tuple of (grad_hook, optimizer)
+    """
     layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Sample input for compressor setup
     sample_inputs = {k: v.to(config.device) for k, v in
                      tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
                      if k != 'labels'}
 
-    # Setup compression
+    # Setup compression (GraSS uses random_mask sparsifier + SJLT projection)
+    # Note: proj_dim is the factorized dimension (e.g., 1024 for random_mask-1024*1024)
     sparsifier_kwargs = {
-        "proj_dim": config.meso_sparsifier_dim,
-        "proj_max_batch_size": config.batch_size,
+        "proj_dim": 1024,  # Factorized: 1024*1024, so each dimension is 1024
+        "proj_max_batch_size": 64,  # Match train.py default
         "proj_seed": 42,
         "device": str(config.device),
         "proj_type": "random_mask",
     }
 
     projector_kwargs = {
-        "proj_dim": config.meso_projector_dim,
-        "proj_max_batch_size": config.batch_size,
+        "proj_dim": 256,  # SJLT projection dimension
+        "proj_max_batch_size": 64,  # Match train.py default
         "proj_seed": 42,
         "device": str(config.device),
-        "proj_type": config.meso_projector_type,
+        "proj_type": "sjlt",
     }
 
     compressors = setup_model_compressors(
@@ -859,7 +794,7 @@ def setup_full_meso(config: BenchmarkConfig):
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(config.device),
-        update_freq=config.meso_update_freq
+        update_freq=200  # Default update frequency
     )
 
     grad_hook = GradientHook(
@@ -870,20 +805,37 @@ def setup_full_meso(config: BenchmarkConfig):
     )
     grad_hook.set_compressors(compressors)
 
-    optimizer = MeSOAdamW(
-        model.parameters(),
-        grad_hook=grad_hook,
-        lr=5e-5,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0.0
-    )
+    if use_meso_optimizer:
+        optimizer = MeSOAdamW(
+            model.parameters(),
+            grad_hook=grad_hook,
+            lr=5e-5,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.0
+        )
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    return grad_hook, optimizer, tokenizer
+
+
+def setup_NA_GraSS_full(config: BenchmarkConfig):
+    """NA-GraSS-full: MeSO only (no selection, compressed optimizer)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=True)
 
     return model, optimizer, tokenizer, grad_hook
 
 
-def setup_full_meso_gc(config: BenchmarkConfig):
-    """Full fine-tuning with MeSO + gradient checkpointing."""
+def setup_NA_GraSS_full_gc(config: BenchmarkConfig):
+    """NA-GraSS-full with gradient checkpointing."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -892,6 +844,117 @@ def setup_full_meso_gc(config: BenchmarkConfig):
     model.gradient_checkpointing_enable()
     model.train()
 
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=True)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_Streaming_NA_full(config: BenchmarkConfig):
+    """Streaming-NA-full: Per-layer selection with full gradients (standard optimizer)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    # Need grad_hook for selection scoring but no compression, use standard optimizer
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=False)
+    # Clear compressors to use full gradients for the actual update
+    grad_hook.compressors = [None] * len(grad_hook.layer_names)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_Streaming_NA_full_gc(config: BenchmarkConfig):
+    """Streaming-NA-full with gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=False)
+    grad_hook.compressors = [None] * len(grad_hook.layer_names)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_GREATS_NA_full(config: BenchmarkConfig):
+    """GREATS-NA-full: Global selection with full gradients (standard optimizer)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    # Need grad_hook with compressors for scoring, but use standard optimizer
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=False)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_GREATS_NA_full_gc(config: BenchmarkConfig):
+    """GREATS-NA-full with gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=False)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_Streaming_GraSS_full(config: BenchmarkConfig):
+    """Streaming-GraSS-full: Per-layer selection + MeSO (GraSS)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=True)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_GREATS_GraSS_full(config: BenchmarkConfig):
+    """GREATS-GraSS-full: Global selection + MeSO (GraSS)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=True)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def _setup_logra_compression(model, config: BenchmarkConfig, use_meso_optimizer: bool = True):
+    """
+    Helper to set up LoGra compression for a model.
+
+    LoGra uses Gaussian random projection (normal) without additional projection.
+    This is different from GraSS which uses random_mask + SJLT projection.
+
+    Args:
+        model: The model to set up compression for
+        config: Benchmark configuration
+        use_meso_optimizer: If True, return MeSOAdamW optimizer. If False, return standard AdamW.
+
+    Returns:
+        Tuple of (grad_hook, optimizer, tokenizer)
+    """
     layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
@@ -901,20 +964,24 @@ def setup_full_meso_gc(config: BenchmarkConfig):
                      tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
                      if k != 'labels'}
 
+    # LoGra uses Gaussian projection (normal) without additional projection
+    # train.sh: sparsification="normal-512*512" means proj_dim=512 (factorized, applied to both dimensions)
+    # The actual dimension is 512, not 512*512 - see train.py parsing logic
     sparsifier_kwargs = {
-        "proj_dim": config.meso_sparsifier_dim,
-        "proj_max_batch_size": config.batch_size,
+        "proj_dim": 512,  # Factorized: 512*512, so each dimension is 512
+        "proj_max_batch_size": 64,  # Match train.py default
         "proj_seed": 42,
         "device": str(config.device),
-        "proj_type": "random_mask",
+        "proj_type": "normal",  # Gaussian random projection
     }
 
+    # No projector for LoGra (identity)
     projector_kwargs = {
-        "proj_dim": config.meso_projector_dim,
-        "proj_max_batch_size": config.batch_size,
+        "proj_dim": -1,  # Identity projection
+        "proj_max_batch_size": 64,
         "proj_seed": 42,
         "device": str(config.device),
-        "proj_type": config.meso_projector_type,
+        "proj_type": "identity",
     }
 
     compressors = setup_model_compressors(
@@ -924,7 +991,7 @@ def setup_full_meso_gc(config: BenchmarkConfig):
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(config.device),
-        update_freq=config.meso_update_freq
+        update_freq=200  # Default update frequency
     )
 
     grad_hook = GradientHook(
@@ -935,20 +1002,51 @@ def setup_full_meso_gc(config: BenchmarkConfig):
     )
     grad_hook.set_compressors(compressors)
 
-    optimizer = MeSOAdamW(
-        model.parameters(),
-        grad_hook=grad_hook,
-        lr=5e-5,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0.0
-    )
+    if use_meso_optimizer:
+        optimizer = MeSOAdamW(
+            model.parameters(),
+            grad_hook=grad_hook,
+            lr=5e-5,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.0
+        )
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    return grad_hook, optimizer, tokenizer
+
+
+def setup_NA_LoGra_full(config: BenchmarkConfig):
+    """NA-LoGra-full: MeSO only with LoGra compression (no selection)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_meso_optimizer=True)
 
     return model, optimizer, tokenizer, grad_hook
 
 
-def setup_full_adamw_gc(config: BenchmarkConfig):
-    """Full fine-tuning with AdamW + gradient checkpointing."""
+def setup_Streaming_LoGra_full(config: BenchmarkConfig):
+    """Streaming-LoGra-full: Per-layer selection + MeSO (LoGra)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_meso_optimizer=True)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_Streaming_LoGra_full_gc(config: BenchmarkConfig):
+    """Streaming-LoGra-full with gradient checkpointing."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -957,16 +1055,27 @@ def setup_full_adamw_gc(config: BenchmarkConfig):
     model.gradient_checkpointing_enable()
     model.train()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_meso_optimizer=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
+    return model, optimizer, tokenizer, grad_hook
 
 
-def setup_full_galore_gc(config: BenchmarkConfig):
-    """Full fine-tuning with GaLore + gradient checkpointing."""
+def setup_GREATS_LoGra_full(config: BenchmarkConfig):
+    """GREATS-LoGra-full: Global selection + MeSO (LoGra)."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_meso_optimizer=True)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_GREATS_LoGra_full_gc(config: BenchmarkConfig):
+    """GREATS-LoGra-full with gradient checkpointing."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -975,152 +1084,34 @@ def setup_full_galore_gc(config: BenchmarkConfig):
     model.gradient_checkpointing_enable()
     model.train()
 
-    galore_params = []
-    regular_params = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if param.ndim == 2 and min(param.shape) >= 128:
-                galore_params.append(param)
-            else:
-                regular_params.append(param)
-
-    param_groups = [
-        {'params': regular_params},
-        {'params': galore_params, 'rank': config.galore_rank, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
-    ]
-
-    optimizer = GaLoreAdamW(param_groups, lr=5e-5)
-
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, optimizer, tokenizer
-
-
-def setup_full_greats(config: BenchmarkConfig):
-    """Full fine-tuning with GREATS data selection (uses compression for gradient computation, AdamW optimizer)."""
-    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
-    if config.use_flash_attention:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
-    model.train()
-
-    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
-
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    sample_inputs = {k: v.to(config.device) for k, v in
-                     tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
-                     if k != 'labels'}
-
-    # Setup compression (needed for GREATS gradient computation)
-    sparsifier_kwargs = {
-        "proj_dim": config.meso_sparsifier_dim,
-        "proj_max_batch_size": config.batch_size,
-        "proj_seed": 42,
-        "device": str(config.device),
-        "proj_type": "random_mask",
-    }
-
-    projector_kwargs = {
-        "proj_dim": config.meso_projector_dim,
-        "proj_max_batch_size": config.batch_size,
-        "proj_seed": 42,
-        "device": str(config.device),
-        "proj_type": config.meso_projector_type,
-    }
-
-    compressors = setup_model_compressors(
-        model=model,
-        layer_names=layer_names,
-        sparsifier_kwargs=sparsifier_kwargs,
-        projector_kwargs=projector_kwargs,
-        sample_inputs=sample_inputs,
-        device=str(config.device),
-        update_freq=config.meso_update_freq
-    )
-
-    grad_hook = GradientHook(
-        model=model,
-        layer_names=layer_names,
-        device=str(config.device),
-        register_hooks=True
-    )
-    grad_hook.set_compressors(compressors)
-
-    # Use regular AdamW (not MeSOAdamW) - GREATS is just for data selection
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_meso_optimizer=True)
 
     return model, optimizer, tokenizer, grad_hook
 
 
-def setup_full_greats_gc(config: BenchmarkConfig):
-    """Full fine-tuning with GREATS data selection + gradient checkpointing."""
+def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_meso_optimizer: bool = True, use_gc: bool = False):
+    """
+    Helper to set up LoRA model with gradient hook for data selection.
+
+    Sets up the grad_hook infrastructure needed for selection scoring.
+    Note: For NA (no compression) variants, the compressors should be cleared
+    after calling this function to use full gradients.
+
+    Args:
+        config: Benchmark configuration
+        use_meso_optimizer: If True, return MeSOAdamW optimizer. If False, return standard AdamW.
+        use_gc: If True, enable gradient checkpointing.
+
+    Returns:
+        Tuple of (model, grad_hook, optimizer, tokenizer)
+    """
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
 
     model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
-    model.gradient_checkpointing_enable()
-    model.train()
-
-    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
-
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    sample_inputs = {k: v.to(config.device) for k, v in
-                     tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
-                     if k != 'labels'}
-
-    sparsifier_kwargs = {
-        "proj_dim": config.meso_sparsifier_dim,
-        "proj_max_batch_size": config.batch_size,
-        "proj_seed": 42,
-        "device": str(config.device),
-        "proj_type": "random_mask",
-    }
-
-    projector_kwargs = {
-        "proj_dim": config.meso_projector_dim,
-        "proj_max_batch_size": config.batch_size,
-        "proj_seed": 42,
-        "device": str(config.device),
-        "proj_type": config.meso_projector_type,
-    }
-
-    compressors = setup_model_compressors(
-        model=model,
-        layer_names=layer_names,
-        sparsifier_kwargs=sparsifier_kwargs,
-        projector_kwargs=projector_kwargs,
-        sample_inputs=sample_inputs,
-        device=str(config.device),
-        update_freq=config.meso_update_freq
-    )
-
-    grad_hook = GradientHook(
-        model=model,
-        layer_names=layer_names,
-        device=str(config.device),
-        register_hooks=True
-    )
-    grad_hook.set_compressors(compressors)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
-    return model, optimizer, tokenizer, grad_hook
-
-
-def setup_lora_greats(config: BenchmarkConfig):
-    """LoRA with GREATS data selection."""
-    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
-    if config.use_flash_attention:
-        model_kwargs['attn_implementation'] = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    if use_gc:
+        model.gradient_checkpointing_enable()
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -1145,20 +1136,21 @@ def setup_lora_greats(config: BenchmarkConfig):
                      tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
                      if k != 'labels'}
 
+    # GraSS compression: random_mask sparsifier + SJLT projection
     sparsifier_kwargs = {
-        "proj_dim": config.meso_sparsifier_dim,
-        "proj_max_batch_size": config.batch_size,
+        "proj_dim": 1024,  # Factorized: 1024*1024, so each dimension is 1024
+        "proj_max_batch_size": 64,  # Match train.py default
         "proj_seed": 42,
         "device": str(config.device),
         "proj_type": "random_mask",
     }
 
     projector_kwargs = {
-        "proj_dim": config.meso_projector_dim,
-        "proj_max_batch_size": config.batch_size,
+        "proj_dim": 256,  # SJLT projection dimension
+        "proj_max_batch_size": 64,  # Match train.py default
         "proj_seed": 42,
         "device": str(config.device),
-        "proj_type": config.meso_projector_type,
+        "proj_type": "sjlt",
     }
 
     compressors = setup_model_compressors(
@@ -1168,7 +1160,7 @@ def setup_lora_greats(config: BenchmarkConfig):
         projector_kwargs=projector_kwargs,
         sample_inputs=sample_inputs,
         device=str(config.device),
-        update_freq=config.meso_update_freq
+        update_freq=200  # Default update frequency
     )
 
     grad_hook = GradientHook(
@@ -1179,132 +1171,156 @@ def setup_lora_greats(config: BenchmarkConfig):
     )
     grad_hook.set_compressors(compressors)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+    if use_meso_optimizer:
+        optimizer = MeSOAdamW(
+            model.parameters(),
+            grad_hook=grad_hook,
+            lr=5e-5,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.0
+        )
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
+    return model, grad_hook, optimizer, tokenizer
+
+
+def setup_Streaming_NA_lora(config: BenchmarkConfig):
+    """Streaming-NA-lora: Per-layer selection with full gradients, LoRA."""
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False)
+    # Clear compressors to use full gradients for the actual update
+    grad_hook.compressors = [None] * len(grad_hook.layer_names)
     return model, optimizer, tokenizer, grad_hook
 
 
-def setup_lora_greats_gc(config: BenchmarkConfig):
-    """LoRA with GREATS data selection + gradient checkpointing."""
+def setup_Streaming_NA_lora_gc(config: BenchmarkConfig):
+    """Streaming-NA-lora with gradient checkpointing."""
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False, use_gc=True)
+    grad_hook.compressors = [None] * len(grad_hook.layer_names)
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_GREATS_NA_lora(config: BenchmarkConfig):
+    """GREATS-NA-lora: Global selection with full gradients, LoRA."""
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False)
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_GREATS_NA_lora_gc(config: BenchmarkConfig):
+    """GREATS-NA-lora with gradient checkpointing."""
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False, use_gc=True)
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_Streaming_GraSS_lora(config: BenchmarkConfig):
+    """Streaming-GraSS-lora: Per-layer selection + MeSO, LoRA."""
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=True)
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_GREATS_GraSS_lora(config: BenchmarkConfig):
+    """GREATS-GraSS-lora: Global selection + MeSO, LoRA."""
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=True)
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_full_adamw_gc(config: BenchmarkConfig):
+    """Full fine-tuning with AdamW + gradient checkpointing."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
 
     model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
     model.gradient_checkpointing_enable()
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=config.lora_rank,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=0.1,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
-    )
-    model = get_peft_model(model, lora_config)
-    model = model.to(config.get_torch_dtype())
     model.train()
 
-    layer_names = [n for n, m in model.named_modules()
-                   if isinstance(m, nn.Linear) and ('lora_A' in n or 'lora_B' in n)]
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
-    sample_inputs = {k: v.to(config.device) for k, v in
-                     tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
-                     if k != 'labels'}
-
-    sparsifier_kwargs = {
-        "proj_dim": config.meso_sparsifier_dim,
-        "proj_max_batch_size": config.batch_size,
-        "proj_seed": 42,
-        "device": str(config.device),
-        "proj_type": "random_mask",
-    }
-
-    projector_kwargs = {
-        "proj_dim": config.meso_projector_dim,
-        "proj_max_batch_size": config.batch_size,
-        "proj_seed": 42,
-        "device": str(config.device),
-        "proj_type": config.meso_projector_type,
-    }
-
-    compressors = setup_model_compressors(
-        model=model,
-        layer_names=layer_names,
-        sparsifier_kwargs=sparsifier_kwargs,
-        projector_kwargs=projector_kwargs,
-        sample_inputs=sample_inputs,
-        device=str(config.device),
-        update_freq=config.meso_update_freq
-    )
-
-    grad_hook = GradientHook(
-        model=model,
-        layer_names=layer_names,
-        device=str(config.device),
-        register_hooks=True
-    )
-    grad_hook.set_compressors(compressors)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-
-    return model, optimizer, tokenizer, grad_hook
+    return model, optimizer, tokenizer
 
 
 # =============================================================================
 # Method Registry
 # =============================================================================
 
-# Methods that use standard step function
-STANDARD_METHODS = {
-    'full_adamw': setup_full_adamw,
+# Naming convention: {selection}_{compression}_{training}
+#   selection: NA (baseline), Streaming (per-layer), GREATS (global)
+#   compression: NA (standard optimizer), GraSS, LoGra (MeSO optimizer)
+#   training: full, lora
+
+# === Baseline Methods (NA-NA-*) ===
+# No selection, no compression, standard optimizer
+BASELINE_METHODS = {
+    'NA_NA_full': setup_full_adamw,              # Standard full fine-tuning
+    'NA_NA_lora': setup_lora_adamw,              # Standard LoRA fine-tuning
+    'NA_NA_full_gc': setup_full_adamw_gc,        # With gradient checkpointing
+    'NA_NA_lora_gc': setup_lora_adamw_gc,
+}
+
+# === MeSO Only Methods (NA-{compression}-*) ===
+# Note: Compression without selection doesn't provide meaningful benefit,
+# so we don't include NA-LoGra-full or NA-GraSS-full configurations.
+# These would just add compression overhead without the selection benefit.
+MESO_ONLY_METHODS = {
+}
+
+# === Streaming Selection Methods (Streaming-*-*) ===
+# Per-layer selection (single-pass)
+# Format: method_name -> (setup_fn, selection_frac, has_compression)
+# Note: LoRA doesn't need compression (already low-rank), so no Streaming_LoGra_lora
+# Note: We use LoGra (not GraSS) as the compression method
+STREAMING_METHODS = {
+    # Streaming-NA: Per-layer selection with full gradients
+    'Streaming_NA_full': (setup_Streaming_NA_full, 0.5, False),
+    'Streaming_NA_lora': (setup_Streaming_NA_lora, 0.5, False),
+    'Streaming_NA_full_gc': (setup_Streaming_NA_full_gc, 0.5, False),
+    'Streaming_NA_lora_gc': (setup_Streaming_NA_lora_gc, 0.5, False),
+    # Streaming-LoGra: Per-layer selection with MeSO (full fine-tuning only)
+    'Streaming_LoGra_full': (setup_Streaming_LoGra_full, 0.5, True),
+    'Streaming_LoGra_full_gc': (setup_Streaming_LoGra_full_gc, 0.5, True),
+}
+
+# === GREATS Selection Methods (GREATS-*-*) ===
+# Global selection (two-pass)
+# Format: method_name -> (setup_fn, selection_frac, has_compression)
+# Note: LoRA doesn't need compression (already low-rank), so no GREATS_LoGra_lora
+# Note: We use LoGra (not GraSS) as the compression method
+GREATS_METHODS = {
+    # GREATS-NA: Global selection with full gradients
+    'GREATS_NA_full': (setup_GREATS_NA_full, 0.5, False),
+    'GREATS_NA_lora': (setup_GREATS_NA_lora, 0.5, False),
+    'GREATS_NA_full_gc': (setup_GREATS_NA_full_gc, 0.5, False),
+    'GREATS_NA_lora_gc': (setup_GREATS_NA_lora_gc, 0.5, False),
+    # GREATS-LoGra: Global selection with MeSO (full fine-tuning only)
+    'GREATS_LoGra_full': (setup_GREATS_LoGra_full, 0.5, True),
+    'GREATS_LoGra_full_gc': (setup_GREATS_LoGra_full_gc, 0.5, True),
+}
+
+# === External Baselines ===
+# Other methods for comparison (SGD variants)
+EXTERNAL_BASELINES = {
     'full_sgd': setup_full_sgd,
     'full_sgd_momentum': setup_full_sgd_momentum,
-    'full_galore': setup_full_galore,
-    'lora_adamw': setup_lora_adamw,
     'lora_sgd': setup_lora_sgd,
     'lora_sgd_momentum': setup_lora_sgd_momentum,
-    'full_adamw_gc': setup_full_adamw_gc,
     'full_sgd_gc': setup_full_sgd_gc,
     'full_sgd_momentum_gc': setup_full_sgd_momentum_gc,
-    'full_galore_gc': setup_full_galore_gc,
-    'lora_adamw_gc': setup_lora_adamw_gc,
     'lora_sgd_gc': setup_lora_sgd_gc,
     'lora_sgd_momentum_gc': setup_lora_sgd_momentum_gc,
 }
 
-# Methods that use MeSO (without selection)
-MESO_METHODS = {
-    'full_meso': setup_full_meso,
-    'full_meso_gc': setup_full_meso_gc,
-}
-
-# Methods that use MeSO with data selection
-# Format: method_name -> (setup_fn, selection_frac, selection_mode)
-MESO_SELECTION_METHODS = {
-    'full_meso_greats': (setup_full_meso, 0.5, 'per_layer'),  # Per-layer selection (default)
-    'full_meso_greats_gc': (setup_full_meso_gc, 0.5, 'per_layer'),
-    # Full sample-level selection variants (two-pass approach)
-    'full_meso_greats_full': (setup_full_meso, 0.5, 'full'),  # Full selection
-    'full_meso_greats_full_gc': (setup_full_meso_gc, 0.5, 'full'),
-}
-
-# Methods that use GREATS selection with standard optimizer (AdamW)
-# These use compression for gradient computation but regular AdamW for optimization
-# Format: method_name -> (setup_fn, selection_frac)
-GREATS_METHODS = {
-    'full_greats': (setup_full_greats, 0.5),
-    'full_greats_gc': (setup_full_greats_gc, 0.5),
-    'lora_greats': (setup_lora_greats, 0.5),
-    'lora_greats_gc': (setup_lora_greats_gc, 0.5),
-}
-
 # Combined list for CLI help
-ALL_METHODS = (list(STANDARD_METHODS.keys()) + list(MESO_METHODS.keys()) +
-               list(MESO_SELECTION_METHODS.keys()) + list(GREATS_METHODS.keys()))
+ALL_METHODS = (
+    list(BASELINE_METHODS.keys()) +
+    list(MESO_ONLY_METHODS.keys()) +
+    list(STREAMING_METHODS.keys()) +
+    list(GREATS_METHODS.keys()) +
+    list(EXTERNAL_BASELINES.keys())
+)
 
 
 # =============================================================================
@@ -1317,53 +1333,62 @@ def run_benchmark(methods: List[str], config: BenchmarkConfig, output_file: Opti
     results = []
 
     for method_name in methods:
-        # Check which category this method belongs to
-        if method_name in STANDARD_METHODS:
-            setup_fn = STANDARD_METHODS[method_name]
-            step_fn = step_standard
-        elif method_name in MESO_METHODS:
-            setup_fn = MESO_METHODS[method_name]
-            step_fn = step_meso
-        elif method_name in MESO_SELECTION_METHODS:
-            # Handle MeSO with GREATS selection - needs special setup
-            base_setup_fn, selection_frac, sel_mode = MESO_SELECTION_METHODS[method_name]
+        setup_fn = None
+        step_fn = None
 
-            # We need to wrap this to create the selection helper after setup
-            def make_selection_setup_and_step(base_setup, sel_frac, mode):
+        # === Baseline Methods (NA-NA-*) ===
+        if method_name in BASELINE_METHODS:
+            setup_fn = BASELINE_METHODS[method_name]
+            step_fn = step_standard
+
+        # === MeSO Only Methods (NA-{compression}-*) ===
+        elif method_name in MESO_ONLY_METHODS:
+            setup_fn = MESO_ONLY_METHODS[method_name]
+            step_fn = step_meso
+
+        # === Streaming Selection Methods ===
+        elif method_name in STREAMING_METHODS:
+            base_setup_fn, selection_frac, has_compression = STREAMING_METHODS[method_name]
+
+            def make_streaming_setup(base_setup, sel_frac, has_comp):
                 def wrapped_setup(cfg):
                     model, optimizer, tokenizer, grad_hook = base_setup(cfg)
-                    # Create selection helper with the tokenizer
                     helper = SelectionStepHelper(tokenizer, cfg.seq_length, cfg.val_batch_size, cfg.device)
-                    # Create the step function with selection_mode
-                    step = make_step_meso_greats(helper, sel_frac, use_second_order=cfg.use_second_order, selection_mode=mode)
+                    step = make_step_streaming(helper, sel_frac, use_second_order=cfg.use_second_order, has_compression=has_comp)
                     return model, optimizer, tokenizer, grad_hook, step
                 return wrapped_setup
 
-            setup_fn = make_selection_setup_and_step(base_setup_fn, selection_frac, sel_mode)
+            setup_fn = make_streaming_setup(base_setup_fn, selection_frac, has_compression)
 
-            # For selection methods, the step function is returned as part of setup
-            def selection_step_wrapper(model, optimizer, batch, grad_hook, step_fn):
+            def streaming_step_wrapper(model, optimizer, batch, grad_hook, step_fn):
                 return step_fn(model, optimizer, batch, grad_hook)
 
-            step_fn = selection_step_wrapper
-        elif method_name in GREATS_METHODS:
-            # Handle pure GREATS with standard optimizer (AdamW)
-            base_setup_fn, selection_frac = GREATS_METHODS[method_name]
+            step_fn = streaming_step_wrapper
 
-            def make_greats_setup_and_step(base_setup, sel_frac):
+        # === GREATS Selection Methods ===
+        elif method_name in GREATS_METHODS:
+            base_setup_fn, selection_frac, has_compression = GREATS_METHODS[method_name]
+
+            def make_greats_setup(base_setup, sel_frac, has_comp):
                 def wrapped_setup(cfg):
                     model, optimizer, tokenizer, grad_hook = base_setup(cfg)
                     helper = SelectionStepHelper(tokenizer, cfg.seq_length, cfg.val_batch_size, cfg.device)
-                    step = make_step_greats(helper, sel_frac, use_second_order=cfg.use_second_order)
+                    step = make_step_greats(helper, sel_frac, use_second_order=cfg.use_second_order, has_compression=has_comp)
                     return model, optimizer, tokenizer, grad_hook, step
                 return wrapped_setup
 
-            setup_fn = make_greats_setup_and_step(base_setup_fn, selection_frac)
+            setup_fn = make_greats_setup(base_setup_fn, selection_frac, has_compression)
 
             def greats_step_wrapper(model, optimizer, batch, grad_hook, step_fn):
                 return step_fn(model, optimizer, batch, grad_hook)
 
             step_fn = greats_step_wrapper
+
+        # === External Baselines ===
+        elif method_name in EXTERNAL_BASELINES:
+            setup_fn = EXTERNAL_BASELINES[method_name]
+            step_fn = step_standard
+
         else:
             print(f"Unknown method: {method_name}. Available: {ALL_METHODS}")
             continue
@@ -1459,11 +1484,27 @@ def print_summary_from_file(results_file: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Simplified Memory and Performance Benchmark')
+    parser = argparse.ArgumentParser(
+        description='Memory and Performance Benchmark for Gradient Streaming',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Naming Convention: {selection}_{compression}_{training}
+  selection:   NA (baseline), Streaming (per-layer), GREATS (global)
+  compression: NA (standard optimizer), LoGra (MeSO optimizer)
+  training:    full, lora
+
+Note: GraSS compression is also available but LoGra is used in default experiments.
+
+Examples:
+  NA_NA_full           - Baseline full fine-tuning
+  Streaming_LoGra_full - Per-layer selection with MeSO
+  GREATS_NA_full       - Global selection with standard optimizer
+        """
+    )
 
     # Method selection
-    parser.add_argument('--methods', nargs='+', default=['full_adamw', 'full_meso'],
-                        help=f'Methods to benchmark. Available: {ALL_METHODS}')
+    parser.add_argument('--methods', nargs='+', default=['NA_NA_full', 'Streaming_LoGra_full'],
+                        help=f'Methods to benchmark. Use --list to see all available methods.')
     parser.add_argument('--all', action='store_true', help='Run all methods')
     parser.add_argument('--list', action='store_true', help='List all available methods and exit')
 
@@ -1474,18 +1515,18 @@ def main():
     parser.add_argument('--no-flash-attention', action='store_true', help='Disable flash attention')
 
     # Training config
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--seq-length', type=int, default=64)
+    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--seq-length', type=int, default=512)
     parser.add_argument('--val-batch-size', type=int, default=1,
-                        help='Validation batch size for GREATS selection (default: 1)')
+                        help='Validation batch size for data selection (Streaming/GREATS)')
 
     # Benchmark config
     parser.add_argument('--num-warmup', type=int, default=10)
     parser.add_argument('--num-iterations', type=int, default=10)
 
-    # GREATS config
+    # Selection config
     parser.add_argument('--use-second-order', action='store_true',
-                        help='Use second-order interactions in GREATS (greedy selection, slower)')
+                        help='Use second-order interactions for selection (greedy, slower but more accurate)')
 
     # Output
     parser.add_argument('--output', type=str, default=None, help='Output JSON file')
@@ -1504,23 +1545,37 @@ def main():
     # If --list is specified, list all methods and exit
     if args.list:
         print("\nAvailable methods:")
-        print("=" * 70)
-        print(f"{'Index':<6} {'Method Name':<35} {'Category'}")
-        print("-" * 70)
+        print("Naming convention: {selection}_{compression}_{training}")
+        print("  selection: NA (baseline), Streaming (per-layer), GREATS (global)")
+        print("  compression: NA (standard optimizer), LoGra (MeSO optimizer)")
+        print("  training: full, lora")
+        print("")
+        print("Note: GraSS compression is also available but LoGra is used in default experiments.")
+        print("")
+        print("=" * 80)
+        print(f"{'Index':<6} {'Method Name':<30} {'Category':<25} {'Description'}")
+        print("-" * 80)
         idx = 0
-        for name in STANDARD_METHODS:
-            print(f"{idx:<6} {name:<35} Standard")
+        for name in BASELINE_METHODS:
+            print(f"{idx:<6} {name:<30} {'Baseline (NA-NA)':<25} No selection, standard optimizer")
             idx += 1
-        for name in MESO_METHODS:
-            print(f"{idx:<6} {name:<35} MeSO")
+        for name in MESO_ONLY_METHODS:
+            print(f"{idx:<6} {name:<30} {'MeSO Only':<25} No selection, compressed optimizer")
             idx += 1
-        for name in MESO_SELECTION_METHODS:
-            print(f"{idx:<6} {name:<35} MeSO+Selection")
+        for name in STREAMING_METHODS:
+            _, _, has_comp = STREAMING_METHODS[name]
+            desc = "Per-layer selection" + (" + MeSO" if has_comp else " + AdamW")
+            print(f"{idx:<6} {name:<30} {'Streaming':<25} {desc}")
             idx += 1
         for name in GREATS_METHODS:
-            print(f"{idx:<6} {name:<35} GREATS")
+            _, _, has_comp = GREATS_METHODS[name]
+            desc = "Global selection" + (" + MeSO" if has_comp else " + AdamW")
+            print(f"{idx:<6} {name:<30} {'GREATS':<25} {desc}")
             idx += 1
-        print("=" * 70)
+        for name in EXTERNAL_BASELINES:
+            print(f"{idx:<6} {name:<30} {'External Baseline':<25} Comparison methods")
+            idx += 1
+        print("=" * 80)
         print(f"Total: {len(ALL_METHODS)} methods")
         return
 

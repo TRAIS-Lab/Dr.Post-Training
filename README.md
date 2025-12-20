@@ -13,23 +13,28 @@ The codebase supports three main features that can be combined:
 
 Experiments follow the pattern: `{selection}-{compression}-{training_type}`
 
-| Component    | Options                                      | Description                                    |
-| ------------ | -------------------------------------------- | ---------------------------------------------- |
-| `selection`  | `NA`, `Streaming`, `GREATS`                  | Data selection method                          |
-| `compression`| `NA`, `GraSS`, `LoGra`                       | Gradient compression (implies MeSO optimizer)  |
-| `training`   | `full`, `lora`                               | Full fine-tuning or LoRA                       |
+| Component     | Options                     | Description                                   |
+| ------------- | --------------------------- | --------------------------------------------- |
+| `selection`   | `NA`, `Streaming`, `GREATS` | Data selection method                         |
+| `compression` | `NA`, `LoGra`               | Gradient compression (implies MeSO optimizer) |
+| `training`    | `full`, `lora`              | Full fine-tuning or LoRA                      |
 
 **Examples:**
 - `NA-NA-full` - Baseline full fine-tuning (no selection, no compression)
 - `Streaming-NA-full` - Per-layer selection with full gradients
-- `GREATS-GraSS-full` - Global selection with GraSS compression (MeSO optimizer)
-- `Streaming-LoGra-lora` - Per-layer selection with LoGra compression and LoRA
+- `GREATS-LoGra-full` - Global selection with LoGra compression (MeSO optimizer)
+- `Streaming-NA-lora` - Per-layer selection with LoRA (no compression needed)
 
-### Key Design Principle
+> **Note:** GraSS compression is also available (`--compression GraSS`) but LoGra is used in default experiments.
+
+### Key Design Principles
 
 **Compression controls both scoring AND optimizer:**
-- If compression is specified (`GraSS` or `LoGra`) → Use compressed gradients for scoring AND MeSO optimizer
+- If compression is specified (`LoGra`) → Use compressed gradients for scoring AND MeSO optimizer
 - If no compression (`NA`) → Use full gradients for scoring AND standard AdamW optimizer
+
+**LoRA doesn't need compression:**
+- LoRA already reduces trainable parameters significantly, so gradient compression is unnecessary
 
 ## Quick Start
 
@@ -121,24 +126,20 @@ bash SFT/train/launch_experiments.sh --task mmlu --subject sociology
 bash SFT/train/launch_experiments.sh --task mmlu --subject sociology --sbatch
 ```
 
-This launches **16 configurations**:
+This launches **10 configurations**:
 
-| # | Configuration | Description |
-|---|---------------|-------------|
-| 1a | `NA-NA-full` | Baseline full fine-tuning |
-| 1b | `NA-NA-lora` | Baseline LoRA fine-tuning |
-| 2a | `Streaming-NA-full` | Per-layer selection, full gradients |
-| 2b | `Streaming-NA-lora` | Per-layer selection, full gradients, LoRA |
-| 3a | `GREATS-NA-full` | Global selection, full gradients |
-| 3b | `GREATS-NA-lora` | Global selection, full gradients, LoRA |
-| 4a | `NA-GraSS-full` | MeSO only with GraSS (no selection) |
-| 4b | `NA-LoGra-full` | MeSO only with LoGra (no selection) |
-| 5a | `Streaming-GraSS-full` | Per-layer selection + MeSO (GraSS) |
-| 5b | `Streaming-LoGra-full` | Per-layer selection + MeSO (LoGra) |
-| 6a | `GREATS-GraSS-full` | Global selection + MeSO (GraSS) |
-| 6b | `GREATS-LoGra-full` | Global selection + MeSO (LoGra) |
-| 7a | `Streaming-GraSS-2nd-full` | Per-layer + MeSO + second-order selection |
-| 7b | `GREATS-GraSS-2nd-full` | Global + MeSO + second-order selection |
+| #   | Configuration              | Description                               |
+| --- | -------------------------- | ----------------------------------------- |
+| 1a  | `NA-NA-full`               | Baseline full fine-tuning                 |
+| 1b  | `NA-NA-lora`               | Baseline LoRA fine-tuning                 |
+| 2a  | `Streaming-NA-full`        | Per-layer selection, full gradients       |
+| 2b  | `Streaming-NA-lora`        | Per-layer selection, full gradients, LoRA |
+| 3a  | `GREATS-NA-full`           | Global selection, full gradients          |
+| 3b  | `GREATS-NA-lora`           | Global selection, full gradients, LoRA    |
+| 4   | `Streaming-LoGra-full`     | Per-layer selection + MeSO                |
+| 5   | `GREATS-LoGra-full`        | Global selection + MeSO                   |
+| 6a  | `Streaming-LoGra-2nd-full` | Per-layer + MeSO + second-order selection |
+| 6b  | `GREATS-LoGra-2nd-full`    | Global + MeSO + second-order selection    |
 
 ### Single Experiment
 
@@ -163,31 +164,27 @@ bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b --lora
 
 # Streaming-NA-full: Per-layer selection with full gradients
 bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --data_selection Streaming --selection_mode per_layer
+    --data_selection Streaming
 
 # GREATS-NA-full: Global selection with full gradients
 bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --data_selection Streaming --selection_mode global
+    --data_selection GREATS
 
-# NA-GraSS-full: MeSO only (no selection, compressed optimizer)
+# Streaming-LoGra-full: Per-layer selection + MeSO
 bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --compression GraSS
+    --data_selection Streaming --compression LoGra
 
-# Streaming-GraSS-full: Per-layer selection + MeSO
+# GREATS-LoGra-full: Global selection + MeSO
 bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --data_selection Streaming --selection_mode per_layer --compression GraSS
-
-# GREATS-LoGra-full: Global selection + MeSO with LoGra
-bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --data_selection Streaming --selection_mode global --compression LoGra
+    --data_selection GREATS --compression LoGra
 
 # With second-order selection
 bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --data_selection Streaming --selection_mode global --compression GraSS --use_second_order
+    --data_selection GREATS --compression LoGra --use_second_order
 
 # Custom training dataset
 bash SFT/train/train.sh --task samsum --model llama3-1b \
-    --train openhermes --data_selection Streaming --compression GraSS
+    --train openhermes --data_selection Streaming --compression LoGra
 ```
 
 #### Parameters
@@ -205,17 +202,17 @@ The unified training script accepts the following arguments:
 
 ##### Data Selection Arguments
 
-- `--data_selection <method>` - Enable data selection: `NA` (none), `Streaming` (default: `NA`)
-- `--selection_mode <mode>` - Selection granularity (only when `--data_selection Streaming`):
-  - `per_layer` - Streaming: each layer independently selects (single-pass, default)
-  - `global` - GREATS: accumulate scores across layers (two-pass)
+- `--data_selection <method>` - Data selection method:
+  - `NA` - No selection (baseline, default)
+  - `Streaming` - Per-layer selection (single-pass)
+  - `GREATS` - Global selection (two-pass)
 - `--use_second_order` - Enable greedy selection with second-order interactions (flag)
 
 ##### Compression Arguments
 
 - `--compression <method>` - Gradient compression method (implies MeSO optimizer):
-  - `GraSS` - Gradient Sparsification with Sketching
-  - `LoGra` - Low-rank Gradient compression
+  - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
+  - `GraSS` - Gradient Sparsification with Sketching (available but not used in default experiments)
   - If not specified, uses full gradients and standard AdamW optimizer
 - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
 

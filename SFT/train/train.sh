@@ -46,7 +46,7 @@ export base_training_args="--do_train=True \
 --use_flash_attention=True"
 
 # Default values
-data_selection="NA"  # NA or Streaming
+data_selection="NA"  # NA, Streaming (per-layer), or GREATS (global)
 optim="adamw_torch"  # Standard HF optimizer (adamw_torch, adamw_hf, etc.)
 data_dir="SFT/data"
 percentage=0.05
@@ -62,7 +62,6 @@ task="mmlu"
 train_dataset=""  # Training dataset (if empty, uses task-based default)
 subject="world_religions"
 compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer.
-selection_mode="per_layer"  # per_layer (Streaming) or global (GREATS)
 use_second_order=false  # If true, use greedy selection with second-order interactions
 use_lora=false
 use_flash_attention=true
@@ -137,10 +136,6 @@ while [[ $# -gt 0 ]]; do
             compression="$2"
             shift 2
             ;;
-        --selection_mode)
-            selection_mode="$2"
-            shift 2
-            ;;
         --use_second_order)
             use_second_order=true
             shift 1
@@ -178,9 +173,8 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo ""
             echo "Options:"
-            echo "  --data_selection <method>              Data selection: NA, Streaming (default: NA)"
-            echo "  --selection_mode <mode>                Selection mode: per_layer (Streaming), global (GREATS) (default: per_layer)"
-            echo "  --compression <method>                 Compression: GraSS, LoGra (implies MeSO optimizer) (default: none)"
+            echo "  --data_selection <method>              Data selection: NA, Streaming, GREATS (default: NA)"
+            echo "  --compression <method>                 Compression: LoGra (default), GraSS (implies MeSO optimizer)"
             echo "  --use_second_order                     Use greedy selection with second-order interactions"
             echo ""
             echo "  --lora                                 Use LoRA fine-tuning (default: full fine-tuning)"
@@ -225,21 +219,13 @@ fi
 # Compression implies MeSO optimizer. No compression = standard optimizer.
 
 # Validate and configure compression method
+# Default: LoGra (Gaussian projection). GraSS (random mask + SJLT) also available.
 sparsification=""
 projection=""
 if [[ -n "$compression" ]]; then
     case "$compression" in
-        GraSS)
-            # if lora is used, use smaller sketch sizes
-            if [ "$use_lora" = true ]; then
-                sparsification="random_mask-256*256"
-                projection="sjlt-16384"
-            else
-                sparsification="random_mask-1024*1024"
-                projection="sjlt-262144"
-            fi
-            ;;
         LoGra)
+            # LoGra: Gaussian random projection, no additional projection
             if [ "$use_lora" = true ]; then
                 sparsification="normal-128*128"
                 projection=""
@@ -248,9 +234,20 @@ if [[ -n "$compression" ]]; then
                 projection=""
             fi
             ;;
+        GraSS)
+            # GraSS: Random mask sparsification + SJLT projection
+            # (Available but not used in default experiments)
+            if [ "$use_lora" = true ]; then
+                sparsification="random_mask-256*256"
+                projection="sjlt-16384"
+            else
+                sparsification="random_mask-1024*1024"
+                projection="sjlt-262144"
+            fi
+            ;;
         *)
             echo "ERROR: Invalid compression method: $compression"
-            echo "Valid options: GraSS, LoGra"
+            echo "Valid options: LoGra (default), GraSS"
             exit 1
             ;;
     esac
@@ -269,25 +266,25 @@ else
     job_type="full"
 fi
 
-# Build selection string
+# Validate data_selection
 # - NA: no data selection
-# - Streaming: per-layer selection (selection_mode=per_layer)
-# - GREATS: global selection (selection_mode=global)
-if [[ "$data_selection" == "Streaming" ]]; then
-    if [[ "$selection_mode" == "global" ]]; then
-        selection_str="GREATS"
-    else
-        selection_str="Streaming"
-    fi
-else
-    selection_str="NA"
-fi
+# - Streaming: per-layer selection
+# - GREATS: global selection
+case "$data_selection" in
+    NA|Streaming|GREATS)
+        ;;
+    *)
+        echo "ERROR: Invalid data_selection: $data_selection"
+        echo "Valid options: NA, Streaming, GREATS"
+        exit 1
+        ;;
+esac
 
 # Build method string: {selection}-{compression}
-method_str="${selection_str}-${compression:-NA}"
+method_str="${data_selection}-${compression:-NA}"
 
 # Add second-order suffix for data selection experiments
-if [[ "$data_selection" == "Streaming" ]] && [ "$use_second_order" = true ]; then
+if [[ "$data_selection" != "NA" ]] && [ "$use_second_order" = true ]; then
     method_str="${method_str}-2nd"
 fi
 
@@ -315,9 +312,8 @@ echo "Training type: $([ "$use_lora" = true ] && echo "LoRA (alpha=$lora_alpha, 
 echo "Task: $task"
 echo "Training data: ${train_dataset:-default for $task}"
 echo ""
-echo "Selection: $selection_str"
-if [[ "$data_selection" == "Streaming" ]]; then
-    echo "  Selection mode: $selection_mode"
+echo "Selection: $data_selection"
+if [[ "$data_selection" != "NA" ]]; then
     echo "  Second-order: $([ "$use_second_order" = true ] && echo "yes" || echo "no")"
 fi
 echo "Compression: ${compression:-None}"
@@ -414,13 +410,8 @@ if [[ -n "$compression" ]]; then
     training_args="$training_args --update_compressor_freq $update_compressor_freq"
 fi
 
-# Add selection_mode for data selection (per_layer=Streaming, global=GREATS)
-if [[ "$data_selection" == "Streaming" ]]; then
-    training_args="$training_args --selection_mode $selection_mode"
-fi
-
 # Add use_second_order for data selection
-if [[ "$data_selection" == "Streaming" ]] && [ "$use_second_order" = true ]; then
+if [[ "$data_selection" != "NA" ]] && [ "$use_second_order" = true ]; then
     training_args="$training_args --use_second_order True"
 fi
 

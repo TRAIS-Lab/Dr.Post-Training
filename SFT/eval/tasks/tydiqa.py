@@ -4,7 +4,7 @@ import evaluate
 metric = evaluate.load("squad")
 
 from SFT.data.get_val_dataset import load_unified_jsonl
-from utils import generate_completions
+from ..utils import generate_completions
 
 # llama-chat model's instruction format
 B_INST, E_INST = "[INST]", "[/INST]"
@@ -60,25 +60,31 @@ def get_tydiqa_dataset_df(
 
 def compute_accuracy(args, model, tokenizer):
     """
-    Compute F1 score for TyDiQA evaluation.
+    Compute F1 and exact match scores for TyDiQA evaluation.
 
     Args:
-        args: Arguments containing n_test
+        args: Arguments containing n_test and data_dir
         model: The model to evaluate
         tokenizer: The tokenizer for the model
 
     Returns:
-        float: Average F1 score across all examples
+        dict: Dictionary with f1_score, exact_match, and n_test
     """
+    # Get data_dir from args, default to ./data
+    data_dir = getattr(args, 'data_dir', './data')
+    n_test = getattr(args, 'n_test', 100)
+    if n_test <= 0:
+        n_test = 10000  # Load all available
+
     # Load test dataset
     # Note: get_tydiqa_dataset_df returns list of tuples: (formatted_prompt, answer, lang)
     # where formatted_prompt already contains the full prompt with context and question
     test_dataset = get_tydiqa_dataset_df(
-        data_dir="./data",
+        data_dir=data_dir,
         validation=False,
         use_chat_format=True,  # This controls the format returned by get_tydiqa_dataset_df
         chat_format="tulu",
-        k=args.n_test
+        k=n_test
     )
 
     print(f'Loaded {len(test_dataset)} test examples')
@@ -99,8 +105,8 @@ def compute_accuracy(args, model, tokenizer):
     # Clean outputs
     outputs = [g.strip().replace("\n", "") for g in generations]
 
-    # Compute F1 scores
-    acc, length = 0, 0
+    # Compute F1 and exact match scores
+    total_f1, total_em, valid_count = 0, 0, 0
     for i, (prompt, answer, lang) in enumerate(test_dataset):
         # Clean up the output by removing any special tokens
         if "<|user|>" in outputs[i]:
@@ -118,16 +124,26 @@ def compute_accuracy(args, model, tokenizer):
             lang_references = [{"id": str(i), "answers": {"text": [clean_answer], "answer_start": [0]}}]
             res = metric.compute(predictions=lang_predictions, references=lang_references)
             if isinstance(res["f1"], float):
-                acc += res["f1"]
-                length += 1
+                total_f1 += res["f1"]
+                total_em += res["exact_match"]
+                valid_count += 1
         except Exception as e:
-            # Skip examples where F1 computation fails
+            # Skip examples where computation fails
             continue
 
-    if length == 0:
-        print("Warning: No valid F1 scores computed")
-        return 0.0
+    if valid_count == 0:
+        print("Warning: No valid scores computed")
+        return {"f1_score": 0.0, "exact_match": 0.0, "n_test": len(test_dataset)}
 
-    avg_f1 = acc / length
-    print(f"\nAverage F1 Score: {avg_f1:.4f} ({length}/{len(test_dataset)} examples)")
-    return avg_f1
+    avg_f1 = total_f1 / valid_count
+    avg_em = total_em / valid_count
+    print(f"\nTyDiQA Results:")
+    print(f"  F1 Score: {avg_f1:.4f}")
+    print(f"  Exact Match: {avg_em:.4f}")
+    print(f"  Examples evaluated: {valid_count}/{len(test_dataset)}")
+
+    return {
+        "f1_score": avg_f1,
+        "exact_match": avg_em,
+        "n_test": len(test_dataset)
+    }

@@ -1,21 +1,24 @@
 #!/usr/bin/env python
 """
-Unified evaluation script for MMLU and TyDiQA datasets.
+Unified evaluation script for SFT experiments.
+
+Supports:
+- SAMSum: Dialogue summarization (ROUGE-1, ROUGE-2, ROUGE-L)
+- TyDiQA: Multilingual QA (F1 score)
+- MMLU: Multiple-choice QA (Accuracy)
+- BBH: Big Bench Hard reasoning tasks (Accuracy)
+- GSM8K: Grade school math (Accuracy)
+- MATH500: Competition math (Accuracy)
 
 Usage:
-    # MMLU evaluation
-    python evaluate.py \
-        --task mmlu \
-        --model_path ./out/model \
-        --subject sociology \
-        --n_val 5 \
-        --n_eval 500
+    # Evaluate all models (default)
+    python -m SFT.eval.eval --models_dir /scratch/pbb/Project/Gradient-Streaming/SFT
 
-    # TyDiQA evaluation
-    python evaluate.py \
-        --task tydiqa \
-        --model_path ./out/model \
-        --n_test 100
+    # Filter by pattern
+    python -m SFT.eval.eval --models_dir /path/to/models --filter alpaca
+
+    # Single model
+    python -m SFT.eval.eval --model_path /path/to/model --tasks samsum
 """
 
 import argparse
@@ -23,13 +26,12 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
+from typing import Dict, List, Optional
 
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from mmlu import compute_accuracy as compute_mmlu_accuracy
-from tydiqa import compute_accuracy as compute_tydiqa_accuracy
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -39,229 +41,541 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_model_and_tokenizer(model_path, base_model=None):
-    """
-    Load trained model and tokenizer.
+def get_device():
+    """Get the appropriate CUDA device (respects CUDA_VISIBLE_DEVICES)."""
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
 
-    Args:
-        model_path: Path to the trained model (can be a LoRA adapter)
-        base_model: Base model name/path if model_path is a LoRA adapter
 
-    Returns:
-        tuple: (model, tokenizer)
-    """
-    logger.info(f"Loading model from {model_path}")
+def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None):
+    """Load trained model and tokenizer."""
+    device = get_device()
+    logger.info(f"Loading model from {model_path} to {device}")
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    # Check if tokenizer exists in model_path
+    tokenizer_path = model_path
+    if not os.path.exists(os.path.join(model_path, "tokenizer_config.json")):
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            with open(adapter_config_path, "r") as f:
+                adapter_config = json.load(f)
+            tokenizer_path = adapter_config.get("base_model_name_or_path", model_path)
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     # Check if this is a LoRA adapter
     adapter_config_path = os.path.join(model_path, "adapter_config.json")
 
     if os.path.exists(adapter_config_path):
-        # This is a LoRA adapter
         logger.info("Detected LoRA adapter")
-
-        # Load adapter config to get base model
         with open(adapter_config_path, "r") as f:
             adapter_config = json.load(f)
 
         if base_model is None:
             base_model = adapter_config.get("base_model_name_or_path")
             if base_model is None:
-                raise ValueError(
-                    "Could not determine base model from adapter config. "
-                    "Please specify --base_model"
-                )
+                raise ValueError("Could not determine base model. Please specify --base_model")
 
         logger.info(f"Loading base model: {base_model}")
         model = AutoModelForCausalLM.from_pretrained(
-            base_model, torch_dtype=torch.bfloat16, device_map="auto"
-        )
+            base_model, torch_dtype=torch.bfloat16
+        ).to(device)
 
-        # Resize embeddings if tokenizer has additional tokens
         embedding_size = model.get_input_embeddings().weight.shape[0]
         if len(tokenizer) > embedding_size:
-            logger.info(
-                f"Resizing model embeddings from {embedding_size} to {len(tokenizer)} "
-                f"to match tokenizer vocabulary size"
-            )
             model.resize_token_embeddings(len(tokenizer))
 
-        logger.info(f"Loading LoRA adapter from {model_path}")
         model = PeftModel.from_pretrained(model, model_path)
-        model = model.merge_and_unload()  # Merge adapter weights into base model
-
+        model = model.merge_and_unload()
     else:
-        # This is a full model
         logger.info("Loading full model")
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto"
-        )
+            model_path, torch_dtype=torch.bfloat16
+        ).to(device)
 
     model.eval()
-    logger.info("Model loaded successfully")
 
+    # Check for NaN/Inf in model weights
+    nan_inf_params = []
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            nan_inf_params.append(name)
+    if nan_inf_params:
+        logger.warning(f"Model contains NaN/Inf values in {len(nan_inf_params)} parameters")
+        if len(nan_inf_params) > 10:
+            # Model is severely corrupted - raise error to skip
+            raise ValueError(f"Model is corrupted: NaN/Inf in {len(nan_inf_params)} parameters (training diverged)")
+
+    logger.info("Model loaded successfully")
     return model, tokenizer
 
 
-def evaluate_mmlu(args, model, tokenizer):
-    """Run MMLU evaluation."""
-    # Get answer choice token IDs
-    choices = ["A", "B", "C", "D"]
-    answer_choice_ids = [
-        tokenizer.encode(" " + answer_choice, add_special_tokens=False)[-1]
-        for answer_choice in choices
-    ]
+def parse_model_name(model_name: str) -> Dict[str, str]:
+    """Parse model name to extract experiment configuration."""
+    config = {
+        "model_name": model_name,
+        "train_dataset": "",
+        "eval_task": "",
+        "selection": "",
+        "compression": "",
+        "model": "",
+        "training_type": "",
+        "percentage": "",
+        "learning_rate": "",
+        "batch_size": "",
+        "n_val": "",
+        "seed": "",
+    }
 
-    logger.info(f"Evaluating on MMLU subject: {args.subject}")
-    logger.info(f"Number of validation examples: {args.n_val}")
-    logger.info(f"Number of evaluation examples: {args.n_eval}")
+    parts = model_name.split("-")
+    if len(parts) >= 6:
+        train_task = parts[0].split("_")
+        if len(train_task) >= 2:
+            config["train_dataset"] = train_task[0]
+            config["eval_task"] = train_task[1]
+        else:
+            config["train_dataset"] = parts[0]
 
-    # Run evaluation
-    cors, accuracy, all_probs = compute_mmlu_accuracy(
+        config["selection"] = parts[1]
+
+        idx = 2
+        if parts[idx] == "LoGra" and len(parts) > idx + 1 and parts[idx + 1] == "2nd":
+            config["compression"] = "LoGra-2nd"
+            idx = 4
+        else:
+            config["compression"] = parts[idx]
+            idx = 3
+
+        if idx < len(parts):
+            config["model"] = parts[idx]
+            idx += 1
+        if idx < len(parts):
+            config["training_type"] = parts[idx]
+            idx += 1
+
+        for part in parts[idx:]:
+            if part.startswith("p") and "." in part:
+                config["percentage"] = part[1:]
+            elif part.startswith("lr"):
+                config["learning_rate"] = part[2:]
+            elif part.startswith("b") and part[1:].isdigit():
+                config["batch_size"] = part[1:]
+            elif part.startswith("v") and part[1:].isdigit():
+                config["n_val"] = part[1:]
+            elif part.startswith("s") and part[1:].isdigit():
+                config["seed"] = part[1:]
+
+    return config
+
+
+def find_models(models_dir: str, train_dataset: Optional[str] = None) -> List[str]:
+    """Find all model directories, optionally filtering by training dataset."""
+    model_paths = []
+    for entry in os.listdir(models_dir):
+        entry_path = os.path.join(models_dir, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        has_model = (
+            os.path.exists(os.path.join(entry_path, "config.json")) or
+            os.path.exists(os.path.join(entry_path, "adapter_config.json"))
+        )
+        if has_model:
+            if train_dataset is None:
+                model_paths.append(entry_path)
+            else:
+                # Match training dataset: entry starts with "{train}_"
+                parsed = parse_model_name(entry)
+                if parsed["train_dataset"] == train_dataset:
+                    model_paths.append(entry_path)
+    return sorted(model_paths)
+
+
+def evaluate_samsum(args, model, tokenizer) -> dict:
+    """Run SAMSum evaluation."""
+    from .tasks.samsum import compute_accuracy
+
+    logger.info("Evaluating on SAMSum")
+    rouge_scores = compute_accuracy(
         args=args,
         model=model,
         tokenizer=tokenizer,
-        answer_choice_ids=answer_choice_ids,
         batch_size=args.batch_size,
+        max_new_tokens=args.max_new_tokens
     )
-
-    # Prepare results
-    results = {
-        "task": "mmlu",
-        "subject": args.subject,
-        "n_val": args.n_val,
-        "n_eval": args.n_eval,
-        "accuracy": accuracy,
-        "num_correct": cors.sum().item(),
-        "num_total": len(cors),
+    return {
+        "task": "samsum",
+        "rouge1": rouge_scores["rouge1"],
+        "rouge2": rouge_scores["rouge2"],
+        "rougeL": rouge_scores["rougeL"],
     }
 
-    logger.info(f"Accuracy: {accuracy:.4f} ({cors.sum().item()}/{len(cors)})")
 
-    return results
-
-
-def evaluate_tydiqa(args, model, tokenizer):
+def evaluate_tydiqa(args, model, tokenizer) -> dict:
     """Run TyDiQA evaluation."""
-    logger.info(f"Evaluating on TyDiQA")
-    logger.info(f"Number of test examples: {args.n_test}")
+    from .tasks.tydiqa import compute_accuracy
 
-    # Run evaluation
-    f1_score = compute_tydiqa_accuracy(
+    logger.info("Evaluating on TyDiQA")
+    results = compute_accuracy(args=args, model=model, tokenizer=tokenizer)
+    return {
+        "task": "tydiqa",
+        "f1_score": results["f1_score"],
+        "exact_match": results["exact_match"],
+        "n_test": results["n_test"],
+    }
+
+
+def evaluate_mmlu(args, model, tokenizer) -> dict:
+    """Run MMLU evaluation."""
+    from .tasks.mmlu import compute_accuracy
+
+    logger.info("Evaluating on MMLU")
+    results = compute_accuracy(
         args=args,
         model=model,
         tokenizer=tokenizer,
+        batch_size=args.batch_size
     )
-
-    # Prepare results
-    results = {
-        "task": "tydiqa",
-        "n_test": args.n_test,
-        "f1_score": f1_score,
+    return {
+        "task": "mmlu",
+        "accuracy": results["accuracy"],
+        "n_test": results["n_test"],
     }
 
-    logger.info(f"F1 Score: {f1_score:.4f}")
 
+def evaluate_bbh(args, model, tokenizer) -> dict:
+    """Run BBH (Big Bench Hard) evaluation."""
+    from .tasks.bbh import compute_accuracy
+
+    logger.info("Evaluating on BBH")
+    results = compute_accuracy(
+        args=args,
+        model=model,
+        tokenizer=tokenizer,
+        batch_size=args.batch_size,
+        max_new_tokens=64
+    )
+    return {
+        "task": "bbh",
+        "accuracy": results["accuracy"],
+        "n_test": results["n_test"],
+    }
+
+
+def evaluate_gsm8k(args, model, tokenizer) -> dict:
+    """Run GSM8K evaluation."""
+    from .tasks.gsm8k import compute_accuracy
+
+    logger.info("Evaluating on GSM8K")
+    results = compute_accuracy(
+        args=args,
+        model=model,
+        tokenizer=tokenizer,
+        batch_size=args.batch_size,
+        max_new_tokens=256
+    )
+    return {
+        "task": "gsm8k",
+        "accuracy": results["accuracy"],
+        "n_test": results["n_test"],
+    }
+
+
+def evaluate_math500(args, model, tokenizer) -> dict:
+    """Run MATH500 evaluation."""
+    from .tasks.math500 import compute_accuracy
+
+    logger.info("Evaluating on MATH500")
+    results = compute_accuracy(
+        args=args,
+        model=model,
+        tokenizer=tokenizer,
+        batch_size=args.batch_size,
+        max_new_tokens=512
+    )
+    return {
+        "task": "math500",
+        "accuracy": results["accuracy"],
+        "n_test": results["n_test"],
+    }
+
+
+def get_task_from_model_name(model_name: str) -> Optional[str]:
+    """Extract the evaluation task from model name (e.g., alpaca_samsum -> samsum)."""
+    valid_tasks = ["samsum", "tydiqa", "mmlu", "bbh", "gsm8k", "math500"]
+    parts = model_name.split("-")
+    if parts:
+        train_task = parts[0].split("_")
+        if len(train_task) >= 2:
+            task = train_task[1].lower()
+            if task in valid_tasks:
+                return task
+    return None
+
+
+def evaluate_model(
+    model_path: str,
+    data_dir: str,
+    n_test: int = -1,
+    batch_size: int = 1,
+    max_new_tokens: int = 128,
+    base_model: Optional[str] = None,
+    task_override: Optional[str] = None,
+) -> Dict:
+    """Evaluate a single model. Task is auto-detected from model name."""
+    model_name = os.path.basename(model_path)
+    results = parse_model_name(model_name)
+    results["model_path"] = model_path
+
+    # Auto-detect task from model name, or use override
+    task = task_override or get_task_from_model_name(model_name)
+    if task is None:
+        logger.error(f"Could not detect task from model name: {model_name}")
+        results["error"] = "Could not detect task from model name"
+        return results
+
+    logger.info(f"Auto-detected task: {task}")
+
+    try:
+        model, tokenizer = load_model_and_tokenizer(model_path, base_model)
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        results["error"] = str(e)
+        return results
+
+    class Args:
+        pass
+    args = Args()
+    args.data_dir = data_dir
+    args.n_test = n_test
+    args.batch_size = batch_size
+    args.max_new_tokens = max_new_tokens
+
+    try:
+        if task == "samsum":
+            logger.info(f"Evaluating {model_name} on SAMSum...")
+            samsum_results = evaluate_samsum(args, model, tokenizer)
+            results["samsum_rouge1"] = samsum_results["rouge1"]
+            results["samsum_rouge2"] = samsum_results["rouge2"]
+            results["samsum_rougeL"] = samsum_results["rougeL"]
+
+            with open(os.path.join(model_path, "samsum_results.json"), "w") as f:
+                json.dump(samsum_results, f, indent=2)
+
+        elif task == "tydiqa":
+            logger.info(f"Evaluating {model_name} on TyDiQA...")
+            tydiqa_results = evaluate_tydiqa(args, model, tokenizer)
+            results["tydiqa_f1"] = tydiqa_results["f1_score"]
+            results["tydiqa_em"] = tydiqa_results["exact_match"]
+
+            with open(os.path.join(model_path, "tydiqa_results.json"), "w") as f:
+                json.dump(tydiqa_results, f, indent=2)
+
+        elif task == "mmlu":
+            logger.info(f"Evaluating {model_name} on MMLU...")
+            mmlu_results = evaluate_mmlu(args, model, tokenizer)
+            results["mmlu_accuracy"] = mmlu_results["accuracy"]
+
+            with open(os.path.join(model_path, "mmlu_results.json"), "w") as f:
+                json.dump(mmlu_results, f, indent=2)
+
+        elif task == "bbh":
+            logger.info(f"Evaluating {model_name} on BBH...")
+            bbh_results = evaluate_bbh(args, model, tokenizer)
+            results["bbh_accuracy"] = bbh_results["accuracy"]
+
+            with open(os.path.join(model_path, "bbh_results.json"), "w") as f:
+                json.dump(bbh_results, f, indent=2)
+
+        elif task == "gsm8k":
+            logger.info(f"Evaluating {model_name} on GSM8K...")
+            gsm8k_results = evaluate_gsm8k(args, model, tokenizer)
+            results["gsm8k_accuracy"] = gsm8k_results["accuracy"]
+
+            with open(os.path.join(model_path, "gsm8k_results.json"), "w") as f:
+                json.dump(gsm8k_results, f, indent=2)
+
+        elif task == "math500":
+            logger.info(f"Evaluating {model_name} on MATH500...")
+            math500_results = evaluate_math500(args, model, tokenizer)
+            results["math500_accuracy"] = math500_results["accuracy"]
+
+            with open(os.path.join(model_path, "math500_results.json"), "w") as f:
+                json.dump(math500_results, f, indent=2)
+
+    except Exception as e:
+        logger.error(f"Evaluation failed: {e}")
+        results["error"] = str(e)
+
+    del model
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except RuntimeError as e:
+            logger.warning(f"Failed to clear CUDA cache: {e}")
+            # Try to reset CUDA state
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
+    results["timestamp"] = datetime.now().isoformat()
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Unified evaluation script for MMLU and TyDiQA"
-    )
+    parser = argparse.ArgumentParser(description="SFT Evaluation Script")
 
-    # Common arguments
-    parser.add_argument(
-        "--task",
-        type=str,
-        required=True,
-        choices=["mmlu", "tydiqa"],
-        help="Evaluation task to run",
-    )
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        required=True,
-        help="Path to the trained model checkpoint (can be LoRA adapter or full model)",
-    )
-    parser.add_argument(
-        "--base_model",
-        type=str,
-        default=None,
-        help="Base model name/path (required if model_path is a LoRA adapter and base model cannot be inferred)",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=1,
-        help="Batch size for evaluation",
-    )
-    parser.add_argument(
-        "--output_file",
-        type=str,
-        default=None,
-        help="Path to save results JSON file (default: model_path/{task}_results.json)",
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="./data",
-        help="Directory containing evaluation data",
-    )
+    # Model selection (batch is default)
+    model_group = parser.add_mutually_exclusive_group()
+    model_group.add_argument("--models_dir", type=str,
+        default="/scratch/pbb/Project/Gradient-Streaming/SFT",
+        help="Directory containing trained models (default)")
+    model_group.add_argument("--model_path", type=str,
+        help="Path to single model to evaluate")
 
-    # MMLU-specific arguments
-    parser.add_argument(
-        "--subject",
-        type=str,
-        default="sociology",
-        help="MMLU subject to evaluate on (only for --task mmlu)",
-    )
-    parser.add_argument(
-        "--n_val",
-        type=int,
-        default=5,
-        help="Number of validation examples for in-context learning (only for --task mmlu)",
-    )
-    parser.add_argument(
-        "--n_eval",
-        type=int,
-        default=500,
-        help="Number of evaluation examples to evaluate (only for --task mmlu)",
-    )
-
-    # TyDiQA-specific arguments
-    parser.add_argument(
-        "--n_test",
-        type=int,
-        default=100,
-        help="Number of test examples to evaluate (only for --task tydiqa)",
-    )
+    parser.add_argument("--train", type=str, default=None,
+        help="Filter by training dataset (e.g., alpaca, less, tulu3, wizardlm)")
+    parser.add_argument("--task", type=str, default=None,
+        choices=["samsum", "tydiqa", "mmlu", "bbh", "gsm8k", "math500"],
+        help="Override auto-detected task (optional)")
+    parser.add_argument("--data_dir", type=str, default=None,
+        help="Data directory (default: auto-detect)")
+    parser.add_argument("--n_test", type=int, default=-1,
+        help="Number of test examples (-1 for all)")
+    parser.add_argument("--batch_size", type=int, default=1,
+        help="Batch size for generation")
+    parser.add_argument("--max_new_tokens", type=int, default=128,
+        help="Maximum tokens to generate")
+    parser.add_argument("--base_model", type=str, default=None,
+        help="Base model for LoRA adapters")
 
     args = parser.parse_args()
 
-    # Set output file path
-    if args.output_file is None:
-        args.output_file = os.path.join(args.model_path, f"{args.task}_results.json")
+    # Auto-detect data directory
+    if args.data_dir is None:
+        sft_data_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
+        )
+        args.data_dir = sft_data_dir if os.path.exists(sft_data_dir) else "./data"
 
-    # Load model and tokenizer
-    model, tokenizer = load_model_and_tokenizer(args.model_path, args.base_model)
+    logger.info(f"Data directory: {args.data_dir}")
 
-    # Run appropriate evaluation
-    if args.task == "mmlu":
-        results = evaluate_mmlu(args, model, tokenizer)
-    elif args.task == "tydiqa":
-        results = evaluate_tydiqa(args, model, tokenizer)
-    else:
-        raise ValueError(f"Unknown task: {args.task}")
+    # Single model evaluation
+    if args.model_path:
+        results = evaluate_model(
+            model_path=args.model_path,
+            data_dir=args.data_dir,
+            n_test=args.n_test,
+            batch_size=args.batch_size,
+            max_new_tokens=args.max_new_tokens,
+            base_model=args.base_model,
+            task_override=args.task,
+        )
+        print("\n" + "=" * 60)
+        print("Results:")
+        for k, v in results.items():
+            if k not in ["model_path", "timestamp", "model_name"]:
+                print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+        return
 
-    # Save results
-    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
-    with open(args.output_file, "w") as f:
-        json.dump(results, f, indent=2)
+    # Batch evaluation
+    model_paths = find_models(args.models_dir, args.train)
+    logger.info(f"Found {len(model_paths)} models to evaluate")
 
-    logger.info(f"Results saved to {args.output_file}")
+    if not model_paths:
+        logger.error(f"No models found in {args.models_dir}")
+        sys.exit(1)
+
+    all_results = []
+    for i, model_path in enumerate(model_paths):
+        print(f"\n{'=' * 70}")
+        print(f"[{i+1}/{len(model_paths)}] {os.path.basename(model_path)}")
+        print(f"{'=' * 70}")
+
+        results = evaluate_model(
+            model_path=model_path,
+            data_dir=args.data_dir,
+            n_test=args.n_test,
+            batch_size=args.batch_size,
+            max_new_tokens=args.max_new_tokens,
+            base_model=args.base_model,
+            task_override=args.task,
+        )
+        all_results.append(results)
+
+    # Print summary
+    print("\n" + "=" * 100)
+    print("Summary")
+    print("=" * 100)
+
+    # SAMSum results
+    samsum_results = [r for r in all_results if "samsum_rougeL" in r]
+    if samsum_results:
+        print(f"\nSAMSum Results:")
+        print(f"{'Model':<50} {'Selection':<12} {'Compress':<12} {'R-1':>7} {'R-2':>7} {'R-L':>7}")
+        print("-" * 100)
+        for r in sorted(samsum_results, key=lambda x: x.get("samsum_rougeL", 0), reverse=True):
+            print(f"{r['model_name'][:50]:<50} {r['selection']:<12} {r['compression']:<12} "
+                  f"{r['samsum_rouge1']:>7.4f} {r['samsum_rouge2']:>7.4f} {r['samsum_rougeL']:>7.4f}")
+
+    # TyDiQA results
+    tydiqa_results = [r for r in all_results if "tydiqa_f1" in r]
+    if tydiqa_results:
+        print(f"\nTyDiQA Results:")
+        print(f"{'Model':<60} {'Selection':<12} {'Compress':<12} {'F1':>7} {'EM':>7}")
+        print("-" * 100)
+        for r in sorted(tydiqa_results, key=lambda x: x.get("tydiqa_f1", 0), reverse=True):
+            print(f"{r['model_name'][:60]:<60} {r['selection']:<12} {r['compression']:<12} "
+                  f"{r['tydiqa_f1']:>7.4f} {r.get('tydiqa_em', 0):>7.4f}")
+
+    # MMLU results
+    mmlu_results = [r for r in all_results if "mmlu_accuracy" in r]
+    if mmlu_results:
+        print(f"\nMMLU Results:")
+        print(f"{'Model':<60} {'Selection':<12} {'Compress':<12} {'Acc':>7}")
+        print("-" * 100)
+        for r in sorted(mmlu_results, key=lambda x: x.get("mmlu_accuracy", 0), reverse=True):
+            print(f"{r['model_name'][:60]:<60} {r['selection']:<12} {r['compression']:<12} "
+                  f"{r['mmlu_accuracy']:>7.4f}")
+
+    # BBH results
+    bbh_results = [r for r in all_results if "bbh_accuracy" in r]
+    if bbh_results:
+        print(f"\nBBH Results:")
+        print(f"{'Model':<60} {'Selection':<12} {'Compress':<12} {'Acc':>7}")
+        print("-" * 100)
+        for r in sorted(bbh_results, key=lambda x: x.get("bbh_accuracy", 0), reverse=True):
+            print(f"{r['model_name'][:60]:<60} {r['selection']:<12} {r['compression']:<12} "
+                  f"{r['bbh_accuracy']:>7.4f}")
+
+    # GSM8K results
+    gsm8k_results = [r for r in all_results if "gsm8k_accuracy" in r]
+    if gsm8k_results:
+        print(f"\nGSM8K Results:")
+        print(f"{'Model':<60} {'Selection':<12} {'Compress':<12} {'Acc':>7}")
+        print("-" * 100)
+        for r in sorted(gsm8k_results, key=lambda x: x.get("gsm8k_accuracy", 0), reverse=True):
+            print(f"{r['model_name'][:60]:<60} {r['selection']:<12} {r['compression']:<12} "
+                  f"{r['gsm8k_accuracy']:>7.4f}")
+
+    # MATH500 results
+    math500_results = [r for r in all_results if "math500_accuracy" in r]
+    if math500_results:
+        print(f"\nMATH500 Results:")
+        print(f"{'Model':<60} {'Selection':<12} {'Compress':<12} {'Acc':>7}")
+        print("-" * 100)
+        for r in sorted(math500_results, key=lambda x: x.get("math500_accuracy", 0), reverse=True):
+            print(f"{r['model_name'][:60]:<60} {r['selection']:<12} {r['compression']:<12} "
+                  f"{r['math500_accuracy']:>7.4f}")
+
+    errors = [r for r in all_results if r.get("error")]
+    if errors:
+        print(f"\nErrors: {len(errors)} models failed")
 
 
 if __name__ == "__main__":

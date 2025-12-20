@@ -57,7 +57,7 @@ class StreamingTrainer(Trainer):
         # Set selection_frac to 1.0 when no selection method is specified (consistency)
         # This means we "select" all samples when not doing data selection
         if not hasattr(self.args, 'selection_frac') or self.args.selection_frac is None:
-            if self.args.method != 'Streaming':
+            if self.args.method == 'NA':
                 self.args.selection_frac = 1.0
 
         # Initialize results tracking
@@ -97,9 +97,7 @@ class StreamingTrainer(Trainer):
         logger.info("="*60)
         logger.info("Initialized StreamingTrainer")
         selection_frac = getattr(self.args, 'selection_frac', None)
-        selection_mode = getattr(self.args, 'selection_mode', 'per_layer')
         logger.info(f"  Method: {self.args.method} (selection fraction: {selection_frac})")
-        logger.info(f"  Selection mode: {selection_mode}")
         logger.info(f"  Compression: {self.has_compression}")
         logger.info(f"  Validation set size: {len(val_dataset) if val_dataset is not None else 0}")
         logger.info(f"  Evaluation set size: {len(eval_dataset) if eval_dataset is not None else 0}")
@@ -108,12 +106,11 @@ class StreamingTrainer(Trainer):
 
         # Log the training mode based on configuration
         # Naming convention: {selection}-{compression}-{training_type}
-        if val_dataset is not None and self.args.method == 'Streaming':
-            selection_name = "GREATS" if selection_mode == 'global' else "Streaming"
+        if self.args.method in ('Streaming', 'GREATS'):
             if self.has_compression:
-                logger.info(f"  Mode: {selection_name} with compression (MeSO optimizer)")
+                logger.info(f"  Mode: {self.args.method} with compression (MeSO optimizer)")
             else:
-                logger.info(f"  Mode: {selection_name} without compression (standard optimizer)")
+                logger.info(f"  Mode: {self.args.method} without compression (standard optimizer)")
         elif self.has_compression:
             logger.info(f"  Mode: MeSO only (compressed gradients, no selection)")
         else:
@@ -251,13 +248,13 @@ class StreamingTrainer(Trainer):
         """
         Training step supporting 4 data selection modes + 2 baseline modes.
 
-        Data Selection Modes (method == 'Streaming'):
+        Data Selection Modes (method in ['Streaming', 'GREATS']):
         - Streaming + compression: Single-pass, per-layer selection, compressed gradients (MeSO)
         - GREATS + compression: Two-pass, global selection, compressed gradients (MeSO)
         - Streaming + no compression: Single-pass, per-layer selection, full gradients
         - GREATS + no compression: Two-pass, global selection, full gradients
 
-        Baseline Modes (method != 'Streaming'):
+        Baseline Modes (method == 'NA'):
         - MeSO only: Compressed gradients without selection
         - Baseline: Standard training with full gradients
         """
@@ -271,7 +268,7 @@ class StreamingTrainer(Trainer):
                 unwrapped_optimizer.refresh_compressors_if_needed()
 
         # === DATA SELECTION MODE ===
-        if args.method == 'Streaming':
+        if args.method in ('Streaming', 'GREATS'):
             # Get validation batch for selection
             try:
                 val_batch = next(self.val_dataloader_iter)
@@ -294,9 +291,12 @@ class StreamingTrainer(Trainer):
             if lr is None or lr == 0:
                 lr = args.learning_rate
 
-            selection_mode = getattr(args, 'selection_mode', 'per_layer')
+            # Derive selection mode from method
+            # - Streaming: per-layer selection (single-pass)
+            # - GREATS: global selection (two-pass)
+            is_global_selection = (args.method == 'GREATS')
 
-            if selection_mode == 'global':
+            if is_global_selection:
                 # === GREATS MODE (global selection) ===
                 # Two-pass approach: score accumulation -> global selection -> gradient computation
 
