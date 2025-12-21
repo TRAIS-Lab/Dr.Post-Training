@@ -54,12 +54,12 @@ n_val=8
 n_eval=500
 model="llama3-1b"
 batch_size=8
-val_batch_size=""  # Defaults to batch_size if not specified
+val_batch_size="1"  # Defaults to batch_size if not specified
 lr=""  # Learning rate (looked up from lr_config.json if not specified)
 seed=42
 
 # LR configuration
-lr_config_file="SFT/train/lr_config.json"
+lr_config_file="SFT/train/lr/config.json"
 lr_override=""  # Set when --lr is explicitly passed
 gradient_accumulation_steps=1
 task="mmlu"
@@ -106,7 +106,7 @@ declare -A CATEGORY_EXPERIMENTS=(
 
 # LoRA-specific defaults (only used if --lora is passed)
 lora_alpha=1
-lora_r=8
+lora_r=32
 lora_dropout=0.1
 
 update_compressor_freq=200
@@ -265,10 +265,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --train <dataset>                      Training dataset (default: task-based)"
             echo "  --subject <subject>                    MMLU/BBH subject (default: world_religions)"
             echo ""
-            echo "  --batch_size <size>                    Training batch size (default: 4)"
-            echo "  --val_batch_size <size>                Validation batch size for selection (default: same as batch_size)"
+            echo "  --batch_size <size>                    Training batch size (default: 8)"
+            echo "  --val_batch_size <size>                Validation batch size for selection (default: 1)"
             echo "  --lr <lr>                              Learning rate override (ignores config file)"
-            echo "  --lr_config <path>                     LR config file (default: SFT/train/lr_config.json)"
+            echo "  --lr_config <path>                     LR config file (default: SFT/train/lr/config.json)"
             echo "  --percentage <pct>                     Data sampling percentage (default: 0.05)"
             echo ""
             echo "Learning Rate Resolution:"

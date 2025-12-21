@@ -174,7 +174,7 @@ def parse_model_name(model_name: str) -> Dict[str, str]:
 
 
 def find_models(models_dir: str, train_dataset: Optional[str] = None) -> List[str]:
-    """Find all model directories, optionally filtering by training dataset."""
+    """Find all model directories, optionally filtering by prefix pattern."""
     model_paths = []
     for entry in os.listdir(models_dir):
         entry_path = os.path.join(models_dir, entry)
@@ -188,9 +188,8 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None) -> List[st
             if train_dataset is None:
                 model_paths.append(entry_path)
             else:
-                # Match training dataset: entry starts with "{train}_"
-                parsed = parse_model_name(entry)
-                if parsed["train_dataset"] == train_dataset:
+                # Match if entry starts with the filter pattern (followed by - or _)
+                if entry.startswith(train_dataset + "-") or entry.startswith(train_dataset + "_"):
                     model_paths.append(entry_path)
     return sorted(model_paths)
 
@@ -257,7 +256,7 @@ def evaluate_bbh(args, model, tokenizer) -> dict:
         model=model,
         tokenizer=tokenizer,
         batch_size=args.batch_size,
-        max_new_tokens=64
+        max_new_tokens=512  # Chain-of-thought requires more tokens
     )
     return {
         "task": "bbh",
@@ -491,7 +490,13 @@ def main():
         return
 
     # Batch evaluation
-    model_paths = find_models(args.models_dir, args.train)
+    # Construct filter prefix from train, task, and subject
+    filter_prefix = args.train
+    if filter_prefix and args.task:
+        filter_prefix = f"{filter_prefix}_{args.task}"
+        if args.subject:
+            filter_prefix = f"{filter_prefix}_{args.subject}"
+    model_paths = find_models(args.models_dir, filter_prefix)
     logger.info(f"Found {len(model_paths)} models to evaluate")
 
     if not model_paths:

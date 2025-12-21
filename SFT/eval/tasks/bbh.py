@@ -7,11 +7,30 @@ BBH contains multiple reasoning tasks with short answer outputs.
 
 import json
 import os
-from typing import List, Tuple
-
-from tqdm import tqdm
+import re
+from typing import Dict, List, Tuple
 
 from ..utils import generate_completions
+
+
+def load_fewshot_examples(data_dir: str) -> Dict[str, str]:
+    """
+    Load few-shot examples for each BBH task.
+
+    Args:
+        data_dir: Base data directory containing eval/bbh/
+
+    Returns:
+        Dictionary mapping task name to few-shot prompt string
+    """
+    fewshot_path = os.path.join(data_dir, "eval", "bbh", "bbh_fewshot.json")
+
+    if not os.path.exists(fewshot_path):
+        print(f"Warning: Few-shot examples not found at {fewshot_path}")
+        return {}
+
+    with open(fewshot_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
 
 def load_bbh_test_data(data_dir: str, k: int = -1, task: str = None) -> List[Tuple[str, str, str]]:
@@ -51,10 +70,7 @@ def load_bbh_test_data(data_dir: str, k: int = -1, task: str = None) -> List[Tup
             reference = messages[1]['content']
             task_name = example.get('task', 'unknown')
 
-            # Format prompt with chat template
-            prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-
-            examples.append((prompt, reference, task_name))
+            examples.append((user_content, reference, task_name))
 
             if k > 0 and len(examples) >= k:
                 break
@@ -72,7 +88,29 @@ def normalize_answer(answer: str) -> str:
     return answer
 
 
-def compute_accuracy(args, model, tokenizer, batch_size: int = 1, max_new_tokens: int = 64) -> dict:
+def extract_answer(prediction: str) -> str:
+    """
+    Extract the final answer from a prediction.
+    Looks for patterns like "So the answer is X." or "the answer is X"
+    """
+    # Try to find "So the answer is X" or "the answer is X" pattern
+    patterns = [
+        r"[Ss]o the answer is[:\s]*([^\.\n]+)",
+        r"[Tt]he answer is[:\s]*([^\.\n]+)",
+        r"[Aa]nswer[:\s]*([^\.\n]+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, prediction)
+        if match:
+            return match.group(1).strip()
+
+    # If no pattern found, return the last line/sentence
+    lines = prediction.strip().split('\n')
+    return lines[-1].strip() if lines else prediction
+
+
+def compute_accuracy(args, model, tokenizer, batch_size: int = 1, max_new_tokens: int = 512) -> dict:
     """
     Evaluate model on BBH test set using exact match accuracy.
 
@@ -92,12 +130,28 @@ def compute_accuracy(args, model, tokenizer, batch_size: int = 1, max_new_tokens
         n_test = 10000  # Load all available
     task_filter = getattr(args, 'bbh_task', None)
 
+    # Load few-shot examples
+    fewshot_examples = load_fewshot_examples(data_dir)
+
     # Load test data
     test_data = load_bbh_test_data(data_dir, k=n_test, task=task_filter)
     print(f"Loaded {len(test_data)} BBH test examples")
 
-    # Extract prompts and references
-    prompts = [prompt for prompt, _, _ in test_data]
+    # Build prompts with few-shot examples
+    prompts = []
+    for user_content, _, task_name in test_data:
+        # Get few-shot examples for this task
+        fewshot = fewshot_examples.get(task_name, "")
+
+        if fewshot:
+            # Format: few-shot examples followed by the test question
+            prompt = f"<|user|>\n{fewshot}\n\nQ: {user_content}\nA: Let's think step by step.\n<|assistant|>\n"
+        else:
+            # No few-shot examples available
+            prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+
+        prompts.append(prompt)
+
     references = [ref for _, ref, _ in test_data]
     tasks = [task for _, _, task in test_data]
 
@@ -111,8 +165,7 @@ def compute_accuracy(args, model, tokenizer, batch_size: int = 1, max_new_tokens
         max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        temperature=1.0,
-        top_p=0.95,
+        do_sample=False,  # Use greedy decoding for consistency
         disable_tqdm=False
     )
 
@@ -121,16 +174,21 @@ def compute_accuracy(args, model, tokenizer, batch_size: int = 1, max_new_tokens
     task_correct = {}
     task_total = {}
 
-    for i, (pred, ref, task) in enumerate(zip(predictions, references, tasks)):
-        # Clean prediction - take first line/sentence
+    for pred, ref, task in zip(predictions, references, tasks):
+        # Clean prediction
         pred = pred.strip()
-        for stop_pattern in ["<|user|>", "<|assistant|>", "</s>", "<|end|>", "\n"]:
+
+        # Remove any trailing special tokens
+        for stop_pattern in ["<|user|>", "<|assistant|>", "</s>", "<|end|>", "<|eot_id|>"]:
             if stop_pattern in pred:
                 pred = pred[:pred.find(stop_pattern)]
         pred = pred.strip()
 
+        # Extract final answer from the prediction
+        pred_answer = extract_answer(pred)
+
         # Normalize for comparison
-        pred_norm = normalize_answer(pred)
+        pred_norm = normalize_answer(pred_answer)
         ref_norm = normalize_answer(ref)
 
         # Track per-task accuracy

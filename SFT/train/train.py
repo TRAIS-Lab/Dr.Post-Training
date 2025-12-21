@@ -355,6 +355,10 @@ def main():
     logger.info("*** Starting training with gradient streaming ***")
     train_result = trainer.train()
 
+    # Final evaluation after training
+    logger.info("*** Running final evaluation after training ***")
+    trainer.evaluate()
+
     # Save final evaluation results
     trainer.on_train_end()
 

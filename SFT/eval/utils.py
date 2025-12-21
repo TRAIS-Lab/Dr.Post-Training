@@ -36,6 +36,8 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
         generation_kwargs["max_new_tokens"] = 20
 
     num_return_sequences = generation_kwargs.get("num_return_sequences", 1)
+    # Remove pad_token_id from generation_kwargs if present, since we pass it explicitly
+    generation_kwargs.pop("pad_token_id", None)
     for i in range(0, len(prompts), batch_size):
         batch_prompts = prompts[i:i+batch_size]
         tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
@@ -49,6 +51,7 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
             batch_outputs = model.generate(
                 input_ids=batch_input_ids,
                 attention_mask=attention_mask,
+                pad_token_id=tokenizer.pad_token_id,
                 stopping_criteria=[KeyWordsCriteria(stop_id_sequences)] if stop_id_sequences else None,
                 **generation_kwargs
             )

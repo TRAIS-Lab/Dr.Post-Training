@@ -44,7 +44,7 @@ export base_training_args="--do_train=True \
 --warmup_ratio=0.03 \
 --weight_decay=0.0 \
 --logging_steps=1 \
---eval_steps=50 \
+--eval_steps=99999 \
 --eval_strategy=steps \
 --save_strategy=no \
 --num_train_epochs=1 \
@@ -64,10 +64,10 @@ optim="adamw_torch"
 data_dir="SFT/data"
 sweep_percentage=0.05  # Use 5% of data for LR sweep
 n_val=8
-n_eval=100  # Fewer eval examples for speed
+n_eval=50  # Fewer eval examples for speed
 model="llama3-1b"
 batch_size=8
-val_batch_size=""
+val_batch_size="1"
 seed=42
 gradient_accumulation_steps=1
 task="mmlu"
@@ -82,17 +82,30 @@ use_flash_attention=true
 lr_grid="1e-6,5e-6,1e-5,5e-5,1e-4"
 lr_grid_lora="5e-5,1e-4,2e-4,5e-4,1e-3"
 
+# Sweep mode
+sweep_mode="grid"  # "grid" or "binary"
+
+# Binary search defaults
+binary_lr_min="1e-6"
+binary_lr_max="1e-3"
+binary_lr_min_lora="1e-5"
+binary_lr_max_lora="1e-2"
+binary_max_iters=6  # ~6 iterations narrows range by ~10x
+
+# Stability margin: prefer smaller LR unless larger LR is significantly better
+lr_margin=0.05  # 5% - larger LR must have loss at least 5% lower to be preferred
+
 # Multi-experiment mode
 experiments=""
 dry_run=false
 
 # Output paths
-lr_config_file="SFT/train/lr_config.json"
-sweep_results_dir="SFT/lr_sweep_results"
+lr_config_file="SFT/train/lr/config.json"
+sweep_results_dir="SFT/train/lr/results"
 
 # LoRA defaults
 lora_alpha=1
-lora_r=8
+lora_r=32
 lora_dropout=0.1
 update_compressor_freq=200
 
@@ -223,18 +236,62 @@ while [[ $# -gt 0 ]]; do
             dry_run=true
             shift
             ;;
+        --mode)
+            sweep_mode="$2"
+            shift 2
+            ;;
+        --binary_lr_min)
+            binary_lr_min="$2"
+            shift 2
+            ;;
+        --binary_lr_max)
+            binary_lr_max="$2"
+            shift 2
+            ;;
+        --binary_lr_min_lora)
+            binary_lr_min_lora="$2"
+            shift 2
+            ;;
+        --binary_lr_max_lora)
+            binary_lr_max_lora="$2"
+            shift 2
+            ;;
+        --binary_max_iters)
+            binary_max_iters="$2"
+            shift 2
+            ;;
+        --lr_margin)
+            lr_margin="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
-            echo "Perform learning rate grid search for SFT experiments."
+            echo "Perform learning rate search for SFT experiments."
             echo ""
-            echo "LR Sweep Options:"
+            echo "Sweep Mode:"
+            echo "  --mode <mode>                          Sweep mode: 'grid' (default) or 'binary'"
+            echo ""
+            echo "Grid Search Options (--mode grid):"
             echo "  --lr_grid <lrs>                        Comma-separated LRs for full fine-tuning"
             echo "                                         (default: 1e-6,5e-6,1e-5,5e-5,1e-4)"
             echo "  --lr_grid_lora <lrs>                   Comma-separated LRs for LoRA"
             echo "                                         (default: 5e-5,1e-4,2e-4,5e-4,1e-3)"
+            echo ""
+            echo "Binary Search Options (--mode binary):"
+            echo "  --binary_lr_min <lr>                   Min LR for full fine-tuning (default: 1e-6)"
+            echo "  --binary_lr_max <lr>                   Max LR for full fine-tuning (default: 1e-3)"
+            echo "  --binary_lr_min_lora <lr>              Min LR for LoRA (default: 1e-5)"
+            echo "  --binary_lr_max_lora <lr>              Max LR for LoRA (default: 1e-2)"
+            echo "  --binary_max_iters <n>                 Max iterations (default: 6)"
+            echo ""
+            echo "Stability Options:"
+            echo "  --lr_margin <pct>                      Prefer smaller LR unless larger LR is this much"
+            echo "                                         better (default: 0.05 = 5%)"
+            echo ""
+            echo "Common Options:"
             echo "  --sweep_percentage <pct>               Data percentage for sweep (default: 0.05)"
-            echo "  --lr_config <path>                     Output config file (default: SFT/train/lr_config.json)"
+            echo "  --lr_config <path>                     Output config file (default: SFT/train/lr/config.json)"
             echo ""
             echo "Multi-Experiment Mode:"
             echo "  --experiments <list>                   Run sweep for multiple experiments"
@@ -296,28 +353,29 @@ resolve_experiments() {
 }
 
 # ========================================
-# Extract validation loss from training output
+# Extract evaluation loss from training output
 # ========================================
-# IMPORTANT: We use val_loss (validation set) for LR selection, NOT eval_loss (test set).
-# This prevents test set leakage into hyperparameter tuning.
-extract_val_loss() {
+# We use eval_loss (evaluation/test set) for LR selection, NOT val_loss (validation set).
+# This prevents overfitting to the validation set which is also used for data selection
+# during Streaming/GREATS training.
+extract_eval_loss() {
     local output_dir="$1"
-    local val_loss=""
+    local eval_loss=""
 
     # Primary: Read from evaluation_results.json (structured output)
     local eval_json="$output_dir/evaluation_results.json"
     if [[ -f "$eval_json" ]]; then
-        # Get the last val_loss from the JSON array
-        val_loss=$(python3 -c "
+        # Get the last eval_loss from the JSON array
+        eval_loss=$(python3 -c "
 import json
 import sys
 try:
     with open('$eval_json', 'r') as f:
         results = json.load(f)
     if results and len(results) > 0:
-        last_val_loss = results[-1].get('val_loss')
-        if last_val_loss is not None:
-            print(f'{last_val_loss:.10e}')
+        last_eval_loss = results[-1].get('eval_loss')
+        if last_eval_loss is not None:
+            print(f'{last_eval_loss:.10e}')
         else:
             sys.exit(1)
     else:
@@ -328,18 +386,18 @@ except:
     fi
 
     # Fallback: Try parsing train.log if JSON not available
-    if [[ -z "$val_loss" ]]; then
+    if [[ -z "$eval_loss" ]]; then
         local log_file="$output_dir/train.log"
         if [[ -f "$log_file" ]]; then
-            val_loss=$(grep -oP "val_loss['\"]?\s*[:=]\s*\K[0-9]+\.[0-9]+" "$log_file" 2>/dev/null | tail -1)
+            eval_loss=$(grep -oP "eval_loss['\"]?\s*[:=]\s*\K[0-9]+\.[0-9]+" "$log_file" 2>/dev/null | tail -1)
         fi
     fi
 
     # Return default if no valid value found
-    if [[ -z "$val_loss" ]]; then
+    if [[ -z "$eval_loss" ]]; then
         echo "999.0"
     else
-        echo "$val_loss"
+        echo "$eval_loss"
     fi
 }
 
@@ -496,10 +554,10 @@ run_lr_trial() {
     else
         mkdir -p "$trial_output_dir"
         # Run training and capture output to log file only (not stdout)
-        # This prevents training output from being mixed with val_loss return value
+        # This prevents training output from being mixed with eval_loss return value
         eval "$header" "$training_args" > "$log_file" 2>&1
-        # Extract val_loss from output directory (reads evaluation_results.json)
-        extract_val_loss "$trial_output_dir"
+        # Extract eval_loss from output directory (reads evaluation_results.json)
+        extract_eval_loss "$trial_output_dir"
     fi
 }
 
@@ -510,7 +568,7 @@ update_lr_config() {
     local config_key="$1"
     local exp_name="$2"
     local best_lr="$3"
-    local best_val_loss="$4"
+    local best_eval_loss="$4"
 
     # Initialize config file if it doesn't exist
     if [[ ! -f "$lr_config_file" ]]; then
@@ -526,7 +584,7 @@ config_file = "$lr_config_file"
 config_key = "$config_key"
 exp_name = "$exp_name"
 best_lr = "$best_lr"
-best_val_loss = float("$best_val_loss") if "$best_val_loss" != "" else None
+best_eval_loss = float("$best_eval_loss") if "$best_eval_loss" != "" else None
 
 try:
     with open(config_file, 'r') as f:
@@ -539,7 +597,7 @@ if config_key not in config:
 
 config[config_key][exp_name] = {
     "lr": float(best_lr),
-    "val_loss": best_val_loss,
+    "eval_loss": best_eval_loss,
     "sweep_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
     "sweep_percentage": float("$sweep_percentage"),
     "model": "$model"
@@ -573,9 +631,17 @@ echo "Task: $task"
 echo "Training data: ${train_dataset:-default}"
 echo "Model: $model"
 echo "Sweep percentage: $sweep_percentage"
+echo "Sweep mode: $sweep_mode"
 echo ""
-echo "LR grid (full): $lr_grid"
-echo "LR grid (LoRA): $lr_grid_lora"
+if [[ "$sweep_mode" == "grid" ]]; then
+    echo "LR grid (full): $lr_grid"
+    echo "LR grid (LoRA): $lr_grid_lora"
+elif [[ "$sweep_mode" == "binary" ]]; then
+    echo "LR range (full): $binary_lr_min -> $binary_lr_max"
+    echo "LR range (LoRA): $binary_lr_min_lora -> $binary_lr_max_lora"
+    echo "Max iterations: $binary_max_iters"
+fi
+echo "LR margin: $lr_margin (prefer smaller LR for stability)"
 echo ""
 echo "Output config: $lr_config_file"
 echo "Results dir: $sweep_results_dir"
@@ -613,57 +679,227 @@ if [[ -n "$experiments" ]]; then
         exp_use_lora="${exp_parts[2]}"
         exp_use_second_order="${exp_parts[3]}"
 
-        # Select appropriate LR grid
-        if [ "$exp_use_lora" = true ]; then
-            current_lr_grid="$lr_grid_lora"
-        else
-            current_lr_grid="$lr_grid"
-        fi
-
-        echo "Testing LRs: $current_lr_grid"
         echo "" >> "$summary_file"
         echo "=== $exp_name ===" >> "$summary_file"
-        echo "LR grid: $current_lr_grid" >> "$summary_file"
 
         best_lr=""
-        best_val_loss=999.0
+        best_eval_loss=999.0
 
-        # Run trials for each LR
-        IFS=',' read -ra lr_values <<< "$current_lr_grid"
-        for trial_lr in "${lr_values[@]}"; do
-            trial_lr=$(echo "$trial_lr" | xargs)  # Trim whitespace
-            echo ""
-            echo "--- Testing LR: $trial_lr ---"
-
-            trial_output_dir="$sweep_results_dir/${config_key}/${exp_name}/lr_${trial_lr}"
-
-            val_loss=$(run_lr_trial "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$trial_lr" "$exp_name" "$trial_output_dir")
-
-            echo "LR $trial_lr -> val_loss: $val_loss"
-            echo "  LR $trial_lr: val_loss=$val_loss" >> "$summary_file"
-
-            # Check if this is the best (lower val_loss is better)
-            # Validate that val_loss is a proper number before comparing
-            if is_valid_number "$val_loss" && is_valid_number "$best_val_loss"; then
-                if (( $(echo "$val_loss < $best_val_loss" | bc -l) )); then
-                    best_val_loss="$val_loss"
-                    best_lr="$trial_lr"
-                fi
+        if [[ "$sweep_mode" == "binary" ]]; then
+            # ========================================
+            # Binary Search Mode (Golden Section Search)
+            # ========================================
+            # Select appropriate LR bounds
+            if [ "$exp_use_lora" = true ]; then
+                current_lr_min="$binary_lr_min_lora"
+                current_lr_max="$binary_lr_max_lora"
             else
-                echo "  Warning: Invalid val_loss value '$val_loss', skipping comparison"
+                current_lr_min="$binary_lr_min"
+                current_lr_max="$binary_lr_max"
             fi
 
-            # Clean up model weights to save disk space (keeps eval results and logs)
-            cleanup_model_weights "$trial_output_dir"
-        done
+            echo "Running Binary Search: $current_lr_min -> $current_lr_max (max $binary_max_iters iterations)"
+            echo "Mode: Binary Search ($current_lr_min -> $current_lr_max, max $binary_max_iters iters)" >> "$summary_file"
+
+            # Golden section search in log space
+            # φ = (1 + √5) / 2 ≈ 1.618, 1/φ ≈ 0.618
+            inv_phi="0.6180339887"
+
+            # Work in log10 space
+            log_a=$(python3 -c "import math; print(math.log10($current_lr_min))")
+            log_b=$(python3 -c "import math; print(math.log10($current_lr_max))")
+
+            # Track all evaluated points to find best (reset for each experiment)
+            declare -A lr_losses
+            lr_losses=()
+
+            for ((iter=1; iter<=binary_max_iters; iter++)); do
+                echo ""
+                echo "--- Binary Search Iteration $iter/$binary_max_iters ---"
+                echo "  Current range: [10^$log_a, 10^$log_b]"
+
+                # Calculate two interior points using golden ratio
+                log_c=$(python3 -c "print($log_b - $inv_phi * ($log_b - $log_a))")
+                log_d=$(python3 -c "print($log_a + $inv_phi * ($log_b - $log_a))")
+
+                lr_c=$(python3 -c "print(f'{10**$log_c:.2e}')")
+                lr_d=$(python3 -c "print(f'{10**$log_d:.2e}')")
+
+                echo "  Testing LR_c=$lr_c and LR_d=$lr_d"
+
+                # Evaluate lr_c if not already evaluated
+                if [[ -z "${lr_losses[$lr_c]}" ]]; then
+                    trial_output_dir="$sweep_results_dir/${config_key}/${exp_name}/binary_iter${iter}_lr_${lr_c}"
+                    loss_c=$(run_lr_trial "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$lr_c" "$exp_name" "$trial_output_dir")
+                    lr_losses[$lr_c]="$loss_c"
+                    echo "  LR $lr_c -> eval_loss: $loss_c"
+                    echo "  Iter $iter: LR $lr_c -> eval_loss=$loss_c" >> "$summary_file"
+                    cleanup_model_weights "$trial_output_dir"
+                else
+                    loss_c="${lr_losses[$lr_c]}"
+                    echo "  LR $lr_c -> eval_loss: $loss_c (cached)"
+                fi
+
+                # Evaluate lr_d if not already evaluated
+                if [[ -z "${lr_losses[$lr_d]}" ]]; then
+                    trial_output_dir="$sweep_results_dir/${config_key}/${exp_name}/binary_iter${iter}_lr_${lr_d}"
+                    loss_d=$(run_lr_trial "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$lr_d" "$exp_name" "$trial_output_dir")
+                    lr_losses[$lr_d]="$loss_d"
+                    echo "  LR $lr_d -> eval_loss: $loss_d"
+                    echo "  Iter $iter: LR $lr_d -> eval_loss=$loss_d" >> "$summary_file"
+                    cleanup_model_weights "$trial_output_dir"
+                else
+                    loss_d="${lr_losses[$lr_d]}"
+                    echo "  LR $lr_d -> eval_loss: $loss_d (cached)"
+                fi
+
+                # Narrow the search interval (bias toward lower half if losses within margin)
+                # Only go to upper half if loss_d is significantly better than loss_c
+                prefer_lower=$(python3 -c "
+loss_c = float('$loss_c')
+loss_d = float('$loss_d')
+margin = float('$lr_margin')
+# Prefer lower half unless upper half is significantly better (by margin)
+if loss_d < loss_c * (1 - margin):
+    print('0')  # Upper half is significantly better
+else:
+    print('1')  # Prefer lower half for stability
+" 2>/dev/null)
+                if [[ "$prefer_lower" == "1" ]]; then
+                    # Prefer lower half (smaller LRs)
+                    log_b="$log_d"
+                    echo "  -> Narrowing to lower half: [10^$log_a, 10^$log_b] (prefer smaller LR)"
+                else
+                    # Upper half is significantly better
+                    log_a="$log_c"
+                    echo "  -> Narrowing to upper half: [10^$log_a, 10^$log_b] (significantly better)"
+                fi
+            done
+
+            # Find the best LR from all evaluated points (prefer smaller LR for stability)
+            best_lr=""
+            best_eval_loss="999.0"
+            # Sort LRs from smallest to largest and iterate
+            sorted_lrs=$(python3 -c "
+lrs = '${!lr_losses[*]}'.split()
+for lr in sorted(lrs, key=float):
+    print(lr)
+" 2>/dev/null)
+            for lr in $sorted_lrs; do
+                loss="${lr_losses[$lr]}"
+                if is_valid_number "$loss"; then
+                    should_update=$(python3 -c "
+loss = float('$loss')
+best_loss = float('$best_eval_loss')
+margin = float('$lr_margin')
+best_lr = float('${best_lr:-0}') if '${best_lr:-}' else 0
+current_lr = float('$lr')
+
+if best_lr == 0:
+    print('1')  # First result
+elif current_lr < best_lr:
+    # Smaller LR: update if loss is not worse (within margin)
+    if loss <= best_loss * (1 + margin):
+        print('1')
+    else:
+        print('0')
+else:
+    # Larger LR: only update if significantly better
+    if loss < best_loss * (1 - margin):
+        print('1')
+    else:
+        print('0')
+" 2>/dev/null)
+                    if [[ "$should_update" == "1" ]]; then
+                        best_eval_loss="$loss"
+                        best_lr="$lr"
+                    fi
+                fi
+            done
+
+            echo ""
+            echo "Binary search complete. Best LR: $best_lr (eval_loss: $best_eval_loss)"
+
+        elif [[ "$sweep_mode" == "grid" ]]; then
+            # ========================================
+            # Grid Search Mode
+            # ========================================
+            # Select appropriate LR grid
+            if [ "$exp_use_lora" = true ]; then
+                current_lr_grid="$lr_grid_lora"
+            else
+                current_lr_grid="$lr_grid"
+            fi
+
+            echo "Testing LRs: $current_lr_grid"
+            echo "LR grid: $current_lr_grid" >> "$summary_file"
+
+            # Run trials for each LR
+            IFS=',' read -ra lr_values <<< "$current_lr_grid"
+            for trial_lr in "${lr_values[@]}"; do
+                trial_lr=$(echo "$trial_lr" | xargs)  # Trim whitespace
+                echo ""
+                echo "--- Testing LR: $trial_lr ---"
+
+                trial_output_dir="$sweep_results_dir/${config_key}/${exp_name}/lr_${trial_lr}"
+
+                eval_loss=$(run_lr_trial "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$trial_lr" "$exp_name" "$trial_output_dir")
+
+                echo "LR $trial_lr -> eval_loss: $eval_loss"
+                echo "  LR $trial_lr: eval_loss=$eval_loss" >> "$summary_file"
+
+                # Check if this is the best (prefer smaller LR for stability)
+                # Only update to larger LR if improvement exceeds lr_margin
+                if is_valid_number "$eval_loss" && is_valid_number "$best_eval_loss"; then
+                    # Compute threshold: new loss must be at least (margin)% better
+                    # threshold = best_eval_loss * (1 - lr_margin)
+                    should_update=$(python3 -c "
+eval_loss = float('$eval_loss')
+best_loss = float('$best_eval_loss')
+margin = float('$lr_margin')
+trial_lr = float('$trial_lr')
+best_lr = float('${best_lr:-0}') if '${best_lr:-}' else 0
+
+if best_lr == 0:
+    # First valid result
+    print('1')
+elif trial_lr < best_lr:
+    # Smaller LR: update if loss is not worse (within margin)
+    if eval_loss <= best_loss * (1 + margin):
+        print('1')
+    else:
+        print('0')
+else:
+    # Larger LR: only update if loss is significantly better (exceeds margin)
+    if eval_loss < best_loss * (1 - margin):
+        print('1')
+    else:
+        print('0')
+" 2>/dev/null)
+                    if [[ "$should_update" == "1" ]]; then
+                        echo "  -> New best (margin=$lr_margin)"
+                        best_eval_loss="$eval_loss"
+                        best_lr="$trial_lr"
+                    fi
+                else
+                    echo "  Warning: Invalid eval_loss value '$eval_loss', skipping comparison"
+                fi
+
+                # Clean up model weights to save disk space (keeps eval results and logs)
+                cleanup_model_weights "$trial_output_dir"
+            done
+        else
+            echo "ERROR: Unknown sweep mode '$sweep_mode'. Use 'grid' or 'binary'."
+            exit 1
+        fi
 
         echo ""
-        echo "Best LR for $exp_name: $best_lr (val_loss: $best_val_loss)"
-        echo "  BEST: $best_lr (val_loss=$best_val_loss)" >> "$summary_file"
+        echo "Best LR for $exp_name: $best_lr (eval_loss: $best_eval_loss)"
+        echo "  BEST: $best_lr (eval_loss=$best_eval_loss)" >> "$summary_file"
 
         # Update config file
         if [[ -n "$best_lr" ]]; then
-            update_lr_config "$config_key" "$exp_name" "$best_lr" "$best_val_loss"
+            update_lr_config "$config_key" "$exp_name" "$best_lr" "$best_eval_loss"
         fi
     done
 else

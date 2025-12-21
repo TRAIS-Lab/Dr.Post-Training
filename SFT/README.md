@@ -26,18 +26,20 @@ python SFT/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
 
 | Dataset   | Task Type          | Description                                              |
 | --------- | ------------------ | -------------------------------------------------------- |
+| `samsum`  | Summarization      | SAMSum dialogue summarization                            |
+| `tydiqa`  | Question Answering | Typologically Diverse QA (9 languages)                   |
 | `mmlu`    | Multiple Choice    | Massive Multitask Language Understanding (57 subjects)   |
 | `bbh`     | Reasoning          | BIG-Bench Hard (23 challenging reasoning tasks with CoT) |
-| `tydiqa`  | Question Answering | Typologically Diverse QA (9 languages)                   |
 | `gsm8k`   | Math               | Grade School Math (8K problems)                          |
 | `math500` | Math               | MATH benchmark (500 competition problems)                |
-| `samsum`  | Summarization      | SAMSum dialogue summarization                            |
 
 #### Training Datasets
 
 | Dataset      | Size | Description                           |
 | ------------ | ---- | ------------------------------------- |
+| `less`       | 1M   | LESS-selected instruction data        |
 | `alpaca`     | 52K  | Stanford Alpaca instruction-following |
+| `tulu3`      | 939K | Tulu-3 SFT mixture                    |
 | `dolly`      | 15K  | Databricks Dolly 2.0                  |
 | `flan_v2`    | 100K | FLAN v2 instruction tuning mixture    |
 | `cot`        | 100K | Chain-of-Thought reasoning examples   |
@@ -45,8 +47,6 @@ python SFT/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
 | `vicuna`     | 125K | ShareGPT-based conversations          |
 | `wizardlm`   | 196K | WizardLM evolved instructions         |
 | `openhermes` | 1M   | OpenHermes 2.5 diverse instructions   |
-| `tulu3`      | 939K | Tulu-3 SFT mixture                    |
-| `less`       | 1M   | LESS-selected instruction data        |
 
 ## Naming Convention
 
@@ -90,50 +90,19 @@ Experiments follow the pattern: `{train}_{task}-{selection}-{compression}-{model
 
 ## Learning Rate Configuration
 
-Learning rates are managed via `SFT/train/lr_config.json`. Each experiment configuration (selection × compression × training type) can have its own optimal LR for each task/dataset combination.
+The `SFT/train/lr/` folder contains tools for finding optimal learning rates, where learing rates are managed via `SFT/train/lr/config.json`.
 
 ### Recommended Workflow
 
-1. **Run LR sweep** (uses 5% of data by default):
+1. **Run LR sweep** using either Grid Search or Binary Search:
+
 ```bash
-# Sweep all experiments for a specific task/dataset
-bash SFT/train/lr_sweep.sh --experiments all --task samsum --train alpaca
+# Grid Search (default) - tests multiple discrete LRs
+bash SFT/train/lr/lr_sweep.sh --mode grid --experiments all --task samsum --train alpaca
 
-# Sweep specific experiments
-bash SFT/train/lr_sweep.sh --experiments baseline --task tydiqa --train less
-
-# Custom LR grid
-bash SFT/train/lr_sweep.sh --experiments all --task samsum --train alpaca \
-    --lr_grid "1e-6,5e-6,1e-5,5e-5" \
-    --lr_grid_lora "5e-5,1e-4,2e-4,5e-4"
+# Binary Search - efficient search using golden section method
+bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --task samsum --train alpaca
 ```
-
-2. **Review results**: Check `SFT/lr_sweep_results/` for detailed logs and `SFT/train/lr_config.json` for best LRs.
-
-3. **Run full training**: LRs are automatically loaded from the config:
-```bash
-bash SFT/train/train.sh --experiments all --task samsum --train alpaca
-```
-
-### LR Resolution Order
-
-1. If `--lr` is specified on command line, use that (override)
-2. Look up from `lr_config.json` based on `{train}_{task}` + experiment name
-3. Fall back to defaults (5e-05 for full, 2e-04 for LoRA)
-
-### lr_config.json Format
-
-```json
-{
-  "alpaca_samsum": {
-    "NA-NA-full": {"lr": 5e-6, "val_loss": 1.23},
-    "Streaming-NA-full": {"lr": 1e-5, "val_loss": 1.18},
-    ...
-  }
-}
-```
-
-> **Important:** LR selection uses `val_loss` (validation set), not `eval_loss` (test set), to prevent test set leakage into hyperparameter tuning.
 
 ## Running Experiments
 
@@ -230,7 +199,7 @@ The unified training script accepts the following arguments:
 #### Task Arguments
 
 - `--task <task>` - Evaluation task: `mmlu`, `bbh`, `tydiqa`, `gsm8k`, `math500`, `samsum`
-- `--subject <subject>` - Subject for MMLU/BBH (default: `world_religions`)
+- `--subject <subject>` - Subject for MMLU/BBH (default: `sociology`)
 - `--train <dataset>` - Training dataset (optional, overrides task-based default):
   - `alpaca`, `dolly`, `flan_v2`, `cot`, `oasst1` - Instruction tuning
   - `gsm8k` - Math training data
@@ -255,24 +224,25 @@ The unified training script accepts the following arguments:
 #### Core Training Arguments
 
 - `--model <model>` - Model: `llama3-1b`, `llama2-7b`, `llama2-13b`, `mistral-7b` (default: `llama3-1b`)
-- `--lr <lr>` - Learning rate (default: `5e-05`)
-- `--batch_size <size>` - Batch size (default: `4`)
+- `--lr <lr>` - Learning rate override (if not specified, looked up from `lr_config.json`; fallback: `5e-05` for full, `2e-04` for LoRA)
+- `--lr_config <path>` - LR config file path (default: `SFT/train/lr/config.json`)
+- `--batch_size <size>` - Batch size (default: `8`)
 - `--seed <seed>` - Random seed (default: `42`)
 - `--gradient_accumulation_steps <steps>` - Gradient accumulation (default: `1`)
 
 #### Data Arguments
 
 - `--percentage <pct>` - Data sampling, e.g., `0.05` for 5% (default: `0.05`)
-- `--n_val <n>` - Validation examples for data selection (default: `5`)
+- `--n_val <n>` - Validation examples for data selection (default: `8`)
 - `--n_eval <n>` - Evaluation examples (default: `500`)
-- `--val_batch_size <size>` - Validation batch size for data selection (default: same as `batch_size`)
+- `--val_batch_size <size>` - Validation batch size for data selection (default: `1`)
 - `--data_dir <dir>` - Data directory (default: `SFT/data`)
 
 #### LoRA Arguments
 
 - `--lora` - Enable LoRA fine-tuning (flag, omit for full fine-tuning)
 - `--lora_alpha <alpha>` - LoRA alpha (default: `1`)
-- `--lora_r <r>` - LoRA rank (default: `8`)
+- `--lora_r <r>` - LoRA rank (default: `32`)
 - `--lora_dropout <dropout>` - LoRA dropout (default: `0.1`)
 
 ## Evaluation
@@ -297,14 +267,14 @@ python SFT/eval/eval.py --task tydiqa --model_path <path_to_model> \
 
 The following experiments have been run and can be rerun with the commands below.
 
-| Train Dataset | Eval Task | Percentage | Batch | N_val |
-| ------------- | --------- | ---------- | ----- | ----- |
-| Alpaca        | SAMSum    | 0.4        | 8     | 8     |
-| LESS          | MMLU      | 0.05       | 8     | 8     |
-| WizardLM      | BBH       | 0.1        | 8     | 8     |
-| Tulu3         | TydiQA    | 0.01       | 8     | 8     |
+| Train Dataset | Eval Task | Percentage | Batch | Val Size | LoRA Rank |
+| ------------- | --------- | ---------- | ----- | -------- | --------- |
+| Alpaca        | SAMSum    | 0.4        | 8     | 32       | 32        |
+| Tulu3         | TydiQA    | 0.01       | 8     | 32       | 32        |
+| LESS          | MMLU      | 0.05       | 8     | 32       | 128       |
+| LESS          | BBH       | 0.05       | 8     | 32       | 128       |
 
-> **Note:** Learning rates are managed via `SFT/train/lr_config.json`. Run `lr_sweep.sh` to find optimal LRs before training.
+> **Note:** Learning rates are managed via `SFT/train/lr/config.json`. Run `lr_sweep.sh` to find optimal LRs before training.
 
 ### LR Sweep Commands
 
@@ -312,20 +282,16 @@ Run LR sweep before full training to find optimal learning rates:
 
 ```bash
 # Alpaca -> SAMSum
-bash SFT/train/lr_sweep.sh --experiments all --task samsum --train alpaca \
-    --batch_size 8 --n_val 8 --sweep_percentage 0.04
-
-# LESS -> MMLU
-bash SFT/train/lr_sweep.sh --experiments all --task mmlu --subject sociology --train less \
-    --batch_size 8 --n_val 8 --sweep_percentage 0.005
-
-# WizardLM -> BBH
-bash SFT/train/lr_sweep.sh --experiments all --task bbh --subject navigate --train wizardlm \
-    --batch_size 8 --n_val 8 --sweep_percentage 0.01
+bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --task samsum --train alpaca \
+    --batch_size 8 --n_val 4 --sweep_percentage 0.04 --seed 2
 
 # Tulu3 -> TydiQA
-bash SFT/train/lr_sweep.sh --experiments all --task tydiqa --train tulu3 \
-    --batch_size 8 --n_val 8 --sweep_percentage 0.001
+bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --task tydiqa --train tulu3 \
+    --batch_size 8 --n_val 4 --sweep_percentage 0.001 --seed 2
+
+# LESS -> MMLU/BBH
+bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --task mmlu --subject sociology --train less \
+    --batch_size 8 --n_val 4 --sweep_percentage 0.005 --seed 2 --lora_r 128
 ```
 
 ### Training Commands
@@ -335,19 +301,15 @@ Training commands for each experiment (LRs loaded from lr_config.json):
 ```bash
 # Alpaca -> SAMSum
 bash SFT/train/train.sh --experiments all --task samsum --train alpaca \
-    --batch_size 8 --n_val 8 --percentage 0.4 --seed 42
-
-# LESS -> MMLU
-bash SFT/train/train.sh --experiments all --task mmlu --subject sociology --train less \
-    --batch_size 8 --n_val 8 --percentage 0.05 --seed 42
-
-# WizardLM -> BBH
-bash SFT/train/train.sh --experiments all --task bbh --subject navigate --train wizardlm \
-    --batch_size 8 --n_val 8 --percentage 0.1 --seed 42
+    --batch_size 8 --n_val 32 --percentage 0.4 --seed 42
 
 # Tulu3 -> TydiQA
 bash SFT/train/train.sh --experiments all --task tydiqa --train tulu3 \
-    --batch_size 8 --n_val 8 --percentage 0.01 --seed 42
+    --batch_size 8 --n_val 32 --percentage 0.01 --seed 42
+
+# LESS -> MMLU/BBH
+bash SFT/train/train.sh --experiments all --task mmlu --subject sociology --train less \
+    --batch_size 8 --n_val 32 --percentage 0.05 --seed 42 --lora_r 128
 ```
 
 Evaluation commands for each experiment:
@@ -356,14 +318,11 @@ Evaluation commands for each experiment:
 # Alpaca -> SAMSum
 bash SFT/eval/eval.sh --train alpaca --task samsum --batch_size 64
 
-# LESS -> MMLU
-bash SFT/eval/eval.sh --train less --task mmlu --subject sociology --batch_size 64
-
-# WizardLM -> BBH
-bash SFT/eval/eval.sh --train wizardlm --task bbh --subject navigate --batch_size 64
-
 # Tulu3 -> TyDiQA
 bash SFT/eval/eval.sh --train tulu3 --task tydiqa --batch_size 64
+
+# LESS -> MMLU/BBH
+bash SFT/eval/eval.sh --train less --task mmlu --subject sociology --batch_size 64
 ```
 
 ## Output Directory

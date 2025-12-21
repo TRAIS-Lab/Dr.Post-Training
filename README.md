@@ -1,13 +1,9 @@
-# Gradient Streaming
+# One Stream to Rule Them All
 
-This repository implements **Gradient Streaming** for memory-efficient fine-tuning with compressed gradient scoring and data selection.
-
-## Overview
-
-Gradient Streaming enables on-the-fly data selection during training by computing gradient-based scores layer-by-layer, avoiding the need to store full gradients. The codebase supports:
+This repository implements **Gradient Streaming** for fine-grained data selection for modern model training. The codebase supports:
 
 - **Data Selection** - Streaming (per-layer) or GREATS (global) selection
-- **Gradient Compression** - GraSS or LoGra methods for reduced memory
+- **Gradient Compression** - GraSS or LoGra methods for reduced memory (MeSO optimizer)
 - **Training Type** - Full fine-tuning or LoRA
 
 ## Installation
@@ -44,12 +40,6 @@ The `gradstream/` module provides the core components for gradient streaming:
 | `GradientHook`            | Captures and processes gradients layer-by-layer       |
 | `setup_model_compressors` | Sets up gradient compressors (sparsifiers/projectors) |
 | `MeSOAdamW`               | Memory-efficient Subspace Optimizer                   |
-
-```python
-from gradstream import GradientHook, MeSOAdamW, setup_model_compressors
-```
-
-Task-specific trainers (e.g., `StreamingTrainer` for SFT) are in their respective experiment directories.
 
 ## Experiments
 
