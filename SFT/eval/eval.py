@@ -25,10 +25,12 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 from datetime import datetime
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -39,6 +41,16 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def set_seed(seed: int):
+    """Set random seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    logger.info(f"Random seed set to {seed}")
 
 
 def get_device():
@@ -458,8 +470,13 @@ def main():
         help="Maximum tokens to generate")
     parser.add_argument("--base_model", type=str, default=None,
         help="Base model for LoRA adapters")
+    parser.add_argument("--seed", type=int, default=42,
+        help="Random seed for reproducibility (default: 42)")
 
     args = parser.parse_args()
+
+    # Set random seed for reproducibility
+    set_seed(args.seed)
 
     # Auto-detect data directory
     if args.data_dir is None:

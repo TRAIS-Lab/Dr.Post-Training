@@ -282,15 +282,15 @@ Run LR sweep before full training to find optimal learning rates:
 
 ```bash
 # Alpaca -> SAMSum
-bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --task samsum --train alpaca \
+bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --train alpaca --task samsum \
     --batch_size 8 --n_val 4 --sweep_percentage 0.04 --seed 2
 
 # Tulu3 -> TydiQA
-bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --task tydiqa --train tulu3 \
+bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --train tulu3 --task tydiqa \
     --batch_size 8 --n_val 4 --sweep_percentage 0.001 --seed 2
 
 # LESS -> MMLU/BBH
-bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --task mmlu --subject sociology --train less \
+bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --train less --task mmlu --subject sociology \
     --batch_size 8 --n_val 4 --sweep_percentage 0.005 --seed 2 --lora_r 128
 ```
 
@@ -300,15 +300,15 @@ Training commands for each experiment (LRs loaded from lr_config.json):
 
 ```bash
 # Alpaca -> SAMSum
-bash SFT/train/train.sh --experiments all --task samsum --train alpaca \
+bash SFT/train/train.sh --experiments all --train alpaca --task samsum \
     --batch_size 8 --n_val 32 --percentage 0.4 --seed 42
 
 # Tulu3 -> TydiQA
-bash SFT/train/train.sh --experiments all --task tydiqa --train tulu3 \
+bash SFT/train/train.sh --experiments all --train tulu3 --task tydiqa \
     --batch_size 8 --n_val 32 --percentage 0.01 --seed 42
 
 # LESS -> MMLU/BBH
-bash SFT/train/train.sh --experiments all --task mmlu --subject sociology --train less \
+bash SFT/train/train.sh --experiments all --train less --task mmlu --subject sociology \
     --batch_size 8 --n_val 32 --percentage 0.05 --seed 42 --lora_r 128
 ```
 
@@ -316,13 +316,13 @@ Evaluation commands for each experiment:
 
 ```bash
 # Alpaca -> SAMSum
-bash SFT/eval/eval.sh --train alpaca --task samsum --batch_size 64
+bash SFT/eval/eval.sh --train alpaca --task samsum --batch_size 64 --seed 82
 
 # Tulu3 -> TyDiQA
-bash SFT/eval/eval.sh --train tulu3 --task tydiqa --batch_size 64
+bash SFT/eval/eval.sh --train tulu3 --task tydiqa --batch_size 64 --seed 82
 
 # LESS -> MMLU/BBH
-bash SFT/eval/eval.sh --train less --task mmlu --subject sociology --batch_size 64
+bash SFT/eval/eval.sh --train less --task mmlu --subject sociology --batch_size 64 --seed 82
 ```
 
 ## Output Directory

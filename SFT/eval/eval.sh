@@ -21,6 +21,7 @@ SUBJECT=""
 N_TEST=-1
 BATCH_SIZE=1
 MAX_NEW_TOKENS=128
+SEED=42
 SBATCH=false
 DRY_RUN=false
 
@@ -55,6 +56,10 @@ while [[ $# -gt 0 ]]; do
             MAX_NEW_TOKENS="$2"
             shift 2
             ;;
+        --seed)
+            SEED="$2"
+            shift 2
+            ;;
         --sbatch)
             SBATCH=true
             shift
@@ -74,6 +79,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --n_test N           Number of test examples (-1 for all)"
             echo "  --batch_size N       Batch size for generation (default: 1)"
             echo "  --max_new_tokens N   Max tokens to generate (default: 128)"
+            echo "  --seed N             Random seed for reproducibility (default: 42)"
             echo "  --sbatch             Submit as SLURM job"
             echo "  --dry-run            Print command without executing"
             exit 0
@@ -99,6 +105,7 @@ echo "Train:      ${TRAIN:-all}"
 echo "Task:       ${TASK:-auto-detect}"
 echo "Subject:    ${SUBJECT:-all}"
 echo "Batch size: $BATCH_SIZE"
+echo "Seed:       $SEED"
 echo "======================================"
 
 # Build command
@@ -108,6 +115,7 @@ CMD="$CMD --data_dir $DATA_DIR"
 CMD="$CMD --n_test $N_TEST"
 CMD="$CMD --batch_size $BATCH_SIZE"
 CMD="$CMD --max_new_tokens $MAX_NEW_TOKENS"
+CMD="$CMD --seed $SEED"
 
 if [[ -n "$TRAIN" ]]; then
     CMD="$CMD --train $TRAIN"
