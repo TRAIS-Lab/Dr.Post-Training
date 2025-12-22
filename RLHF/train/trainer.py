@@ -160,6 +160,7 @@ class StreamingPPOTrainer:
         logger.info(f"  KL coefficient: {self.kl_coef} (reward shaping)")
         logger.info(f"  Clip range: {self.cliprange}")
         logger.info(f"  PPO epochs per batch: {self.ppo_epochs}")
+        logger.info(f"  Reference model: {'loaded (frozen)' if self.ref_model is not None else 'None (WARNING: KL penalty disabled!)'}")
         logger.info("=" * 60)
 
     @torch.no_grad()
@@ -487,8 +488,16 @@ class StreamingPPOTrainer:
 
             loss.backward()
 
-            # Gradient clipping
-            if self.args.max_grad_norm is not None:
+            # Debug: compute gradient norm before clipping
+            total_grad_norm = 0.0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    total_grad_norm += p.grad.data.norm(2).item() ** 2
+            total_grad_norm = total_grad_norm ** 0.5
+            stats["debug/grad_norm"] = total_grad_norm
+
+            # Gradient clipping (disabled if max_grad_norm=0 or None)
+            if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.args.max_grad_norm,
@@ -589,8 +598,8 @@ class StreamingPPOTrainer:
 
             loss.backward()
 
-            # Gradient clipping
-            if self.args.max_grad_norm is not None:
+            # Gradient clipping (disabled if max_grad_norm=0 or None)
+            if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.args.max_grad_norm,
@@ -749,11 +758,18 @@ class StreamingPPOTrainer:
 
                 # PPO epochs: multiple updates per rollout batch
                 # old_logprobs stays fixed, new_logprobs recomputed each epoch
+                ppo_epoch_ratios = []
                 for ppo_epoch in range(self.ppo_epochs):
                     stats = self.training_step(
                         query_ids, response_ids, query_mask, response_mask,
                         old_logprobs.detach(), advantages.detach(), returns.detach(), old_values.detach(),
                     )
+                    ppo_epoch_ratios.append(stats.get("policy/ratio_mean", 1.0))
+
+                # Log per-epoch ratio progression (helps debug if updates are happening)
+                if len(ppo_epoch_ratios) > 1:
+                    stats["debug/ratio_epoch0"] = ppo_epoch_ratios[0]
+                    stats["debug/ratio_final"] = ppo_epoch_ratios[-1]
 
                 # Add reward and KL stats
                 stats["reward/mean"] = raw_rewards.mean().item()

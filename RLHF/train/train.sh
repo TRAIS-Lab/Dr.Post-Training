@@ -29,22 +29,23 @@ export base_training_args="--bf16=True \
 --weight_decay=0.0 \
 --logging_steps=1 \
 --report_to=none \
+--max_grad_norm=0.0 \
 --selection_frac=0.5"
 
 # Default values
 task="toxicity"
 method="NA"  # NA, Streaming, or GREATS
-model="EleutherAI/gpt-neo-125m"
+model="EleutherAI/gpt-neo-2.7B"
 reward_model="facebook/roberta-hate-speech-dynabench-r4-target"
 
 # Training hyperparameters
 batch_size=64
 lr=""  # Learning rate (looked up from config if not specified)
 lr_override=""  # Set when --lr is explicitly passed
-n_val=16
-val_batch_size=""
+n_val=128
+val_batch_size="32"
 selection_frac=0.5
-max_steps=200
+max_steps=1000
 seed=42
 
 # LR configuration
@@ -65,7 +66,7 @@ update_compressor_freq=200
 ppo_epochs=4
 kl_coef=0.04
 max_new_tokens=30
-min_new_tokens=10
+min_new_tokens=20
 
 # Validation settings
 val_strategy="random"
@@ -251,7 +252,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --batch_size <size>        Training batch size (default: 64)"
             echo "  --lr <lr>                  Learning rate override (ignores config file)"
             echo "  --lr_config <path>         LR config file (default: RLHF/train/lr/config.json)"
-            echo "  --n_val <n>                Validation samples (default: 16)"
+            echo "  --n_val <n>                Validation samples (default: 128)"
             echo "  --selection_frac <frac>    Fraction to select (default: 0.5)"
             echo "  --max_steps <steps>        Maximum training steps (default: 200)"
             echo "  --seed <seed>              Random seed (default: 42)"

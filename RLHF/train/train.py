@@ -155,6 +155,16 @@ def main():
         **model_kwargs,
     ).to(device)
 
+    # Load frozen reference model for KL penalty
+    logger.info("Loading reference model (frozen)...")
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        **model_kwargs,
+    ).to(device)
+    ref_model.eval()
+    for param in ref_model.parameters():
+        param.requires_grad = False
+
     # Apply LoRA if enabled
     if model_args.lora:
         lora_config = LoraConfig(
@@ -332,7 +342,7 @@ def main():
     # Create trainer
     trainer = StreamingPPOTrainer(
         model=model,
-        ref_model=None,  # Use initial policy as reference
+        ref_model=ref_model,  # Frozen reference model for KL penalty
         reward_model=reward_model,
         tokenizer=tokenizer,
         args=training_args,

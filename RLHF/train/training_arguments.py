@@ -149,7 +149,7 @@ class TrainingArguments(TA):
         metadata={"help": "Maximum new tokens to generate"},
     )
     min_new_tokens: int = field(
-        default=10,
+        default=20,
         metadata={"help": "Minimum new tokens to generate"},
     )
     temperature: float = field(

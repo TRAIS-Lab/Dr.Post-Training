@@ -155,7 +155,7 @@ The unified training script accepts the following arguments:
 #### Task Arguments
 
 - `--task <task>` - Task: `toxicity`, `imdb` (default: `toxicity`)
-- `--model <model>` - Policy model (default: `EleutherAI/gpt-neo-125m`)
+- `--model <model>` - Policy model (default: `EleutherAI/gpt-neo-2.7B`)
 - `--reward_model <model>` - Reward model (default: `facebook/roberta-hate-speech-dynabench-r4-target`)
 
 #### Data Selection Arguments
@@ -185,7 +185,7 @@ The unified training script accepts the following arguments:
 #### Data Selection Arguments
 
 - `--n_val <n>` - Validation examples for data selection (default: `16`)
-- `--val_batch_size <size>` - Validation batch size for data selection
+- `--val_batch_size <size>` - Validation batch size for data selection (default: `32`)
 - `--selection_frac <frac>` - Fraction of samples to select (default: `0.5`)
 
 #### PPO Arguments
@@ -193,13 +193,20 @@ The unified training script accepts the following arguments:
 - `--ppo_epochs <n>` - PPO epochs per batch (default: `4`)
 - `--kl_coef <coef>` - KL penalty coefficient (default: `0.04`)
 - `--max_new_tokens <n>` - Maximum new tokens to generate (default: `30`)
-- `--min_new_tokens <n>` - Minimum new tokens to generate (default: `10`)
+- `--min_new_tokens <n>` - Minimum new tokens to generate (default: `20`)
 
 #### LoRA Arguments
 
 - `--lora` - Enable LoRA fine-tuning (flag, omit for full fine-tuning)
 - `--lora_r <r>` - LoRA rank (default: `16`)
 - `--lora_alpha <alpha>` - LoRA alpha (default: `32`)
+
+#### Training Configuration
+
+- `--max_grad_norm` - Gradient clipping (default: `0.0` = disabled)
+- Learning rate: `1e-5` (fallback if not in config.json)
+
+> **Note:** Gradient clipping is disabled by default (`max_grad_norm=0.0`). With gradient clipping enabled (e.g., `max_grad_norm=1.0`), the effective updates become too small for PPO to learn properly.
 
 ## Key Differences from SFT
 
@@ -218,7 +225,7 @@ The following experiments can be run with the commands below.
 
 | Task     | Model        | Batch | Val Size | Max Steps | LoRA Rank |
 | -------- | ------------ | ----- | -------- | --------- | --------- |
-| Toxicity | gpt-neo-125m | 64    | 16       | 200       | 16        |
+| Toxicity | gpt-neo-2.7B | 256   | 16       | 200       | 16        |
 
 > **Note:** Learning rates are managed via `RLHF/train/lr/config.json`. Run `lr_sweep.sh` to find optimal LRs before training.
 
@@ -229,7 +236,7 @@ Run LR sweep before full training to find optimal learning rates:
 ```bash
 # Toxicity task
 bash RLHF/train/lr/lr_sweep.sh --mode binary --experiments all --task toxicity \
-    --batch_size 64 --n_val 4 --sweep_max_steps 50 --seed 2
+    --batch_size 256 --n_val 4 --sweep_max_steps 50 --seed 2
 ```
 
 ### Training Commands
@@ -239,15 +246,15 @@ Training commands (LRs loaded from lr_config.json):
 ```bash
 # Toxicity task - all experiments
 bash RLHF/train/train.sh --experiments all --task toxicity \
-    --batch_size 64 --n_val 16 --max_steps 200 --seed 42
+    --batch_size 64 --n_val 128 --seed 42
 
 # Toxicity task - baseline only
 bash RLHF/train/train.sh --experiments baseline --task toxicity \
-    --batch_size 64 --n_val 16 --max_steps 200 --seed 42
+    --batch_size 64 --n_val 128 --seed 42
 
 # Toxicity task - streaming methods
 bash RLHF/train/train.sh --experiments streaming --task toxicity \
-    --batch_size 64 --n_val 16 --max_steps 200 --seed 42
+    --batch_size 64 --n_val 128 --seed 42
 ```
 
 ### Evaluation Commands
@@ -256,7 +263,7 @@ Evaluate trained models for toxicity:
 
 ```bash
 # Evaluate all models
-bash RLHF/eval/eval.sh --task toxicity --batch_size 16 --seed 82
+bash RLHF/eval/eval.sh --task toxicity --batch_size 256 --seed 82
 
 # Evaluate specific model
 python -m RLHF.eval.eval --model_path /path/to/model --n_samples 400
