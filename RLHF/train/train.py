@@ -28,7 +28,7 @@ import warnings
 import torch
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, set_seed
+from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, set_seed, get_scheduler
 
 # Suppress torch.compile warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
@@ -287,7 +287,7 @@ def main():
         )
         logger.info("Using AdamW optimizer")
 
-    # Create dataloaders
+    # Create dataloaders (needed for step calculation)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=training_args.per_device_train_batch_size,
@@ -305,6 +305,30 @@ def main():
             collate_fn=collator,
         )
 
+    # Calculate training steps for lr_scheduler
+    if training_args.max_steps > 0:
+        num_training_steps = training_args.max_steps
+    else:
+        num_training_steps = len(train_dataloader) * int(training_args.num_train_epochs)
+
+    # Calculate warmup steps
+    if training_args.warmup_steps > 0:
+        num_warmup_steps = training_args.warmup_steps
+    else:
+        num_warmup_steps = int(num_training_steps * training_args.warmup_ratio)
+
+    # Create lr_scheduler
+    lr_scheduler = get_scheduler(
+        name=training_args.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+    logger.info(
+        f"LR scheduler: {training_args.lr_scheduler_type}, "
+        f"warmup_steps={num_warmup_steps}, total_steps={num_training_steps}"
+    )
+
     # Create trainer
     trainer = StreamingPPOTrainer(
         model=model,
@@ -314,17 +338,15 @@ def main():
         args=training_args,
         grad_hook=grad_hook,
         optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
     )
 
     # Calculate training steps
     num_epochs = training_args.num_train_epochs
     max_steps = training_args.max_steps if training_args.max_steps > 0 else None
 
-    # Determine log interval
-    if max_steps:
-        log_interval = max(1, max_steps // 20)
-    else:
-        log_interval = max(1, len(train_dataloader) // 10)
+    # Use logging_steps from training args
+    log_interval = int(training_args.logging_steps)
 
     # Train
     logger.info("Starting training...")

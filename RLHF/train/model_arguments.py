@@ -71,6 +71,8 @@ class ModelArguments:
 
 
 def add_padding_to_tokenizer(tokenizer):
-    """Add padding token to tokenizer if not present."""
+    """Add padding token to tokenizer if not present and set left-padding for generation."""
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Left-padding is required for decoder-only models during generation
+    tokenizer.padding_side = "left"

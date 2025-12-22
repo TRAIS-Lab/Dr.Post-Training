@@ -288,18 +288,22 @@ class StreamingPPOTrainer:
 
     def capture_validation_gradients(
         self,
-        val_input_ids: Tensor,
-        val_attention_mask: Tensor,
+        val_query_ids: Tensor,
+        val_query_mask: Tensor,
     ) -> float:
         """
-        Phase 1 (GREATS): Capture validation gradients.
+        Capture validation gradients using sequence-level attribution.
 
-        Forward/backward on validation data to capture compressed gradients
-        representing the "good direction" for selection.
+        Implements the sequence-level objective from Snapshot paper:
+            f^seq(θ) = -E[log π_θ(y|x) * Â(x,y)]
+
+        This gradient represents the "good direction" - moving towards
+        higher reward sequences. The gradient points in the direction
+        that increases log probability of high-reward responses.
 
         Args:
-            val_input_ids: Validation input IDs
-            val_attention_mask: Validation attention mask
+            val_query_ids: Validation query token IDs [batch, query_len]
+            val_query_mask: Validation query attention mask [batch, query_len]
 
         Returns:
             Validation loss value
@@ -310,10 +314,51 @@ class StreamingPPOTrainer:
         self.grad_hook.set_mode("capture_val")
         self.grad_hook.enable_hooks()
 
+        # Generate responses from validation queries
+        with torch.no_grad():
+            response_ids, response_mask, response_texts = self.generate_rollouts(
+                val_query_ids, val_query_mask
+            )
+
+            # Compute rewards for validation responses
+            query_texts = self.tokenizer.batch_decode(val_query_ids, skip_special_tokens=True)
+            rewards = self.reward_model.compute_rewards(query_texts, response_texts)
+
+            # Normalize rewards to get advantages (z-normalization)
+            if rewards.std() > 1e-8:
+                rewards_normalized = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+            else:
+                rewards_normalized = rewards - rewards.mean()
+
+        # Now compute sequence-level log probability with gradients
         self.model.train()
 
-        # Compute validation loss
-        val_loss = self.compute_validation_loss(val_input_ids, val_attention_mask)
+        full_ids = torch.cat([val_query_ids, response_ids], dim=1)
+        full_mask = torch.cat([val_query_mask, response_mask], dim=1)
+        query_len = val_query_ids.shape[1]
+
+        # Forward pass
+        outputs = self.model(
+            input_ids=full_ids,
+            attention_mask=full_mask,
+            return_dict=True,
+        )
+
+        # Log probs for response tokens
+        logits = outputs.logits[:, query_len - 1:-1, :]
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        token_log_probs = torch.gather(
+            log_probs,
+            dim=-1,
+            index=response_ids.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # Sequence log probability (sum over response tokens)
+        seq_log_probs = (token_log_probs * response_mask).sum(dim=1)
+
+        # Sequence-level loss: -E[log π_θ(y|x) * Â(x,y)]
+        # Negative because we want gradient towards higher reward
+        val_loss = -(rewards_normalized * seq_log_probs).mean()
 
         # Backward - hooks capture compressed gradients
         val_loss.backward()
@@ -322,8 +367,9 @@ class StreamingPPOTrainer:
         self.optimizer.zero_grad()
 
         logger.debug(
-            f"Captured validation gradients: "
+            f"Captured validation gradients (seq-level): "
             f"{len(self.grad_hook.val_grad_buffer)} layers, "
+            f"mean_reward={rewards.mean().item():.4f}, "
             f"loss={val_loss.item():.4f}, time={time.time() - t_start:.3f}s"
         )
 
@@ -511,7 +557,7 @@ class StreamingPPOTrainer:
             self.grad_hook.set_mode("train_select")
             self.grad_hook.setup_selection(
                 train_batch_size=batch_size,
-                selection_method="GREATS",  # Use GREATS scoring
+                selection_method="Streaming",  # Per-layer selection during backward
                 selection_frac=self.selection_frac,
                 lr=lr,
                 compute_scores_only=False,  # Apply selection during backward
@@ -645,36 +691,40 @@ class StreamingPPOTrainer:
             self.model.train()
             epoch_stats = []
 
-            # Capture validation gradients once per epoch (for GREATS)
-            val_loss = 0.0
-            if self.method == "GREATS" and val_dataloader is not None:
+            # Prepare validation queries for gradient capture
+            val_query_ids = None
+            val_query_mask = None
+            if self.method != "NA" and val_dataloader is not None:
                 val_batch = next(iter(val_dataloader))
-                val_input_ids = val_batch["input_ids"]
-                if isinstance(val_input_ids, list):
-                    # Pad to same length
-                    max_len = max(t.shape[0] if t.dim() == 1 else t.shape[1] for t in val_input_ids)
-                    val_input_ids = torch.stack([
-                        F.pad(t.flatten(), (0, max_len - t.numel()), value=self.tokenizer.pad_token_id)
-                        for t in val_input_ids
+                val_query_ids = val_batch["input_ids"]
+                if isinstance(val_query_ids, list):
+                    # Left-pad to same length (required for decoder-only generation)
+                    max_len = max(t.shape[0] if t.dim() == 1 else t.shape[1] for t in val_query_ids)
+                    val_query_ids = torch.stack([
+                        F.pad(t.flatten(), (max_len - t.numel(), 0), value=self.tokenizer.pad_token_id)
+                        for t in val_query_ids
                     ]).to(self.device)
                 else:
-                    val_input_ids = val_input_ids.to(self.device)
+                    val_query_ids = val_query_ids.to(self.device)
+                val_query_mask = (val_query_ids != self.tokenizer.pad_token_id).long()
 
-                val_attention_mask = (val_input_ids != self.tokenizer.pad_token_id).long()
-
+            # Capture validation gradients once per epoch for GREATS
+            # (Streaming captures per-step inside the loop)
+            val_loss = 0.0
+            if self.method == "GREATS" and val_query_ids is not None:
                 val_loss = self.capture_validation_gradients(
-                    val_input_ids, val_attention_mask
+                    val_query_ids, val_query_mask
                 )
 
             # Training loop
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}")
             for batch in pbar:
-                # Get queries
+                # Get queries (left-pad for decoder-only generation)
                 query_ids = batch["input_ids"]
                 if isinstance(query_ids, list):
                     max_len = max(t.shape[0] if t.dim() == 1 else t.shape[1] for t in query_ids)
                     query_ids = torch.stack([
-                        F.pad(t.flatten(), (0, max_len - t.numel()), value=self.tokenizer.pad_token_id)
+                        F.pad(t.flatten(), (max_len - t.numel(), 0), value=self.tokenizer.pad_token_id)
                         for t in query_ids
                     ]).to(self.device)
                 else:
@@ -719,6 +769,12 @@ class StreamingPPOTrainer:
                     adv_mean = (advantages * response_mask).sum() / response_mask.sum().clamp(min=1)
                     adv_var = ((advantages - adv_mean) ** 2 * response_mask).sum() / response_mask.sum().clamp(min=1)
                     advantages = (advantages - adv_mean) / (adv_var.sqrt() + 1e-8)
+
+                # Capture validation gradients per-step for Streaming
+                if self.method == "Streaming" and val_query_ids is not None:
+                    val_loss = self.capture_validation_gradients(
+                        val_query_ids, val_query_mask
+                    )
 
                 # Training step
                 stats = self.training_step(

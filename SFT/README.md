@@ -90,7 +90,7 @@ Experiments follow the pattern: `{train}_{task}-{selection}-{compression}-{model
 
 ## Learning Rate Configuration
 
-The `SFT/train/lr/` folder contains tools for finding optimal learning rates, where learing rates are managed via `SFT/train/lr/config.json`.
+The `SFT/train/lr/` folder contains tools for finding optimal learning rates, where learning rates are managed via `SFT/train/lr/config.json`.
 
 ### Recommended Workflow
 
@@ -324,12 +324,3 @@ bash SFT/eval/eval.sh --train tulu3 --task tydiqa --batch_size 64 --seed 82
 # LESS -> MMLU/BBH
 bash SFT/eval/eval.sh --train less --task mmlu --subject sociology --batch_size 64 --seed 82
 ```
-
-## Output Directory
-
-Results are saved to: `/scratch/pbb/Project/Gradient-Streaming/SFT/`
-
-Each experiment creates a folder with the naming pattern above, containing:
-- `train.log` - Training logs
-- Model checkpoints (if save enabled)
-- Evaluation results
