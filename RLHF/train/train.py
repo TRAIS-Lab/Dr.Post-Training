@@ -209,15 +209,22 @@ def main():
     if n_policy_trainable == 0:
         logger.warning("WARNING: No policy parameters are trainable! This will break PPO training.")
 
-    # Load frozen reference model for KL penalty (no value head needed)
-    logger.info("Loading reference model (frozen)...")
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        **model_kwargs,
-    ).to(device)
-    ref_model.eval()
-    for param in ref_model.parameters():
-        param.requires_grad = False
+    # Reference model handling:
+    # - For PEFT (LoRA) models: No separate reference model needed
+    #   The trainer uses disable_adapter() on the policy model (matching reference implementation)
+    # - For non-PEFT models: Load a frozen copy for KL penalty
+    ref_model = None
+    if not model_args.lora:
+        logger.info("Loading reference model (frozen) for non-PEFT training...")
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            **model_kwargs,
+        ).to(device)
+        ref_model.eval()
+        for param in ref_model.parameters():
+            param.requires_grad = False
+    else:
+        logger.info("Using disable_adapter() for reference logprobs (PEFT model)")
 
     # Load reward model
     logger.info("Loading reward model...")
@@ -315,11 +322,14 @@ def main():
             grad_hook.set_compressors(compressors)
             logger.info(f"Compression setup complete: {len(compressors)} layers")
 
-    # Create optimizer
+    # Create optimizer - only pass trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    logger.info(f"Optimizer will optimize {len(trainable_params)} parameter groups")
+
     if training_args.has_compression:
         # Use MeSO optimizer
         optimizer = MeSOAdamW(
-            model.parameters(),
+            trainable_params,
             lr=training_args.learning_rate,
             weight_decay=training_args.weight_decay,
         )
@@ -327,7 +337,7 @@ def main():
     else:
         # Standard AdamW
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            trainable_params,
             lr=training_args.learning_rate,
             weight_decay=training_args.weight_decay,
         )
@@ -376,9 +386,10 @@ def main():
     )
 
     # Create trainer
+    # Note: For PEFT models, ref_model=None and trainer uses disable_adapter()
     trainer = StreamingPPOTrainer(
         model=model,
-        ref_model=ref_model,  # Frozen reference model for KL penalty
+        ref_model=ref_model,  # None for PEFT, frozen model for non-PEFT
         reward_model=reward_model,
         tokenizer=tokenizer,
         args=training_args,

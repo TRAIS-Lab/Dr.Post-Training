@@ -110,35 +110,96 @@ class TrainingArguments(TA):
     # ===================
     ppo_epochs: int = field(
         default=4,
-        metadata={"help": "Number of PPO epochs per batch"},
+        metadata={"help": "Number of PPO epochs per batch (reference default: 4)"},
     )
+    mini_batch_size: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Mini-batch size for PPO backward passes (optimizer.step()). "
+                "Reference uses 1, meaning one optimizer.step() per sample. "
+                "This prevents ratio explosion by making small updates."
+            )
+        },
+    )
+    forward_batch_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Batch size for forward passes during PPO updates (computing new logprobs). "
+                "Reference uses tracin_batch_size=256 for efficient GPU utilization. "
+                "0 means use full batch size. This is separate from mini_batch_size "
+                "which controls backward passes."
+            )
+        },
+    )
+    ratio_threshold: float = field(
+        default=10.0,
+        metadata={"help": "Skip batches where avg ratio exceeds this (prevents divergence)"},
+    )
+
+    # KL Control (matching reference implementation)
+    # Reference: archive/LDA-ORL-main/rlhf-toxicity/scripts/run_train_std.sh uses init_kl_coef=0.04
     kl_coef: float = field(
         default=0.04,
-        metadata={"help": "KL penalty coefficient"},
+        metadata={"help": "KL penalty coefficient (reference default: 0.04). Alias for init_kl_coef."},
     )
+    init_kl_coef: float = field(
+        default=0.04,
+        metadata={
+            "help": (
+                "Initial KL penalty coefficient (reference default: 0.04). "
+                "With adaptive KL control, this value changes during training."
+            )
+        },
+    )
+    adap_kl_ctrl: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Use adaptive KL control (reference default: True). "
+                "Dynamically adjusts KL coefficient based on observed KL divergence."
+            )
+        },
+    )
+    target_kl: float = field(
+        default=6.0,
+        metadata={
+            "help": (
+                "Target KL divergence for adaptive KL control (reference default: 6.0). "
+                "Also used for early stopping if enabled."
+            )
+        },
+    )
+    horizon: int = field(
+        default=10000,
+        metadata={
+            "help": (
+                "Horizon for adaptive KL control (reference default: 10000). "
+                "Larger values = slower adaptation."
+            )
+        },
+    )
+
     cliprange: float = field(
         default=0.2,
-        metadata={"help": "PPO clipping range for policy"},
+        metadata={"help": "PPO clipping range for policy (reference default: 0.2)"},
     )
     cliprange_value: float = field(
         default=0.2,
-        metadata={"help": "PPO clipping range for value"},
+        metadata={"help": "PPO clipping range for value (reference default: 0.2)"},
     )
     vf_coef: float = field(
         default=0.1,
-        metadata={"help": "Value function coefficient"},
+        metadata={"help": "Value function coefficient (reference default: 0.1)"},
     )
     gamma: float = field(
         default=1.0,
-        metadata={"help": "Discount factor"},
+        metadata={"help": "Discount factor (reference default: 1.0)"},
     )
     gae_lambda: float = field(
         default=0.95,
-        metadata={"help": "GAE lambda parameter"},
-    )
-    target_kl: Optional[float] = field(
-        default=None,
-        metadata={"help": "Target KL divergence for early stopping (None to disable)"},
+        metadata={"help": "GAE lambda parameter (reference default: 0.95)"},
     )
 
     # ===================
@@ -169,12 +230,12 @@ class TrainingArguments(TA):
     # Validation Loss Type
     # ===================
     val_loss_type: str = field(
-        default="logprob",
+        default="reward_weighted",
         metadata={
             "help": (
                 "Validation loss type for gradient capture: "
                 "'logprob' (NLL on validation), "
-                "'reward_weighted' (NLL weighted by reward), "
+                "'reward_weighted' (NLL weighted by reward - sequence-level attribution), "
                 "'advantage_weighted' (NLL weighted by advantage)"
             )
         },

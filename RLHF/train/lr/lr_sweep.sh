@@ -63,7 +63,7 @@ min_new_tokens=10
 
 # Validation settings
 val_strategy="random"
-val_loss_type="logprob"
+val_loss_type="reward_weighted"  # Sequence-level attribution: f^seq(θ) = -E[log π_θ(y|x) * Â(x,y)]
 
 # LR grid defaults
 lr_grid="1e-6,5e-6,1e-5,5e-5,1e-4"

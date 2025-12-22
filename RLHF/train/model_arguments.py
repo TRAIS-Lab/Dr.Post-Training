@@ -55,8 +55,8 @@ class ModelArguments:
         metadata={"help": "LoRA alpha"},
     )
     lora_dropout: float = field(
-        default=0.05,
-        metadata={"help": "LoRA dropout"},
+        default=0.0,
+        metadata={"help": "LoRA dropout (0.0 recommended for PPO to avoid train/eval mode mismatch)"},
     )
     lora_target_modules: List[str] = field(
         default_factory=lambda: ["q_proj", "v_proj"],

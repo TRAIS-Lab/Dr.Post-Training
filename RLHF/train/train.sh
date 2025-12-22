@@ -23,13 +23,14 @@ cd $HOME/Project/Gradient-Streaming
 export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
 
 # Base training arguments (shared across all experiments, matching SFT)
+# Note: warmup_ratio=0 for PPO (pretrained policy doesn't need warmup, and LR=0 breaks first batch)
+# Note: max_grad_norm removed to match reference (reference doesn't use gradient clipping)
 export base_training_args="--bf16=True \
---lr_scheduler_type=linear \
---warmup_ratio=0.03 \
+--lr_scheduler_type=constant \
+--warmup_ratio=0 \
 --weight_decay=0.0 \
 --logging_steps=1 \
 --report_to=none \
---max_grad_norm=0.0 \
 --selection_frac=0.5"
 
 # Default values
@@ -39,7 +40,7 @@ model="EleutherAI/gpt-neo-2.7B"
 reward_model="facebook/roberta-hate-speech-dynabench-r4-target"
 
 # Training hyperparameters
-batch_size=64
+batch_size=256  # Reference uses 256 for stable gradients
 lr=""  # Learning rate (looked up from config if not specified)
 lr_override=""  # Set when --lr is explicitly passed
 n_val=128
@@ -49,8 +50,9 @@ max_steps=1000
 seed=42
 
 # LR configuration
+# Reference: archive/LDA-ORL-main/rlhf-toxicity/scripts/run_train_std.sh uses 1e-5
 lr_config_file="RLHF/train/lr/config.json"
-fallback_lr_full="1e-6"
+fallback_lr_full="1e-5"
 fallback_lr_lora="1e-5"
 
 # LoRA settings
@@ -62,15 +64,20 @@ lora_alpha=32
 compression=""  # LoGra or GraSS
 update_compressor_freq=200
 
-# PPO settings
+# PPO settings (matching reference implementation)
+# Reference: archive/LDA-ORL-main/rlhf-toxicity/scripts/run_train_std.sh
 ppo_epochs=4
-kl_coef=0.04
+mini_batch_size=1  # Reference uses 1: one optimizer.step() per sample within each PPO epoch
+forward_batch_size=256  # Reference uses tracin_batch_size=256 for forward passes (GPU efficiency)
+init_kl_coef=0.04  # Reference uses 0.04 (NOT 0.2)
+adap_kl_ctrl=true  # Reference uses adaptive KL control
+target_kl=6.0      # Reference default
 max_new_tokens=30
 min_new_tokens=20
 
 # Validation settings
 val_strategy="random"
-val_loss_type="logprob"
+val_loss_type="reward_weighted"  # Sequence-level attribution: f^seq(θ) = -E[log π_θ(y|x) * Â(x,y)]
 use_second_order=false
 
 # Output
@@ -181,6 +188,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --ppo_epochs)
             ppo_epochs="$2"
+            shift 2
+            ;;
+        --forward_batch_size)
+            forward_batch_size="$2"
             shift 2
             ;;
         --kl_coef)
@@ -464,7 +475,11 @@ run_single_experiment() {
 --max_steps=$max_steps \
 --seed=$seed \
 --ppo_epochs=$ppo_epochs \
---kl_coef=$kl_coef \
+--mini_batch_size=$mini_batch_size \
+--forward_batch_size=$forward_batch_size \
+--init_kl_coef=$init_kl_coef \
+--adap_kl_ctrl=$adap_kl_ctrl \
+--target_kl=$target_kl \
 --max_new_tokens=$max_new_tokens \
 --min_new_tokens=$min_new_tokens \
 --val_strategy=$val_strategy \
@@ -544,7 +559,9 @@ if [[ -n "$experiments" ]]; then
     echo ""
     echo "PPO Settings:"
     echo "  PPO epochs: $ppo_epochs"
-    echo "  KL coefficient: $kl_coef"
+    echo "  Init KL coefficient: $init_kl_coef"
+    echo "  Adaptive KL control: $adap_kl_ctrl"
+    echo "  Target KL: $target_kl"
     echo ""
     echo "LR Config: $lr_config_file"
     echo "Experiments to run: $resolved_experiments"

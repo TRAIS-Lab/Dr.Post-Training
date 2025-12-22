@@ -196,15 +196,28 @@ class RewardModelWrapper(nn.Module):
         """
         Compute rewards for query-response pairs.
 
+        IMPORTANT: For toxicity detection, we score ONLY the response text,
+        not the query+response. This matches the reference implementation
+        (rl_utils.py line 839):
+            if 'hate' in rmname:
+                # only score the generations
+                rewards = process_reward(batch["response"], rmname, ...)
+
+        Scoring query+response would dilute the reward signal because the
+        query (prompt) may be toxic by design (we want the model to generate
+        less toxic continuations to toxic prompts).
+
         Args:
-            queries: Query texts
+            queries: Query texts (unused for toxicity, kept for API compatibility)
             responses: Response texts
 
         Returns:
             Reward tensor [batch_size]
         """
-        # Concatenate query and response
-        texts = [q + r for q, r in zip(queries, responses)]
+        # CRITICAL: Score ONLY the response, not query+response
+        # For toxicity, we want to reward the model for generating
+        # less toxic responses regardless of how toxic the prompt was
+        texts = responses  # NOT [q + r for q, r in zip(queries, responses)]
 
         # Tokenize with reward tokenizer
         inputs = self.reward_tokenizer(
