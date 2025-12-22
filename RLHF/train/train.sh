@@ -50,7 +50,7 @@ seed=42
 
 # LR configuration
 lr_config_file="RLHF/train/lr/config.json"
-fallback_lr_full="1e-5"
+fallback_lr_full="1e-6"
 fallback_lr_lora="1e-5"
 
 # LoRA settings

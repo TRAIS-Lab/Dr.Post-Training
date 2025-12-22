@@ -237,11 +237,18 @@ class StreamingPPOTrainer:
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            return_dict=True,
         )
 
+        # Handle model output format
+        # AutoModelForCausalLMWithValueHead returns tuple: (logits, loss, values)
+        # Regular model returns object with .logits attribute
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+        else:
+            logits = outputs.logits
+
         # Shift logits for next-token prediction
-        logits = outputs.logits[:, response_start - 1:-1, :]
+        logits = logits[:, response_start - 1:-1, :]
         labels = input_ids[:, response_start:]
 
         log_probs = F.log_softmax(logits.float(), dim=-1)
@@ -252,6 +259,42 @@ class StreamingPPOTrainer:
         ).squeeze(-1)
 
         return selected_log_probs
+
+    def compute_values(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        response_start: int,
+    ) -> Tensor:
+        """
+        Compute value estimates for response tokens using the value head.
+
+        Args:
+            input_ids: Full sequence [batch, seq_len]
+            attention_mask: Attention mask [batch, seq_len]
+            response_start: Index where response starts
+
+        Returns:
+            Value estimates [batch, response_len]
+        """
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        # AutoModelForCausalLMWithValueHead returns tuple: (logits, loss, values)
+        if isinstance(outputs, tuple) and len(outputs) >= 3:
+            values_full = outputs[2]  # [batch, seq_len] or [batch, seq_len, 1]
+            # Extract values for response tokens only
+            if values_full.dim() == 3:
+                values_full = values_full.squeeze(-1)
+            values = values_full[:, response_start:]
+        else:
+            # Fallback if no value head (shouldn't happen)
+            response_len = input_ids.shape[1] - response_start
+            values = torch.zeros(input_ids.shape[0], response_len, device=self.device)
+
+        return values
 
     def capture_validation_gradients(
         self,
@@ -308,11 +351,17 @@ class StreamingPPOTrainer:
         outputs = self.model(
             input_ids=full_ids,
             attention_mask=full_mask,
-            return_dict=True,
         )
 
+        # Handle model output format
+        # AutoModelForCausalLMWithValueHead returns tuple: (logits, loss, values)
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+        else:
+            logits = outputs.logits
+
         # Log probs for response tokens
-        logits = outputs.logits[:, query_len - 1:-1, :]
+        logits = logits[:, query_len - 1:-1, :]
         log_probs = F.log_softmax(logits.float(), dim=-1)
         token_log_probs = torch.gather(
             log_probs,
@@ -381,16 +430,28 @@ class StreamingPPOTrainer:
         input_ids = torch.cat([query_ids, response_ids], dim=1)
         attention_mask = torch.cat([query_mask, response_mask], dim=1)
 
-        # Forward pass
+        # Forward pass - model returns (logits, loss, values) for AutoModelForCausalLMWithValueHead
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            return_dict=True,
         )
 
+        # Handle model output format
+        # AutoModelForCausalLMWithValueHead returns tuple: (logits, loss, values)
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+            values_full = outputs[2]  # [batch, seq_len]
+        else:
+            # Fallback for standard model (shouldn't happen with value head)
+            logits = outputs.logits
+            values_full = torch.zeros(batch_size, input_ids.shape[1], device=self.device)
+
+        # Extract values for response tokens only
+        values = values_full[:, query_len:].squeeze(-1) if values_full.dim() == 3 else values_full[:, query_len:]
+
         # New log probs
-        logits = outputs.logits[:, query_len - 1:-1, :]
-        log_probs = F.log_softmax(logits.float(), dim=-1)
+        logits_for_probs = logits[:, query_len - 1:-1, :]
+        log_probs = F.log_softmax(logits_for_probs.float(), dim=-1)
         new_logprobs = torch.gather(
             log_probs,
             dim=-1,
@@ -398,7 +459,8 @@ class StreamingPPOTrainer:
         ).squeeze(-1)
 
         # PPO policy loss with clipping
-        ratio = torch.exp(new_logprobs - old_logprobs)
+        logprob_diff = new_logprobs - old_logprobs
+        ratio = torch.exp(logprob_diff)
         clipped_ratio = torch.clamp(ratio, 1 - self.cliprange, 1 + self.cliprange)
 
         pg_loss1 = -advantages * ratio
@@ -406,8 +468,7 @@ class StreamingPPOTrainer:
         pg_loss = torch.max(pg_loss1, pg_loss2)
         pg_loss = (pg_loss * response_mask).sum() / response_mask.sum().clamp(min=1)
 
-        # Value loss (simplified - assumes model has value head or we use 0)
-        values = torch.zeros_like(old_values)  # Placeholder if no value head
+        # Value loss with clipping
         values_clipped = old_values + torch.clamp(
             values - old_values,
             -self.cliprange_value,
@@ -434,6 +495,7 @@ class StreamingPPOTrainer:
             "policy/approx_kl": approx_kl.item(),
             "policy/clipfrac": clipfrac,
             "policy/ratio_mean": ratio.mean().item(),
+            "values/mean": values.mean().item(),
         }
 
         return total_loss, stats
@@ -487,14 +549,6 @@ class StreamingPPOTrainer:
             )
 
             loss.backward()
-
-            # Debug: compute gradient norm before clipping
-            total_grad_norm = 0.0
-            for p in self.model.parameters():
-                if p.grad is not None:
-                    total_grad_norm += p.grad.data.norm(2).item() ** 2
-            total_grad_norm = total_grad_norm ** 0.5
-            stats["debug/grad_norm"] = total_grad_norm
 
             # Gradient clipping (disabled if max_grad_norm=0 or None)
             if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
@@ -671,9 +725,8 @@ class StreamingPPOTrainer:
                 val_query_mask = (val_query_ids != self.tokenizer.pad_token_id).long()
 
             # For GREATS: capture validation gradients once per epoch
-            val_loss = 0.0
             if self.method == "GREATS" and val_query_ids is not None:
-                val_loss = self.capture_validation_gradients(
+                self.capture_validation_gradients(
                     val_query_ids, val_query_mask
                 )
 
@@ -736,8 +789,8 @@ class StreamingPPOTrainer:
                     kl_penalty = old_logprobs - ref_logprobs  # KL(π||π_ref) per token
                     rewards = rewards - self.kl_coef * kl_penalty * response_mask.float()
 
-                    # Values (zeros if no value head)
-                    old_values = torch.zeros_like(response_mask, dtype=torch.float, device=self.device)
+                    # Compute value estimates from value head
+                    old_values = self.compute_values(full_ids, full_mask, query_len)
 
                     # Compute advantages and returns using KL-shaped rewards
                     advantages, returns = compute_gae(
@@ -752,33 +805,29 @@ class StreamingPPOTrainer:
 
                 # Capture validation gradients per-step for Streaming
                 if self.method == "Streaming" and val_query_ids is not None:
-                    val_loss = self.capture_validation_gradients(
+                    self.capture_validation_gradients(
                         val_query_ids, val_query_mask
                     )
 
                 # PPO epochs: multiple updates per rollout batch
                 # old_logprobs stays fixed, new_logprobs recomputed each epoch
-                ppo_epoch_ratios = []
                 for ppo_epoch in range(self.ppo_epochs):
                     stats = self.training_step(
                         query_ids, response_ids, query_mask, response_mask,
                         old_logprobs.detach(), advantages.detach(), returns.detach(), old_values.detach(),
                     )
-                    ppo_epoch_ratios.append(stats.get("policy/ratio_mean", 1.0))
-
-                # Log per-epoch ratio progression (helps debug if updates are happening)
-                if len(ppo_epoch_ratios) > 1:
-                    stats["debug/ratio_epoch0"] = ppo_epoch_ratios[0]
-                    stats["debug/ratio_final"] = ppo_epoch_ratios[-1]
 
                 # Add reward and KL stats
                 stats["reward/mean"] = raw_rewards.mean().item()
                 stats["reward/std"] = raw_rewards.std().item()
                 stats["objective/kl"] = kl_penalty.mean().item()
-                stats["val_loss"] = val_loss
 
                 epoch_stats.append(stats)
                 global_step += 1
+
+                # LR scheduler step (must be per-step, not per-epoch, for warmup to work)
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
 
                 # Update progress bar
                 pbar.set_postfix({
@@ -803,10 +852,6 @@ class StreamingPPOTrainer:
                 if max_steps is not None and global_step >= max_steps:
                     logger.info(f"Reached max_steps ({max_steps})")
                     break
-
-            # LR scheduler step
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step()
 
             if max_steps is not None and global_step >= max_steps:
                 break

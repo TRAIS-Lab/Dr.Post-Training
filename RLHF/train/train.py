@@ -29,6 +29,7 @@ import torch
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, set_seed, get_scheduler
+from trl import AutoModelForCausalLMWithValueHead
 
 # Suppress torch.compile warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
@@ -50,31 +51,39 @@ def find_trainable_layers(model, lora_only: bool = True):
     Find trainable layers for gradient hooks.
 
     Args:
-        model: The model
+        model: The model (can be AutoModelForCausalLMWithValueHead or base model)
         lora_only: If True, only find LoRA layers
 
     Returns:
-        List of layer names
+        List of layer names (with correct prefix for wrapper models)
     """
     layer_names = []
 
-    for name, module in model.named_modules():
+    # Handle AutoModelForCausalLMWithValueHead wrapper
+    # The pretrained_model attribute contains the actual model
+    target_model = model
+    prefix = ""
+    if hasattr(model, "pretrained_model"):
+        target_model = model.pretrained_model
+        prefix = "pretrained_model."
+
+    for name, module in target_model.named_modules():
         if lora_only:
             if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
                 if hasattr(module.lora_A, "default"):
-                    layer_names.append(f"{name}.lora_A.default")
+                    layer_names.append(f"{prefix}{name}.lora_A.default")
                 elif isinstance(module.lora_A, torch.nn.Linear):
-                    layer_names.append(f"{name}.lora_A")
+                    layer_names.append(f"{prefix}{name}.lora_A")
 
                 if hasattr(module.lora_B, "default"):
-                    layer_names.append(f"{name}.lora_B.default")
+                    layer_names.append(f"{prefix}{name}.lora_B.default")
                 elif isinstance(module.lora_B, torch.nn.Linear):
-                    layer_names.append(f"{name}.lora_B")
+                    layer_names.append(f"{prefix}{name}.lora_B")
         else:
             if isinstance(module, torch.nn.Linear):
                 # Skip special heads
                 if "lm_head" not in name and "v_head" not in name:
-                    layer_names.append(name)
+                    layer_names.append(f"{prefix}{name}")
 
     return layer_names
 
@@ -144,18 +153,63 @@ def main():
         )
         logger.info(f"  Validation dataset: {len(val_dataset)} samples")
 
-    # Load policy model
-    logger.info("Loading policy model...")
+    # Load policy model with value head for PPO
+    logger.info("Loading policy model with value head...")
     model_kwargs = {"torch_dtype": getattr(torch, model_args.torch_dtype)}
     if model_args.use_flash_attention:
         model_kwargs["attn_implementation"] = "flash_attention_2"
 
-    model = AutoModelForCausalLM.from_pretrained(
+    # Setup LoRA config if enabled
+    peft_config = None
+    if model_args.lora:
+        peft_config = LoraConfig(
+            r=model_args.lora_r,
+            lora_alpha=model_args.lora_alpha,
+            lora_dropout=model_args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=model_args.lora_target_modules if model_args.lora_target_modules else None,
+        )
+
+    # Load model with value head (and LoRA if configured)
+    # AutoModelForCausalLMWithValueHead adds a v_head for value estimation
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(
         model_args.model_name_or_path,
+        peft_config=peft_config,
         **model_kwargs,
     ).to(device)
 
-    # Load frozen reference model for KL penalty
+    if model_args.lora:
+        logger.info(f"Applied LoRA with r={model_args.lora_r}")
+        model.pretrained_model.print_trainable_parameters()
+
+        # Enable input gradients for checkpointing
+        if hasattr(model.pretrained_model, "enable_input_require_grads"):
+            model.pretrained_model.enable_input_require_grads()
+
+    # Log value head info
+    logger.info(f"Value head: {model.v_head}")
+
+    # Verify and log trainable parameters
+    n_trainable = 0
+    n_frozen = 0
+    n_policy_trainable = 0
+    n_v_head_trainable = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            n_trainable += param.numel()
+            if "v_head" in name:
+                n_v_head_trainable += param.numel()
+            else:
+                n_policy_trainable += param.numel()
+        else:
+            n_frozen += param.numel()
+    logger.info(f"Trainable parameters: {n_trainable:,} (policy: {n_policy_trainable:,}, v_head: {n_v_head_trainable:,})")
+    logger.info(f"Frozen parameters: {n_frozen:,}")
+    if n_policy_trainable == 0:
+        logger.warning("WARNING: No policy parameters are trainable! This will break PPO training.")
+
+    # Load frozen reference model for KL penalty (no value head needed)
     logger.info("Loading reference model (frozen)...")
     ref_model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
@@ -164,24 +218,6 @@ def main():
     ref_model.eval()
     for param in ref_model.parameters():
         param.requires_grad = False
-
-    # Apply LoRA if enabled
-    if model_args.lora:
-        lora_config = LoraConfig(
-            r=model_args.lora_r,
-            lora_alpha=model_args.lora_alpha,
-            lora_dropout=model_args.lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=model_args.lora_target_modules if model_args.lora_target_modules else None,
-        )
-        model = get_peft_model(model, lora_config)
-        logger.info(f"Applied LoRA with r={model_args.lora_r}")
-        model.print_trainable_parameters()
-
-        # Enable input gradients for checkpointing
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
 
     # Load reward model
     logger.info("Loading reward model...")
