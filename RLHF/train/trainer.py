@@ -2,12 +2,18 @@
 Streaming PPO Trainer for RLHF experiments.
 
 This module implements PPO training with gradient streaming for data selection,
-following the same design patterns as SFT/train/trainer.py.
+following the design patterns from the Snapshot paper (LDA-ORL).
 
 Key Design:
-- Two-phase approach for GREATS: capture validation gradients, then train with selection
-- Single-pass approach for Streaming: per-layer selection during backward
-- Supports NA (baseline), Streaming, and GREATS methods
+- Separate validation and training passes (different loss functions)
+- Validation: sequence-level reward-weighted log probs (f^seq)
+- Training: PPO loss (policy + value + KL)
+- KL penalty applied via reward shaping (before GAE), not as loss term
+
+Methods:
+- NA: Standard PPO (no selection)
+- Streaming: Per-layer selection during backward (single-pass for training)
+- GREATS: Global selection with validation gradients (two-pass for training)
 """
 
 import logging
@@ -35,7 +41,7 @@ def compute_gae(
     Compute Generalized Advantage Estimation.
 
     Args:
-        rewards: Per-token rewards [batch, seq_len]
+        rewards: Per-token rewards (with KL penalty already applied) [batch, seq_len]
         values: Value estimates [batch, seq_len]
         mask: Valid token mask [batch, seq_len]
         gamma: Discount factor
@@ -69,15 +75,14 @@ class StreamingPPOTrainer:
 
     This trainer implements PPO with support for three training methods:
     - NA: Standard PPO (no selection)
-    - Streaming: Per-layer selection during backward (single-pass)
+    - Streaming: Per-layer selection during backward (uses stored val gradients)
     - GREATS: Global selection with validation gradients (two-pass)
 
-    The training loop:
-    1. Generate rollouts (responses) from the policy
-    2. Compute rewards using the reward model
-    3. Compute advantages using GAE
-    4. (If GREATS) Capture validation gradients
-    5. PPO update with optional selection
+    Key design choices for RLHF (vs SFT):
+    1. Validation and training use DIFFERENT loss functions, so we can't merge batches
+    2. Validation loss: -E[log π_θ(y|x) * Â(x,y)] (sequence-level, reward-weighted)
+    3. Training loss: PPO clipped policy gradient + value loss
+    4. KL penalty: Applied via reward shaping (subtracted from rewards before GAE)
     """
 
     def __init__(
@@ -132,6 +137,7 @@ class StreamingPPOTrainer:
         self.vf_coef = args.vf_coef
         self.gamma = args.gamma
         self.gae_lambda = args.gae_lambda
+        self.ppo_epochs = getattr(args, 'ppo_epochs', 4)  # PPO update epochs per batch
 
         # Selection configuration
         self.method = args.method
@@ -151,8 +157,9 @@ class StreamingPPOTrainer:
             logger.info(f"  Selection fraction: {self.selection_frac}")
             logger.info(f"  Validation loss type: {self.val_loss_type}")
             logger.info(f"  Second-order selection: {self.use_second_order}")
-        logger.info(f"  KL coefficient: {self.kl_coef}")
+        logger.info(f"  KL coefficient: {self.kl_coef} (reward shaping)")
         logger.info(f"  Clip range: {self.cliprange}")
+        logger.info(f"  PPO epochs per batch: {self.ppo_epochs}")
         logger.info("=" * 60)
 
     @torch.no_grad()
@@ -245,47 +252,6 @@ class StreamingPPOTrainer:
 
         return selected_log_probs
 
-    def compute_validation_loss(
-        self,
-        val_input_ids: Tensor,
-        val_attention_mask: Tensor,
-    ) -> Tensor:
-        """
-        Compute validation loss for gradient capture.
-
-        This loss represents the "good direction" for data selection.
-
-        Args:
-            val_input_ids: Validation input IDs [batch, seq_len]
-            val_attention_mask: Validation attention mask [batch, seq_len]
-
-        Returns:
-            Scalar validation loss
-        """
-        outputs = self.model(
-            input_ids=val_input_ids,
-            attention_mask=val_attention_mask,
-            return_dict=True,
-        )
-
-        # Shift for causal LM
-        logits = outputs.logits[:, :-1, :].contiguous()
-        labels = val_input_ids[:, 1:].contiguous()
-
-        # Per-token loss
-        loss_fct = nn.CrossEntropyLoss(reduction="none")
-        per_token_loss = loss_fct(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
-        ).view(logits.size(0), -1)
-
-        # Apply mask
-        mask = val_attention_mask[:, 1:].contiguous()
-        per_token_loss = per_token_loss * mask
-        val_loss = per_token_loss.sum() / mask.sum().clamp(min=1)
-
-        return val_loss
-
     def capture_validation_gradients(
         self,
         val_query_ids: Tensor,
@@ -310,8 +276,8 @@ class StreamingPPOTrainer:
         """
         t_start = time.time()
 
-        # Set hook to capture mode
-        self.grad_hook.set_mode("capture_val")
+        # Start validation capture mode
+        self.grad_hook.start_val_capture()
         self.grad_hook.enable_hooks()
 
         # Generate responses from validation queries
@@ -324,7 +290,7 @@ class StreamingPPOTrainer:
             query_texts = self.tokenizer.batch_decode(val_query_ids, skip_special_tokens=True)
             rewards = self.reward_model.compute_rewards(query_texts, response_texts)
 
-            # Normalize rewards to get advantages (z-normalization)
+            # Normalize rewards to get advantages (z-normalization for variance reduction)
             if rewards.std() > 1e-8:
                 rewards_normalized = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
             else:
@@ -360,15 +326,17 @@ class StreamingPPOTrainer:
         # Negative because we want gradient towards higher reward
         val_loss = -(rewards_normalized * seq_log_probs).mean()
 
-        # Backward - hooks capture compressed gradients
+        # Backward - hooks capture gradients into val_grad_buffer
         val_loss.backward()
 
-        # Clear optimizer gradients (we only wanted compressed grads)
+        # Clear optimizer gradients (we only wanted to capture compressed grads)
         self.optimizer.zero_grad()
+
+        # End capture mode
+        self.grad_hook.end_val_capture()
 
         logger.debug(
             f"Captured validation gradients (seq-level): "
-            f"{len(self.grad_hook.val_grad_buffer)} layers, "
             f"mean_reward={rewards.mean().item():.4f}, "
             f"loss={val_loss.item():.4f}, time={time.time() - t_start:.3f}s"
         )
@@ -389,13 +357,16 @@ class StreamingPPOTrainer:
         """
         Compute PPO loss.
 
+        Note: KL penalty is already applied to rewards via reward shaping
+        (see train method), so we don't add it as a loss term here.
+
         Args:
             query_ids: Query token IDs [batch, query_len]
             response_ids: Response token IDs [batch, response_len]
             query_mask: Query attention mask
             response_mask: Response attention mask
             old_logprobs: Log probs from rollout [batch, response_len]
-            advantages: GAE advantages [batch, response_len]
+            advantages: GAE advantages (from KL-shaped rewards) [batch, response_len]
             returns: Returns for value loss [batch, response_len]
             old_values: Old value estimates [batch, response_len]
 
@@ -425,24 +396,6 @@ class StreamingPPOTrainer:
             index=response_ids.unsqueeze(-1),
         ).squeeze(-1)
 
-        # Reference log probs for KL
-        if self.ref_model is not None:
-            with torch.no_grad():
-                ref_outputs = self.ref_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                )
-                ref_logits = ref_outputs.logits[:, query_len - 1:-1, :]
-                ref_log_probs = F.log_softmax(ref_logits.float(), dim=-1)
-                ref_logprobs = torch.gather(
-                    ref_log_probs,
-                    dim=-1,
-                    index=response_ids.unsqueeze(-1),
-                ).squeeze(-1)
-        else:
-            ref_logprobs = old_logprobs.detach()
-
         # PPO policy loss with clipping
         ratio = torch.exp(new_logprobs - old_logprobs)
         clipped_ratio = torch.clamp(ratio, 1 - self.cliprange, 1 + self.cliprange)
@@ -452,7 +405,7 @@ class StreamingPPOTrainer:
         pg_loss = torch.max(pg_loss1, pg_loss2)
         pg_loss = (pg_loss * response_mask).sum() / response_mask.sum().clamp(min=1)
 
-        # Value loss (simplified - assumes model has value head)
+        # Value loss (simplified - assumes model has value head or we use 0)
         values = torch.zeros_like(old_values)  # Placeholder if no value head
         values_clipped = old_values + torch.clamp(
             values - old_values,
@@ -464,14 +417,10 @@ class StreamingPPOTrainer:
         vf_loss = 0.5 * torch.max(vf_loss1, vf_loss2)
         vf_loss = (vf_loss * response_mask).sum() / response_mask.sum().clamp(min=1)
 
-        # KL penalty
-        kl = (ref_logprobs - new_logprobs) * response_mask
-        kl_loss = kl.sum() / response_mask.sum().clamp(min=1)
+        # Total loss (no KL term - it's in the rewards/advantages already)
+        total_loss = pg_loss + self.vf_coef * vf_loss
 
-        # Total loss
-        total_loss = pg_loss + self.vf_coef * vf_loss + self.kl_coef * kl_loss
-
-        # Stats
+        # Stats for logging
         with torch.no_grad():
             clipfrac = ((ratio - 1).abs() > self.cliprange).float().mean().item()
             approx_kl = (0.5 * (new_logprobs - old_logprobs) ** 2 * response_mask).sum()
@@ -481,7 +430,6 @@ class StreamingPPOTrainer:
             "loss/total": total_loss.item(),
             "loss/policy": pg_loss.item(),
             "loss/value": vf_loss.item(),
-            "objective/kl": kl_loss.item(),
             "policy/approx_kl": approx_kl.item(),
             "policy/clipfrac": clipfrac,
             "policy/ratio_mean": ratio.mean().item(),
@@ -505,14 +453,14 @@ class StreamingPPOTrainer:
 
         Handles all three methods:
         - NA: Standard PPO update
-        - Streaming: Per-layer selection during backward
-        - GREATS: Global selection (two-pass)
+        - Streaming: Per-layer selection during backward (uses stored val grads)
+        - GREATS: Global selection (two-pass for training)
 
         Args:
             query_ids, response_ids: Token IDs
             query_mask, response_mask: Attention masks
             old_logprobs: Log probs from rollout
-            advantages: GAE advantages
+            advantages: GAE advantages (from KL-shaped rewards)
             returns: Returns
             old_values: Old value estimates
 
@@ -527,6 +475,10 @@ class StreamingPPOTrainer:
         # ========================================
         if self.method == "NA":
             self.optimizer.zero_grad()
+
+            # Disable hooks for baseline
+            if self.grad_hook is not None:
+                self.grad_hook.disable_hooks()
 
             loss, stats = self.compute_ppo_loss(
                 query_ids, response_ids, query_mask, response_mask,
@@ -545,22 +497,24 @@ class StreamingPPOTrainer:
             self.optimizer.step()
             self.optimizer.zero_grad()
 
+            if self.grad_hook is not None:
+                self.grad_hook.enable_hooks()
+
             return stats
 
         # ========================================
-        # Method: Streaming (per-layer selection)
+        # Method: Streaming (per-layer selection with stored val grads)
         # ========================================
         if self.method == "Streaming":
             self.optimizer.zero_grad()
 
-            # Setup selection for single-pass
-            self.grad_hook.set_mode("train_select")
-            self.grad_hook.setup_selection(
+            # Setup selection using pre-captured validation gradients
+            self.grad_hook.setup_selection_with_stored_val(
                 train_batch_size=batch_size,
-                selection_method="Streaming",  # Per-layer selection during backward
+                selection_method="Streaming",
                 selection_frac=self.selection_frac,
                 lr=lr,
-                compute_scores_only=False,  # Apply selection during backward
+                compute_scores_only=False,  # Per-layer selection during backward
                 use_second_order=self.use_second_order,
             )
 
@@ -569,7 +523,7 @@ class StreamingPPOTrainer:
                 old_logprobs, advantages, returns, old_values,
             )
 
-            # Backward with per-layer selection
+            # Backward with per-layer selection using stored val grads
             loss.backward()
 
             # Get selection stats
@@ -587,13 +541,12 @@ class StreamingPPOTrainer:
             return stats
 
         # ========================================
-        # Method: GREATS (global selection, two-pass)
+        # Method: GREATS (global selection, two-pass for training)
         # ========================================
         if self.method == "GREATS":
-            # Pass 1: Compute selection scores
+            # Pass 1: Compute selection scores using stored val grads
             self.optimizer.zero_grad()
-            self.grad_hook.set_mode("train_select")
-            self.grad_hook.setup_selection(
+            self.grad_hook.setup_selection_with_stored_val(
                 train_batch_size=batch_size,
                 selection_method="GREATS",
                 selection_frac=self.selection_frac,
@@ -708,8 +661,7 @@ class StreamingPPOTrainer:
                     val_query_ids = val_query_ids.to(self.device)
                 val_query_mask = (val_query_ids != self.tokenizer.pad_token_id).long()
 
-            # Capture validation gradients once per epoch for GREATS
-            # (Streaming captures per-step inside the loop)
+            # For GREATS: capture validation gradients once per epoch
             val_loss = 0.0
             if self.method == "GREATS" and val_query_ids is not None:
                 val_loss = self.capture_validation_gradients(
@@ -738,28 +690,47 @@ class StreamingPPOTrainer:
                         query_ids, query_mask
                     )
 
-                    # Compute rewards
+                    # Compute rewards from reward model
                     query_texts = self.tokenizer.batch_decode(query_ids, skip_special_tokens=True)
-                    rewards_scalar = self.reward_model.compute_rewards(query_texts, response_texts)
+                    raw_rewards = self.reward_model.compute_rewards(query_texts, response_texts)
 
-                    # Per-token rewards (sparse at end)
+                    # Create per-token reward tensor (sparse - only at last token)
                     rewards = torch.zeros_like(response_mask, dtype=torch.float, device=self.device)
                     for i in range(len(response_texts)):
                         last_idx = response_mask[i].sum().item() - 1
                         if last_idx >= 0:
-                            rewards[i, last_idx] = rewards_scalar[i]
+                            rewards[i, last_idx] = raw_rewards[i]
 
-                    # Old log probs
+                    # Compute old log probs and ref log probs
                     full_ids = torch.cat([query_ids, response_ids], dim=1)
                     full_mask = torch.cat([query_mask, response_mask], dim=1)
+                    query_len = query_ids.shape[1]
+
                     old_logprobs = self.compute_log_probs(
-                        self.model, full_ids, full_mask, query_ids.shape[1]
+                        self.model, full_ids, full_mask, query_len
                     )
+
+                    # Compute reference log probs for KL penalty
+                    if self.ref_model is not None:
+                        ref_logprobs = self.compute_log_probs(
+                            self.ref_model, full_ids, full_mask, query_len
+                        )
+                    else:
+                        ref_logprobs = old_logprobs.detach()
+
+                    # ========================================
+                    # KL PENALTY VIA REWARD SHAPING
+                    # ========================================
+                    # This is the correct implementation per the Snapshot paper
+                    # and standard PPO for RLHF. The KL penalty is subtracted
+                    # from rewards BEFORE computing GAE, not added as a loss term.
+                    kl_penalty = old_logprobs - ref_logprobs  # KL(π||π_ref) per token
+                    rewards = rewards - self.kl_coef * kl_penalty * response_mask.float()
 
                     # Values (zeros if no value head)
                     old_values = torch.zeros_like(response_mask, dtype=torch.float, device=self.device)
 
-                    # Compute advantages
+                    # Compute advantages and returns using KL-shaped rewards
                     advantages, returns = compute_gae(
                         rewards, old_values, response_mask.float(),
                         self.gamma, self.gae_lambda
@@ -776,15 +747,18 @@ class StreamingPPOTrainer:
                         val_query_ids, val_query_mask
                     )
 
-                # Training step
-                stats = self.training_step(
-                    query_ids, response_ids, query_mask, response_mask,
-                    old_logprobs, advantages, returns, old_values,
-                )
+                # PPO epochs: multiple updates per rollout batch
+                # old_logprobs stays fixed, new_logprobs recomputed each epoch
+                for ppo_epoch in range(self.ppo_epochs):
+                    stats = self.training_step(
+                        query_ids, response_ids, query_mask, response_mask,
+                        old_logprobs.detach(), advantages.detach(), returns.detach(), old_values.detach(),
+                    )
 
-                # Add reward stats
-                stats["reward/mean"] = rewards_scalar.mean().item()
-                stats["reward/std"] = rewards_scalar.std().item()
+                # Add reward and KL stats
+                stats["reward/mean"] = raw_rewards.mean().item()
+                stats["reward/std"] = raw_rewards.std().item()
+                stats["objective/kl"] = kl_penalty.mean().item()
                 stats["val_loss"] = val_loss
 
                 epoch_stats.append(stats)
