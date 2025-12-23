@@ -65,14 +65,14 @@ lora_alpha=32
 compression=""  # LoGra or GraSS
 update_compressor_freq=200
 
-# PPO settings (matching reference implementation)
-# Reference: archive/LDA-ORL-main/rlhf-toxicity/scripts/run_train_std.sh
+# PPO settings
 ppo_epochs=4
-mini_batch_size=1  # Reference uses 1: one optimizer.step() per sample within each PPO epoch
-forward_batch_size=256  # Reference uses tracin_batch_size=256 for forward passes (GPU efficiency)
-init_kl_coef=0.04  # Reference uses 0.04 (NOT 0.2)
-adap_kl_ctrl=true  # Reference uses adaptive KL control
-target_kl=6.0      # Reference default
+mini_batch_size=1
+forward_batch_size=256
+init_kl_coef=0.2
+kl_penalty="kl"  # Options: kl (default, can be negative), abs (always positive), mse, full
+adap_kl_ctrl=true
+target_kl=6.0
 max_new_tokens=30
 min_new_tokens=20
 
@@ -201,6 +201,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --kl_coef)
             kl_coef="$2"
+            shift 2
+            ;;
+        --kl_penalty)
+            kl_penalty="$2"
             shift 2
             ;;
         --max_new_tokens)
@@ -485,6 +489,7 @@ run_single_experiment() {
 --mini_batch_size=$mini_batch_size \
 --forward_batch_size=$forward_batch_size \
 --init_kl_coef=$init_kl_coef \
+--kl_penalty=$kl_penalty \
 --adap_kl_ctrl=$adap_kl_ctrl \
 --target_kl=$target_kl \
 --max_new_tokens=$max_new_tokens \

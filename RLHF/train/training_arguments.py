@@ -110,7 +110,7 @@ class TrainingArguments(TA):
     # ===================
     ppo_epochs: int = field(
         default=4,
-        metadata={"help": "Number of PPO epochs per batch (reference default: 4)"},
+        metadata={"help": "Number of PPO epochs per batch (default: 4)"},
     )
     mini_batch_size: int = field(
         default=1,
@@ -138,18 +138,29 @@ class TrainingArguments(TA):
         metadata={"help": "Skip batches where avg ratio exceeds this (prevents divergence)"},
     )
 
-    # KL Control (matching reference implementation)
-    # Reference: archive/LDA-ORL-main/rlhf-toxicity/scripts/run_train_std.sh uses init_kl_coef=0.04
+    # KL Control
     kl_coef: float = field(
         default=0.04,
-        metadata={"help": "KL penalty coefficient (reference default: 0.04). Alias for init_kl_coef."},
+        metadata={"help": "KL penalty coefficient (default: 0.04). Alias for init_kl_coef."},
     )
     init_kl_coef: float = field(
         default=0.04,
         metadata={
             "help": (
-                "Initial KL penalty coefficient (reference default: 0.04). "
+                "Initial KL penalty coefficient (default: 0.04). "
                 "With adaptive KL control, this value changes during training."
+            )
+        },
+    )
+    kl_penalty: str = field(
+        default="kl",
+        metadata={
+            "help": (
+                "KL penalty mode (reference: ppo_config.py:80-85): "
+                "'kl': model_logp - ref_logp (can be negative), "
+                "'abs': abs(model_logp - ref_logp) (always positive, prevents reward bonus), "
+                "'mse': 0.5 * (model_logp - ref_logp)^2 (always positive), "
+                "'full': true KL divergence using F.kl_div"
             )
         },
     )
@@ -157,7 +168,7 @@ class TrainingArguments(TA):
         default=True,
         metadata={
             "help": (
-                "Use adaptive KL control (reference default: True). "
+                "Use adaptive KL control (default: True). "
                 "Dynamically adjusts KL coefficient based on observed KL divergence."
             )
         },
@@ -166,7 +177,7 @@ class TrainingArguments(TA):
         default=6.0,
         metadata={
             "help": (
-                "Target KL divergence for adaptive KL control (reference default: 6.0). "
+                "Target KL divergence for adaptive KL control (default: 6.0). "
                 "Also used for early stopping if enabled."
             )
         },
@@ -175,7 +186,7 @@ class TrainingArguments(TA):
         default=10000,
         metadata={
             "help": (
-                "Horizon for adaptive KL control (reference default: 10000). "
+                "Horizon for adaptive KL control (default: 10000). "
                 "Larger values = slower adaptation."
             )
         },
@@ -183,23 +194,23 @@ class TrainingArguments(TA):
 
     cliprange: float = field(
         default=0.2,
-        metadata={"help": "PPO clipping range for policy (reference default: 0.2)"},
+        metadata={"help": "PPO clipping range for policy (default: 0.2)"},
     )
     cliprange_value: float = field(
         default=0.2,
-        metadata={"help": "PPO clipping range for value (reference default: 0.2)"},
+        metadata={"help": "PPO clipping range for value (default: 0.2)"},
     )
     vf_coef: float = field(
         default=0.1,
-        metadata={"help": "Value function coefficient (reference default: 0.1)"},
+        metadata={"help": "Value function coefficient (default: 0.1)"},
     )
     gamma: float = field(
         default=1.0,
-        metadata={"help": "Discount factor (reference default: 1.0)"},
+        metadata={"help": "Discount factor (default: 1.0)"},
     )
     gae_lambda: float = field(
         default=0.95,
-        metadata={"help": "GAE lambda parameter (reference default: 0.95)"},
+        metadata={"help": "GAE lambda parameter (default: 0.95)"},
     )
 
     # ===================
@@ -250,6 +261,11 @@ class TrainingArguments(TA):
         # Validate selection_frac
         if not 0 < self.selection_frac <= 1:
             raise ValueError(f"selection_frac must be in (0, 1], got {self.selection_frac}")
+
+        # Validate kl_penalty (matching reference: ppo_config.py:217)
+        valid_kl_penalties = ["kl", "abs", "mse", "full"]
+        if self.kl_penalty not in valid_kl_penalties:
+            raise ValueError(f"kl_penalty must be one of {valid_kl_penalties}, got {self.kl_penalty}")
 
         super().__post_init__()
 

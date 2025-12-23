@@ -23,6 +23,7 @@ Reference Implementation:
 
 import logging
 import time
+import warnings
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
@@ -225,6 +226,10 @@ class StreamingPPOTrainer:
         else:
             self.kl_ctl = FixedKLController(init_kl_coef)
 
+        # KL penalty mode (matching reference: ppo_trainer.py _kl_penalty method)
+        # Options: "kl", "abs", "mse", "full"
+        self.kl_penalty_mode = getattr(args, 'kl_penalty', 'kl')
+
         # Selection configuration
         self.method = args.method
         self.selection_frac = args.selection_frac
@@ -244,6 +249,7 @@ class StreamingPPOTrainer:
             logger.info(f"  Validation loss type: {self.val_loss_type}")
             logger.info(f"  Second-order selection: {self.use_second_order}")
         logger.info(f"  KL coefficient: {self.kl_ctl.value} ({'adaptive' if self.adap_kl_ctrl else 'fixed'})")
+        logger.info(f"  KL penalty mode: {self.kl_penalty_mode}")
         logger.info(f"  Clip range: {self.cliprange}")
         logger.info(f"  PPO epochs per batch: {self.ppo_epochs}")
         logger.info(f"  Mini-batch size (backward): {self.mini_batch_size}")
@@ -254,6 +260,42 @@ class StreamingPPOTrainer:
         else:
             logger.info(f"  Reference model: {'loaded (frozen)' if self.ref_model is not None else 'None'}")
         logger.info("=" * 60)
+
+    def _kl_penalty(
+        self,
+        logprob: torch.FloatTensor,
+        ref_logprob: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        """
+        Compute KL penalty based on configured mode.
+
+        Matches reference implementation: ppo_trainer.py lines 3317-3329
+
+        Args:
+            logprob: Policy log probabilities [batch, seq_len]
+            ref_logprob: Reference log probabilities [batch, seq_len]
+
+        Returns:
+            KL penalty tensor [batch, seq_len]
+        """
+        if self.kl_penalty_mode == "kl":
+            # Standard: can be negative if policy assigns lower prob than reference
+            return logprob - ref_logprob
+
+        if self.kl_penalty_mode == "abs":
+            # Absolute value: always positive, prevents reward bonus from negative KL
+            return (logprob - ref_logprob).abs()
+
+        if self.kl_penalty_mode == "mse":
+            # Mean squared error: always positive, smoother penalty
+            return 0.5 * (logprob - ref_logprob).square()
+
+        if self.kl_penalty_mode == "full":
+            # True KL divergence using F.kl_div
+            # Note: Flip is required due to PyTorch issue #57459
+            return F.kl_div(ref_logprob, logprob, log_target=True, reduction="none").sum(-1)
+
+        raise ValueError(f"Unknown kl_penalty mode: {self.kl_penalty_mode}")
 
     @torch.no_grad()
     def generate_rollouts(
@@ -1181,7 +1223,8 @@ class StreamingPPOTrainer:
                     # Reference: ppo_trainer.py compute_rewards lines 3304-3314
                     # ========================================
                     # KL penalty is subtracted from rewards BEFORE computing GAE
-                    kl_penalty = old_logprobs - ref_logprobs  # KL(π||π_ref) per token
+                    # Uses configured kl_penalty mode (kl/abs/mse/full)
+                    kl_penalty = self._kl_penalty(old_logprobs, ref_logprobs)
                     non_score_rewards = -self.kl_ctl.value * kl_penalty
                     rewards = rewards + non_score_rewards * response_mask.float()
 
@@ -1258,6 +1301,17 @@ class StreamingPPOTrainer:
                 mean_kl = kl_per_seq.mean().item()
                 stats["objective/kl"] = mean_kl
                 stats["objective/kl_coef"] = self.kl_ctl.value
+
+                # Warning for negative KL (reference: ppo_trainer.py lines 3474-3480)
+                # This indicates the policy assigns lower probability to its own
+                # generated tokens than the reference - a pathological state
+                if mean_kl < -1.0:
+                    warnings.warn(
+                        f"KL divergence is starting to become negative: {mean_kl:.2f} - "
+                        "this might be a precursor for failed training. "
+                        "Consider using kl_penalty='abs' to prevent reward bonus from negative KL, "
+                        "or review your training hyperparameters (try increasing mini_batch_size)."
+                    )
 
                 # Update KL controller (reference line 933-936)
                 # multiply batch_size by num_processes for distributed training
