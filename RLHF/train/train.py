@@ -178,7 +178,7 @@ def main():
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         model_args.model_name_or_path,
         peft_config=peft_config,
-        summary_dropout_prob=0.0,  # Disable value head dropout for train/eval consistency
+        summary_dropout_prob=0.1,
         **model_kwargs,
     ).to(device)
 
