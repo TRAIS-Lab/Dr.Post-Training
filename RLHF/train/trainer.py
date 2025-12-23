@@ -291,9 +291,10 @@ class StreamingPPOTrainer:
             return 0.5 * (logprob - ref_logprob).square()
 
         if self.kl_penalty_mode == "full":
-            # True KL divergence using F.kl_div
+            # Per-token KL divergence using F.kl_div
             # Note: Flip is required due to PyTorch issue #57459
-            return F.kl_div(ref_logprob, logprob, log_target=True, reduction="none").sum(-1)
+            # Returns [batch, seq_len] for per-token reward shaping
+            return F.kl_div(ref_logprob, logprob, log_target=True, reduction="none")
 
         raise ValueError(f"Unknown kl_penalty mode: {self.kl_penalty_mode}")
 
@@ -531,10 +532,11 @@ class StreamingPPOTrainer:
             batch_attention_mask = attention_mask[i:end_idx]
             batch_response_ids = response_ids[i:end_idx]
 
-            # Forward pass
+            # Forward pass (use_cache=False to prevent KV cache issues after generate())
             outputs = self.model(
                 input_ids=batch_input_ids,
                 attention_mask=batch_attention_mask,
+                use_cache=False,
             )
 
             # Handle output format
@@ -546,7 +548,20 @@ class StreamingPPOTrainer:
                 values_full = None
 
             # Extract logits for response tokens
-            logits_for_probs = logits[:, query_len - 1:-1, :]
+            # Use explicit response_len to ensure correct slicing regardless of model output shape
+            response_len = batch_response_ids.shape[1]
+            start_idx = query_len - 1
+            end_idx = start_idx + response_len
+            logits_for_probs = logits[:, start_idx:end_idx, :]
+
+            # Debug assertion to catch shape mismatches early
+            if logits_for_probs.shape[1] != response_len:
+                raise RuntimeError(
+                    f"Logits shape mismatch: expected {response_len} positions, "
+                    f"got {logits_for_probs.shape[1]}. "
+                    f"logits.shape={logits.shape}, query_len={query_len}, "
+                    f"response_len={response_len}, start_idx={start_idx}, end_idx={end_idx}"
+                )
 
             # Compute log probs
             log_probs = F.log_softmax(logits_for_probs.float(), dim=-1)
@@ -563,7 +578,7 @@ class StreamingPPOTrainer:
             if values_full is not None:
                 if values_full.dim() == 3:
                     values_full = values_full.squeeze(-1)
-                batch_values = values_full[:, query_len - 1:-1]
+                batch_values = values_full[:, start_idx:end_idx]
             else:
                 batch_values = torch.zeros_like(batch_logprobs)
 
@@ -644,10 +659,11 @@ class StreamingPPOTrainer:
                 batch_attention_mask = attention_mask[i:end_idx]
                 batch_response_ids = response_ids[i:end_idx]
 
-                # Forward pass
+                # Forward pass (use_cache=False to prevent KV cache issues)
                 outputs = ref_model(
                     input_ids=batch_input_ids,
                     attention_mask=batch_attention_mask,
+                    use_cache=False,
                 )
 
                 # Handle output format
@@ -657,7 +673,20 @@ class StreamingPPOTrainer:
                     logits = outputs.logits
 
                 # Extract logits for response tokens
-                logits_for_probs = logits[:, query_len - 1:-1, :]
+                # Use explicit response_len to ensure correct slicing
+                response_len = batch_response_ids.shape[1]
+                start_idx = query_len - 1
+                end_idx = start_idx + response_len
+                logits_for_probs = logits[:, start_idx:end_idx, :]
+
+                # Debug assertion to catch shape mismatches early
+                if logits_for_probs.shape[1] != response_len:
+                    raise RuntimeError(
+                        f"Ref logits shape mismatch: expected {response_len} positions, "
+                        f"got {logits_for_probs.shape[1]}. "
+                        f"logits.shape={logits.shape}, query_len={query_len}, "
+                        f"response_len={response_len}"
+                    )
 
                 # Compute log probs
                 log_probs = F.log_softmax(logits_for_probs.float(), dim=-1)
@@ -817,9 +846,11 @@ class StreamingPPOTrainer:
         attention_mask = torch.cat([query_mask, response_mask], dim=1)
 
         # Forward pass - model returns (logits, loss, values) for AutoModelForCausalLMWithValueHead
+        # use_cache=False to prevent KV cache issues
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            use_cache=False,
         )
 
         # Handle model output format
@@ -832,15 +863,28 @@ class StreamingPPOTrainer:
             logits = outputs.logits
             values_full = torch.zeros(batch_size, input_ids.shape[1], device=self.device)
 
-        # Extract values for response tokens only
-        # Fix: Values should start from position before first response token
+        # Extract values and logits for response tokens only
+        # Use explicit response_len for robust slicing
+        response_len = response_ids.shape[1]
+        start_idx = query_len - 1
+        end_idx = start_idx + response_len
+
         # V(s_t) = value at state BEFORE taking action t
         if values_full.dim() == 3:
             values_full = values_full.squeeze(-1)
-        values = values_full[:, query_len - 1:-1]
+        values = values_full[:, start_idx:end_idx]
 
         # New log probs
-        logits_for_probs = logits[:, query_len - 1:-1, :]
+        logits_for_probs = logits[:, start_idx:end_idx, :]
+
+        # Debug assertion
+        if logits_for_probs.shape[1] != response_len:
+            raise RuntimeError(
+                f"PPO loss logits shape mismatch: expected {response_len}, "
+                f"got {logits_for_probs.shape[1]}. "
+                f"logits.shape={logits.shape}, query_len={query_len}"
+            )
+
         log_probs = F.log_softmax(logits_for_probs.float(), dim=-1)
         new_logprobs = torch.gather(
             log_probs,

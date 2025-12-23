@@ -25,6 +25,22 @@ class TrainingArguments(TA):
     """
 
     # ===================
+    # Override: LR Scheduler
+    # ===================
+    # Reference implementation uses constant LR (no scheduler)
+    # See: archive/LDA-ORL-main/rlhf-toxicity/scripts/ppo_config.py
+    # The default in transformers is "linear" which decays LR over training
+    lr_scheduler_type: str = field(
+        default="constant",
+        metadata={
+            "help": (
+                "Learning rate scheduler type. Default 'constant' matches reference "
+                "implementation. Use 'linear' for decay, 'cosine' for cosine annealing."
+            )
+        },
+    )
+
+    # ===================
     # Task Configuration
     # ===================
     task: str = field(
