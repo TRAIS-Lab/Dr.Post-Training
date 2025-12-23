@@ -98,6 +98,9 @@ def _load_toxicity_prompts(
     ds = ds.map(tokenize, batched=False)
     ds.set_format(type="torch")
 
+    # Match reference: 80/20 train/test split, use only training portion
+    ds = ds.train_test_split(test_size=0.2, shuffle=False, seed=seed)["train"]
+
     # Shuffle and return
     ds = ds.shuffle(seed=seed)
 

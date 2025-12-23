@@ -874,6 +874,8 @@ class StreamingPPOTrainer:
         advantages: Tensor,
         returns: Tensor,
         old_values: Tensor,
+        accumulate: bool = False,
+        loss_scale: float = 1.0,
     ) -> Dict[str, float]:
         """
         Perform one training step with optional selection.
@@ -890,6 +892,8 @@ class StreamingPPOTrainer:
             advantages: GAE advantages (from KL-shaped rewards)
             returns: Returns
             old_values: Old value estimates
+            accumulate: If True, only accumulate gradients without optimizer.step()
+            loss_scale: Scale factor for loss (for gradient accumulation, use 1/num_accumulation_steps)
 
         Returns:
             Training statistics dictionary
@@ -901,7 +905,9 @@ class StreamingPPOTrainer:
         # Method: NA (baseline, no selection)
         # ========================================
         if self.method == "NA":
-            self.optimizer.zero_grad()
+            # Only zero grad if not accumulating (first call of accumulation cycle)
+            if not accumulate:
+                self.optimizer.zero_grad()
 
             # Disable hooks for baseline
             if self.grad_hook is not None:
@@ -912,10 +918,14 @@ class StreamingPPOTrainer:
                 old_logprobs, advantages, returns, old_values,
             )
 
-            loss.backward()
+            # Scale loss for gradient accumulation
+            scaled_loss = loss * loss_scale
+            scaled_loss.backward()
 
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+            # Only step optimizer if not accumulating
+            if not accumulate:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
             if self.grad_hook is not None:
                 self.grad_hook.enable_hooks()
@@ -1115,19 +1125,35 @@ class StreamingPPOTrainer:
                 query_len = query_ids.shape[1]
 
                 # ========================================
-                # CRITICAL: Set model to eval mode for forward pass
-                # Reference: ppo_trainer.py line 771
-                # This ensures consistent logprobs (no dropout noise)
+                # IMPORTANT: Keep model in TRAIN mode throughout PPO
+                #
+                # The reference implementation switches to eval() mode here,
+                # but this causes train/eval mode mismatch when computing
+                # new_logprobs in the PPO loop (which runs in train mode).
+                #
+                # With all dropouts set to 0 (lora_dropout=0, summary_dropout_prob=0),
+                # there should be no functional difference between train/eval modes.
+                # Keeping train mode throughout ensures consistent logprobs.
+                #
+                # NOTE: generate_rollouts() sets model to eval() for generation.
+                # We must restore train() mode here before computing old_logprobs.
                 # ========================================
-                self.model.eval()
+                self.model.train()  # Restore train mode after generation
 
                 with torch.no_grad():
-                    # Determine forward batch size for efficient GPU utilization
-                    # Reference uses tracin_batch_size=256 for forward passes
-                    fwd_batch_size = self.forward_batch_size if self.forward_batch_size > 0 else 0
+                    # ========================================
+                    # CRITICAL FIX: Use mini_batch_size for old_logprobs computation
+                    #
+                    # The model gives different logprobs for different batch sizes
+                    # (due to numerical precision in batched attention with left-padding).
+                    # Since PPO loop computes new_logprobs with mini_batch_size,
+                    # we MUST compute old_logprobs with the same batch size.
+                    #
+                    # This is slower but ensures ratio ≈ 1.0 at the start of training.
+                    # ========================================
+                    fwd_batch_size = self.mini_batch_size  # Use mini_batch_size, NOT forward_batch_size
 
-                    # Compute old log probs and values in batches (policy model in eval mode)
-                    # This improves GPU utilization by batching the forward passes
+                    # Compute old log probs and values in batches (policy model in train mode)
                     old_logprobs, _, old_values = self.batched_forward_pass(
                         query_ids, response_ids, query_mask, response_mask,
                         batch_size=fwd_batch_size,
@@ -1183,24 +1209,11 @@ class StreamingPPOTrainer:
                 batch_size = query_ids.shape[0]
                 all_mini_batch_stats = []
 
-                # Set model to train mode for PPO epochs
-                # Reference: step_with_validation line 1398
+                # Ensure model is in train mode for PPO epochs
+                # (Should already be in train mode from epoch start, but call again to be safe)
                 self.model.train()
 
-                # Diagnostic: verify old_logprobs match recomputed logprobs before any update
-                if global_step == 0:
-                    with torch.no_grad():
-                        test_logprobs, _, _ = self.batched_forward_pass(
-                            query_ids[:1], response_ids[:1], query_mask[:1], response_mask[:1],
-                            batch_size=1,
-                        )
-                        diff = (test_logprobs - old_logprobs[:1]).abs().max().item()
-                        logger.info(f"[DIAGNOSTIC] Logprob consistency check: max_diff={diff:.6f}")
-                        if diff > 0.01:
-                            logger.warning(
-                                f"[DIAGNOSTIC] Large logprob discrepancy detected! "
-                                f"This may cause ratio explosion. Check train/eval mode consistency."
-                            )
+                # Removed duplicate diagnostic - the batch size check above is sufficient
 
                 for ppo_epoch in range(self.ppo_epochs):
                     # Shuffle indices at the start of each epoch (like reference)

@@ -173,9 +173,12 @@ def main():
 
     # Load model with value head (and LoRA if configured)
     # AutoModelForCausalLMWithValueHead adds a v_head for value estimation
+    # NOTE: Set summary_dropout_prob=0.0 to disable value head dropout
+    # This ensures consistent behavior between train/eval modes for forward passes
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         model_args.model_name_or_path,
         peft_config=peft_config,
+        summary_dropout_prob=0.0,  # Disable value head dropout for train/eval consistency
         **model_kwargs,
     ).to(device)
 

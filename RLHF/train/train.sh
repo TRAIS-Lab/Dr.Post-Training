@@ -46,7 +46,8 @@ lr_override=""  # Set when --lr is explicitly passed
 n_val=128
 val_batch_size="32"
 selection_frac=0.5
-max_steps=1000
+max_steps=-1  # -1 means no step limit (use epochs instead)
+epochs=1  # Number of training epochs (used when max_steps <= 0)
 seed=42
 
 # LR configuration
@@ -162,6 +163,10 @@ while [[ $# -gt 0 ]]; do
             max_steps="$2"
             shift 2
             ;;
+        --epochs)
+            epochs="$2"
+            shift 2
+            ;;
         --seed)
             seed="$2"
             shift 2
@@ -265,7 +270,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --lr_config <path>         LR config file (default: RLHF/train/lr/config.json)"
             echo "  --n_val <n>                Validation samples (default: 128)"
             echo "  --selection_frac <frac>    Fraction to select (default: 0.5)"
-            echo "  --max_steps <steps>        Maximum training steps (default: 200)"
+            echo "  --max_steps <steps>        Maximum training steps (default: -1, meaning no limit)"
+            echo "  --epochs <n>               Number of training epochs (default: 3, used when max_steps <= 0)"
             echo "  --seed <seed>              Random seed (default: 42)"
             echo ""
             echo "Learning Rate Resolution:"
@@ -473,6 +479,7 @@ run_single_experiment() {
 --n_val=$n_val \
 --selection_frac=$selection_frac \
 --max_steps=$max_steps \
+--num_train_epochs=$epochs \
 --seed=$seed \
 --ppo_epochs=$ppo_epochs \
 --mini_batch_size=$mini_batch_size \
@@ -554,7 +561,8 @@ if [[ -n "$experiments" ]]; then
     echo "  Batch size: $batch_size"
     echo "  Val batch size: ${val_batch_size:-same as n_val}"
     echo "  N_val: $n_val"
-    echo "  Max steps: $max_steps"
+    echo "  Epochs: $epochs"
+    echo "  Max steps: $max_steps (use -1 for epoch-based training)"
     echo "  Selection fraction: $selection_frac"
     echo ""
     echo "PPO Settings:"
