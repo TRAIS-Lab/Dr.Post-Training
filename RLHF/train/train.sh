@@ -60,6 +60,10 @@ fallback_lr_lora="1e-5"
 use_lora=false
 lora_r=16
 lora_alpha=32
+lora_target_modules="q_proj k_proj v_proj o_proj"
+
+# Flash attention
+use_flash_attention=false
 
 # Compression settings
 compression=""  # LoGra or GraSS
@@ -70,7 +74,7 @@ ppo_epochs=4
 mini_batch_size=1
 forward_batch_size=256
 init_kl_coef=0.2
-kl_penalty="full"  # Options: kl (default, can be negative), abs (always positive), mse, full
+kl_penalty="full"  # Options: kl, abs, mse, full
 adap_kl_ctrl=true
 target_kl=0.1
 max_new_tokens=30
@@ -80,6 +84,14 @@ min_new_tokens=20
 val_strategy="random"
 val_loss_type="reward_weighted"  # Sequence-level attribution: f^seq(θ) = -E[log π_θ(y|x) * Â(x,y)]
 use_second_order=false
+
+# Toxicity evaluation settings
+# Uses a DIFFERENT classifier than reward model for unbiased evaluation
+enable_toxicity_eval=true
+eval_interval=0  # 0 = end of epoch only, N > 0 = every N steps
+eval_n_samples=500
+eval_batch_size=256
+eval_on_step_generations=true  # Evaluate toxicity on each step's generations
 
 # Output
 output_dir=""
@@ -183,6 +195,18 @@ while [[ $# -gt 0 ]]; do
             lora_alpha="$2"
             shift 2
             ;;
+        --lora_target_modules)
+            lora_target_modules="$2"
+            shift 2
+            ;;
+        --flash_attention)
+            use_flash_attention=true
+            shift 1
+            ;;
+        --no_flash_attention)
+            use_flash_attention=false
+            shift 1
+            ;;
         --compression)
             compression="$2"
             shift 2
@@ -221,6 +245,34 @@ while [[ $# -gt 0 ]]; do
             ;;
         --use_second_order)
             use_second_order=true
+            shift 1
+            ;;
+        --enable_toxicity_eval)
+            enable_toxicity_eval=true
+            shift 1
+            ;;
+        --disable_toxicity_eval|--no_toxicity_eval)
+            enable_toxicity_eval=false
+            shift 1
+            ;;
+        --eval_interval)
+            eval_interval="$2"
+            shift 2
+            ;;
+        --eval_n_samples)
+            eval_n_samples="$2"
+            shift 2
+            ;;
+        --eval_batch_size)
+            eval_batch_size="$2"
+            shift 2
+            ;;
+        --eval_on_step_generations)
+            eval_on_step_generations=true
+            shift 1
+            ;;
+        --no_eval_on_step_generations)
+            eval_on_step_generations=false
             shift 1
             ;;
         --output_dir)
@@ -264,19 +316,45 @@ while [[ $# -gt 0 ]]; do
             echo "  --lora                     Enable LoRA fine-tuning (default: full fine-tuning)"
             echo "  --lora_r <r>               LoRA rank (default: 16)"
             echo "  --lora_alpha <alpha>       LoRA alpha (default: 32)"
+            echo "  --lora_target_modules <m>  Target modules (default: q_proj k_proj v_proj o_proj)"
+            echo ""
+            echo "  --flash_attention          Enable Flash Attention 2 (default: enabled)"
+            echo "  --no_flash_attention       Disable Flash Attention 2"
             echo ""
             echo "  --compression <method>     Compression: LoGra, GraSS (implies MeSO optimizer)"
             echo "  --use_second_order         Enable second-order selection"
             echo ""
             echo "Shared Options:"
-            echo "  --batch_size <size>        Training batch size (default: 64)"
+            echo "  --batch_size <size>        Training batch size (default: 256)"
             echo "  --lr <lr>                  Learning rate override (ignores config file)"
             echo "  --lr_config <path>         LR config file (default: RLHF/train/lr/config.json)"
             echo "  --n_val <n>                Validation samples (default: 128)"
+            echo "  --val_batch_size <n>       Validation batch size for selection (default: 32)"
             echo "  --selection_frac <frac>    Fraction to select (default: 0.5)"
             echo "  --max_steps <steps>        Maximum training steps (default: -1, meaning no limit)"
-            echo "  --epochs <n>               Number of training epochs (default: 3, used when max_steps <= 0)"
+            echo "  --epochs <n>               Number of training epochs (default: 1, used when max_steps <= 0)"
             echo "  --seed <seed>              Random seed (default: 42)"
+            echo ""
+            echo "PPO Options:"
+            echo "  --ppo_epochs <n>           PPO epochs per batch (default: 4)"
+            echo "  --forward_batch_size <n>   Forward batch size for PPO updates (default: 256)"
+            echo "  --kl_coef <coef>           Initial KL penalty coefficient (default: 0.2)"
+            echo "  --kl_penalty <mode>        KL penalty mode: kl, abs, mse, full (default: full)"
+            echo "  --max_new_tokens <n>       Maximum new tokens to generate (default: 30)"
+            echo "  --val_strategy <strategy>  Validation strategy: random, top (default: random)"
+            echo "  --val_loss_type <type>     Validation loss type (default: reward_weighted)"
+            echo ""
+            echo "Toxicity Evaluation Options:"
+            echo "  --enable_toxicity_eval     Enable toxicity evaluation (default: true)"
+            echo "  --disable_toxicity_eval    Disable toxicity evaluation"
+            echo "  --eval_interval <n>        Evaluate every N steps (0=epoch end only, default: 0)"
+            echo "  --eval_n_samples <n>       Samples for full evaluation (default: 500)"
+            echo "  --eval_batch_size <n>      Batch size for generation (default: 256)"
+            echo "  --eval_on_step_generations Evaluate toxicity on each step's generations (default: true)"
+            echo "  --no_eval_on_step_generations Disable per-step toxicity evaluation"
+            echo ""
+            echo "  Note: Evaluation uses a DIFFERENT classifier (DaNLP/da-electra-hatespeech-detection)"
+            echo "        than the reward model to provide unbiased toxicity measurement."
             echo ""
             echo "Learning Rate Resolution:"
             echo "  1. If --lr is specified, use that value"
@@ -500,9 +578,16 @@ run_single_experiment() {
 
     # Add LoRA settings
     if [[ "$exp_use_lora" == "true" ]]; then
-        training_args="$training_args --lora=True --lora_r=$lora_r --lora_alpha=$lora_alpha"
+        training_args="$training_args --lora=True --lora_r=$lora_r --lora_alpha=$lora_alpha --lora_target_modules $lora_target_modules"
     else
         training_args="$training_args --lora=False"
+    fi
+
+    # Add flash attention setting
+    if [[ "$use_flash_attention" == "true" ]]; then
+        training_args="$training_args --use_flash_attention=True"
+    else
+        training_args="$training_args --use_flash_attention=False"
     fi
 
     # Add compression settings
@@ -524,6 +609,21 @@ run_single_experiment() {
     # Add second-order flag
     if [[ "$exp_use_second_order" == "true" ]]; then
         training_args="$training_args --use_second_order=True"
+    fi
+
+    # Add toxicity evaluation settings
+    if [[ "$enable_toxicity_eval" == "true" ]]; then
+        training_args="$training_args --enable_toxicity_eval=True"
+        training_args="$training_args --eval_interval=$eval_interval"
+        training_args="$training_args --eval_n_samples=$eval_n_samples"
+        training_args="$training_args --eval_batch_size=$eval_batch_size"
+        if [[ "$eval_on_step_generations" == "true" ]]; then
+            training_args="$training_args --eval_on_step_generations=True"
+        else
+            training_args="$training_args --eval_on_step_generations=False"
+        fi
+    else
+        training_args="$training_args --enable_toxicity_eval=False"
     fi
 
     # Add log file
@@ -575,6 +675,15 @@ if [[ -n "$experiments" ]]; then
     echo "  Init KL coefficient: $init_kl_coef"
     echo "  Adaptive KL control: $adap_kl_ctrl"
     echo "  Target KL: $target_kl"
+    echo ""
+    echo "Toxicity Evaluation:"
+    echo "  Enabled: $enable_toxicity_eval"
+    if [[ "$enable_toxicity_eval" == "true" ]]; then
+        echo "  Eval interval: $eval_interval (0=epoch end only)"
+        echo "  Eval samples: $eval_n_samples"
+        echo "  Eval batch size: $eval_batch_size"
+        echo "  Eval on step generations: $eval_on_step_generations"
+    fi
     echo ""
     echo "LR Config: $lr_config_file"
     echo "Experiments to run: $resolved_experiments"

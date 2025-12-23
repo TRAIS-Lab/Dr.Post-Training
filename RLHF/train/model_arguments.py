@@ -18,7 +18,7 @@ class ModelArguments:
     """
 
     model_name_or_path: Optional[str] = field(
-        default="EleutherAI/gpt-neo-125m",
+        default="EleutherAI/gpt-neo-2.7B",
         metadata={"help": "The model checkpoint for weights initialization."},
     )
     reward_model_name: Optional[str] = field(
@@ -43,7 +43,7 @@ class ModelArguments:
 
     # LoRA arguments
     lora: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Whether to use LoRA for training"},
     )
     lora_r: int = field(
@@ -59,13 +59,13 @@ class ModelArguments:
         metadata={"help": "LoRA dropout"},
     )
     lora_target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "v_proj"],
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"],
         metadata={"help": "Target modules for LoRA"},
     )
 
     # Flash attention
     use_flash_attention: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether to use Flash Attention 2"},
     )
 

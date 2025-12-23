@@ -9,6 +9,7 @@ Key Design:
 - Validation: sequence-level reward-weighted log probs (f^seq)
 - Training: PPO loss (policy + value + KL)
 - KL penalty applied via reward shaping (before GAE), not as loss term
+- Toxicity evaluation at end of each PPO round using independent classifier
 
 Methods:
 - NA: Standard PPO (no selection)
@@ -19,6 +20,7 @@ Reference Implementation:
 - Matches archive/LDA-ORL-main/rlhf-toxicity/scripts/ppo_trainer.py
 - Uses disable_adapter() for PEFT reference logprobs (no separate ref model)
 - Adaptive KL control for stable training
+- Toxicity evaluation uses DaNLP/da-electra-hatespeech-detection (different from reward model)
 """
 
 import logging
@@ -161,6 +163,7 @@ class StreamingPPOTrainer:
         grad_hook=None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         lr_scheduler=None,
+        evaluator=None,
     ):
         """
         Initialize the trainer.
@@ -174,6 +177,7 @@ class StreamingPPOTrainer:
             grad_hook: GradientHook instance (None for NA/baseline)
             optimizer: Optimizer (created if None)
             lr_scheduler: LR scheduler (optional)
+            evaluator: ToxicityEvaluator instance for evaluation during training (optional)
         """
         self.model = model
         self.ref_model = ref_model
@@ -182,6 +186,7 @@ class StreamingPPOTrainer:
         self.args = args
         self.grad_hook = grad_hook
         self.lr_scheduler = lr_scheduler
+        self.evaluator = evaluator
 
         # Device
         self.device = next(model.parameters()).device
@@ -1359,6 +1364,17 @@ class StreamingPPOTrainer:
                 # multiply batch_size by num_processes for distributed training
                 self.kl_ctl.update(mean_kl, batch_size)
 
+                # ========================================
+                # TOXICITY EVALUATION ON STEP GENERATIONS
+                # Evaluate toxicity using independent classifier (DaNLP model)
+                # This provides per-step feedback without extra generation cost
+                # ========================================
+                if self.evaluator is not None and getattr(self.args, 'eval_on_step_generations', True):
+                    eval_results = self.evaluator.evaluate_generations(response_texts)
+                    stats["eval/toxicity_prob"] = eval_results["mean_toxicity_prob"]
+                    stats["eval/toxicity_rate"] = eval_results["toxicity_rate"]
+                    stats["eval/toxicity_logit"] = eval_results["mean_toxicity_logit"]
+
                 epoch_stats.append(stats)
                 global_step += 1
 
@@ -1367,10 +1383,13 @@ class StreamingPPOTrainer:
                     self.lr_scheduler.step()
 
                 # Update progress bar
-                pbar.set_postfix({
+                postfix = {
                     "loss": f"{stats['loss/total']:.4f}",
                     "reward": f"{stats['reward/mean']:.2f}",
-                })
+                }
+                if "eval/toxicity_prob" in stats:
+                    postfix["tox"] = f"{stats['eval/toxicity_prob']:.3f}"
+                pbar.set_postfix(postfix)
 
                 # Logging
                 if global_step % log_interval == 0:
@@ -1385,16 +1404,85 @@ class StreamingPPOTrainer:
                     history["reward"].append(avg_stats["reward/mean"])
                     history["kl"].append(avg_stats["objective/kl"])
 
+                    # Track toxicity evaluation in history
+                    if "eval/toxicity_prob" in avg_stats:
+                        if "toxicity_prob" not in history:
+                            history["toxicity_prob"] = []
+                            history["toxicity_rate"] = []
+                        history["toxicity_prob"].append(avg_stats["eval/toxicity_prob"])
+                        history["toxicity_rate"].append(avg_stats["eval/toxicity_rate"])
+
+                # ========================================
+                # PERIODIC FULL TOXICITY EVALUATION
+                # Run comprehensive evaluation at specified intervals
+                # ========================================
+                eval_interval = getattr(self.args, 'eval_interval', 0)
+                if (self.evaluator is not None and
+                    eval_interval > 0 and
+                    global_step % eval_interval == 0):
+                    self._run_full_evaluation(global_step, history)
+
                 # Check max steps
                 if max_steps is not None and global_step >= max_steps:
                     logger.info(f"Reached max_steps ({max_steps})")
                     break
+
+            # ========================================
+            # END OF EPOCH EVALUATION
+            # Run full evaluation at the end of each epoch
+            # ========================================
+            if self.evaluator is not None and getattr(self.args, 'eval_interval', 0) == 0:
+                self._run_full_evaluation(global_step, history)
 
             if max_steps is not None and global_step >= max_steps:
                 break
 
         logger.info("Training complete")
         return history
+
+    def _run_full_evaluation(
+        self,
+        global_step: int,
+        history: Dict[str, List[float]],
+    ):
+        """
+        Run full toxicity evaluation on test prompts.
+
+        This uses a separate toxicity classifier (DaNLP/da-electra-hatespeech-detection)
+        to evaluate the model's toxicity on a held-out set of prompts.
+
+        Args:
+            global_step: Current training step
+            history: Training history dictionary to update
+        """
+        eval_n_samples = getattr(self.args, 'eval_n_samples', 100)
+        eval_batch_size = getattr(self.args, 'eval_batch_size', 16)
+
+        # Run evaluation
+        eval_results = self.evaluator.evaluate(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            n_samples=eval_n_samples,
+            max_new_tokens=self.args.max_new_tokens,
+            generation_batch_size=eval_batch_size,
+            temperature=getattr(self.args, 'temperature', 0.7),
+            top_p=getattr(self.args, 'top_p', 0.9),
+        )
+
+        # Log results (single line)
+        logger.info(
+            f"[Eval step {global_step}] toxicity: {eval_results['mean_toxicity_prob']:.4f} (rate={eval_results['toxicity_rate']:.1%})"
+        )
+
+        # Update history with full evaluation results
+        if "full_eval_toxicity_prob" not in history:
+            history["full_eval_toxicity_prob"] = []
+            history["full_eval_toxicity_rate"] = []
+            history["full_eval_steps"] = []
+
+        history["full_eval_toxicity_prob"].append(eval_results["mean_toxicity_prob"])
+        history["full_eval_toxicity_rate"].append(eval_results["toxicity_rate"])
+        history["full_eval_steps"].append(global_step)
 
     def save_model(self, output_dir: str):
         """Save model to directory."""

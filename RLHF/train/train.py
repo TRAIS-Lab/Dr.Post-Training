@@ -40,10 +40,109 @@ from RLHF.train.model_arguments import ModelArguments, add_padding_to_tokenizer
 from RLHF.train.training_arguments import TrainingArguments
 from RLHF.train.trainer import StreamingPPOTrainer
 from RLHF.train.rewards import load_reward_model, RewardModelWrapper
+from RLHF.train.evaluation import ToxicityEvaluator
 
 from gradstream import GradientHook, setup_model_compressors, create_sample_inputs, MeSOAdamW
 
 logger = logging.getLogger(__name__)
+
+
+def _patch_gpt_neo_flash_attention():
+    """
+    Monkey-patch fix for GPT-Neo Flash Attention 2 bug in transformers.
+
+    Bug: GPTNeoFlashAttention2.forward assumes attention_mask is 4D, but when
+    using FA2 with padded batches, _update_causal_mask returns the 2D mask directly.
+    This causes: IndexError: too many indices for tensor of dimension 2
+
+    This patch fixes the mask slicing to handle both 2D and 4D masks correctly.
+    """
+    try:
+        from transformers.models.gpt_neo import modeling_gpt_neo
+
+        if not hasattr(modeling_gpt_neo, "GPTNeoFlashAttention2"):
+            return  # FA2 class doesn't exist in this version
+
+        original_forward = modeling_gpt_neo.GPTNeoFlashAttention2.forward
+
+        def patched_forward(self, hidden_states, attention_mask=None, layer_past=None,
+                           head_mask=None, use_cache=False, output_attentions=False,
+                           cache_position=None):
+            bsz, _, _ = hidden_states.size()
+
+            query = self.q_proj(hidden_states)
+            key = self.k_proj(hidden_states)
+            value = self.v_proj(hidden_states)
+
+            query = self._split_heads(query, self.num_heads, self.head_dim)
+            key = self._split_heads(key, self.num_heads, self.head_dim)
+            value = self._split_heads(value, self.num_heads, self.head_dim)
+
+            if layer_past is not None:
+                cache_kwargs = {"cache_position": cache_position}
+                key, value = layer_past.update(key, value, self.layer_id, cache_kwargs)
+
+            query_length = query.shape[2]
+            tgt_len = key.shape[2]
+
+            query = query.transpose(1, 2).view(bsz, query_length, self.num_heads, self.head_dim)
+            key = key.transpose(1, 2).view(bsz, tgt_len, self.num_heads, self.head_dim)
+            value = value.transpose(1, 2).view(bsz, tgt_len, self.num_heads, self.head_dim)
+
+            attn_dropout = self.config.attention_dropout if self.training else 0.0
+
+            # FIX: Only slice if attention_mask is 4D (the bug was assuming 4D always)
+            if attention_mask is not None and attention_mask.dim() == 4:
+                attention_mask = attention_mask[:, :, :, : key.shape[1]]
+            # For 2D masks, pass as-is (Flash Attention handles them correctly)
+
+            # Handle dtype casting for PEFT
+            import torch
+            device_type = query.device.type if query.device.type != "mps" else "cpu"
+            if query.dtype == torch.float32:
+                if torch.is_autocast_enabled():
+                    target_dtype = (
+                        torch.get_autocast_dtype(device_type)
+                        if hasattr(torch, "get_autocast_dtype")
+                        else torch.get_autocast_gpu_dtype()
+                    )
+                elif hasattr(self.config, "_pre_quantization_dtype"):
+                    target_dtype = self.config._pre_quantization_dtype
+                else:
+                    target_dtype = self.q_proj.weight.dtype
+
+                query = query.to(target_dtype)
+                key = key.to(target_dtype)
+                value = value.to(target_dtype)
+
+            from transformers.modeling_flash_attention_utils import _flash_attention_forward
+
+            attn_output = _flash_attention_forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                query_length,
+                dropout=attn_dropout,
+                softmax_scale=1.0,
+                is_causal=self.is_causal,
+                use_top_left_mask=self._flash_attn_uses_top_left_mask,
+            )
+
+            attn_weights_reshaped = attn_output.reshape(bsz, query_length, self.num_heads * self.head_dim)
+            attn_output = self.out_proj(attn_weights_reshaped)
+            attn_output = self.resid_dropout(attn_output)
+
+            return attn_output, attn_weights_reshaped
+
+        modeling_gpt_neo.GPTNeoFlashAttention2.forward = patched_forward
+        logger.info("Applied GPT-Neo Flash Attention 2 monkey-patch fix")
+    except Exception as e:
+        logger.warning(f"Failed to apply GPT-Neo FA2 patch: {e}")
+
+
+# Apply the patch at import time
+_patch_gpt_neo_flash_attention()
 
 
 def find_trainable_layers(model, lora_only: bool = True):
@@ -389,6 +488,17 @@ def main():
         f"warmup_steps={num_warmup_steps}, total_steps={num_training_steps}"
     )
 
+    # Create toxicity evaluator (uses different classifier than reward model)
+    # This provides unbiased evaluation during training
+    evaluator = None
+    if training_args.enable_toxicity_eval:
+        logger.info("Creating toxicity evaluator (DaNLP/da-electra-hatespeech-detection)...")
+        evaluator = ToxicityEvaluator(
+            device=device,
+            batch_size=32,
+        )
+        logger.info("Toxicity evaluator ready")
+
     # Create trainer
     # Note: For PEFT models, ref_model=None and trainer uses disable_adapter()
     trainer = StreamingPPOTrainer(
@@ -400,6 +510,7 @@ def main():
         grad_hook=grad_hook,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
+        evaluator=evaluator,
     )
 
     # Calculate training steps
@@ -408,6 +519,24 @@ def main():
 
     # Use logging_steps from training args
     log_interval = int(training_args.logging_steps)
+
+    # Initial evaluation before training (step 0)
+    initial_eval_results = None
+    if training_args.enable_toxicity_eval and evaluator is not None:
+        logger.info("*** Running initial evaluation before training ***")
+        initial_eval_results = evaluator.evaluate(
+            model=model,
+            tokenizer=tokenizer,
+            n_samples=training_args.eval_n_samples,
+            max_new_tokens=training_args.max_new_tokens,
+            generation_batch_size=training_args.eval_batch_size,
+            temperature=training_args.temperature,
+            top_p=training_args.top_p,
+        )
+        logger.info(
+            f"[Initial Eval] toxicity: {initial_eval_results['mean_toxicity_prob']:.4f} "
+            f"(rate={initial_eval_results['toxicity_rate']:.1%})"
+        )
 
     # Train
     logger.info("Starting training...")
@@ -422,6 +551,18 @@ def main():
     # Save model
     final_output_dir = os.path.join(training_args.output_dir, "final")
     trainer.save_model(final_output_dir)
+
+    # Add initial evaluation results to history
+    if initial_eval_results is not None:
+        history["initial_eval_toxicity_prob"] = initial_eval_results["mean_toxicity_prob"]
+        history["initial_eval_toxicity_rate"] = initial_eval_results["toxicity_rate"]
+
+    # Save training history with evaluation results
+    import json
+    history_file = os.path.join(training_args.output_dir, "training_history.json")
+    with open(history_file, "w") as f:
+        json.dump(history, f, indent=2)
+    logger.info(f"Training history saved to {history_file}")
 
     # Clean up hooks
     if grad_hook is not None and grad_hook.hooks_registered:

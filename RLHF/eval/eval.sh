@@ -20,6 +20,7 @@ N_SAMPLES=400
 BATCH_SIZE=16
 MAX_NEW_TOKENS=30
 SEED=42
+CLASSIFIER="independent"  # Use independent classifier by default for unbiased evaluation
 SBATCH=false
 DRY_RUN=false
 
@@ -50,6 +51,10 @@ while [[ $# -gt 0 ]]; do
             SEED="$2"
             shift 2
             ;;
+        --classifier)
+            CLASSIFIER="$2"
+            shift 2
+            ;;
         --sbatch)
             SBATCH=true
             shift
@@ -68,6 +73,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --batch_size N         Batch size for generation (default: 16)"
             echo "  --max_new_tokens N     Max tokens to generate (default: 30)"
             echo "  --seed N               Random seed for reproducibility (default: 42)"
+            echo "  --classifier TYPE      Toxicity classifier: independent (default) or reward"
+            echo "                         'independent' uses DaNLP/da-electra-hatespeech-detection"
+            echo "                         'reward' uses facebook/roberta-hate-speech-dynabench-r4-target"
             echo "  --sbatch               Submit as SLURM job"
             echo "  --dry-run              Print command without executing"
             exit 0
@@ -92,6 +100,7 @@ echo "Task:       ${TASK:-all}"
 echo "Samples:    $N_SAMPLES"
 echo "Batch size: $BATCH_SIZE"
 echo "Seed:       $SEED"
+echo "Classifier: $CLASSIFIER"
 echo "======================================"
 
 # Build command
@@ -101,6 +110,7 @@ CMD="$CMD --n_samples $N_SAMPLES"
 CMD="$CMD --batch_size $BATCH_SIZE"
 CMD="$CMD --max_new_tokens $MAX_NEW_TOKENS"
 CMD="$CMD --seed $SEED"
+CMD="$CMD --classifier $CLASSIFIER"
 
 if [[ -n "$TASK" ]]; then
     CMD="$CMD --task $TASK"

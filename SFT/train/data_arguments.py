@@ -40,7 +40,8 @@ class DataArguments:
         default=42, metadata={"help": ("The seed used for data sampling.")},
     )
     percentage: float = field(
-        default=1.0, metadata={"help": ("Sampling percentage for each dataset")},
+        default=0.05,
+        metadata={"help": "Sampling percentage for each dataset"},
     )
 
 

@@ -178,20 +178,24 @@ The unified training script accepts the following arguments:
 
 - `--lr <lr>` - Learning rate override (if not specified, looked up from `lr_config.json`; fallback: `1e-5`)
 - `--lr_config <path>` - LR config file path (default: `RLHF/train/lr/config.json`)
-- `--batch_size <size>` - Batch size (default: `64`)
-- `--max_steps <steps>` - Maximum training steps (default: `200`)
+- `--batch_size <size>` - Batch size (default: `256`)
+- `--max_steps <steps>` - Maximum training steps (default: `-1`, meaning use epochs instead)
+- `--epochs <n>` - Number of training epochs (default: `1`, used when max_steps <= 0)
 - `--seed <seed>` - Random seed (default: `42`)
 
 #### Data Selection Arguments
 
-- `--n_val <n>` - Validation examples for data selection (default: `16`)
+- `--n_val <n>` - Validation examples for data selection (default: `128`)
 - `--val_batch_size <size>` - Validation batch size for data selection (default: `32`)
 - `--selection_frac <frac>` - Fraction of samples to select (default: `0.5`)
 
 #### PPO Arguments
 
 - `--ppo_epochs <n>` - PPO epochs per batch (default: `4`)
-- `--kl_coef <coef>` - KL penalty coefficient (default: `0.04`)
+- `--forward_batch_size <n>` - Forward batch size for PPO updates (default: `256`)
+- `--init_kl_coef <coef>` - Initial KL penalty coefficient (default: `0.2`)
+- `--kl_penalty <mode>` - KL penalty mode: `kl`, `abs`, `mse`, `full` (default: `full`)
+- `--target_kl <kl>` - Target KL for adaptive control (default: `0.1`)
 - `--max_new_tokens <n>` - Maximum new tokens to generate (default: `30`)
 - `--min_new_tokens <n>` - Minimum new tokens to generate (default: `20`)
 
@@ -200,6 +204,29 @@ The unified training script accepts the following arguments:
 - `--lora` - Enable LoRA fine-tuning (flag, omit for full fine-tuning)
 - `--lora_r <r>` - LoRA rank (default: `16`)
 - `--lora_alpha <alpha>` - LoRA alpha (default: `32`)
+- `--lora_target_modules <modules>` - Target modules for LoRA (default: `q_proj k_proj v_proj o_proj`)
+
+#### Model Arguments
+
+- `--flash_attention` - Enable Flash Attention 2 (default: enabled)
+- `--no_flash_attention` - Disable Flash Attention 2
+
+#### Toxicity Evaluation Arguments
+
+Training-time toxicity evaluation uses a **different classifier** than the reward model to prevent reward hacking and provide unbiased measurement.
+
+- `--enable_toxicity_eval` - Enable toxicity evaluation during training (default: `true`)
+- `--disable_toxicity_eval` - Disable toxicity evaluation
+- `--eval_interval <n>` - Evaluate every N steps; 0 = epoch end only (default: `0`)
+- `--eval_n_samples <n>` - Number of samples for full evaluation (default: `500`)
+- `--eval_batch_size <n>` - Batch size for generation during evaluation (default: `256`)
+- `--eval_on_step_generations` - Evaluate toxicity on each PPO step's generations (default: `true`)
+- `--no_eval_on_step_generations` - Disable per-step toxicity evaluation
+
+| Classifier Type | Model                                              | Usage                         |
+| --------------- | -------------------------------------------------- | ----------------------------- |
+| Reward Model    | `facebook/roberta-hate-speech-dynabench-r4-target` | Training signal (reward)      |
+| Evaluation      | `DaNLP/da-electra-hatespeech-detection`            | Unbiased toxicity measurement |
 
 #### Training Configuration
 
@@ -223,9 +250,9 @@ The unified training script accepts the following arguments:
 
 The following experiments can be run with the commands below.
 
-| Task     | Model        | Batch | Val Size | Max Steps | LoRA Rank |
-| -------- | ------------ | ----- | -------- | --------- | --------- |
-| Toxicity | gpt-neo-2.7B | 256   | 16       | 200       | 16        |
+| Task     | Model        | Batch | Val Size | Epochs | LoRA Rank |
+| -------- | ------------ | ----- | -------- | ------ | --------- |
+| Toxicity | gpt-neo-2.7B | 256   | 128      | 1      | 16        |
 
 > **Note:** Learning rates are managed via `RLHF/train/lr/config.json`. Run `lr_sweep.sh` to find optimal LRs before training.
 
@@ -245,16 +272,13 @@ Training commands (LRs loaded from lr_config.json):
 
 ```bash
 # Toxicity task - all experiments
-bash RLHF/train/train.sh --experiments all --task toxicity \
-    --batch_size 64 --n_val 128 --seed 42
+bash RLHF/train/train.sh --experiments all --task toxicity
 
 # Toxicity task - baseline only
-bash RLHF/train/train.sh --experiments baseline --task toxicity \
-    --batch_size 64 --n_val 128 --seed 42
+bash RLHF/train/train.sh --experiments baseline --task toxicity
 
 # Toxicity task - streaming methods
-bash RLHF/train/train.sh --experiments streaming --task toxicity \
-    --batch_size 64 --n_val 128 --seed 42
+bash RLHF/train/train.sh --experiments streaming --task toxicity
 ```
 
 ### Evaluation Commands
@@ -271,15 +295,40 @@ python -m RLHF.eval.eval --model_path /path/to/model --n_samples 400
 
 ## Evaluation
 
+### Two-Classifier Approach
+
+To ensure genuine toxicity reduction (not reward hacking), we use **different classifiers** for training and evaluation:
+
+| Purpose    | Classifier                                         | Library    |
+| ---------- | -------------------------------------------------- | ---------- |
+| Training   | `facebook/roberta-hate-speech-dynabench-r4-target` | Direct     |
+| Evaluation | `DaNLP/da-electra-hatespeech-detection`            | `evaluate` |
+
+This follows the reference implementation approach where the evaluation classifier is independent from the reward model used during training.
+
+### Training-Time Evaluation
+
+During training, toxicity is evaluated automatically (enabled by default):
+- **Per-step evaluation**: Evaluates toxicity on each PPO step's generated responses (no extra generation cost)
+- **Full evaluation**: Runs at configurable intervals or at epoch end
+
+Training metrics include:
+- `eval/step_toxicity_prob` - Mean toxicity probability of step generations
+- `eval/step_toxicity_rate` - Fraction of toxic generations per step
+- `eval/toxicity_prob` - Mean toxicity from full evaluation
+- `eval/toxicity_rate` - Fraction of toxic generations from full evaluation
+
+### Post-Training Evaluation
+
 The evaluation script measures model toxicity on toxic prompt completions.
 
-### Dataset
+#### Dataset
 
-- **Source**: `OxAISH-AL-LLM/wiki_toxic` (test split)
-- **Filtering**: Only toxic prompts (label == 1)
-- **Default samples**: 400
+- **Source**: `allenai/real-toxicity-prompts` (train split)
+- **Filtering**: Prompts with toxicity score > 0.5
+- **Default samples**: 100 (training), 400 (post-training eval)
 
-### Metrics
+#### Metrics
 
 | Metric        | Description                                 |
 | ------------- | ------------------------------------------- |
@@ -288,16 +337,22 @@ The evaluation script measures model toxicity on toxic prompt completions.
 | Max Toxicity  | Maximum toxicity score in batch             |
 | Toxicity Rate | Fraction of generations with toxicity > 0.5 |
 
-### Toxicity Classifier
+#### Classifier Selection
 
-Uses `facebook/roberta-hate-speech-dynabench-r4-target` (same as training reward model):
-- Class 0: nothate
-- Class 1: hate (toxicity score)
-
-### Usage
+The evaluation script supports both classifiers:
 
 ```bash
-# Evaluate all models in directory
+# Use independent classifier (default, recommended)
+python -m RLHF.eval.eval --model_path /path/to/model --classifier independent
+
+# Use reward model classifier (for comparison)
+python -m RLHF.eval.eval --model_path /path/to/model --classifier reward
+```
+
+#### Usage
+
+```bash
+# Evaluate all models in directory (uses independent classifier by default)
 bash RLHF/eval/eval.sh
 
 # Filter by task
@@ -305,6 +360,9 @@ bash RLHF/eval/eval.sh --task toxicity
 
 # Custom settings
 bash RLHF/eval/eval.sh --n_samples 1000 --batch_size 32 --max_new_tokens 50
+
+# Use reward model classifier for comparison
+bash RLHF/eval/eval.sh --classifier reward
 
 # Submit to SLURM
 bash RLHF/eval/eval.sh --sbatch

@@ -244,6 +244,11 @@ The unified training script accepts the following arguments:
 - `--lora_alpha <alpha>` - LoRA alpha (default: `1`)
 - `--lora_r <r>` - LoRA rank (default: `32`)
 - `--lora_dropout <dropout>` - LoRA dropout (default: `0.1`)
+- `--lora_target_modules <modules>` - Target modules for LoRA (default: `q_proj k_proj v_proj o_proj`)
+
+#### Model Arguments
+
+- `--flash_attention` - Enable Flash Attention 2 (default: enabled)
 
 ## Evaluation
 

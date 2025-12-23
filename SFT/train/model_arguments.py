@@ -62,16 +62,32 @@ class ModelArguments:
         },
     )
 
-    ### added ####
-    lora: Optional[bool] = field(default=False, metadata={"help": "whether to use lora"})
-    lora_r: Optional[int] = field(default=8, metadata={"help": ("r for lora")})
-    lora_alpha: Optional[float] = field(default=32, metadata={"help": ("alpha for lora")})
-    lora_dropout: Optional[float] = field(default=0.1, metadata={"help": ("dropout for lora")})
-    lora_target_modules: List[str] = field(default_factory=list, metadata={"help": ("target modules for lora")})
-
-    use_flash_attention: Optional[bool] = field(
+    # LoRA arguments
+    lora: bool = field(
         default=False,
-        metadata={"help": "Whether to use Flash Attention 2 (requires flash-attn installed and bfloat16/float16 dtype)"}
+        metadata={"help": "Whether to use LoRA for training"},
+    )
+    lora_r: int = field(
+        default=32,
+        metadata={"help": "LoRA rank"},
+    )
+    lora_alpha: float = field(
+        default=1,
+        metadata={"help": "LoRA alpha"},
+    )
+    lora_dropout: float = field(
+        default=0.1,
+        metadata={"help": "LoRA dropout"},
+    )
+    lora_target_modules: List[str] = field(
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"],
+        metadata={"help": "Target modules for LoRA"},
+    )
+
+    # Flash attention
+    use_flash_attention: bool = field(
+        default=True,
+        metadata={"help": "Whether to use Flash Attention 2"},
     )
 
 def add_padding_to_tokenizer(tokenizer):

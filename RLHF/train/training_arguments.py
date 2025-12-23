@@ -67,7 +67,7 @@ class TrainingArguments(TA):
         metadata={"help": "Fraction of samples to select (0-1)"},
     )
     n_val: int = field(
-        default=16,
+        default=128,
         metadata={"help": "Number of validation samples for data selection"},
     )
     val_batch_size: Optional[int] = field(
@@ -139,7 +139,7 @@ class TrainingArguments(TA):
         },
     )
     forward_batch_size: int = field(
-        default=0,
+        default=256,
         metadata={
             "help": (
                 "Batch size for forward passes during PPO updates (computing new logprobs). "
@@ -156,20 +156,20 @@ class TrainingArguments(TA):
 
     # KL Control
     kl_coef: float = field(
-        default=0.04,
-        metadata={"help": "KL penalty coefficient (default: 0.04). Alias for init_kl_coef."},
+        default=0.2,
+        metadata={"help": "KL penalty coefficient (default: 0.2). Alias for init_kl_coef."},
     )
     init_kl_coef: float = field(
-        default=0.04,
+        default=0.2,
         metadata={
             "help": (
-                "Initial KL penalty coefficient (default: 0.04). "
+                "Initial KL penalty coefficient (default: 0.2). "
                 "With adaptive KL control, this value changes during training."
             )
         },
     )
     kl_penalty: str = field(
-        default="kl",
+        default="full",
         metadata={
             "help": (
                 "KL penalty mode (reference: ppo_config.py:80-85): "
@@ -190,10 +190,10 @@ class TrainingArguments(TA):
         },
     )
     target_kl: float = field(
-        default=6.0,
+        default=0.1,
         metadata={
             "help": (
-                "Target KL divergence for adaptive KL control (default: 6.0). "
+                "Target KL divergence for adaptive KL control (default: 0.1). "
                 "Also used for early stopping if enabled."
             )
         },
@@ -264,6 +264,47 @@ class TrainingArguments(TA):
                 "'logprob' (NLL on validation), "
                 "'reward_weighted' (NLL weighted by reward - sequence-level attribution), "
                 "'advantage_weighted' (NLL weighted by advantage)"
+            )
+        },
+    )
+
+    # ===================
+    # Toxicity Evaluation (during training)
+    # ===================
+    enable_toxicity_eval: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Enable toxicity evaluation during training. "
+                "Uses a DIFFERENT classifier (DaNLP/da-electra-hatespeech-detection) "
+                "than the reward model to provide unbiased evaluation."
+            )
+        },
+    )
+    eval_interval: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Steps between toxicity evaluations. "
+                "0 = evaluate at the end of each epoch only. "
+                "N > 0 = evaluate every N steps."
+            )
+        },
+    )
+    eval_n_samples: int = field(
+        default=500,
+        metadata={"help": "Number of samples for toxicity evaluation (default: 500)"},
+    )
+    eval_batch_size: int = field(
+        default=256,
+        metadata={"help": "Batch size for generation during evaluation"},
+    )
+    eval_on_step_generations: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Evaluate toxicity on the generations produced during each PPO step. "
+                "This provides per-step toxicity metrics without extra generation cost."
             )
         },
     )

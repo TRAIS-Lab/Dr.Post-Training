@@ -79,14 +79,34 @@ class TrainingArguments(TA):
     )
 
 
-    ### added ###
-    method: str = field(default='NA', metadata={"help": "Data selection method: 'NA' (no selection), 'Streaming' (per-layer selection), or 'GREATS' (global selection)"})
-    selection_frac: float = field(default=1.0, metadata={"help": "training method"})
-    subject: str = field(default='abstract_algebra', metadata={"help": "subject for evaluation"})
-    n_val: int = field(default=5, metadata={"help": "number of validation data (for data selection)"})
-    n_eval: int = field(default=500, metadata={"help": "number of evaluation data (for generalization testing)"})
+    # Data Selection Arguments
+    method: str = field(
+        default="NA",
+        metadata={
+            "help": (
+                "Data selection method: 'NA' (no selection), "
+                "'Streaming' (per-layer selection), or 'GREATS' (global selection)"
+            )
+        },
+    )
+    selection_frac: float = field(
+        default=0.5,
+        metadata={"help": "Fraction of samples to select (0-1)"},
+    )
+    subject: str = field(
+        default="sociology",
+        metadata={"help": "Subject for MMLU/BBH evaluation"},
+    )
+    n_val: int = field(
+        default=8,
+        metadata={"help": "Number of validation samples for data selection"},
+    )
+    n_eval: int = field(
+        default=500,
+        metadata={"help": "Number of evaluation samples for generalization testing"},
+    )
     val_batch_size_for_selection: int = field(
-        default=None,
+        default=1,
         metadata={
             "help": (
                 "Batch size for validation data used during training for data selection. "
@@ -96,7 +116,7 @@ class TrainingArguments(TA):
         },
     )
 
-    ### Gradient compression arguments ###
+    # Gradient Compression Arguments
     sparsification: str = field(
         default=None,
         metadata={
