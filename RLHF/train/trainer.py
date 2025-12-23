@@ -1167,20 +1167,18 @@ class StreamingPPOTrainer:
                 query_len = query_ids.shape[1]
 
                 # ========================================
-                # IMPORTANT: Keep model in TRAIN mode throughout PPO
+                # IMPORTANT: Set model to EVAL mode for old_logprobs computation
+                # (Matching reference implementation: ppo_trainer.py line 771)
                 #
-                # The reference implementation switches to eval() mode here,
-                # but this causes train/eval mode mismatch when computing
-                # new_logprobs in the PPO loop (which runs in train mode).
+                # Reference behavior:
+                #   self.model.eval()  # BEFORE computing old_logprobs
+                #   with torch.no_grad():
+                #       all_logprobs, logits_or_none, values, masks = self.batched_forward_pass(...)
                 #
-                # With all dropouts set to 0 (lora_dropout=0, summary_dropout_prob=0),
-                # there should be no functional difference between train/eval modes.
-                # Keeping train mode throughout ensures consistent logprobs.
-                #
-                # NOTE: generate_rollouts() sets model to eval() for generation.
-                # We must restore train() mode here before computing old_logprobs.
+                # This ensures consistent dropout behavior. With summary_dropout_prob=0.0,
+                # eval mode guarantees no dropout variation between old and new logprobs.
                 # ========================================
-                self.model.train()  # Restore train mode after generation
+                self.model.eval()  # Match reference: eval mode for old_logprobs
 
                 with torch.no_grad():
                     # ========================================
@@ -1195,7 +1193,7 @@ class StreamingPPOTrainer:
                     # ========================================
                     fwd_batch_size = self.mini_batch_size  # Use mini_batch_size, NOT forward_batch_size
 
-                    # Compute old log probs and values in batches (policy model in train mode)
+                    # Compute old log probs and values in batches (model in eval mode)
                     old_logprobs, _, old_values = self.batched_forward_pass(
                         query_ids, response_ids, query_mask, response_mask,
                         batch_size=fwd_batch_size,
@@ -1252,8 +1250,8 @@ class StreamingPPOTrainer:
                 batch_size = query_ids.shape[0]
                 all_mini_batch_stats = []
 
-                # Ensure model is in train mode for PPO epochs
-                # (Should already be in train mode from epoch start, but call again to be safe)
+                # Set model back to train mode for PPO epochs (backward passes)
+                # Reference: model was in eval() for old_logprobs, now train() for updates
                 self.model.train()
 
                 # Removed duplicate diagnostic - the batch size check above is sufficient

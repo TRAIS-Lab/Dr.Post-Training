@@ -72,7 +72,7 @@ forward_batch_size=256
 init_kl_coef=0.2
 kl_penalty="kl"  # Options: kl (default, can be negative), abs (always positive), mse, full
 adap_kl_ctrl=true
-target_kl=6.0
+target_kl=0.1
 max_new_tokens=30
 min_new_tokens=20
 

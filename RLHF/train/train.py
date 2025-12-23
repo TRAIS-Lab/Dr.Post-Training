@@ -175,10 +175,11 @@ def main():
     # AutoModelForCausalLMWithValueHead adds a v_head for value estimation
     # NOTE: Set summary_dropout_prob=0.0 to disable value head dropout
     # This ensures consistent behavior between train/eval modes for forward passes
+    # Reference: ppo_trainer.py uses eval() mode for old_logprobs computation
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         model_args.model_name_or_path,
         peft_config=peft_config,
-        summary_dropout_prob=0.1,
+        summary_dropout_prob=0.0,
         **model_kwargs,
     ).to(device)
 
