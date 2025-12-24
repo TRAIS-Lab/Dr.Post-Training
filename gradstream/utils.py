@@ -342,6 +342,85 @@ def topk_selection(scores, k: int):
     return selected_indices
 
 
+def negative_filtering(scores, filter_frac: float = 1.0):
+    """
+    Filter out negative-influence samples.
+
+    Keep all samples with positive influence scores, and drop the bottom
+    filter_frac of samples with negative influence scores.
+
+    Algorithm:
+    1. Keep ALL samples with positive scores (influence > 0)
+    2. From samples with negative scores, DROP the bottom filter_frac
+       (most negative samples)
+    3. Return indices of: all positive + kept negative samples
+    4. Always keep at least 1 sample (the best one) to avoid empty batches
+
+    Arguments:
+    - scores: A tensor of influence scores for each data point.
+    - filter_frac: Fraction of negative-influence samples to drop (0.0 to 1.0).
+                   - 0.0: Keep all samples (no filtering)
+                   - 1.0: Drop all negative-influence samples
+                   - 0.5: Drop only the most negative 50%
+
+    Returns:
+    - selected_indices: Tensor of indices of the kept data points (on same device as scores).
+    """
+    n_samples = scores.shape[0]
+    device = scores.device
+
+    # Handle edge case: no filtering
+    if filter_frac <= 0.0:
+        return torch.arange(n_samples, device=device)
+
+    # Identify positive and negative samples
+    positive_mask = scores > 0
+    negative_mask = scores <= 0
+
+    # Get indices of positive samples (always kept)
+    positive_indices = torch.where(positive_mask)[0]
+
+    # Get negative samples
+    negative_indices = torch.where(negative_mask)[0]
+    n_negative = negative_indices.shape[0]
+
+    if n_negative == 0:
+        # No negative samples, return all positive
+        return positive_indices
+
+    # Number of negative samples to DROP (bottom filter_frac)
+    n_to_drop = int(n_negative * filter_frac)
+
+    if n_to_drop >= n_negative:
+        # Drop all negative samples (filter_frac = 1.0 or very high)
+        # But ensure at least 1 sample is kept if no positive samples exist
+        if positive_indices.shape[0] == 0:
+            # All samples are negative - keep the least negative one
+            best_idx = torch.argmax(scores)
+            return best_idx.unsqueeze(0)
+        return positive_indices
+
+    # Keep the top (100 - filter_frac)% of negative samples (less negative ones)
+    # Sort negative scores in descending order (least negative first)
+    negative_scores = scores[negative_indices]
+    sorted_neg_indices = torch.argsort(negative_scores, descending=True)
+
+    # Keep the first (n_negative - n_to_drop) indices (least negative)
+    n_to_keep = n_negative - n_to_drop
+    kept_negative_local_indices = sorted_neg_indices[:n_to_keep]
+    kept_negative_indices = negative_indices[kept_negative_local_indices]
+
+    # Combine positive and kept negative indices
+    selected_indices = torch.cat([positive_indices, kept_negative_indices])
+
+    # Final safety check: ensure at least 1 sample
+    if selected_indices.shape[0] == 0:
+        best_idx = torch.argmax(scores)
+        return best_idx.unsqueeze(0)
+
+    return selected_indices
+
+
 def greedy_selection(scores, interaction_matrix, k: int):
     """
     Select k data points based on the highest scores, dynamically updating scores

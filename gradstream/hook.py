@@ -23,7 +23,7 @@ import functools
 import logging
 
 from .compressor import Compressor
-from .utils import greedy_selection, topk_selection
+from .utils import greedy_selection, topk_selection, negative_filtering
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +46,13 @@ class StreamingState:
         train_batch_size: int,
         num_layers: int,
         selection_method: str,
-        selection_frac: float,
+        frac: float,
         lr: float,
         device: str = 'cpu',
         compute_scores_only: bool = False,
         dtype: torch.dtype = torch.float32,
-        use_second_order: bool = False
+        use_second_order: bool = False,
+        selection_mode: str = "topk"
     ):
         """
         Initialize streaming state.
@@ -59,8 +60,10 @@ class StreamingState:
         Args:
             train_batch_size: Number of training samples
             num_layers: Total number of layers (for tracking backward progress)
-            selection_method: Selection method (Streaming, Regular)
-            selection_frac: Fraction of samples to select
+            selection_method: Selection method (Streaming, Regular, GREATS)
+            frac: Fraction parameter. Meaning depends on selection_mode:
+                  - "topk": Fraction of samples to select (top frac by score)
+                  - "filtering": Fraction of negative-influence samples to DROP
             lr: Learning rate for score scaling (unused in per-layer mode)
             device: Device for tensors
             compute_scores_only: If True, only maintain running scores without aggregating gradients.
@@ -70,19 +73,23 @@ class StreamingState:
             use_second_order: If True, compute similarity matrix and use greedy selection with
                             second-order interactions. If False, use simple top-k selection
                             which is ~200x faster. Default False for efficiency.
+            selection_mode: How to select samples based on scores:
+                           - "topk": Select top frac samples by score (SFT style)
+                           - "filtering": Keep all positive + drop bottom frac of negative (RLHF style)
         """
         self.train_batch_size = train_batch_size
         self.num_layers = num_layers
         self.selection_method = selection_method
-        self.selection_frac = selection_frac
+        self.frac = frac
         self.lr = lr
         self.device = device
         self.compute_scores_only = compute_scores_only
         self.dtype = dtype
         self.use_second_order = use_second_order
+        self.selection_mode = selection_mode
 
-        # Number of samples to select (at least 1 to avoid empty batches)
-        self.num_selected = max(1, int(train_batch_size * selection_frac))
+        # Number of samples to select (for top-k mode)
+        self.num_selected = max(1, int(train_batch_size * frac))
 
         # Running scores only needed for compute_scores_only mode (Streaming without MeSO)
         # For per-layer selection with MeSO, we compute scores directly in select_and_reduce
@@ -162,7 +169,11 @@ class StreamingState:
 
         if self.selection_method in ('Streaming', 'GREATS'):
             scores = self.grad_dot_scores * self.lr
-            if self.use_second_order and self.similarity_matrix is not None:
+
+            if self.selection_mode == "filtering":
+                # RLHF filtering mode: keep positive samples, drop bottom frac of negative
+                selected_indices = negative_filtering(scores, self.frac)
+            elif self.use_second_order and self.similarity_matrix is not None:
                 similarity = self.similarity_matrix * (self.lr ** 2)
                 selected_indices = greedy_selection(scores, similarity, self.num_selected)
             else:
@@ -587,10 +598,11 @@ class GradientHook:
         self,
         train_batch_size: int,
         selection_method: str,
-        selection_frac: float,
+        frac: float,
         lr: float,
         compute_scores_only: bool = False,
-        use_second_order: bool = False
+        use_second_order: bool = False,
+        selection_mode: str = "topk"
     ) -> None:
         """
         Set up streaming state for on-the-fly gradient streaming.
@@ -600,14 +612,19 @@ class GradientHook:
 
         Args:
             train_batch_size: Number of training samples
-            selection_method: Selection method (Streaming, Regular)
-            selection_frac: Fraction of samples to select
+            selection_method: Selection method (Streaming, Regular, GREATS)
+            frac: Fraction parameter. Meaning depends on selection_mode:
+                  - "topk": Fraction of samples to select (top frac by score)
+                  - "filtering": Fraction of negative-influence samples to DROP
             lr: Learning rate for score scaling
             compute_scores_only: If True, only compute scores without aggregating gradients.
                                 Used for Streaming without MeSO (Case 2).
             use_second_order: If True, compute similarity matrix and use greedy selection
                             with second-order interactions. If False (default), use simple
                             top-k selection which is ~200x faster.
+            selection_mode: How to select samples based on scores:
+                           - "topk": Select top frac samples by score (SFT style)
+                           - "filtering": Keep all positive + drop bottom frac of negative (RLHF style)
         """
         # Infer dtype from model parameters (use first parameter's dtype)
         dtype = next(self.model.parameters()).dtype
@@ -617,14 +634,15 @@ class GradientHook:
             train_batch_size=train_batch_size,
             num_layers=num_layers,
             selection_method=selection_method,
-            selection_frac=selection_frac,
+            frac=frac,
             lr=lr,
             device=self.device,
             compute_scores_only=compute_scores_only,
             dtype=dtype,
-            use_second_order=use_second_order
+            use_second_order=use_second_order,
+            selection_mode=selection_mode
         )
-        logger.debug(f"Set up streaming state: {train_batch_size} train, scores_only={compute_scores_only}, use_second_order={use_second_order}, dtype={dtype}")
+        logger.debug(f"Set up streaming state: {train_batch_size} train, scores_only={compute_scores_only}, use_second_order={use_second_order}, selection_mode={selection_mode}, frac={frac}, dtype={dtype}")
 
     def clear_selection(self) -> None:
         """Clear selection state after forward/backward."""
@@ -669,10 +687,11 @@ class GradientHook:
         self,
         train_batch_size: int,
         selection_method: str,
-        selection_frac: float,
+        frac: float,
         lr: float,
         compute_scores_only: bool = False,
-        use_second_order: bool = False
+        use_second_order: bool = False,
+        selection_mode: str = "topk"
     ) -> None:
         """
         Set up selection state using pre-captured validation gradients (RLHF mode).
@@ -684,10 +703,15 @@ class GradientHook:
         Args:
             train_batch_size: Number of training samples
             selection_method: Selection method (Streaming, GREATS)
-            selection_frac: Fraction of samples to select
+            frac: Fraction parameter. Meaning depends on selection_mode:
+                  - "topk": Fraction of samples to select (top frac by score)
+                  - "filtering": Fraction of negative-influence samples to DROP
             lr: Learning rate for score scaling
             compute_scores_only: If True, only compute scores (for GREATS two-pass)
             use_second_order: If True, use greedy selection with second-order
+            selection_mode: How to select samples based on scores:
+                           - "topk": Select top frac samples by score (SFT style)
+                           - "filtering": Keep all positive + drop bottom frac of negative (RLHF style)
         """
         # Verify we have captured validation gradients
         num_captured = sum(1 for g in self.val_grad_buffer if g is not None)
@@ -705,18 +729,19 @@ class GradientHook:
             train_batch_size=train_batch_size,
             num_layers=num_layers,
             selection_method=selection_method,
-            selection_frac=selection_frac,
+            frac=frac,
             lr=lr,
             device=self.device,
             compute_scores_only=compute_scores_only,
             dtype=dtype,
-            use_second_order=use_second_order
+            use_second_order=use_second_order,
+            selection_mode=selection_mode
         )
         # Mark that we're using stored validation gradients (train_batch_size = actual batch size)
         self.selection_state._use_stored_val = True
         logger.debug(
             f"Set up selection with stored val gradients: {train_batch_size} train samples, "
-            f"{num_captured} layers with val gradients"
+            f"{num_captured} layers with val gradients, selection_mode={selection_mode}, frac={frac}"
         )
 
     def get_compressed_grads(self) -> List[Optional[Tensor]]:

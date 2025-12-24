@@ -1,28 +1,10 @@
 """
 Streaming PPO Trainer for RLHF experiments.
 
-This module implements PPO training with gradient streaming for data selection,
-combining techniques from Gradient Streaming and Snapshot (IIF) papers.
-
-Key Design:
-- Self-referencing validation (Snapshot/IIF style): Training rollout buffer is used
-  as the validation set. No separate validation dataloader needed.
-- Validation gradient: f^seq(θ) = -E[log π_θ(y|x) * Â_{-1}(x,y)]
-- Training: PPO loss (policy + value + KL)
-- KL penalty applied via reward shaping (before GAE), not as loss term
-- Per-step validation gradient capture (buffer changes each step)
-- Mini-batch size safeguard: Selection skipped when batch too small
-
 Methods:
 - NA: Standard PPO (no selection)
 - Streaming: Per-layer selection during backward (single-pass for training)
 - GREATS: Global selection with validation gradients (two-pass for training)
-
-Reference Implementation:
-- Matches archive/LDA-ORL-main/rlhf-toxicity/scripts/ppo_trainer.py
-- Uses disable_adapter() for PEFT reference logprobs (no separate ref model)
-- Adaptive KL control for stable training
-- Toxicity evaluation uses DaNLP/da-electra-hatespeech-detection (different from reward model)
 """
 
 import logging
@@ -100,11 +82,6 @@ def compute_gae(
     """
     Compute Generalized Advantage Estimation.
 
-    Following the reference implementation (ppo_trainer.py lines 3333-3356):
-    - Pre-mask values and rewards before GAE loop
-    - Use index bounds checking for next values (not mask multiplication)
-    - This ensures correct handling of terminal states
-
     Args:
         rewards: Per-token rewards (with KL penalty already applied) [batch, seq_len]
         values: Value estimates [batch, seq_len]
@@ -147,12 +124,6 @@ class StreamingPPOTrainer:
     - NA: Standard PPO (no selection)
     - Streaming: Per-layer selection during backward (uses stored val gradients)
     - GREATS: Global selection with validation gradients (two-pass)
-
-    Key Implementation Details (matching reference ppo_trainer.py):
-    - For PEFT models: uses disable_adapter() to compute ref_logprobs (no separate ref model)
-    - Adaptive KL control for stable training
-    - Model in eval mode during forward passes for consistent logprobs
-    - old_logprobs computed once before PPO epochs, new_logprobs computed fresh each mini-batch
     """
 
     def __init__(
@@ -236,7 +207,7 @@ class StreamingPPOTrainer:
 
         # Selection configuration
         self.method = args.method
-        self.selection_frac = args.selection_frac
+        self.filter_frac = args.filter_frac
         self.use_second_order = args.use_second_order
         self.min_batch_size_for_selection = getattr(args, 'min_batch_size_for_selection', 2)
 
@@ -249,7 +220,7 @@ class StreamingPPOTrainer:
         logger.info("StreamingPPOTrainer Configuration")
         logger.info(f"  Method: {self.method}")
         if self.method != "NA":
-            logger.info(f"  Selection fraction: {self.selection_frac}")
+            logger.info(f"  Filter fraction (negative samples to drop): {self.filter_frac}")
             logger.info(f"  Validation: self-reference (training buffer)")
             logger.info(f"  Min batch size for selection: {self.min_batch_size_for_selection}")
             logger.info(f"  Second-order selection: {self.use_second_order}")
@@ -264,6 +235,148 @@ class StreamingPPOTrainer:
         else:
             logger.info(f"  Reference model: {'loaded (frozen)' if self.ref_model is not None else 'None'}")
         logger.info("=" * 60)
+
+    @torch.no_grad()
+    def _compute_initial_stats(
+        self,
+        query_ids: Tensor,
+        response_ids: Tensor,
+        query_mask: Tensor,
+        response_mask: Tensor,
+        old_logprobs: Tensor,
+        advantages: Tensor,
+        returns: Tensor,
+        old_values: Tensor,
+        raw_rewards: Tensor,
+        kl_penalty: Tensor,
+        response_texts: List[str],
+    ) -> Dict[str, float]:
+        """
+        Compute all training statistics without performing any gradient updates.
+
+        This is used to log initial stats at Step 0 before training begins.
+
+        Args:
+            query_ids: Query token IDs [batch, query_len]
+            response_ids: Response token IDs [batch, response_len]
+            query_mask: Query attention mask
+            response_mask: Response attention mask
+            old_logprobs: Log probs from rollout [batch, response_len]
+            advantages: GAE advantages [batch, response_len]
+            returns: Returns for value loss [batch, response_len]
+            old_values: Old value estimates [batch, response_len]
+            raw_rewards: Raw rewards from reward model [batch]
+            kl_penalty: KL penalty values [batch, response_len]
+            response_texts: Generated response texts
+
+        Returns:
+            Dictionary of statistics
+        """
+        batch_size = query_ids.shape[0]
+        query_len = query_ids.shape[1]
+
+        # Concatenate query and response
+        input_ids = torch.cat([query_ids, response_ids], dim=1)
+        attention_mask = torch.cat([query_mask, response_mask], dim=1)
+
+        # Forward pass to get current logprobs and values
+        self.model.eval()
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+
+        # Handle model output format
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+            values_full = outputs[2]
+        else:
+            logits = outputs.logits
+            values_full = torch.zeros(batch_size, input_ids.shape[1], device=self.device)
+
+        # Extract values and logits for response tokens
+        response_len = response_ids.shape[1]
+        start_idx = query_len - 1
+        end_idx = start_idx + response_len
+
+        if values_full.dim() == 3:
+            values_full = values_full.squeeze(-1)
+        values = values_full[:, start_idx:end_idx]
+
+        # Compute new log probs
+        logits_for_probs = logits[:, start_idx:end_idx, :]
+        log_probs = F.log_softmax(logits_for_probs.float(), dim=-1)
+        new_logprobs = torch.gather(
+            log_probs,
+            dim=-1,
+            index=response_ids.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # PPO policy loss computation (without backward)
+        logprob_diff = new_logprobs - old_logprobs
+        ratio = torch.exp(logprob_diff)
+        clipped_ratio = torch.clamp(ratio, 1 - self.cliprange, 1 + self.cliprange)
+
+        pg_loss1 = -advantages * ratio
+        pg_loss2 = -advantages * clipped_ratio
+        pg_loss = torch.max(pg_loss1, pg_loss2)
+        pg_loss = (pg_loss * response_mask).sum() / response_mask.sum().clamp(min=1)
+
+        # Value loss computation
+        values_clipped = old_values + torch.clamp(
+            values - old_values,
+            -self.cliprange_value,
+            self.cliprange_value,
+        )
+        vf_loss1 = (values - returns) ** 2
+        vf_loss2 = (values_clipped - returns) ** 2
+        vf_loss = 0.5 * torch.max(vf_loss1, vf_loss2)
+        vf_loss = (vf_loss * response_mask).sum() / response_mask.sum().clamp(min=1)
+
+        # Total loss
+        total_loss = pg_loss + self.vf_coef * vf_loss
+
+        # Policy stats
+        clipfrac = ((ratio - 1).abs() > self.cliprange).float().mean().item()
+        approx_kl = (0.5 * (new_logprobs - old_logprobs) ** 2 * response_mask).sum()
+        approx_kl = approx_kl / response_mask.sum()
+        avg_ratio = (ratio * response_mask).sum() / response_mask.sum().clamp(min=1)
+
+        # Build stats dictionary
+        stats = {
+            "loss/total": total_loss.item(),
+            "loss/policy": pg_loss.item(),
+            "loss/value": vf_loss.item(),
+            "policy/approx_kl": approx_kl.item(),
+            "policy/clipfrac": clipfrac,
+            "policy/ratio_mean": avg_ratio.item(),
+            "values/mean": values.mean().item(),
+        }
+
+        # Selection stats (initial = no selection, full batch)
+        if self.method != "NA":
+            stats["selection/n_selected"] = float(batch_size)
+            stats["selection/frac"] = 1.0
+
+        # Reward stats
+        stats["reward/mean"] = raw_rewards.mean().item()
+        stats["reward/std"] = raw_rewards.std().item()
+
+        # KL stats
+        kl_per_seq = (kl_penalty * response_mask).sum(dim=-1)
+        mean_kl = kl_per_seq.mean().item()
+        stats["objective/kl"] = mean_kl
+        stats["objective/kl_coef"] = self.kl_ctl.value
+
+        # Toxicity evaluation stats
+        if self.evaluator is not None and getattr(self.args, 'eval_on_step_generations', True):
+            eval_results = self.evaluator.evaluate_generations(response_texts)
+            stats["eval/toxicity_prob"] = eval_results["mean_toxicity_prob"]
+            stats["eval/toxicity_rate"] = eval_results["toxicity_rate"]
+            stats["eval/toxicity_logit"] = eval_results["mean_toxicity_logit"]
+
+        return stats
 
     def _kl_penalty(
         self,
@@ -1067,10 +1180,11 @@ class StreamingPPOTrainer:
             self.grad_hook.setup_selection_with_stored_val(
                 train_batch_size=batch_size,
                 selection_method="Streaming",
-                selection_frac=self.selection_frac,
+                frac=self.filter_frac,
                 lr=lr,
                 compute_scores_only=False,  # Per-layer selection during backward
                 use_second_order=self.use_second_order,
+                selection_mode="filtering",  # RLHF: drop negative samples
             )
 
             loss, stats = self.compute_ppo_loss(
@@ -1104,10 +1218,11 @@ class StreamingPPOTrainer:
             self.grad_hook.setup_selection_with_stored_val(
                 train_batch_size=batch_size,
                 selection_method="GREATS",
-                selection_frac=self.selection_frac,
+                frac=self.filter_frac,
                 lr=lr,
                 compute_scores_only=True,  # Only accumulate scores
                 use_second_order=self.use_second_order,
+                selection_mode="filtering",  # RLHF: drop negative samples
             )
 
             loss_for_scoring, _ = self.compute_ppo_loss(
@@ -1187,6 +1302,7 @@ class StreamingPPOTrainer:
 
         history = {"loss": [], "reward": [], "kl": []}
         global_step = 0
+        logged_initial_stats = False
 
         for epoch in range(num_epochs):
             self.model.train()
@@ -1267,6 +1383,32 @@ class StreamingPPOTrainer:
                     adv_var = ((advantages - adv_mean) ** 2 * response_mask).sum() / response_mask.sum().clamp(min=1)
                     advantages = ((advantages - adv_mean) / (adv_var.sqrt() + 1e-8)) * response_mask.float()
                     advantages = advantages.detach()  # Reference line 3355
+
+                # ========================================
+                # INITIAL STATS LOGGING (Step 0)
+                # Log all statistics before any training updates
+                # ========================================
+                if not logged_initial_stats:
+                    initial_stats = self._compute_initial_stats(
+                        query_ids, response_ids, query_mask, response_mask,
+                        old_logprobs, advantages, returns, old_values,
+                        raw_rewards, kl_penalty, response_texts,
+                    )
+                    logger.info(f"Step 0 (initial): {initial_stats}")
+
+                    # Update history with initial stats
+                    history["loss"].append(initial_stats["loss/total"])
+                    history["reward"].append(initial_stats["reward/mean"])
+                    history["kl"].append(initial_stats["objective/kl"])
+
+                    if "eval/toxicity_prob" in initial_stats:
+                        if "toxicity_prob" not in history:
+                            history["toxicity_prob"] = []
+                            history["toxicity_rate"] = []
+                        history["toxicity_prob"].append(initial_stats["eval/toxicity_prob"])
+                        history["toxicity_rate"].append(initial_stats["eval/toxicity_rate"])
+
+                    logged_initial_stats = True
 
                 # ========================================
                 # SELF-REFERENCING VALIDATION (Snapshot/IIF style)
@@ -1436,6 +1578,10 @@ class StreamingPPOTrainer:
             global_step: Current training step
             history: Training history dictionary to update
         """
+        # Disable gradient hooks during evaluation to avoid overhead
+        if self.grad_hook is not None:
+            self.grad_hook.disable_hooks()
+
         eval_n_samples = getattr(self.args, 'eval_n_samples', 100)
         eval_batch_size = getattr(self.args, 'eval_batch_size', 16)
 
@@ -1464,6 +1610,10 @@ class StreamingPPOTrainer:
         history["full_eval_toxicity_prob"].append(eval_results["mean_toxicity_prob"])
         history["full_eval_toxicity_rate"].append(eval_results["toxicity_rate"])
         history["full_eval_steps"].append(global_step)
+
+        # Re-enable hooks after evaluation if selection method is active
+        if self.grad_hook is not None and self.method != "NA":
+            self.grad_hook.enable_hooks()
 
     def save_model(self, output_dir: str):
         """Save model to directory."""

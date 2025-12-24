@@ -187,7 +187,7 @@ The unified training script accepts the following arguments:
 
 - `--n_val <n>` - Validation examples for data selection (default: `128`)
 - `--val_batch_size <size>` - Validation batch size for data selection (default: `32`)
-- `--selection_frac <frac>` - Fraction of samples to select (default: `0.5`)
+- `--filter_frac <frac>` - Fraction of negative-influence samples to drop (default: `1.0`)
 
 #### PPO Arguments
 

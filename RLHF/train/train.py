@@ -10,11 +10,11 @@ Usage:
     # Baseline (no selection)
     python RLHF/train/train.py --method NA --output_dir outputs/baseline
 
-    # Streaming (per-layer selection)
-    python RLHF/train/train.py --method Streaming --selection_frac 0.5
+    # Streaming (per-layer filtering)
+    python RLHF/train/train.py --method Streaming --filter_frac 1.0
 
-    # GREATS (global selection)
-    python RLHF/train/train.py --method GREATS --selection_frac 0.5
+    # GREATS (global filtering)
+    python RLHF/train/train.py --method GREATS --filter_frac 0.5
 
     # With compression (implies MeSO optimizer)
     python RLHF/train/train.py --method Streaming --sparsification Rademacher-64*64
@@ -212,7 +212,7 @@ def main():
     logger.info(f"  Model: {model_args.model_name_or_path}")
     logger.info(f"  LoRA: {model_args.lora}")
     if training_args.has_selection:
-        logger.info(f"  Selection fraction: {training_args.selection_frac}")
+        logger.info(f"  Filter fraction (drop negative): {training_args.filter_frac}")
     if training_args.has_compression:
         logger.info(f"  Sparsification: {training_args.sparsification}")
         logger.info(f"  Projection: {training_args.projection}")

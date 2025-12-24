@@ -445,6 +445,10 @@ class StreamingTrainer(Trainer):
         Returns:
             Dict of metrics including val_perplexity and eval_perplexity
         """
+        # Disable gradient hooks during evaluation to avoid overhead
+        if self.grad_hook is not None:
+            self.grad_hook.disable_hooks()
+
         # Evaluate on validation dataset (small set for data selection)
         val_loss, val_perplexity = self._evaluate_on_dataset(
             self.val_dataset,
@@ -496,6 +500,10 @@ class StreamingTrainer(Trainer):
             f"eval_perplexity={eval_perplexity:.4f}, "
             f"wall_time={wall_time:.2f}s"
         )
+
+        # Re-enable hooks after evaluation if selection method is active
+        if self.grad_hook is not None and self.args.method != "NA":
+            self.grad_hook.enable_hooks()
 
         return eval_metrics
 

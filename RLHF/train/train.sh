@@ -31,7 +31,7 @@ export base_training_args="--bf16=True \
 --weight_decay=0.0 \
 --logging_steps=1 \
 --report_to=none \
---selection_frac=0.5"
+--filter_frac=1.0"
 
 # Default values
 task="toxicity"
@@ -43,7 +43,7 @@ reward_model="facebook/roberta-hate-speech-dynabench-r4-target"
 batch_size=1024  # Reference uses 256 for stable gradients
 lr=""  # Learning rate (looked up from config if not specified)
 lr_override=""  # Set when --lr is explicitly passed
-selection_frac=0.5
+filter_frac=1.0
 max_steps=-1  # -1 means no step limit (use epochs instead)
 epochs=8  # Number of training epochs (used when max_steps <= 0)
 seed=42
@@ -156,8 +156,8 @@ while [[ $# -gt 0 ]]; do
             lr_config_file="$2"
             shift 2
             ;;
-        --selection_frac)
-            selection_frac="$2"
+        --filter_frac)
+            filter_frac="$2"
             shift 2
             ;;
         --max_steps)
@@ -313,7 +313,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --batch_size <size>        Training batch size (default: 256)"
             echo "  --lr <lr>                  Learning rate override (ignores config file)"
             echo "  --lr_config <path>         LR config file (default: RLHF/train/lr/config.json)"
-            echo "  --selection_frac <frac>    Fraction to select (default: 0.5)"
+            echo "  --filter_frac <frac>       Fraction of negative samples to drop (default: 1.0)"
             echo "  --min_batch_size_for_selection <n>  Min batch size for selection (default: 2)"
             echo "  --max_steps <steps>        Maximum training steps (default: -1, meaning no limit)"
             echo "  --epochs <n>               Number of training epochs (default: 1, used when max_steps <= 0)"
@@ -542,7 +542,7 @@ run_single_experiment() {
 --reward_model_name=$reward_model \
 --per_device_train_batch_size=$batch_size \
 --learning_rate=$exp_lr \
---selection_frac=$selection_frac \
+--filter_frac=$filter_frac \
 --min_batch_size_for_selection=$min_batch_size_for_selection \
 --max_steps=$max_steps \
 --num_train_epochs=$epochs \
@@ -642,7 +642,7 @@ if [[ -n "$experiments" ]]; then
     echo "  Batch size: $batch_size"
     echo "  Epochs: $epochs"
     echo "  Max steps: $max_steps (use -1 for epoch-based training)"
-    echo "  Selection fraction: $selection_frac"
+    echo "  Filter fraction: $filter_frac"
     echo "  Min batch for selection: $min_batch_size_for_selection"
     echo "  Validation: self-reference (training buffer)"
     echo ""

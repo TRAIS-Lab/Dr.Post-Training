@@ -47,7 +47,7 @@ sweep_max_steps=50  # Fewer steps for LR sweep
 batch_size=64
 n_val=16
 val_batch_size=""
-selection_frac=0.5
+filter_frac=1.0
 seed=42
 
 # LoRA settings
@@ -347,7 +347,7 @@ run_lr_trial() {
     --per_device_train_batch_size=$batch_size \
     --learning_rate=$trial_lr \
     --n_val=$n_val \
-    --selection_frac=$selection_frac \
+    --filter_frac=$filter_frac \
     --max_steps=$sweep_max_steps \
     --seed=$seed \
     --ppo_epochs=$ppo_epochs \

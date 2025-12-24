@@ -19,7 +19,7 @@ class TrainingArguments(TA):
     Training arguments for RLHF with gradient streaming.
 
     Inherits from transformers.TrainingArguments and adds:
-    - Data selection arguments (method, selection_frac)
+    - Data selection arguments (method, filter_frac)
     - Gradient compression arguments (sparsification, projection)
     - PPO-specific arguments
     """
@@ -62,9 +62,15 @@ class TrainingArguments(TA):
             )
         },
     )
-    selection_frac: float = field(
-        default=0.5,
-        metadata={"help": "Fraction of samples to select (0-1)"},
+    filter_frac: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Fraction of negative-influence samples to drop (0-1). "
+                "1.0 = drop all negative samples, 0.5 = drop bottom 50% of negative samples. "
+                "All positive-influence samples are always kept."
+            )
+        },
     )
     min_batch_size_for_selection: int = field(
         default=2,
@@ -283,9 +289,9 @@ class TrainingArguments(TA):
         if self.method not in valid_methods:
             raise ValueError(f"method must be one of {valid_methods}, got {self.method}")
 
-        # Validate selection_frac
-        if not 0 < self.selection_frac <= 1:
-            raise ValueError(f"selection_frac must be in (0, 1], got {self.selection_frac}")
+        # Validate filter_frac
+        if not 0 <= self.filter_frac <= 1:
+            raise ValueError(f"filter_frac must be in [0, 1], got {self.filter_frac}")
 
         # Validate kl_penalty (matching reference: ppo_config.py:217)
         valid_kl_penalties = ["kl", "abs", "mse", "full"]
