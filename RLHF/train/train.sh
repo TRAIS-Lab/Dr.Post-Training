@@ -26,8 +26,8 @@ export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
 # Note: warmup_ratio=0 for PPO (pretrained policy doesn't need warmup, and LR=0 breaks first batch)
 # Note: max_grad_norm removed to match reference (reference doesn't use gradient clipping)
 export base_training_args="--bf16=True \
---lr_scheduler_type=constant \
---warmup_ratio=0 \
+--lr_scheduler_type=linear \
+--warmup_ratio=0.03 \
 --weight_decay=0.0 \
 --logging_steps=1 \
 --report_to=none \
@@ -40,15 +40,14 @@ model="EleutherAI/gpt-neo-2.7B"
 reward_model="facebook/roberta-hate-speech-dynabench-r4-target"
 
 # Training hyperparameters
-batch_size=256  # Reference uses 256 for stable gradients
+batch_size=1024  # Reference uses 256 for stable gradients
 lr=""  # Learning rate (looked up from config if not specified)
 lr_override=""  # Set when --lr is explicitly passed
-n_val=128
-val_batch_size="32"
 selection_frac=0.5
 max_steps=-1  # -1 means no step limit (use epochs instead)
-epochs=1  # Number of training epochs (used when max_steps <= 0)
+epochs=8  # Number of training epochs (used when max_steps <= 0)
 seed=42
+min_batch_size_for_selection=2  # Skip selection when mini-batch size is too small
 
 # LR configuration
 # Reference: archive/LDA-ORL-main/rlhf-toxicity/scripts/run_train_std.sh uses 1e-5
@@ -63,7 +62,7 @@ lora_alpha=32
 lora_target_modules="q_proj k_proj v_proj o_proj"
 
 # Flash attention
-use_flash_attention=false
+use_flash_attention=true
 
 # Compression settings
 compression=""  # LoGra or GraSS
@@ -71,8 +70,7 @@ update_compressor_freq=200
 
 # PPO settings
 ppo_epochs=4
-mini_batch_size=1
-forward_batch_size=256
+mini_batch_size=8
 init_kl_coef=0.2
 kl_penalty="full"  # Options: kl, abs, mse, full
 adap_kl_ctrl=true
@@ -80,15 +78,14 @@ target_kl=0.1
 max_new_tokens=30
 min_new_tokens=20
 
-# Validation settings
-val_strategy="random"
-val_loss_type="reward_weighted"  # Sequence-level attribution: f^seq(θ) = -E[log π_θ(y|x) * Â(x,y)]
+# Selection settings
+# Note: Uses self-referencing validation (training buffer as validation set)
 use_second_order=false
 
 # Toxicity evaluation settings
 # Uses a DIFFERENT classifier than reward model for unbiased evaluation
 enable_toxicity_eval=true
-eval_interval=0  # 0 = end of epoch only, N > 0 = every N steps
+eval_interval=1  # 0 = end of epoch only, N > 0 = every N steps
 eval_n_samples=500
 eval_batch_size=256
 eval_on_step_generations=true  # Evaluate toxicity on each step's generations
@@ -159,14 +156,6 @@ while [[ $# -gt 0 ]]; do
             lr_config_file="$2"
             shift 2
             ;;
-        --n_val)
-            n_val="$2"
-            shift 2
-            ;;
-        --val_batch_size)
-            val_batch_size="$2"
-            shift 2
-            ;;
         --selection_frac)
             selection_frac="$2"
             shift 2
@@ -219,8 +208,8 @@ while [[ $# -gt 0 ]]; do
             ppo_epochs="$2"
             shift 2
             ;;
-        --forward_batch_size)
-            forward_batch_size="$2"
+        --mini_batch_size)
+            mini_batch_size="$2"
             shift 2
             ;;
         --kl_coef)
@@ -235,12 +224,8 @@ while [[ $# -gt 0 ]]; do
             max_new_tokens="$2"
             shift 2
             ;;
-        --val_strategy)
-            val_strategy="$2"
-            shift 2
-            ;;
-        --val_loss_type)
-            val_loss_type="$2"
+        --min_batch_size_for_selection)
+            min_batch_size_for_selection="$2"
             shift 2
             ;;
         --use_second_order)
@@ -328,26 +313,25 @@ while [[ $# -gt 0 ]]; do
             echo "  --batch_size <size>        Training batch size (default: 256)"
             echo "  --lr <lr>                  Learning rate override (ignores config file)"
             echo "  --lr_config <path>         LR config file (default: RLHF/train/lr/config.json)"
-            echo "  --n_val <n>                Validation samples (default: 128)"
-            echo "  --val_batch_size <n>       Validation batch size for selection (default: 32)"
             echo "  --selection_frac <frac>    Fraction to select (default: 0.5)"
+            echo "  --min_batch_size_for_selection <n>  Min batch size for selection (default: 2)"
             echo "  --max_steps <steps>        Maximum training steps (default: -1, meaning no limit)"
             echo "  --epochs <n>               Number of training epochs (default: 1, used when max_steps <= 0)"
             echo "  --seed <seed>              Random seed (default: 42)"
             echo ""
             echo "PPO Options:"
             echo "  --ppo_epochs <n>           PPO epochs per batch (default: 4)"
-            echo "  --forward_batch_size <n>   Forward batch size for PPO updates (default: 256)"
+            echo "  --mini_batch_size <n>      Mini-batch size for PPO updates (default: 8)"
             echo "  --kl_coef <coef>           Initial KL penalty coefficient (default: 0.2)"
             echo "  --kl_penalty <mode>        KL penalty mode: kl, abs, mse, full (default: full)"
             echo "  --max_new_tokens <n>       Maximum new tokens to generate (default: 30)"
-            echo "  --val_strategy <strategy>  Validation strategy: random, top (default: random)"
-            echo "  --val_loss_type <type>     Validation loss type (default: reward_weighted)"
+            echo ""
+            echo "Note: Uses self-referencing validation (training buffer as validation set)"
             echo ""
             echo "Toxicity Evaluation Options:"
             echo "  --enable_toxicity_eval     Enable toxicity evaluation (default: true)"
             echo "  --disable_toxicity_eval    Disable toxicity evaluation"
-            echo "  --eval_interval <n>        Evaluate every N steps (0=epoch end only, default: 0)"
+            echo "  --eval_interval <n>        Evaluate every N steps (0=epoch end only, default: 1)"
             echo "  --eval_n_samples <n>       Samples for full evaluation (default: 500)"
             echo "  --eval_batch_size <n>      Batch size for generation (default: 256)"
             echo "  --eval_on_step_generations Evaluate toxicity on each step's generations (default: true)"
@@ -506,7 +490,7 @@ run_single_experiment() {
         training_type="full"
     fi
 
-    local JOB_NAME="${task}-${exp_method}-${compression_name}-${model_short}-${training_type}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
+    local JOB_NAME="${task}-${exp_method}-${compression_name}-${model_short}-${training_type}-lr${exp_lr}-b${batch_size}-s${seed}"
 
     local exp_output_dir
     if [[ -z "$output_dir" ]]; then
@@ -558,22 +542,19 @@ run_single_experiment() {
 --reward_model_name=$reward_model \
 --per_device_train_batch_size=$batch_size \
 --learning_rate=$exp_lr \
---n_val=$n_val \
 --selection_frac=$selection_frac \
+--min_batch_size_for_selection=$min_batch_size_for_selection \
 --max_steps=$max_steps \
 --num_train_epochs=$epochs \
 --seed=$seed \
 --ppo_epochs=$ppo_epochs \
 --mini_batch_size=$mini_batch_size \
---forward_batch_size=$forward_batch_size \
 --init_kl_coef=$init_kl_coef \
 --kl_penalty=$kl_penalty \
 --adap_kl_ctrl=$adap_kl_ctrl \
 --target_kl=$target_kl \
 --max_new_tokens=$max_new_tokens \
 --min_new_tokens=$min_new_tokens \
---val_strategy=$val_strategy \
---val_loss_type=$val_loss_type \
 --output_dir=$exp_output_dir"
 
     # Add LoRA settings
@@ -599,11 +580,6 @@ run_single_experiment() {
     fi
     if [[ -n "$exp_sparsification" || -n "$exp_projection" ]]; then
         training_args="$training_args --update_compressor_freq=$update_compressor_freq"
-    fi
-
-    # Add val_batch_size if specified
-    if [[ -n "$val_batch_size" ]]; then
-        training_args="$training_args --val_batch_size=$val_batch_size"
     fi
 
     # Add second-order flag
@@ -664,14 +640,15 @@ if [[ -n "$experiments" ]]; then
     echo ""
     echo "Training Settings:"
     echo "  Batch size: $batch_size"
-    echo "  Val batch size: ${val_batch_size:-same as n_val}"
-    echo "  N_val: $n_val"
     echo "  Epochs: $epochs"
     echo "  Max steps: $max_steps (use -1 for epoch-based training)"
     echo "  Selection fraction: $selection_frac"
+    echo "  Min batch for selection: $min_batch_size_for_selection"
+    echo "  Validation: self-reference (training buffer)"
     echo ""
     echo "PPO Settings:"
     echo "  PPO epochs: $ppo_epochs"
+    echo "  Mini-batch size: $mini_batch_size"
     echo "  Init KL coefficient: $init_kl_coef"
     echo "  Adaptive KL control: $adap_kl_ctrl"
     echo "  Target KL: $target_kl"

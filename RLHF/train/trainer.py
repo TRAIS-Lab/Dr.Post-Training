@@ -2,14 +2,16 @@
 Streaming PPO Trainer for RLHF experiments.
 
 This module implements PPO training with gradient streaming for data selection,
-following the design patterns from the Snapshot paper (LDA-ORL).
+combining techniques from Gradient Streaming and Snapshot (IIF) papers.
 
 Key Design:
-- Separate validation and training passes (different loss functions)
-- Validation: sequence-level reward-weighted log probs (f^seq)
+- Self-referencing validation (Snapshot/IIF style): Training rollout buffer is used
+  as the validation set. No separate validation dataloader needed.
+- Validation gradient: f^seq(θ) = -E[log π_θ(y|x) * Â_{-1}(x,y)]
 - Training: PPO loss (policy + value + KL)
 - KL penalty applied via reward shaping (before GAE), not as loss term
-- Toxicity evaluation at end of each PPO round using independent classifier
+- Per-step validation gradient capture (buffer changes each step)
+- Mini-batch size safeguard: Selection skipped when batch too small
 
 Methods:
 - NA: Standard PPO (no selection)
@@ -215,9 +217,6 @@ class StreamingPPOTrainer:
         self.gae_lambda = args.gae_lambda
         self.ppo_epochs = getattr(args, 'ppo_epochs', 4)
         self.mini_batch_size = getattr(args, 'mini_batch_size', 1)
-        # Forward batch size for efficient GPU utilization during logprobs computation
-        # Reference uses tracin_batch_size=256 for forward passes
-        self.forward_batch_size = getattr(args, 'forward_batch_size', 0)  # 0 = full batch
 
         # KL Controller (matching reference implementation)
         # Reference: ppo_trainer.py lines 294-297
@@ -239,7 +238,7 @@ class StreamingPPOTrainer:
         self.method = args.method
         self.selection_frac = args.selection_frac
         self.use_second_order = args.use_second_order
-        self.val_loss_type = args.val_loss_type
+        self.min_batch_size_for_selection = getattr(args, 'min_batch_size_for_selection', 2)
 
         # Logging
         self._log_config()
@@ -251,14 +250,14 @@ class StreamingPPOTrainer:
         logger.info(f"  Method: {self.method}")
         if self.method != "NA":
             logger.info(f"  Selection fraction: {self.selection_frac}")
-            logger.info(f"  Validation loss type: {self.val_loss_type}")
+            logger.info(f"  Validation: self-reference (training buffer)")
+            logger.info(f"  Min batch size for selection: {self.min_batch_size_for_selection}")
             logger.info(f"  Second-order selection: {self.use_second_order}")
         logger.info(f"  KL coefficient: {self.kl_ctl.value} ({'adaptive' if self.adap_kl_ctrl else 'fixed'})")
         logger.info(f"  KL penalty mode: {self.kl_penalty_mode}")
         logger.info(f"  Clip range: {self.cliprange}")
         logger.info(f"  PPO epochs per batch: {self.ppo_epochs}")
-        logger.info(f"  Mini-batch size (backward): {self.mini_batch_size}")
-        logger.info(f"  Forward batch size: {self.forward_batch_size if self.forward_batch_size > 0 else 'full batch'}")
+        logger.info(f"  Mini-batch size: {self.mini_batch_size}")
         logger.info(f"  PEFT model: {self.is_peft_model}")
         if self.is_peft_model:
             logger.info(f"  Reference: using disable_adapter() on policy model")
@@ -502,7 +501,7 @@ class StreamingPPOTrainer:
         Compute logprobs, logits, and values in batches for efficiency.
 
         This matches the reference implementation (ppo_trainer.py batched_forward_pass)
-        which uses tracin_batch_size for forward passes to maximize GPU utilization.
+        which uses mini-batch processing for forward passes to maximize GPU utilization.
 
         Args:
             query_ids: Query token IDs [batch, query_len]
@@ -707,24 +706,33 @@ class StreamingPPOTrainer:
         ref_logprobs = torch.cat(all_ref_logprobs, dim=0)
         return ref_logprobs
 
-    def capture_validation_gradients(
+    def capture_validation_gradients_from_buffer(
         self,
-        val_query_ids: Tensor,
-        val_query_mask: Tensor,
+        query_ids: Tensor,
+        response_ids: Tensor,
+        query_mask: Tensor,
+        response_mask: Tensor,
+        advantages: Tensor,
     ) -> float:
         """
-        Capture validation gradients using sequence-level attribution.
+        Capture validation gradients using the training rollout buffer itself.
 
-        Implements the sequence-level objective from Snapshot paper:
-            f^seq(θ) = -E[log π_θ(y|x) * Â(x,y)]
+        Implements self-referencing validation from the Snapshot/IIF paper:
+        Instead of using a separate validation set, this uses the same rollout
+        buffer that will be used for training. This follows the IIF algorithm's
+        approach where the "validation" set is the training data itself.
 
-        This gradient represents the "good direction" - moving towards
-        higher reward sequences. The gradient points in the direction
-        that increases log probability of high-reward responses.
+        The objective is the sequence-level f^seq from the Snapshot paper:
+            f^seq(θ) = -E[log π_θ(y|x) * Â_{-1}(x,y)]
+
+        where Â_{-1} is the sequence-level advantage (sum of per-token advantages).
 
         Args:
-            val_query_ids: Validation query token IDs [batch, query_len]
-            val_query_mask: Validation query attention mask [batch, query_len]
+            query_ids: Query token IDs from training buffer [batch, query_len]
+            response_ids: Response token IDs from training buffer [batch, response_len]
+            query_mask: Query attention mask [batch, query_len]
+            response_mask: Response attention mask [batch, response_len]
+            advantages: Per-token advantages from GAE [batch, response_len]
 
         Returns:
             Validation loss value
@@ -735,69 +743,75 @@ class StreamingPPOTrainer:
         self.grad_hook.start_val_capture()
         self.grad_hook.enable_hooks()
 
-        # Generate responses from validation queries
-        with torch.no_grad():
-            response_ids, response_mask, response_texts = self.generate_rollouts(
-                val_query_ids, val_query_mask
-            )
+        # Compute sequence-level advantage (sum over response tokens)
+        # This gives us Â_{-1}(x,y) from the Snapshot paper
+        seq_advantages = (advantages * response_mask.float()).sum(dim=1)
 
-            # Compute rewards for validation responses
-            query_texts = self.tokenizer.batch_decode(val_query_ids, skip_special_tokens=True)
-            rewards = self.reward_model.compute_rewards(query_texts, response_texts)
+        # Normalize sequence-level advantages for stability (on full batch for correct stats)
+        if seq_advantages.std() > 1e-8:
+            seq_advantages_normalized = (seq_advantages - seq_advantages.mean()) / (seq_advantages.std() + 1e-8)
+        else:
+            seq_advantages_normalized = seq_advantages - seq_advantages.mean()
 
-            # Normalize rewards to get advantages (z-normalization for variance reduction)
-            if rewards.std() > 1e-8:
-                rewards_normalized = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-            else:
-                rewards_normalized = rewards - rewards.mean()
-
-        # Now compute sequence-level log probability with gradients
+        # Set model to train mode for gradient computation
         self.model.train()
 
-        full_ids = torch.cat([val_query_ids, response_ids], dim=1)
-        full_mask = torch.cat([val_query_mask, response_mask], dim=1)
-        query_len = val_query_ids.shape[1]
+        # Concatenate query and response
+        full_ids = torch.cat([query_ids, response_ids], dim=1)
+        full_mask = torch.cat([query_mask, response_mask], dim=1)
+        query_len = query_ids.shape[1]
+        full_batch_size = query_ids.shape[0]
 
-        # Forward pass
-        outputs = self.model(
-            input_ids=full_ids,
-            attention_mask=full_mask,
-        )
+        # Use mini_batch_size for memory-efficient gradient accumulation
+        batch_size = self.mini_batch_size
+        total_val_loss = 0.0
+        num_batches = 0
 
-        # Handle model output format
-        # AutoModelForCausalLMWithValueHead returns tuple: (logits, loss, values)
-        if isinstance(outputs, tuple):
-            logits = outputs[0]
-        else:
-            logits = outputs.logits
+        # Process in mini-batches to avoid OOM
+        for i in range(0, full_batch_size, batch_size):
+            end_idx = min(i + batch_size, full_batch_size)
+            mb_size = end_idx - i
 
-        # Log probs for response tokens
-        logits = logits[:, query_len - 1:-1, :]
-        log_probs = F.log_softmax(logits.float(), dim=-1)
-        token_log_probs = torch.gather(
-            log_probs,
-            dim=-1,
-            index=response_ids.unsqueeze(-1),
-        ).squeeze(-1)
+            # Extract mini-batch
+            mb_full_ids = full_ids[i:end_idx]
+            mb_full_mask = full_mask[i:end_idx]
+            mb_response_ids = response_ids[i:end_idx]
+            mb_response_mask = response_mask[i:end_idx]
+            mb_seq_advantages_normalized = seq_advantages_normalized[i:end_idx]
 
-        # Sequence log probability (sum over response tokens)
-        seq_log_probs = (token_log_probs * response_mask).sum(dim=1)
+            # Forward pass on mini-batch
+            outputs = self.model(
+                input_ids=mb_full_ids,
+                attention_mask=mb_full_mask,
+            )
 
-        # Compute validation loss based on val_loss_type
-        if self.val_loss_type == "logprob":
-            # Simple negative log likelihood (no reward weighting)
-            val_loss = -seq_log_probs.mean()
-        elif self.val_loss_type == "reward_weighted":
-            # NLL weighted by normalized rewards
-            val_loss = -(rewards_normalized * seq_log_probs).mean()
-        elif self.val_loss_type == "advantage_weighted":
-            # NLL weighted by advantages (same as reward_weighted for now since we use rewards as advantages)
-            val_loss = -(rewards_normalized * seq_log_probs).mean()
-        else:
-            raise ValueError(f"Unknown val_loss_type: {self.val_loss_type}")
+            # Handle model output format
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+            else:
+                logits = outputs.logits
 
-        # Backward - hooks capture gradients into val_grad_buffer
-        val_loss.backward()
+            # Log probs for response tokens
+            logits = logits[:, query_len - 1:-1, :]
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            token_log_probs = torch.gather(
+                log_probs,
+                dim=-1,
+                index=mb_response_ids.unsqueeze(-1),
+            ).squeeze(-1)
+
+            # Sequence log probability (sum over response tokens)
+            seq_log_probs = (token_log_probs * mb_response_mask.float()).sum(dim=1)
+
+            # Compute validation loss for this mini-batch
+            # Scale by (mb_size / full_batch_size) so gradients accumulate correctly
+            mb_val_loss = -(mb_seq_advantages_normalized * seq_log_probs).sum() / full_batch_size
+
+            # Backward - hooks accumulate gradients into val_grad_buffer
+            mb_val_loss.backward()
+
+            total_val_loss += mb_val_loss.item()
+            num_batches += 1
 
         # Clear optimizer gradients (we only wanted to capture compressed grads)
         self.optimizer.zero_grad()
@@ -806,12 +820,12 @@ class StreamingPPOTrainer:
         self.grad_hook.end_val_capture()
 
         logger.debug(
-            f"Captured validation gradients (seq-level): "
-            f"mean_reward={rewards.mean().item():.4f}, "
-            f"loss={val_loss.item():.4f}, time={time.time() - t_start:.3f}s"
+            f"Captured validation gradients (self-reference): "
+            f"mean_advantage={seq_advantages.mean().item():.4f}, "
+            f"loss={total_val_loss:.4f}, time={time.time() - t_start:.3f}s"
         )
 
-        return val_loss.item()
+        return total_val_loss
 
     def compute_ppo_loss(
         self,
@@ -825,10 +839,14 @@ class StreamingPPOTrainer:
         old_values: Tensor,
     ) -> Tuple[Tensor, Dict[str, float]]:
         """
-        Compute PPO loss.
+        Compute PPO loss (policy + value).
 
         Note: KL penalty is already applied to rewards via reward shaping
         (see train method), so we don't add it as a loss term here.
+
+        Safety: If the average policy ratio exceeds ratio_threshold (default 10.0),
+        the batch is skipped by zeroing out the loss. This prevents training
+        divergence when the policy has drifted too far from the reference.
 
         Args:
             query_ids: Query token IDs [batch, query_len]
@@ -993,9 +1011,22 @@ class StreamingPPOTrainer:
         lr = self.optimizer.param_groups[0]["lr"]
 
         # ========================================
+        # MINI-BATCH SIZE SAFEGUARD
+        # When batch size is too small, selection becomes unstable
+        # Fall back to NA (no selection) for small batches
+        # ========================================
+        effective_method = self.method
+        if batch_size < self.min_batch_size_for_selection and self.method != "NA":
+            logger.debug(
+                f"Batch size {batch_size} < min_batch_size_for_selection "
+                f"{self.min_batch_size_for_selection}, skipping selection"
+            )
+            effective_method = "NA"
+
+        # ========================================
         # Method: NA (baseline, no selection)
         # ========================================
-        if self.method == "NA":
+        if effective_method == "NA":
             # Only zero grad if not accumulating (first call of accumulation cycle)
             if not accumulate:
                 self.optimizer.zero_grad()
@@ -1029,7 +1060,7 @@ class StreamingPPOTrainer:
         # ========================================
         # Method: Streaming (per-layer selection with stored val grads)
         # ========================================
-        if self.method == "Streaming":
+        if effective_method == "Streaming":
             self.optimizer.zero_grad()
 
             # Setup selection using pre-captured validation gradients
@@ -1067,7 +1098,7 @@ class StreamingPPOTrainer:
         # ========================================
         # Method: GREATS (global selection, two-pass for training)
         # ========================================
-        if self.method == "GREATS":
+        if effective_method == "GREATS":
             # Pass 1: Compute selection scores using stored val grads
             self.optimizer.zero_grad()
             self.grad_hook.setup_selection_with_stored_val(
@@ -1126,22 +1157,23 @@ class StreamingPPOTrainer:
 
             return stats
 
-        raise ValueError(f"Unknown method: {self.method}")
+        raise ValueError(f"Unknown method: {effective_method}")
 
     def train(
         self,
         train_dataloader,
-        val_dataloader=None,
         num_epochs: int = 1,
         max_steps: Optional[int] = None,
         log_interval: int = 10,
     ) -> Dict[str, List[float]]:
         """
-        Main training loop.
+        Main training loop with self-referencing validation (Snapshot/IIF style).
+
+        For selection methods (Streaming/GREATS), validation gradients are captured
+        from the training rollout buffer itself, following the IIF algorithm.
 
         Args:
             train_dataloader: DataLoader for training prompts
-            val_dataloader: DataLoader for validation data (required for selection)
             num_epochs: Number of training epochs
             max_steps: Maximum steps (None = no limit)
             log_interval: Steps between logging
@@ -1150,9 +1182,8 @@ class StreamingPPOTrainer:
             Dictionary of training history
         """
         logger.info(f"Starting training with method={self.method}")
-
-        if self.method != "NA" and val_dataloader is None:
-            raise ValueError("val_dataloader required for selection methods")
+        if self.method != "NA":
+            logger.info("Using self-reference validation (training buffer as validation set)")
 
         history = {"loss": [], "reward": [], "kl": []}
         global_step = 0
@@ -1160,29 +1191,6 @@ class StreamingPPOTrainer:
         for epoch in range(num_epochs):
             self.model.train()
             epoch_stats = []
-
-            # Prepare validation queries for gradient capture
-            val_query_ids = None
-            val_query_mask = None
-            if self.method != "NA" and val_dataloader is not None:
-                val_batch = next(iter(val_dataloader))
-                val_query_ids = val_batch["input_ids"]
-                if isinstance(val_query_ids, list):
-                    # Left-pad to same length (required for decoder-only generation)
-                    max_len = max(t.shape[0] if t.dim() == 1 else t.shape[1] for t in val_query_ids)
-                    val_query_ids = torch.stack([
-                        F.pad(t.flatten(), (max_len - t.numel(), 0), value=self.tokenizer.pad_token_id)
-                        for t in val_query_ids
-                    ]).to(self.device)
-                else:
-                    val_query_ids = val_query_ids.to(self.device)
-                val_query_mask = (val_query_ids != self.tokenizer.pad_token_id).long()
-
-            # For GREATS: capture validation gradients once per epoch
-            if self.method == "GREATS" and val_query_ids is not None:
-                self.capture_validation_gradients(
-                    val_query_ids, val_query_mask
-                )
 
             # Training loop
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}")
@@ -1210,51 +1218,23 @@ class StreamingPPOTrainer:
                     query_texts = self.tokenizer.batch_decode(query_ids, skip_special_tokens=True)
                     raw_rewards = self.reward_model.compute_rewards(query_texts, response_texts)
 
-                # Prepare full sequences
-                full_ids = torch.cat([query_ids, response_ids], dim=1)
-                full_mask = torch.cat([query_mask, response_mask], dim=1)
-                query_len = query_ids.shape[1]
-
-                # ========================================
-                # IMPORTANT: Set model to EVAL mode for old_logprobs computation
-                # (Matching reference implementation: ppo_trainer.py line 771)
-                #
-                # Reference behavior:
-                #   self.model.eval()  # BEFORE computing old_logprobs
-                #   with torch.no_grad():
-                #       all_logprobs, logits_or_none, values, masks = self.batched_forward_pass(...)
-                #
-                # This ensures consistent dropout behavior. With summary_dropout_prob=0.0,
-                # eval mode guarantees no dropout variation between old and new logprobs.
-                # ========================================
-                self.model.eval()  # Match reference: eval mode for old_logprobs
+                # Set model to eval mode for old_logprobs computation
+                # (matching reference: ppo_trainer.py line 771)
+                self.model.eval()
 
                 with torch.no_grad():
-                    # ========================================
-                    # CRITICAL FIX: Use mini_batch_size for old_logprobs computation
-                    #
-                    # The model gives different logprobs for different batch sizes
-                    # (due to numerical precision in batched attention with left-padding).
-                    # Since PPO loop computes new_logprobs with mini_batch_size,
-                    # we MUST compute old_logprobs with the same batch size.
-                    #
-                    # This is slower but ensures ratio ≈ 1.0 at the start of training.
-                    # ========================================
-                    fwd_batch_size = self.mini_batch_size  # Use mini_batch_size, NOT forward_batch_size
-
                     # Compute old log probs and values in batches (model in eval mode)
                     old_logprobs, _, old_values = self.batched_forward_pass(
                         query_ids, response_ids, query_mask, response_mask,
-                        batch_size=fwd_batch_size,
+                        batch_size=self.mini_batch_size,
                     )
 
                     # Compute reference log probs for KL penalty in batches
                     # For PEFT: uses disable_adapter() on same model
                     # For non-PEFT: uses separate frozen reference model
-                    # Reference: ppo_trainer.py lines 780-798
                     ref_logprobs = self.batched_ref_forward_pass(
                         query_ids, response_ids, query_mask, response_mask,
-                        batch_size=fwd_batch_size,
+                        batch_size=self.mini_batch_size,
                     )
 
                     # Create per-token reward tensor (sparse - only at last token)
@@ -1288,10 +1268,14 @@ class StreamingPPOTrainer:
                     advantages = ((advantages - adv_mean) / (adv_var.sqrt() + 1e-8)) * response_mask.float()
                     advantages = advantages.detach()  # Reference line 3355
 
-                # Capture validation gradients per-step for Streaming
-                if self.method == "Streaming" and val_query_ids is not None:
-                    self.capture_validation_gradients(
-                        val_query_ids, val_query_mask
+                # ========================================
+                # SELF-REFERENCING VALIDATION (Snapshot/IIF style)
+                # Capture validation gradients from training buffer itself
+                # This is done per-step since the buffer changes each step
+                # ========================================
+                if self.method != "NA":
+                    self.capture_validation_gradients_from_buffer(
+                        query_ids, response_ids, query_mask, response_mask, advantages
                     )
 
                 # PPO epochs with mini-batching (matching reference implementation)
@@ -1300,13 +1284,10 @@ class StreamingPPOTrainer:
                 all_mini_batch_stats = []
 
                 # Set model back to train mode for PPO epochs (backward passes)
-                # Reference: model was in eval() for old_logprobs, now train() for updates
                 self.model.train()
 
-                # Removed duplicate diagnostic - the batch size check above is sufficient
-
                 for ppo_epoch in range(self.ppo_epochs):
-                    # Shuffle indices at the start of each epoch (like reference)
+                    # Shuffle indices at the start of each epoch
                     perm = torch.randperm(batch_size, device=query_ids.device)
 
                     # Iterate over mini-batches
@@ -1416,7 +1397,7 @@ class StreamingPPOTrainer:
                 # PERIODIC FULL TOXICITY EVALUATION
                 # Run comprehensive evaluation at specified intervals
                 # ========================================
-                eval_interval = getattr(self.args, 'eval_interval', 0)
+                eval_interval = getattr(self.args, 'eval_interval', 1)
                 if (self.evaluator is not None and
                     eval_interval > 0 and
                     global_step % eval_interval == 0):

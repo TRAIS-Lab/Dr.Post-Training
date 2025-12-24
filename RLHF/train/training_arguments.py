@@ -66,22 +66,16 @@ class TrainingArguments(TA):
         default=0.5,
         metadata={"help": "Fraction of samples to select (0-1)"},
     )
-    n_val: int = field(
-        default=128,
-        metadata={"help": "Number of validation samples for data selection"},
-    )
-    val_batch_size: Optional[int] = field(
-        default=None,
+    min_batch_size_for_selection: int = field(
+        default=2,
         metadata={
             "help": (
-                "Batch size for validation data during selection. "
-                "If None, uses all n_val samples."
+                "Minimum mini-batch size for selection to be applied. "
+                "When the mini-batch size is too small (e.g., 1), selection "
+                "becomes unstable. If mini_batch_size < this value, selection "
+                "is skipped for that batch and all samples are used. Default: 2."
             )
         },
-    )
-    val_strategy: str = field(
-        default="random",
-        metadata={"help": "Validation strategy: 'random' or 'top' (most toxic)"},
     )
     use_second_order: bool = field(
         default=False,
@@ -132,20 +126,9 @@ class TrainingArguments(TA):
         default=1,
         metadata={
             "help": (
-                "Mini-batch size for PPO backward passes (optimizer.step()). "
+                "Mini-batch size for PPO updates (both forward and backward passes). "
                 "Reference uses 1, meaning one optimizer.step() per sample. "
                 "This prevents ratio explosion by making small updates."
-            )
-        },
-    )
-    forward_batch_size: int = field(
-        default=256,
-        metadata={
-            "help": (
-                "Batch size for forward passes during PPO updates (computing new logprobs). "
-                "Reference uses tracin_batch_size=256 for efficient GPU utilization. "
-                "0 means use full batch size. This is separate from mini_batch_size "
-                "which controls backward passes."
             )
         },
     )
@@ -254,21 +237,6 @@ class TrainingArguments(TA):
     )
 
     # ===================
-    # Validation Loss Type
-    # ===================
-    val_loss_type: str = field(
-        default="reward_weighted",
-        metadata={
-            "help": (
-                "Validation loss type for gradient capture: "
-                "'logprob' (NLL on validation), "
-                "'reward_weighted' (NLL weighted by reward - sequence-level attribution), "
-                "'advantage_weighted' (NLL weighted by advantage)"
-            )
-        },
-    )
-
-    # ===================
     # Toxicity Evaluation (during training)
     # ===================
     enable_toxicity_eval: bool = field(
@@ -282,7 +250,7 @@ class TrainingArguments(TA):
         },
     )
     eval_interval: int = field(
-        default=0,
+        default=1,
         metadata={
             "help": (
                 "Steps between toxicity evaluations. "

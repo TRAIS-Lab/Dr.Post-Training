@@ -25,21 +25,38 @@ logger = logging.getLogger(__name__)
 
 class StreamingTrainer(Trainer):
     """
-    Streaming trainer with unified data selection and model update.
-    - Single merged forward/backward pass (train + val batches)
-    - Selection scores computed incrementally during backward (gradient streaming)
-    - Gradients aggregated on-the-fly for memory efficiency
+    Trainer supporting gradient-based data selection with optional compression.
+
+    Supports 6 training modes:
+
+    Data Selection Modes (method in ['Streaming', 'GREATS']):
+        - Streaming: Single-pass, per-layer selection during backward.
+          Validation gradients guide sample selection at each layer independently.
+        - GREATS: Two-pass, global selection across all layers.
+          First pass computes selection scores, second pass computes gradients
+          on the globally selected samples.
+
+    Compression Options (MeSO optimizer):
+        - With compression: Uses MeSOAdamW for compressed gradient storage.
+        - Without compression: Uses standard AdamW with full gradients.
+
+    Baseline Modes (method == 'NA'):
+        - MeSO only: Compressed gradients without data selection.
+        - Baseline: Standard training with full gradients.
     """
 
     def __init__(self, grad_hook: GradientHook, val_dataset, *args, **kwargs):
         """
-        Initialize the streaming trainer.
+        Initialize the trainer.
 
         Args:
-            grad_hook: hook.GradientHook instance
-            val_dataset: Validation dataset (for data selection, small)
-            *args, **kwargs: Same as transformers.Trainer
-                - Must include eval_dataset: Evaluation dataset (for generalization testing, large)
+            grad_hook: GradientHook instance for gradient capture and compression.
+            val_dataset: Small validation set used for data selection during training.
+                Batches from this set are merged with training batches to compute
+                selection scores that guide which training samples to use.
+            *args, **kwargs: Same as transformers.Trainer.
+                Must include eval_dataset: Large held-out set for generalization testing.
+                This is separate from val_dataset and used only during evaluation.
         """
         # Extract eval_dataset from kwargs before passing to parent
         eval_dataset = kwargs.get('eval_dataset', None)
@@ -496,8 +513,7 @@ class StreamingTrainer(Trainer):
         model = self.model
         model.eval()
 
-        # Debug: Check dataset size
-        logger.info(f"{description}: Dataset size = {len(dataset)}, Batch size = {self.args.per_device_train_batch_size}")
+        logger.debug(f"{description}: Dataset size = {len(dataset)}, Batch size = {self.args.per_device_train_batch_size}")
 
         # Create dataloader
         dataloader = DataLoader(
@@ -551,13 +567,13 @@ class StreamingTrainer(Trainer):
                 total_samples += batch_size
                 num_batches += 1
 
-        logger.info(f"{description}: Processed {num_batches} batches, {total_samples} samples")
+        logger.debug(f"{description}: Processed {num_batches} batches, {total_samples} samples")
 
         # Compute average loss and perplexity
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
         perplexity = math.exp(avg_loss) if avg_loss != float("inf") else float("inf")
 
-        logger.info(f"{description}: avg_loss={avg_loss:.4f}, perplexity={perplexity:.4f}")
+        logger.debug(f"{description}: avg_loss={avg_loss:.4f}, perplexity={perplexity:.4f}")
 
         model.train()
 

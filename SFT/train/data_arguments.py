@@ -8,11 +8,10 @@ logger = logging.getLogger(__name__)
 
 
 def none_or_str(value):
-    print(value)
+    """Convert string 'None' to Python None, otherwise return the value as-is."""
     if value == "None":
         return None
-    else:
-        return value
+    return value
 
 
 @dataclass

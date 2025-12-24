@@ -217,7 +217,7 @@ Training-time toxicity evaluation uses a **different classifier** than the rewar
 
 - `--enable_toxicity_eval` - Enable toxicity evaluation during training (default: `true`)
 - `--disable_toxicity_eval` - Disable toxicity evaluation
-- `--eval_interval <n>` - Evaluate every N steps; 0 = epoch end only (default: `0`)
+- `--eval_interval <n>` - Evaluate every N steps; 0 = epoch end only (default: `1`)
 - `--eval_n_samples <n>` - Number of samples for full evaluation (default: `500`)
 - `--eval_batch_size <n>` - Batch size for generation during evaluation (default: `256`)
 - `--eval_on_step_generations` - Evaluate toxicity on each PPO step's generations (default: `true`)

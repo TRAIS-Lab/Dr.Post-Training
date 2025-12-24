@@ -35,7 +35,6 @@ from trl import AutoModelForCausalLMWithValueHead
 warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
 
 from RLHF.data.get_prompts import get_prompt_dataset, collator
-from RLHF.data.get_validation import get_validation_dataset
 from RLHF.train.model_arguments import ModelArguments, add_padding_to_tokenizer
 from RLHF.train.training_arguments import TrainingArguments
 from RLHF.train.trainer import StreamingPPOTrainer
@@ -240,17 +239,8 @@ def main():
         seed=training_args.seed,
     )
     logger.info(f"  Train dataset: {len(train_dataset)} samples")
-
-    val_dataset = None
-    if training_args.has_selection:
-        val_dataset = get_validation_dataset(
-            task=training_args.task,
-            tokenizer=tokenizer,
-            n_val=training_args.n_val,
-            seed=training_args.seed,
-            strategy=training_args.val_strategy,
-        )
-        logger.info(f"  Validation dataset: {len(val_dataset)} samples")
+    # Note: Self-referencing validation is used (Snapshot/IIF style)
+    # No separate validation dataset needed - training buffer is used as validation set
 
     # Load policy model with value head for PPO
     logger.info("Loading policy model with value head...")
@@ -454,16 +444,6 @@ def main():
         collate_fn=collator,
     )
 
-    val_dataloader = None
-    if val_dataset is not None:
-        val_batch_size = training_args.val_batch_size or training_args.n_val
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=val_batch_size,
-            shuffle=False,
-            collate_fn=collator,
-        )
-
     # Calculate training steps for lr_scheduler
     if training_args.max_steps > 0:
         num_training_steps = training_args.max_steps
@@ -542,7 +522,6 @@ def main():
     logger.info("Starting training...")
     history = trainer.train(
         train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,
         num_epochs=int(num_epochs),
         max_steps=max_steps,
         log_interval=log_interval,
