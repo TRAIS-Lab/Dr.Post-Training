@@ -52,6 +52,7 @@ def compute_train_loss_from_merged(logits, labels, train_batch_size):
 
 from gradstream.optimizer import MeSOAdamW
 from gradstream.hook import GradientHook
+from gradstream.selection import create_selection_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,16 @@ class StreamingTrainer(Trainer):
         self.has_compression = (
             self.grad_hook is not None and
             any(c is not None for c in self.grad_hook.compressors)
+        )
+
+        # Create selection strategy for clean separation of selection methods
+        self.selection_strategy = create_selection_strategy(
+            method=self.args.method,
+            grad_hook=self.grad_hook,
+            frac=getattr(self.args, 'selection_frac', 0.5),
+            use_second_order=getattr(self.args, 'use_second_order', False),
+            selection_mode="topk",  # SFT uses top-k selection
+            use_stored_val=False    # SFT uses merged batch, not stored val
         )
 
         logger.info("="*60)
@@ -318,17 +329,14 @@ class StreamingTrainer(Trainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """
-        Training step supporting 4 data selection modes + 2 baseline modes.
+        Training step using selection strategy pattern.
 
-        Data Selection Modes (method in ['Streaming', 'GREATS']):
-        - Streaming + compression: Single-pass, per-layer selection, compressed gradients (MeSO)
-        - GREATS + compression: Two-pass, global selection, compressed gradients (MeSO)
-        - Streaming + no compression: Single-pass, per-layer selection, full gradients
-        - GREATS + no compression: Two-pass, global selection, full gradients
+        The selection strategy handles the difference between:
+        - Streaming: Single-pass, per-layer selection
+        - GREATS: Two-pass, global selection
+        - NA: Baseline (no selection)
 
-        Baseline Modes (method == 'NA'):
-        - MeSO only: Compressed gradients without selection
-        - Baseline: Standard training with full gradients
+        With or without compression (MeSO).
         """
         model.train()
         args = self.args
@@ -339,7 +347,7 @@ class StreamingTrainer(Trainer):
             if isinstance(unwrapped_optimizer, MeSOAdamW):
                 unwrapped_optimizer.refresh_compressors_if_needed()
 
-        # === DATA SELECTION MODE ===
+        # === DATA SELECTION MODE (Streaming or GREATS) ===
         if args.method in ('Streaming', 'GREATS'):
             # Get validation batch for selection
             try:
@@ -363,169 +371,80 @@ class StreamingTrainer(Trainer):
             if lr is None or lr == 0:
                 lr = args.learning_rate
 
-            # Derive selection mode from method
-            # - Streaming: per-layer selection (single-pass)
-            # - GREATS: global selection (two-pass)
-            is_global_selection = (args.method == 'GREATS')
-
-            if is_global_selection:
-                # === GREATS MODE (global selection) ===
-                # Two-pass approach: score accumulation -> global selection -> gradient computation
-
-                # Pass 1: Compute selection scores
-                self.grad_hook.setup_selection(
-                    train_batch_size=train_batch_size,
-                    selection_method=args.method,
-                    frac=args.selection_frac,
-                    lr=lr,
-                    compute_scores_only=True,
-                    use_second_order=getattr(args, 'use_second_order', False)
-                )
-
-                # Set token counts for proper gradient scaling in score computation
-                self.grad_hook.set_token_counts(merged_batch['labels'], train_batch_size)
-
-                # NOTE: Do NOT mask val labels - val gradients are needed for selection scoring
-                # The selection mechanism computes scores = train_grad @ val_grad
-                # Masking val labels would zero out val gradients, breaking selection
-
-                model.zero_grad()
-                with self.compute_loss_context_manager():
-                    outputs = model(**merged_batch)
-                    loss_for_scoring = outputs.loss
-
-                if args.n_gpu > 1:
-                    loss_for_scoring = loss_for_scoring.mean()
-                if args.gradient_accumulation_steps > 1:
-                    loss_for_scoring = loss_for_scoring / args.gradient_accumulation_steps
-
-                loss_for_scoring.backward()
-
-                # Get globally selected indices
-                selected_indices = self.grad_hook.selection_state.get_selected_indices()
-                self.grad_hook.clear_selection()
-                self.grad_hook.clear_token_counts()
-
-                # Pass 2: Compute gradients on selected samples
-                filtered_inputs = {
-                    'input_ids': batch_train['input_ids'][selected_indices],
-                    'attention_mask': batch_train['attention_mask'][selected_indices],
-                    'labels': batch_train['labels'][selected_indices]
-                }
-
-                # Set token counts for the filtered inputs (for MeSO gradient scaling)
-                if self.has_compression:
-                    self.grad_hook.set_token_counts(filtered_inputs['labels'])
-
-                model.zero_grad()
-
-                if not self.has_compression:
-                    # GREATS without compression: disable hooks for full gradients
-                    self.grad_hook.disable_hooks()
-
-                with self.compute_loss_context_manager():
-                    outputs = model(**filtered_inputs)
-                    loss = outputs.loss
-
-                if args.n_gpu > 1:
-                    loss = loss.mean()
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
-
-                loss.backward()
-
-                # Debug gradient scaling
-                if getattr(args, 'debug_gradient_scaling', False):
-                    _log_gradient_stats(model, self.grad_hook, self.state.global_step,
-                                       f"GREATS(frac={args.selection_frac})", self.has_compression)
-
-                if not self.has_compression:
-                    self.grad_hook.enable_hooks()
-
-                # Clear token counts after gradient computation
-                if self.has_compression:
-                    self.grad_hook.clear_token_counts()
-
-                return loss.detach()
-
-            else:
-                # === STREAMING MODE (per-layer selection) ===
-                # Single-pass approach: unified selection and gradient computation
-
-                self.grad_hook.setup_selection(
-                    train_batch_size=train_batch_size,
-                    selection_method=args.method,
-                    frac=args.selection_frac,
-                    lr=lr,
-                    compute_scores_only=False,  # Per-layer selection and aggregation
-                    use_second_order=getattr(args, 'use_second_order', False)
-                )
-
-                # Set token counts for proper gradient scaling
-                # Loss is averaged over tokens, not samples, so we track token counts
-                self.grad_hook.set_token_counts(merged_batch['labels'], train_batch_size)
-
-                model.zero_grad()
-                with self.compute_loss_context_manager():
-                    outputs = model(**merged_batch)
-                    loss_merged = outputs.loss
-
-                if args.n_gpu > 1:
-                    loss_merged = loss_merged.mean()
-                if args.gradient_accumulation_steps > 1:
-                    loss_merged = loss_merged / args.gradient_accumulation_steps
-
-                # Backward pass: hook performs per-layer selection and gradient computation
-                # - With compression: stores compressed gradients for MeSO
-                # - Without compression: returns full gradients for standard optimizer
-                loss_merged.backward()
-
-                # Compute train-only loss for reporting (no extra forward pass needed)
-                # This gives the loss on selected train samples, not the merged batch
-                train_loss = compute_train_loss_from_merged(
-                    outputs.logits, merged_batch['labels'], train_batch_size
-                )
-
-                # Debug gradient scaling
-                if getattr(args, 'debug_gradient_scaling', False):
-                    _log_gradient_stats(model, self.grad_hook, self.state.global_step,
-                                       f"Streaming(frac={args.selection_frac})", self.has_compression)
-
-                self.grad_hook.clear_selection()
-                self.grad_hook.clear_token_counts()
-                return train_loss.detach()
-
-        # === BASELINE MODE (no data selection) ===
-        else:
-            model.zero_grad()
-
-            # Disable hooks if no compression (baseline training)
-            if not self.has_compression and self.grad_hook.hooks_registered:
-                self.grad_hook.disable_hooks()
-
-            inputs = self._prepare_inputs(inputs)
-
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
-
-            if args.n_gpu > 1:
-                loss = loss.mean()
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
-
-            loss.backward()
+            # Execute selection strategy
+            loss, stats = self.selection_strategy.execute_training_step(
+                model=model,
+                merged_batch=merged_batch,
+                train_batch_size=train_batch_size,
+                compute_loss_fn=self._compute_loss_for_selection,
+                lr=lr,
+                batch_train=batch_train  # For GREATS pass 2
+            )
 
             # Debug gradient scaling
             if getattr(args, 'debug_gradient_scaling', False):
-                mode = "MeSO" if self.has_compression else "Baseline"
+                frac = stats.get('selection/frac', args.selection_frac)
                 _log_gradient_stats(model, self.grad_hook, self.state.global_step,
-                                   mode, self.has_compression)
+                                   f"{args.method}(frac={frac:.2f})", self.has_compression)
 
-            # Re-enable hooks if they were disabled
-            if not self.has_compression and self.grad_hook.hooks_registered:
-                self.grad_hook.enable_hooks()
+            # For Streaming, compute train-only loss for reporting
+            if args.method == 'Streaming':
+                # Recompute outputs for loss reporting (already done in forward)
+                # Actually, we can return the loss from strategy which is already detached
+                pass
 
-            return loss.detach()
+            return loss
+
+        # === BASELINE MODE (no data selection) ===
+        else:
+            return self._training_step_baseline(model, inputs)
+
+    def _compute_loss_for_selection(self, model, batch):
+        """Compute loss for selection (handles multi-GPU and grad accumulation)."""
+        with self.compute_loss_context_manager():
+            outputs = model(**batch)
+            loss = outputs.loss
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+        if self.args.gradient_accumulation_steps > 1:
+            loss = loss / self.args.gradient_accumulation_steps
+
+        return loss
+
+    def _training_step_baseline(self, model, inputs):
+        """Baseline training step without selection."""
+        args = self.args
+
+        model.zero_grad()
+
+        # Disable hooks if no compression (baseline training)
+        if not self.has_compression and self.grad_hook is not None and self.grad_hook.hooks_registered:
+            self.grad_hook.disable_hooks()
+
+        inputs = self._prepare_inputs(inputs)
+
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+
+        if args.n_gpu > 1:
+            loss = loss.mean()
+        if args.gradient_accumulation_steps > 1:
+            loss = loss / args.gradient_accumulation_steps
+
+        loss.backward()
+
+        # Debug gradient scaling
+        if getattr(args, 'debug_gradient_scaling', False):
+            mode = "MeSO" if self.has_compression else "Baseline"
+            _log_gradient_stats(model, self.grad_hook, self.state.global_step,
+                               mode, self.has_compression)
+
+        # Re-enable hooks if they were disabled
+        if not self.has_compression and self.grad_hook is not None and self.grad_hook.hooks_registered:
+            self.grad_hook.enable_hooks()
+
+        return loss.detach()
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         """

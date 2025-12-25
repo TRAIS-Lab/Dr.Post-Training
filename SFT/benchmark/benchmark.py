@@ -389,7 +389,7 @@ def make_step_streaming(selection_helper: SelectionStepHelper, selection_frac: f
         grad_hook.setup_selection(
             train_batch_size=train_batch_size,
             selection_method='Streaming',
-            selection_frac=selection_frac,
+            frac=selection_frac,
             lr=lr,
             compute_scores_only=False,  # Per-layer selection and aggregation
             use_second_order=use_second_order
@@ -448,7 +448,7 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
         grad_hook.setup_selection(
             train_batch_size=train_batch_size,
             selection_method='GREATS',
-            selection_frac=selection_frac,
+            frac=selection_frac,
             lr=lr,
             compute_scores_only=True,
             use_second_order=use_second_order

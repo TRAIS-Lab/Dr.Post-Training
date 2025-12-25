@@ -5,6 +5,10 @@ This implementation uses monkey-patching with custom autograd Functions to:
 1. Prevent full gradient materialization
 2. Compute selection scores layer-by-layer during backward (streaming)
 3. Reduce gradients on-the-fly to avoid OOM
+
+The hook now supports two distinct selection methods via the selection module:
+- Streaming: Per-layer selection, single-pass (StreamingLinearBackward)
+- GREATS: Global selection, two-pass (GREATSLinearBackward)
 """
 
 from __future__ import annotations
@@ -25,11 +29,22 @@ import logging
 from .compressor import Compressor
 from .utils import greedy_selection, topk_selection, negative_filtering
 
+# Import new selection module
+from .selection.state import StreamingState as NewStreamingState, GREATSState
+from .selection.backward import (
+    StreamingLinearBackward as NewStreamingLinearBackward,
+    GREATSLinearBackward as NewGREATSLinearBackward,
+    set_hook_registry,
+)
+
 logger = logging.getLogger(__name__)
 
 # Global registry: maps a unique ID to hook manager
 # CRITICAL: Used to avoid storing hook_manager in autograd context, which would cause memory leaks
 _HOOK_MANAGER_REGISTRY: Dict[int, GradientHook] = {}
+
+# Share registry with new backward module
+set_hook_registry(_HOOK_MANAGER_REGISTRY)
 
 
 class StreamingState:
@@ -703,16 +718,37 @@ class GradientHook:
     def _custom_linear_forward(self, module: nn.Linear, idx: int, input: Tensor) -> Tensor:
         """
         Replacement forward method that uses our custom streaming Function.
+
+        Routes to appropriate autograd function based on selection state type:
+        - GREATSState -> GREATSLinearBackward (score accumulation only)
+        - NewStreamingState -> NewStreamingLinearBackward (per-layer selection)
+        - Old StreamingState -> StreamingLinearBackward (legacy, for backward compatibility)
+        - None -> StreamingLinearBackward (baseline mode)
         """
-        if self.hooks_enabled:
-            return StreamingLinearBackward.apply(
-                input, module.weight, module.bias, self._hook_manager_id, idx
-            )
-        else:
+        if not self.hooks_enabled:
             if hasattr(module, '_original_forward'):
                 return module._original_forward(input)
             else:
                 return F.linear(input, module.weight, module.bias)
+
+        # Route based on selection state type
+        state = self.selection_state
+
+        if isinstance(state, GREATSState):
+            # GREATS: use dedicated score accumulation function
+            return NewGREATSLinearBackward.apply(
+                input, module.weight, module.bias, self._hook_manager_id, idx
+            )
+        elif isinstance(state, NewStreamingState):
+            # New Streaming: use new per-layer selection function
+            return NewStreamingLinearBackward.apply(
+                input, module.weight, module.bias, self._hook_manager_id, idx
+            )
+        else:
+            # Legacy StreamingState or None (baseline): use original function
+            return StreamingLinearBackward.apply(
+                input, module.weight, module.bias, self._hook_manager_id, idx
+            )
 
     def set_compressors(self, compressors: List[Compressor]) -> None:
         """Set unified compressor objects for each layer."""
@@ -750,7 +786,7 @@ class GradientHook:
                   - "filtering": Fraction of negative-influence samples to DROP
             lr: Learning rate for score scaling
             compute_scores_only: If True, only compute scores without aggregating gradients.
-                                Used for Streaming without MeSO (Case 2).
+                                Used for GREATS two-pass.
             use_second_order: If True, compute similarity matrix and use greedy selection
                             with second-order interactions. If False (default), use simple
                             top-k selection which is ~200x faster.
@@ -760,20 +796,50 @@ class GradientHook:
         """
         # Infer dtype from model parameters (use first parameter's dtype)
         dtype = next(self.model.parameters()).dtype
-
         num_layers = len(self.layer_names)
-        self.selection_state = StreamingState(
-            train_batch_size=train_batch_size,
-            num_layers=num_layers,
-            selection_method=selection_method,
-            frac=frac,
-            lr=lr,
-            device=self.device,
-            compute_scores_only=compute_scores_only,
-            dtype=dtype,
-            use_second_order=use_second_order,
-            selection_mode=selection_mode
-        )
+
+        # Use new state classes based on method
+        # GREATS with compute_scores_only=True -> GREATSState for score accumulation
+        # Streaming (compute_scores_only=False) -> NewStreamingState for per-layer selection
+        if selection_method == "GREATS" and compute_scores_only:
+            # GREATS pass 1: accumulate scores across layers
+            self.selection_state = GREATSState(
+                train_batch_size=train_batch_size,
+                num_layers=num_layers,
+                frac=frac,
+                lr=lr,
+                device=self.device,
+                dtype=dtype,
+                use_second_order=use_second_order,
+                selection_mode=selection_mode
+            )
+        elif selection_method == "Streaming" and not compute_scores_only:
+            # Streaming: per-layer selection
+            self.selection_state = NewStreamingState(
+                train_batch_size=train_batch_size,
+                num_layers=num_layers,
+                frac=frac,
+                lr=lr,
+                device=self.device,
+                dtype=dtype,
+                use_second_order=use_second_order,
+                selection_mode=selection_mode
+            )
+        else:
+            # Fall back to legacy state for other cases
+            self.selection_state = StreamingState(
+                train_batch_size=train_batch_size,
+                num_layers=num_layers,
+                selection_method=selection_method,
+                frac=frac,
+                lr=lr,
+                device=self.device,
+                compute_scores_only=compute_scores_only,
+                dtype=dtype,
+                use_second_order=use_second_order,
+                selection_mode=selection_mode
+            )
+
         logger.debug(f"Set up streaming state: {train_batch_size} train, scores_only={compute_scores_only}, use_second_order={use_second_order}, selection_mode={selection_mode}, frac={frac}, dtype={dtype}")
 
     def clear_selection(self) -> None:
@@ -889,20 +955,50 @@ class GradientHook:
 
         # Infer dtype from model parameters
         dtype = next(self.model.parameters()).dtype
-
         num_layers = len(self.layer_names)
-        self.selection_state = StreamingState(
-            train_batch_size=train_batch_size,
-            num_layers=num_layers,
-            selection_method=selection_method,
-            frac=frac,
-            lr=lr,
-            device=self.device,
-            compute_scores_only=compute_scores_only,
-            dtype=dtype,
-            use_second_order=use_second_order,
-            selection_mode=selection_mode
-        )
+
+        # Use new state classes based on method
+        # GREATS with compute_scores_only=True -> GREATSState for score accumulation
+        # Streaming (compute_scores_only=False) -> NewStreamingState for per-layer selection
+        if selection_method == "GREATS" and compute_scores_only:
+            # GREATS pass 1: accumulate scores across layers
+            self.selection_state = GREATSState(
+                train_batch_size=train_batch_size,
+                num_layers=num_layers,
+                frac=frac,
+                lr=lr,
+                device=self.device,
+                dtype=dtype,
+                use_second_order=use_second_order,
+                selection_mode=selection_mode
+            )
+        elif selection_method == "Streaming" and not compute_scores_only:
+            # Streaming: per-layer selection
+            self.selection_state = NewStreamingState(
+                train_batch_size=train_batch_size,
+                num_layers=num_layers,
+                frac=frac,
+                lr=lr,
+                device=self.device,
+                dtype=dtype,
+                use_second_order=use_second_order,
+                selection_mode=selection_mode
+            )
+        else:
+            # Fall back to legacy state for other cases (e.g., GREATS pass 2)
+            self.selection_state = StreamingState(
+                train_batch_size=train_batch_size,
+                num_layers=num_layers,
+                selection_method=selection_method,
+                frac=frac,
+                lr=lr,
+                device=self.device,
+                compute_scores_only=compute_scores_only,
+                dtype=dtype,
+                use_second_order=use_second_order,
+                selection_mode=selection_mode
+            )
+
         # Mark that we're using stored validation gradients (train_batch_size = actual batch size)
         self.selection_state._use_stored_val = True
         logger.debug(
