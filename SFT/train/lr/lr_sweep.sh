@@ -64,7 +64,7 @@ optim="adamw_torch"
 data_dir="SFT/data"
 sweep_percentage=0.05  # Use 5% of data for LR sweep
 n_val=8
-n_eval=50  # Fewer eval examples for speed
+n_eval=100  # Fewer eval examples for speed
 model="llama3-1b"
 batch_size=8
 val_batch_size="1"
@@ -86,11 +86,11 @@ lr_grid_lora="5e-5,1e-4,2e-4,5e-4,1e-3"
 sweep_mode="grid"  # "grid" or "binary"
 
 # Binary search defaults
-binary_lr_min="1e-6"
+binary_lr_min="1e-7"
 binary_lr_max="1e-3"
-binary_lr_min_lora="1e-5"
+binary_lr_min_lora="1e-6"
 binary_lr_max_lora="1e-2"
-binary_max_iters=6  # ~6 iterations narrows range by ~10x
+binary_max_iters=7  # ~6 iterations narrows range by ~10x
 
 # Stability margin: prefer smaller LR unless larger LR is significantly better
 lr_margin=0.05  # 5% - larger LR must have loss at least 5% lower to be preferred

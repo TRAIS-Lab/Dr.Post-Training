@@ -67,6 +67,7 @@ train_dataset=""  # Training dataset (if empty, uses task-based default)
 subject="sociology"
 compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer.
 use_second_order=false  # If true, use greedy selection with second-order interactions
+selection_frac="0.5"  # Fraction of samples to select (for Streaming/GREATS)
 use_lora=false
 use_flash_attention=true
 
@@ -181,6 +182,10 @@ while [[ $# -gt 0 ]]; do
         --use_second_order)
             use_second_order=true
             shift 1
+            ;;
+        --selection_frac)
+            selection_frac="$2"
+            shift 2
             ;;
         --update_compressor_freq)
             update_compressor_freq="$2"
@@ -843,7 +848,8 @@ training_args="$base_training_args \
 --learning_rate $lr \
 --gradient_accumulation_steps $gradient_accumulation_steps \
 --seed $seed \
---optim $optim"
+--optim $optim \
+--selection_frac $selection_frac"
 
 # Add train_dataset_names if specified
 if [[ -n "$train_dataset" ]]; then

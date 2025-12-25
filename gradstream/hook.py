@@ -91,8 +91,14 @@ class StreamingState:
         # Number of samples to select (for top-k mode)
         self.num_selected = max(1, int(train_batch_size * frac))
 
+        # Token count tracking for proper gradient scaling
+        # These are set by GradientHook.set_token_counts() before backward
+        self.tokens_per_sample: Optional[Tensor] = None  # [train_batch_size]
+        self.total_train_tokens: Optional[int] = None
+        self.total_tokens: Optional[int] = None  # Total in batch (train + val for SFT)
+
         # Running scores only needed for compute_scores_only mode (Streaming without MeSO)
-        # For per-layer selection with MeSO, we compute scores directly in select_and_reduce
+        # For per-layer selection with MeSO, we compute scores directly in backward()
         self.grad_dot_scores = None
         self.similarity_matrix = None
         if compute_scores_only:
@@ -116,7 +122,7 @@ class StreamingState:
             val_grad: Mean compressed validation gradient [k_l]
         """
         if self.grad_dot_scores is None:
-            return  # Per-layer mode: scores computed in select_and_reduce
+            return  # Per-layer mode: scores computed directly in backward()
 
         # Cast to score dtype if needed
         if train_grads.dtype != self.dtype:
@@ -155,61 +161,60 @@ class StreamingState:
                 similarity = similarity.to(self.dtype)
             self.similarity_matrix += similarity
 
-    def get_selected_indices(self) -> Tensor:
+    def get_selected_indices(
+        self,
+        scores: Tensor | None = None,
+        similarity: Tensor | None = None
+    ) -> Tensor:
         """
-        Get selected sample indices based on accumulated scores.
+        Select sample indices based on scores.
 
-        Only used when compute_scores_only=True (global selection modes).
+        Unified method for both GREATS (global selection) and Streaming (per-layer selection).
+
+        Args:
+            scores: Per-sample scores [train_batch_size].
+                   If None, uses accumulated self.grad_dot_scores (GREATS mode).
+            similarity: Per-sample similarity matrix [train_batch_size, train_batch_size]
+                       for second-order selection. If None and using accumulated scores,
+                       uses self.similarity_matrix.
 
         Returns:
-            Tensor of selected training sample indices
+            Selected sample indices tensor
         """
-        if self.grad_dot_scores is None:
-            raise RuntimeError("get_selected_indices called but running scores not enabled")
-
-        if self.selection_method in ('Streaming', 'GREATS'):
+        # Determine whether using accumulated (GREATS) or explicit (Streaming) scores
+        if scores is None:
+            # GREATS mode: use accumulated scores with lr scaling
+            if self.grad_dot_scores is None:
+                raise RuntimeError("No accumulated scores and no explicit scores provided")
             scores = self.grad_dot_scores * self.lr
+            # Use accumulated similarity matrix with lr^2 scaling
+            if similarity is None and self.similarity_matrix is not None:
+                similarity = self.similarity_matrix * (self.lr ** 2)
+        else:
+            # Streaming mode: use explicit scores with lr scaling for consistency with GREATS
+            # Both modes should treat scores similarly: score represents lr * g_train @ g_val
+            # and similarity represents lr^2 * g_train @ g_train
+            scores = scores * self.lr
+            if similarity is not None:
+                similarity = similarity * (self.lr ** 2)
 
+        # Common selection logic
+        if self.selection_method in ('Streaming', 'GREATS'):
             if self.selection_mode == "filtering":
                 # RLHF filtering mode: keep positive samples, drop bottom frac of negative
                 selected_indices = negative_filtering(scores, self.frac)
-            elif self.use_second_order and self.similarity_matrix is not None:
-                similarity = self.similarity_matrix * (self.lr ** 2)
+            elif self.use_second_order and similarity is not None:
+                # Second-order selection using greedy algorithm
                 selected_indices = greedy_selection(scores, similarity, self.num_selected)
             else:
+                # First-order selection using top-k
                 selected_indices = topk_selection(scores, self.num_selected)
+            self.num_selected = len(selected_indices)
         else:
             # Regular mode: no selection
-            selected_indices = torch.arange(self.train_batch_size, device=self.device)
+            selected_indices = torch.arange(self.train_batch_size, device=scores.device)
 
         return selected_indices
-
-    def select_and_reduce(self, train_grads: Tensor, val_grad: Tensor) -> Tensor:
-        """
-        Per-layer streaming: select samples based on this layer's scores and reduce.
-
-        Each layer independently selects based on gradient alignment with validation.
-        This is the core of gradient streaming - unified selection and aggregation.
-
-        Args:
-            train_grads: Per-sample compressed gradients [train_batch_size, k_l]
-            val_grad: Mean compressed validation gradient [k_l]
-
-        Returns:
-            Reduced gradient [1, k_l] for selected samples
-        """
-        if self.selection_method == 'Streaming':
-            # Per-layer scores: dot product of each sample's gradient with val_grad
-            # [train_batch_size, k_l] @ [k_l] -> [train_batch_size]
-            scores = train_grads @ val_grad
-            selected_indices = topk_selection(scores, self.num_selected)
-        else:
-            # Regular mode: no selection
-            selected_indices = torch.arange(self.train_batch_size, device=self.device)
-
-        selected_grads = train_grads[selected_indices]  # [num_selected, k_l]
-        reduced = selected_grads.mean(dim=0, keepdim=True)  # [1, k_l]
-        return reduced
 
 
 class StreamingLinearBackward(Function):
@@ -290,70 +295,152 @@ class StreamingLinearBackward(Function):
             if compressor is not None:
                 # === COMPRESSED MODE ===
                 # Use compressed gradients for scoring and store for MeSO optimizer
+                #
+                # SCALING PRINCIPLE:
+                # - Baseline mode (no selection_state): Don't scale grad_output. The loss already
+                #   has 1/num_tokens scaling. Just compress and sum to get token-averaged gradient.
+                # - Selection mode (selection_state exists): Scale by total_tokens to recover
+                #   per-sample gradients for scoring, then divide by selected_tokens at the end.
+                batch_size = grad_output.shape[0]
 
-                # Prepare input for compressor (add bias column)
+                # Prepare input for compressor: augment with ones column for bias
+                # This combines weight and bias gradients into a single compressed tensor:
+                #   grad_W = grad_output^T @ input        -> weight gradient
+                #   grad_b = grad_output^T @ ones = sum(grad_output)  -> bias gradient
+                # The MeSO optimizer extracts weight/bias portions on decompression.
                 input_for_compressor = input
                 if bias is not None:
                     if input.dim() == 3:
-                        batch_size, seq_length, in_features = input.shape
+                        _, seq_length, in_features = input.shape
                         ones = torch.ones(batch_size, seq_length, 1, device=input.device, dtype=input.dtype)
                     else:
-                        ones = torch.ones(input.size(0), 1, device=input.device, dtype=input.dtype)
+                        ones = torch.ones(batch_size, 1, device=input.device, dtype=input.dtype)
                     input_for_compressor = torch.cat([input, ones], dim=-1)
 
+                # Don't scale grad_output - preserve 1/num_tokens scaling from loss
+                # This matches baseline mode and avoids scaling mismatch issues
+                grad_output_for_compress = grad_output
+
                 # Compute compressed gradients
-                compressed_grad = compressor.forward((grad_output, input_for_compressor))
+                compressed_grad = compressor.forward((grad_output_for_compress, input_for_compressor))
 
                 if capture_val_mode:
-                    # RLHF val capture: Store mean compressed grad for this layer
-                    hook_manager.val_grad_buffer[layer_idx] = compressed_grad.mean(dim=0)  # [k_l]
+                    # RLHF val capture: Accumulate per-sample average for this layer
+                    # mean() directly gives per-sample average since we already scaled
+                    mean_grad = compressed_grad.mean(dim=0)  # [k_l]
+                    if hook_manager.val_grad_buffer[layer_idx] is None:
+                        hook_manager.val_grad_buffer[layer_idx] = mean_grad
+                    else:
+                        hook_manager.val_grad_buffer[layer_idx] = hook_manager.val_grad_buffer[layer_idx] + mean_grad
 
                 elif selection_state is not None:
                     if use_stored_val:
                         # RLHF selection: Use stored val gradients instead of splitting
-                        train_grads = compressed_grad  # All samples are train samples
-                        val_grad = hook_manager.val_grad_buffer[layer_idx]  # Pre-captured
+                        train_grads = compressed_grad  # All samples are train (per-sample magnitude)
+                        val_grad = hook_manager.val_grad_buffer[layer_idx]  # Pre-captured (per-sample avg)
 
                         if val_grad is not None:
-                            # Update running scores
+                            # Update running scores (per-sample @ per-sample_avg = correct alignment)
                             selection_state._update_scores(train_grads, val_grad)
 
                             if not selection_state.compute_scores_only:
-                                # Per-layer selection and reduce
-                                reduced_grad = selection_state.select_and_reduce(train_grads, val_grad)
-                                hook_manager.compressed_grads[layer_idx] = reduced_grad
+                                # Per-layer selection and reduce (parallel structure to full gradient path)
+                                # Step 1: Compute scores
+                                scores = train_grads @ val_grad
+
+                                # Step 2: Compute similarity for second-order selection if enabled
+                                similarity = None
+                                if selection_state.use_second_order:
+                                    similarity = train_grads @ train_grads.T
+
+                                # Step 3: Get selected indices (shared with full gradient path)
+                                selected_indices = selection_state.get_selected_indices(scores, similarity)
+                                num_selected = selected_indices.shape[0]
+
+                                # Step 4: Sum selected samples (or zeros if none selected)
+                                if num_selected == 0:
+                                    reduced_grad = torch.zeros(1, train_grads.shape[1], device=train_grads.device, dtype=train_grads.dtype)
+                                else:
+                                    selected_grads = train_grads[selected_indices]
+                                    reduced_grad = selected_grads.sum(dim=0, keepdim=True)
+
+                                    # Step 5: Apply token-based scaling (same formula as full gradient path)
+                                    if selection_state.tokens_per_sample is not None and selection_state.total_tokens is not None:
+                                        selected_tokens = selection_state.tokens_per_sample[selected_indices].sum().item()
+                                        if selected_tokens > 0:
+                                            scale_factor = selection_state.total_tokens / selected_tokens
+                                        else:
+                                            scale_factor = 1.0
+                                        reduced_grad = reduced_grad * scale_factor
+
+                                hook_manager._store_compressed_grad(layer_idx, reduced_grad)
                         else:
                             # No val grad for this layer, just average
-                            hook_manager.compressed_grads[layer_idx] = compressed_grad.mean(dim=0, keepdim=True)
+                            # Already per-sample, mean() gives correct per-sample average
+                            hook_manager._store_compressed_grad(layer_idx, compressed_grad.mean(dim=0, keepdim=True))
                     else:
                         # SFT mode: Split merged batch into train/val
-                        train_grads = compressed_grad[:selection_state.train_batch_size]
-                        val_grads = compressed_grad[selection_state.train_batch_size:]
-                        val_grad = val_grads.mean(dim=0)
+                        train_grads = compressed_grad[:selection_state.train_batch_size]  # per-sample
+                        val_grads = compressed_grad[selection_state.train_batch_size:]    # per-sample
+                        val_grad = val_grads.mean(dim=0)  # per-sample average
 
-                        # Update running scores (for global selection)
+                        # Update running scores (per-sample @ per-sample_avg = correct alignment)
                         selection_state._update_scores(train_grads, val_grad)
 
                         if not selection_state.compute_scores_only:
-                            # Per-layer selection and reduce (Streaming mode)
-                            reduced_grad = selection_state.select_and_reduce(train_grads, val_grad)
-                            hook_manager.compressed_grads[layer_idx] = reduced_grad
+                            # Per-layer selection and reduce (parallel structure to full gradient path)
+                            # Step 1: Compute scores
+                            scores = train_grads @ val_grad
+
+                            # Step 2: Compute similarity for second-order selection if enabled
+                            similarity = None
+                            if selection_state.use_second_order:
+                                similarity = train_grads @ train_grads.T
+
+                            # Step 3: Get selected indices (shared with full gradient path)
+                            selected_indices = selection_state.get_selected_indices(scores, similarity)
+                            num_selected = selected_indices.shape[0]
+
+                            # Step 4: Sum selected samples (or zeros if none selected)
+                            if num_selected == 0:
+                                reduced_grad = torch.zeros(1, train_grads.shape[1], device=train_grads.device, dtype=train_grads.dtype)
+                            else:
+                                selected_grads = train_grads[selected_indices]
+                                reduced_grad = selected_grads.sum(dim=0, keepdim=True)
+
+                                # Step 5: Apply token-based scaling (same formula as full gradient path)
+                                if selection_state.tokens_per_sample is not None and selection_state.total_tokens is not None:
+                                    selected_tokens = selection_state.tokens_per_sample[selected_indices].sum().item()
+                                    if selected_tokens > 0:
+                                        scale_factor = selection_state.total_tokens / selected_tokens
+                                    else:
+                                        scale_factor = 1.0
+                                    reduced_grad = reduced_grad * scale_factor
+
+                            hook_manager._store_compressed_grad(layer_idx, reduced_grad)
                 else:
-                    # No selection, just average compressed gradients
-                    compressed_grad = compressed_grad.mean(dim=0, keepdim=True)
-                    hook_manager.compressed_grads[layer_idx] = compressed_grad
+                    # Baseline mode (no selection): sum compressed gradients
+                    # grad_output already has 1/num_tokens scaling from loss, so sum
+                    # preserves the token-averaged gradient semantics
+                    compressed_grad = compressed_grad.sum(dim=0, keepdim=True)
+                    hook_manager._store_compressed_grad(layer_idx, compressed_grad)
 
             else:
                 # === FULL GRADIENT MODE ===
                 # No compression: compute scores directly, return full gradients for standard optimizer
 
                 if capture_val_mode:
-                    # RLHF val capture: Store mean full gradient for this layer
+                    # RLHF val capture: Accumulate mean full gradient for this layer
+                    # Use += to properly accumulate across mini-batches
+                    # The trainer scales loss by 1/full_batch_size, so gradients are pre-scaled
                     if grad_output.dim() == 3:
                         val_grad_full = torch.einsum('bso,bsi->oi', grad_output, input) / grad_output.shape[0]
                     else:
                         val_grad_full = torch.einsum('bo,bi->oi', grad_output, input) / grad_output.shape[0]
-                    hook_manager.val_grad_buffer[layer_idx] = val_grad_full  # [O, I]
+                    if hook_manager.val_grad_buffer[layer_idx] is None:
+                        hook_manager.val_grad_buffer[layer_idx] = val_grad_full
+                    else:
+                        hook_manager.val_grad_buffer[layer_idx] = hook_manager.val_grad_buffer[layer_idx] + val_grad_full
 
                 elif selection_state is not None:
                     if use_stored_val:
@@ -370,7 +457,7 @@ class StreamingLinearBackward(Function):
                                 temp = train_input @ val_grad_full.T
                                 scores = (train_grad_output * temp).sum(dim=(1, 2))
 
-                                if selection_state.use_second_order and selection_state.similarity_matrix is not None:
+                                if selection_state.use_second_order:
                                     contracted = torch.bmm(
                                         train_grad_output.permute(0, 2, 1),
                                         train_input
@@ -380,7 +467,7 @@ class StreamingLinearBackward(Function):
                                 temp = train_input @ val_grad_full.T
                                 scores = (train_grad_output * temp).sum(dim=1)
 
-                                if selection_state.use_second_order and selection_state.similarity_matrix is not None:
+                                if selection_state.use_second_order:
                                     dot_g = torch.matmul(train_grad_output, train_grad_output.T)
                                     dot_x = torch.matmul(train_input, train_input.T)
                                     similarity = dot_g * dot_x
@@ -388,23 +475,39 @@ class StreamingLinearBackward(Function):
                             selection_state._update_scores_direct(scores, similarity)
 
                             if not selection_state.compute_scores_only:
-                                if selection_state.selection_method == 'Streaming':
-                                    selected_indices = topk_selection(scores, selection_state.num_selected)
-                                else:
-                                    selected_indices = torch.arange(train_batch_size, device=input.device)
+                                # Use centralized selection logic
+                                selected_indices = selection_state.get_selected_indices(scores, similarity)
+                                num_selected = selected_indices.shape[0]
 
-                                selected_grad_output = train_grad_output[selected_indices]
-                                selected_input = train_input[selected_indices]
-                                num_selected = selected_grad_output.shape[0]
-
-                                if selected_grad_output.dim() == 3:
-                                    grad_weight = torch.einsum('kso,ksi->oi', selected_grad_output, selected_input) / num_selected
+                                # Handle empty selection: set gradients to zero (no update)
+                                if num_selected == 0:
+                                    grad_weight = torch.zeros_like(weight)
                                     if bias is not None:
-                                        grad_bias = selected_grad_output.sum(dim=(0, 1)) / num_selected
+                                        grad_bias = torch.zeros_like(bias)
                                 else:
-                                    grad_weight = torch.einsum('ko,ki->oi', selected_grad_output, selected_input) / num_selected
-                                    if bias is not None:
-                                        grad_bias = selected_grad_output.sum(dim=0) / num_selected
+                                    selected_grad_output = train_grad_output[selected_indices]
+                                    selected_input = train_input[selected_indices]
+
+                                    # GRADIENT SCALING FIX: Use token-based scaling
+                                    # Same principle as SFT mode - scale by total_tokens/selected_tokens
+                                    if selection_state.tokens_per_sample is not None and selection_state.total_tokens is not None:
+                                        selected_tokens = selection_state.tokens_per_sample[selected_indices].sum().item()
+                                        if selected_tokens > 0:
+                                            scale_factor = selection_state.total_tokens / selected_tokens
+                                        else:
+                                            scale_factor = 1.0
+                                    else:
+                                        # Fall back to sample-based scaling if token counts not available
+                                        scale_factor = train_batch_size / num_selected
+
+                                    if selected_grad_output.dim() == 3:
+                                        grad_weight = torch.einsum('kso,ksi->oi', selected_grad_output, selected_input) * scale_factor
+                                        if bias is not None:
+                                            grad_bias = selected_grad_output.sum(dim=(0, 1)) * scale_factor
+                                    else:
+                                        grad_weight = torch.einsum('ko,ki->oi', selected_grad_output, selected_input) * scale_factor
+                                        if bias is not None:
+                                            grad_bias = selected_grad_output.sum(dim=0) * scale_factor
                     else:
                         # SFT mode: Split merged batch
                         train_batch_size = selection_state.train_batch_size
@@ -426,7 +529,7 @@ class StreamingLinearBackward(Function):
                             temp = train_input @ val_grad_full.T
                             scores = (train_grad_output * temp).sum(dim=(1, 2))
 
-                            if selection_state.use_second_order and selection_state.similarity_matrix is not None:
+                            if selection_state.use_second_order:
                                 contracted = torch.bmm(
                                     train_grad_output.permute(0, 2, 1),
                                     train_input
@@ -436,7 +539,7 @@ class StreamingLinearBackward(Function):
                             temp = train_input @ val_grad_full.T
                             scores = (train_grad_output * temp).sum(dim=1)
 
-                            if selection_state.use_second_order and selection_state.similarity_matrix is not None:
+                            if selection_state.use_second_order:
                                 dot_g = torch.matmul(train_grad_output, train_grad_output.T)
                                 dot_x = torch.matmul(train_input, train_input.T)
                                 similarity = dot_g * dot_x
@@ -444,23 +547,42 @@ class StreamingLinearBackward(Function):
                         selection_state._update_scores_direct(scores, similarity)
 
                         if not selection_state.compute_scores_only:
-                            if selection_state.selection_method == 'Streaming':
-                                selected_indices = topk_selection(scores, selection_state.num_selected)
-                            else:
-                                selected_indices = torch.arange(train_batch_size, device=input.device)
+                            # Use centralized selection logic
+                            selected_indices = selection_state.get_selected_indices(scores, similarity)
+                            num_selected = selected_indices.shape[0]
 
-                            selected_grad_output = train_grad_output[selected_indices]
-                            selected_input = train_input[selected_indices]
-                            num_selected = selected_grad_output.shape[0]
-
-                            if selected_grad_output.dim() == 3:
-                                grad_weight = torch.einsum('kso,ksi->oi', selected_grad_output, selected_input) / num_selected
+                            # Handle empty selection: set gradients to zero (no update)
+                            if num_selected == 0:
+                                grad_weight = torch.zeros_like(weight)
                                 if bias is not None:
-                                    grad_bias = selected_grad_output.sum(dim=(0, 1)) / num_selected
+                                    grad_bias = torch.zeros_like(bias)
                             else:
-                                grad_weight = torch.einsum('ko,ki->oi', selected_grad_output, selected_input) / num_selected
-                                if bias is not None:
-                                    grad_bias = selected_grad_output.sum(dim=0) / num_selected
+                                selected_grad_output = train_grad_output[selected_indices]
+                                selected_input = train_input[selected_indices]
+
+                                # GRADIENT SCALING FIX: Use token-based scaling
+                                # Loss is averaged over total_tokens (merged batch), but we want
+                                # gradient as if training on selected train samples' tokens only.
+                                # grad_output has 1/total_tokens scaling, so we multiply by
+                                # total_tokens/selected_tokens to get 1/selected_tokens scaling.
+                                if selection_state.tokens_per_sample is not None and selection_state.total_tokens is not None:
+                                    selected_tokens = selection_state.tokens_per_sample[selected_indices].sum().item()
+                                    if selected_tokens > 0:
+                                        scale_factor = selection_state.total_tokens / selected_tokens
+                                    else:
+                                        scale_factor = 1.0
+                                else:
+                                    # Fall back to sample-based scaling if token counts not available
+                                    scale_factor = train_batch_size / num_selected
+
+                                if selected_grad_output.dim() == 3:
+                                    grad_weight = torch.einsum('kso,ksi->oi', selected_grad_output, selected_input) * scale_factor
+                                    if bias is not None:
+                                        grad_bias = selected_grad_output.sum(dim=(0, 1)) * scale_factor
+                                else:
+                                    grad_weight = torch.einsum('ko,ki->oi', selected_grad_output, selected_input) * scale_factor
+                                    if bias is not None:
+                                        grad_bias = selected_grad_output.sum(dim=0) * scale_factor
 
                 # else: No selection and no compression = baseline, let PyTorch handle gradients normally
 
@@ -506,7 +628,9 @@ class GradientHook:
 
         # Centralized storage arrays
         self.forward_hooks: List[Optional[Any]] = [None] * len(layer_names)
-        self.compressed_grads: List[Optional[Tensor]] = [None] * len(layer_names)
+        # Note: Compressed gradients are now stored directly on weight parameters as
+        # weight._compressed_grad instead of in a separate list. See _store_compressed_grad()
+        # and _get_compressed_grad() for details.
 
         # Unified compressors
         self.compressors: List[Optional[Compressor]] = [None] * len(layer_names)
@@ -523,6 +647,14 @@ class GradientHook:
         # Instead, we capture val gradients first, then use them for selection during train
         self.val_grad_buffer: List[Optional[Tensor]] = [None] * len(layer_names)
         self.capture_val_mode: bool = False  # True when capturing validation gradients
+
+        # Token count tracking for proper gradient scaling
+        # The loss is averaged over valid tokens (where labels != -100), not samples.
+        # To properly scale gradients, we need to track:
+        # - total_tokens: total valid tokens in the batch
+        # - tokens_per_sample: valid tokens per sample [batch_size]
+        self.total_tokens: Optional[int] = None
+        self.tokens_per_sample: Optional[Tensor] = None
 
         # Register in global registry
         self._hook_manager_id: int = id(self)
@@ -648,6 +780,40 @@ class GradientHook:
         """Clear selection state after forward/backward."""
         self.selection_state = None
 
+    def set_token_counts(self, labels: Tensor, train_batch_size: Optional[int] = None) -> None:
+        """
+        Set token counts for proper gradient scaling.
+
+        The loss is averaged over valid tokens (where labels != -100), not samples.
+        This method computes and stores the token counts needed for proper scaling.
+
+        Args:
+            labels: Label tensor [batch_size, seq_length] with -100 for ignored positions
+            train_batch_size: If provided, only count tokens for first train_batch_size samples
+                            (for SFT mode where batch is merged train+val)
+        """
+        # Count valid tokens per sample
+        valid_mask = (labels != -100)  # [batch_size, seq_length]
+        tokens_per_sample = valid_mask.sum(dim=1)  # [batch_size]
+
+        # Total tokens in the batch (used for gradient scaling)
+        self.total_tokens = tokens_per_sample.sum().item()
+        self.tokens_per_sample = tokens_per_sample
+
+        # If train_batch_size is provided, also track train-specific counts
+        if train_batch_size is not None and self.selection_state is not None:
+            train_tokens = tokens_per_sample[:train_batch_size]
+            self.selection_state.tokens_per_sample = train_tokens
+            self.selection_state.total_train_tokens = train_tokens.sum().item()
+            self.selection_state.total_tokens = self.total_tokens
+
+        logger.debug(f"Set token counts: total={self.total_tokens}, per_sample={tokens_per_sample.tolist()}")
+
+    def clear_token_counts(self) -> None:
+        """Clear token counts after forward/backward."""
+        self.total_tokens = None
+        self.tokens_per_sample = None
+
     # ========================================
     # RLHF-specific methods for separate val/train passes
     # ========================================
@@ -744,9 +910,84 @@ class GradientHook:
             f"{num_captured} layers with val gradients, selection_mode={selection_mode}, frac={frac}"
         )
 
+    def _get_layer_name_from_idx(self, layer_idx: int) -> str:
+        """Get layer name from layer index."""
+        return self.layer_names[layer_idx]
+
+    def _get_module_from_idx(self, layer_idx: int) -> nn.Module:
+        """Get module from layer index."""
+        layer_name = self._get_layer_name_from_idx(layer_idx)
+        return self.layer_name_to_module[layer_name]
+
+    def _store_compressed_grad(self, layer_idx: int, compressed_grad: Tensor) -> None:
+        """
+        Store compressed gradient on the weight parameter.
+
+        Also decompresses and stores in param.grad for gradient norm computation.
+        Stored on weight (not bias) because compressed grad is one tensor per layer.
+        """
+        module = self._get_module_from_idx(layer_idx)
+        module.weight._compressed_grad = compressed_grad
+
+        # Also decompress and store in param.grad for HF Trainer's grad_norm
+        compressor = self.compressors[layer_idx] if self.compressors else None
+        if compressor is not None:
+            # Decompress: [1, k] -> [1, out_features * (in_features + has_bias)]
+            full_grad = compressor.transpose(compressed_grad)  # [1, d]
+
+            # Reshape to [out_features, in_features + has_bias]
+            out_features = module.out_features
+            in_features = module.in_features
+            has_bias = module.bias is not None
+
+            if has_bias:
+                # Last column is bias gradient
+                full_grad_2d = full_grad.view(out_features, in_features + 1)
+                weight_grad = full_grad_2d[:, :in_features]
+                bias_grad = full_grad_2d[:, -1]
+                module.weight.grad = weight_grad
+                module.bias.grad = bias_grad
+            else:
+                full_grad_2d = full_grad.view(out_features, in_features)
+                module.weight.grad = full_grad_2d
+
+    def _get_compressed_grad(self, layer_idx: int) -> Optional[Tensor]:
+        """
+        Get compressed gradient from the weight parameter of the layer.
+
+        Args:
+            layer_idx: Index of the layer
+
+        Returns:
+            Compressed gradient tensor or None if not set
+        """
+        module = self._get_module_from_idx(layer_idx)
+        return getattr(module.weight, '_compressed_grad', None)
+
+    def _clear_compressed_grad(self, layer_idx: int) -> None:
+        """
+        Clear compressed gradient from the weight parameter of the layer.
+
+        Args:
+            layer_idx: Index of the layer
+        """
+        module = self._get_module_from_idx(layer_idx)
+        if hasattr(module.weight, '_compressed_grad'):
+            module.weight._compressed_grad = None
+
+    def clear_all_compressed_grads(self) -> None:
+        """Clear all compressed gradients from all layer weight parameters."""
+        for layer_idx in range(len(self.layer_names)):
+            self._clear_compressed_grad(layer_idx)
+
     def get_compressed_grads(self) -> List[Optional[Tensor]]:
-        """Get all captured compressed gradients."""
-        return self.compressed_grads
+        """
+        Get all captured compressed gradients.
+
+        Returns a list for backward compatibility, but the gradients are actually
+        stored on weight._compressed_grad attributes.
+        """
+        return [self._get_compressed_grad(idx) for idx in range(len(self.layer_names))]
 
     def refresh_compressors(self, step: int) -> Tuple[int, List[Optional[Any]]]:
         """

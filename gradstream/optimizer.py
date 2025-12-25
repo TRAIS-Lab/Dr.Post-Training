@@ -706,7 +706,16 @@ class MeSOAdamW(Optimizer):
                 if layer_name is not None:
                     layer_idx = self.grad_hook.layer_name_to_idx.get(layer_name)
                     if layer_idx is not None:
-                        compressed_grad = self.grad_hook.compressed_grads[layer_idx]
+                        # Get compressed gradient from the weight parameter's _compressed_grad attribute
+                        # Note: Compressed grad is always stored on weight (even for bias params)
+                        # because it contains both weight and bias gradients combined
+                        if param_type == 'weight':
+                            compressed_grad = getattr(p, '_compressed_grad', None)
+                        else:
+                            # For bias, get compressed grad from the weight of the same layer
+                            module = self.grad_hook.layer_name_to_module.get(layer_name)
+                            compressed_grad = getattr(module.weight, '_compressed_grad', None) if module else None
+
                         if compressed_grad is not None:
                             # Use compressed gradient pathway
                             # Note: p.grad will be None for hooked layers (intentional)
@@ -794,9 +803,11 @@ class MeSOAdamW(Optimizer):
         # Apply decompression
         full_update = compressor.transpose(compressed_update_batch)  # ĝ → ḡ [1, p_l]
 
-        # CRITICAL: Extract the correct portion for this parameter
-        # The decompressed gradient contains both weight and bias (if applicable)
-        # We need to extract just the part for this specific parameter
+        # Extract the correct portion for this parameter.
+        # Decompressed gradient has shape [1, out_features * (in_features + 1)]
+        # when bias exists, because input was augmented with ones column in backward().
+        # The gradient matrix [out_features, in_features + 1] is flattened in row-major order,
+        # so weight and bias elements are interleaved. We must reshape to extract correctly.
         layer_name_for_param, param_type = self._get_layer_info(param)
 
         # Get the module to check if it has bias
@@ -807,15 +818,20 @@ class MeSOAdamW(Optimizer):
         has_bias = hasattr(module, 'bias') and module.bias is not None
 
         if has_bias and param_type == 'bias':
-            # Extract bias portion: last out_features elements
-            # For Linear: full_update is [1, in_features * out_features + out_features]
-            # Bias is the last out_features elements
-            param_numel = param.numel()
-            param_update = full_update[:, -param_numel:].reshape(param.shape)
+            # Extract bias portion from augmented gradient matrix
+            # full_update is [1, out_features * (in_features + 1)] flattened in row-major order
+            # Reshape to [out_features, in_features + 1], bias is the last column
+            out_features = param.numel()
+            in_features_plus_1 = full_update.shape[1] // out_features
+            grad_matrix = full_update.reshape(out_features, in_features_plus_1)
+            param_update = grad_matrix[:, -1]  # Last column is bias [out_features]
         elif has_bias and param_type == 'weight':
-            # Extract weight portion: first (total - out_features) elements
-            param_numel = param.numel()
-            param_update = full_update[:, :param_numel].reshape(param.shape)
+            # Extract weight portion from augmented gradient matrix
+            # Reshape to [out_features, in_features + 1], weight is all but last column
+            out_features, in_features = param.shape
+            in_features_plus_1 = in_features + 1
+            grad_matrix = full_update.reshape(out_features, in_features_plus_1)
+            param_update = grad_matrix[:, :-1]  # All but last column [out_features, in_features]
         else:
             # No bias, so full_update is just the weight
             param_update = full_update.reshape(param.shape)
@@ -954,10 +970,21 @@ class MeSOSGD(Optimizer):
                 if layer_name is not None:
                     layer_idx = self.grad_hook.layer_name_to_idx.get(layer_name)
                     if layer_idx is not None:
-                        compressed_grad = self.grad_hook.compressed_grads[layer_idx]
+                        # Get compressed gradient from the weight parameter's _compressed_grad attribute
+                        # Note: Compressed grad is always stored on weight (even for bias params)
+                        # because it contains both weight and bias gradients combined
+                        if param_type == 'weight':
+                            compressed_grad = getattr(p, '_compressed_grad', None)
+                            if compressed_grad is not None:
+                                # Free memory immediately after retrieval
+                                p._compressed_grad = None
+                        else:
+                            # For bias, get compressed grad from the weight of the same layer
+                            module = self.grad_hook.layer_name_to_module.get(layer_name)
+                            compressed_grad = getattr(module.weight, '_compressed_grad', None) if module else None
+                            # Note: Don't clear here - the weight param will clear it
+
                         if compressed_grad is not None:
-                            # Free memory immediately after retrieval
-                            self.grad_hook.compressed_grads[layer_idx] = None
                             # Use compressed gradient pathway (layer-by-layer decompression)
                             self._step_compressed(p, compressed_grad, group, layer_name)
                             continue
@@ -1028,18 +1055,45 @@ class MeSOSGD(Optimizer):
         # Apply decompression
         full_update = compressor.transpose(compressed_update_batch)  # [1, p_l]
 
-        # Dimension check: full_update should match parameter size
-        param_numel = param.numel()
-        assert full_update.numel() == param_numel, \
-            f"Full update size mismatch for {layer_name}: " \
-            f"expected {param_numel}, got {full_update.numel()}"
+        # Extract the correct portion for this parameter.
+        # Decompressed gradient has shape [1, out_features * (in_features + 1)]
+        # when bias exists, because input was augmented with ones column in backward().
+        # The gradient matrix [out_features, in_features + 1] is flattened in row-major order,
+        # so weight and bias elements are interleaved. We must reshape to extract correctly.
+        layer_name_for_param, param_type = self._get_layer_info(param)
+
+        # Get the module to check if it has bias
+        module = self.grad_hook.model
+        for attr in layer_name.split('.'):
+            module = getattr(module, attr)
+
+        has_bias = hasattr(module, 'bias') and module.bias is not None
+
+        if has_bias and param_type == 'bias':
+            # Extract bias portion from augmented gradient matrix
+            # full_update is [1, out_features * (in_features + 1)] flattened in row-major order
+            # Reshape to [out_features, in_features + 1], bias is the last column
+            out_features = param.numel()
+            in_features_plus_1 = full_update.shape[1] // out_features
+            grad_matrix = full_update.reshape(out_features, in_features_plus_1)
+            param_update = grad_matrix[:, -1]  # Last column is bias [out_features]
+        elif has_bias and param_type == 'weight':
+            # Extract weight portion from augmented gradient matrix
+            # Reshape to [out_features, in_features + 1], weight is all but last column
+            out_features, in_features = param.shape
+            in_features_plus_1 = in_features + 1
+            grad_matrix = full_update.reshape(out_features, in_features_plus_1)
+            param_update = grad_matrix[:, :-1]  # All but last column [out_features, in_features]
+        else:
+            # No bias, so full_update is just the weight
+            param_update = full_update.reshape(param.shape)
 
         # Apply weight decay (in parameter space)
         if group['weight_decay'] != 0:
             param.mul_(1 - group['lr'] * group['weight_decay'])
 
         # Apply update
-        param.add_(full_update.view_as(param), alpha=-group['lr'])
+        param.add_(param_update, alpha=-group['lr'])
 
     def _step_standard(self, param, group):
         """

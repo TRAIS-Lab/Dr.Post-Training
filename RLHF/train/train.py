@@ -144,13 +144,19 @@ def _patch_gpt_neo_flash_attention():
 _patch_gpt_neo_flash_attention()
 
 
-def find_trainable_layers(model, lora_only: bool = True):
+def find_trainable_layers(model, lora_only: bool = True, include_v_head: bool = False):
     """
     Find trainable layers for gradient hooks.
 
     Args:
         model: The model (can be AutoModelForCausalLMWithValueHead or base model)
         lora_only: If True, only find LoRA layers
+        include_v_head: If True, include value head in hooks. Default False because:
+                       - Selection is based on policy gradient alignment with validation
+                       - Validation loss (reward-weighted log-probs) has no gradient to v_head
+                       - Including v_head would give zero/random selection scores
+                       - Reference (LDA-ORL) explicitly excludes v_head from selection
+                       The value head trains on full batch via standard autograd.
 
     Returns:
         List of layer names (with correct prefix for wrapper models)
@@ -179,9 +185,18 @@ def find_trainable_layers(model, lora_only: bool = True):
                     layer_names.append(f"{prefix}{name}.lora_B")
         else:
             if isinstance(module, torch.nn.Linear):
-                # Skip special heads
-                if "lm_head" not in name and "v_head" not in name:
+                # Skip lm_head (weight-tied with embeddings in many models)
+                if "lm_head" not in name:
                     layer_names.append(f"{prefix}{name}")
+
+    # Include value head if present and requested
+    # v_head is a sibling of pretrained_model, not a child, so we check separately
+    if include_v_head and hasattr(model, "v_head"):
+        # v_head is typically a Sequential with Linear layers
+        for name, module in model.v_head.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                full_name = f"v_head.{name}" if name else "v_head"
+                layer_names.append(full_name)
 
     return layer_names
 
@@ -420,11 +435,13 @@ def main():
     logger.info(f"Optimizer will optimize {len(trainable_params)} parameter groups")
 
     if training_args.has_compression:
-        # Use MeSO optimizer
+        # Use MeSO optimizer with gradient hook for compressed gradient access
         optimizer = MeSOAdamW(
             trainable_params,
+            grad_hook=grad_hook,
             lr=training_args.learning_rate,
             weight_decay=training_args.weight_decay,
+            compressed_layer_names=layer_names,
         )
         logger.info("Using MeSO optimizer")
     else:

@@ -63,12 +63,13 @@ class TrainingArguments(TA):
         },
     )
     filter_frac: float = field(
-        default=1.0,
+        default=0.5,
         metadata={
             "help": (
                 "Fraction of negative-influence samples to drop (0-1). "
                 "1.0 = drop all negative samples, 0.5 = drop bottom 50% of negative samples. "
-                "All positive-influence samples are always kept."
+                "All positive-influence samples are always kept. "
+                "Note: 1.0 is too aggressive and often leaves only 1-2 samples per batch."
             )
         },
     )
@@ -129,12 +130,13 @@ class TrainingArguments(TA):
         metadata={"help": "Number of PPO epochs per batch (default: 4)"},
     )
     mini_batch_size: int = field(
-        default=1,
+        default=8,
         metadata={
             "help": (
-                "Mini-batch size for PPO updates (both forward and backward passes). "
-                "Reference uses 1, meaning one optimizer.step() per sample. "
-                "This prevents ratio explosion by making small updates."
+                "Mini-batch size for PPO updates. With mini_batch_size=1 and ppo_epochs=4, "
+                "there are batch_size*4 optimizer steps per rollout, causing old_logprobs "
+                "to become stale and ratio to explode. Larger mini_batch_size (e.g., 8) "
+                "reduces the number of updates, keeping ratios stable."
             )
         },
     )
@@ -145,27 +147,27 @@ class TrainingArguments(TA):
 
     # KL Control
     kl_coef: float = field(
-        default=0.2,
-        metadata={"help": "KL penalty coefficient (default: 0.2). Alias for init_kl_coef."},
+        default=0.1,
+        metadata={"help": "KL penalty coefficient (default: 0.1). Alias for init_kl_coef."},
     )
     init_kl_coef: float = field(
-        default=0.2,
+        default=0.1,
         metadata={
             "help": (
-                "Initial KL penalty coefficient (default: 0.2). "
+                "Initial KL penalty coefficient (default: 0.1). "
                 "With adaptive KL control, this value changes during training."
             )
         },
     )
     kl_penalty: str = field(
-        default="full",
+        default="kl",
         metadata={
             "help": (
-                "KL penalty mode (reference: ppo_config.py:80-85): "
-                "'kl': model_logp - ref_logp (can be negative), "
+                "KL penalty mode: "
+                "'kl': model_logp - ref_logp (recommended for token-level stability), "
                 "'abs': abs(model_logp - ref_logp) (always positive, prevents reward bonus), "
                 "'mse': 0.5 * (model_logp - ref_logp)^2 (always positive), "
-                "'full': true KL divergence using F.kl_div"
+                "'full': F.kl_div (broken for token-level logprobs, avoid)"
             )
         },
     )
@@ -179,11 +181,11 @@ class TrainingArguments(TA):
         },
     )
     target_kl: float = field(
-        default=0.1,
+        default=6.0,
         metadata={
             "help": (
-                "Target KL divergence for adaptive KL control (default: 0.1). "
-                "Also used for early stopping if enabled."
+                "Target KL divergence for adaptive KL control (default: 6.0). "
+                "Matches TRL reference. Lower values (e.g., 0.1) are too restrictive."
             )
         },
     )

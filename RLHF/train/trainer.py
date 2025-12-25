@@ -214,6 +214,41 @@ class StreamingPPOTrainer:
         # Logging
         self._log_config()
 
+    def _compute_gradient_norms(self) -> Dict[str, float]:
+        """
+        Compute gradient norms for policy (LoRA) and v_head layers.
+
+        This helps verify that gradient normalization is working correctly.
+        For Streaming/GREATS, policy gradients should match NA baseline if
+        normalization is correct.
+
+        Returns:
+            Dictionary with policy_grad_norm, vhead_grad_norm, and per-layer norms
+        """
+        policy_grad_norm_sq = 0.0
+        vhead_grad_norm_sq = 0.0
+        lora_a_grad_norm_sq = 0.0
+        lora_b_grad_norm_sq = 0.0
+
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                grad_norm_sq = param.grad.norm().item() ** 2
+                if "v_head" in name:
+                    vhead_grad_norm_sq += grad_norm_sq
+                elif "lora" in name.lower():
+                    policy_grad_norm_sq += grad_norm_sq
+                    if "lora_A" in name or "lora_a" in name:
+                        lora_a_grad_norm_sq += grad_norm_sq
+                    elif "lora_B" in name or "lora_b" in name:
+                        lora_b_grad_norm_sq += grad_norm_sq
+
+        return {
+            "grad_norm/policy": policy_grad_norm_sq ** 0.5,
+            "grad_norm/vhead": vhead_grad_norm_sq ** 0.5,
+            "grad_norm/lora_a": lora_a_grad_norm_sq ** 0.5,
+            "grad_norm/lora_b": lora_b_grad_norm_sq ** 0.5,
+        }
+
     def _log_config(self):
         """Log trainer configuration."""
         logger.info("=" * 60)
@@ -1157,6 +1192,10 @@ class StreamingPPOTrainer:
             scaled_loss = loss * loss_scale
             scaled_loss.backward()
 
+            # Compute gradient norms before optimizer step
+            grad_norms = self._compute_gradient_norms()
+            stats.update(grad_norms)
+
             # Only step optimizer if not accumulating
             if not accumulate:
                 self.optimizer.step()
@@ -1194,6 +1233,10 @@ class StreamingPPOTrainer:
 
             # Backward with per-layer selection using stored val grads
             loss.backward()
+
+            # Compute gradient norms before optimizer step
+            grad_norms = self._compute_gradient_norms()
+            stats.update(grad_norms)
 
             # Get selection stats
             if self.grad_hook.selection_state is not None:
@@ -1259,6 +1302,10 @@ class StreamingPPOTrainer:
 
             loss.backward()
 
+            # Compute gradient norms before optimizer step
+            grad_norms = self._compute_gradient_norms()
+            stats.update(grad_norms)
+
             self.optimizer.step()
             self.optimizer.zero_grad()
 
@@ -1274,6 +1321,249 @@ class StreamingPPOTrainer:
 
         raise ValueError(f"Unknown method: {effective_method}")
 
+    def _prepare_batch(self, batch: Dict) -> Tuple[Tensor, Tensor]:
+        """
+        Prepare query tensors from a batch.
+
+        Args:
+            batch: Batch dictionary with 'input_ids'
+
+        Returns:
+            Tuple of (query_ids, query_mask)
+        """
+        query_ids = batch["input_ids"]
+        if isinstance(query_ids, list):
+            max_len = max(t.shape[0] if t.dim() == 1 else t.shape[1] for t in query_ids)
+            query_ids = torch.stack([
+                F.pad(t.flatten(), (max_len - t.numel(), 0), value=self.tokenizer.pad_token_id)
+                for t in query_ids
+            ]).to(self.device)
+        else:
+            query_ids = query_ids.to(self.device)
+
+        query_mask = (query_ids != self.tokenizer.pad_token_id).long()
+        return query_ids, query_mask
+
+    @torch.no_grad()
+    def _generate_rollout_data(
+        self,
+        query_ids: Tensor,
+        query_mask: Tensor,
+    ) -> Dict[str, Any]:
+        """
+        Generate rollouts and compute all data needed for PPO training.
+
+        This includes: response generation, reward computation, logprobs,
+        KL penalty, advantages, and returns.
+
+        Args:
+            query_ids: Query token IDs [batch, query_len]
+            query_mask: Query attention mask
+
+        Returns:
+            Dictionary containing all rollout data
+        """
+        # Generate responses
+        response_ids, response_mask, response_texts = self.generate_rollouts(query_ids, query_mask)
+
+        # Compute rewards
+        query_texts = self.tokenizer.batch_decode(query_ids, skip_special_tokens=True)
+        raw_rewards = self.reward_model.compute_rewards(query_texts, response_texts)
+
+        # Compute logprobs and values (model in eval mode)
+        self.model.eval()
+        old_logprobs, _, old_values = self.batched_forward_pass(
+            query_ids, response_ids, query_mask, response_mask,
+            batch_size=self.mini_batch_size,
+        )
+
+        # Compute reference logprobs for KL penalty
+        ref_logprobs = self.batched_ref_forward_pass(
+            query_ids, response_ids, query_mask, response_mask,
+            batch_size=self.mini_batch_size,
+        )
+
+        # Create per-token reward tensor (sparse - only at last token)
+        rewards = torch.zeros_like(response_mask, dtype=torch.float, device=self.device)
+        for i in range(len(response_texts)):
+            last_idx = response_mask[i].sum().item() - 1
+            if last_idx >= 0:
+                rewards[i, last_idx] = raw_rewards[i]
+
+        # Apply KL penalty via reward shaping
+        kl_penalty = self._kl_penalty(old_logprobs, ref_logprobs)
+        non_score_rewards = -self.kl_ctl.value * kl_penalty
+        rewards = rewards + non_score_rewards * response_mask.float()
+
+        # Compute advantages and returns
+        advantages, returns = compute_gae(
+            rewards, old_values, response_mask.float(),
+            self.gamma, self.gae_lambda
+        )
+
+        # Normalize advantages
+        adv_mean = (advantages * response_mask).sum() / response_mask.sum().clamp(min=1)
+        adv_var = ((advantages - adv_mean) ** 2 * response_mask).sum() / response_mask.sum().clamp(min=1)
+        advantages = ((advantages - adv_mean) / (adv_var.sqrt() + 1e-8)) * response_mask.float()
+        advantages = advantages.detach()
+
+        return {
+            "response_ids": response_ids,
+            "response_mask": response_mask,
+            "response_texts": response_texts,
+            "raw_rewards": raw_rewards,
+            "old_logprobs": old_logprobs,
+            "old_values": old_values,
+            "kl_penalty": kl_penalty,
+            "advantages": advantages,
+            "returns": returns,
+        }
+
+    def _run_ppo_epochs(
+        self,
+        query_ids: Tensor,
+        query_mask: Tensor,
+        rollout_data: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """
+        Run PPO training epochs on rollout data.
+
+        Args:
+            query_ids: Query token IDs
+            query_mask: Query attention mask
+            rollout_data: Dictionary from _generate_rollout_data()
+
+        Returns:
+            Aggregated training statistics
+        """
+        response_ids = rollout_data["response_ids"]
+        response_mask = rollout_data["response_mask"]
+        old_logprobs = rollout_data["old_logprobs"]
+        old_values = rollout_data["old_values"]
+        advantages = rollout_data["advantages"]
+        returns = rollout_data["returns"]
+
+        batch_size = query_ids.shape[0]
+        all_mini_batch_stats = []
+
+        self.model.train()
+
+        for ppo_epoch in range(self.ppo_epochs):
+            perm = torch.randperm(batch_size, device=query_ids.device)
+
+            for mb_start in range(0, batch_size, self.mini_batch_size):
+                mb_end = min(mb_start + self.mini_batch_size, batch_size)
+                mb_inds = perm[mb_start:mb_end]
+
+                mb_stats = self.training_step(
+                    query_ids[mb_inds],
+                    response_ids[mb_inds],
+                    query_mask[mb_inds],
+                    response_mask[mb_inds],
+                    old_logprobs[mb_inds].detach(),
+                    advantages[mb_inds].detach(),
+                    returns[mb_inds].detach(),
+                    old_values[mb_inds].detach(),
+                )
+                all_mini_batch_stats.append(mb_stats)
+
+        # Aggregate stats
+        stats = all_mini_batch_stats[-1].copy()
+        if len(all_mini_batch_stats) > 1:
+            for key in ["loss/total", "loss/policy", "loss/value", "policy/ratio_mean", "policy/clipfrac"]:
+                if key in stats:
+                    stats[key] = float(np.mean([s[key] for s in all_mini_batch_stats if key in s]))
+
+        return stats
+
+    def _build_step_stats(
+        self,
+        ppo_stats: Dict[str, float],
+        rollout_data: Dict[str, Any],
+        response_mask: Tensor,
+    ) -> Dict[str, float]:
+        """
+        Build complete step statistics from PPO stats and rollout data.
+
+        Args:
+            ppo_stats: Stats from _run_ppo_epochs()
+            rollout_data: Data from _generate_rollout_data()
+            response_mask: Response attention mask
+
+        Returns:
+            Complete statistics dictionary
+        """
+        stats = ppo_stats.copy()
+
+        raw_rewards = rollout_data["raw_rewards"]
+        kl_penalty = rollout_data["kl_penalty"]
+        response_texts = rollout_data["response_texts"]
+
+        # Reward stats
+        stats["reward/mean"] = raw_rewards.mean().item()
+        stats["reward/std"] = raw_rewards.std().item()
+
+        # KL stats
+        kl_per_seq = (kl_penalty * response_mask).sum(dim=-1)
+        mean_kl = kl_per_seq.mean().item()
+        stats["objective/kl"] = mean_kl
+        stats["objective/kl_coef"] = self.kl_ctl.value
+
+        # Toxicity evaluation on step generations
+        if self.evaluator is not None and getattr(self.args, 'eval_on_step_generations', True):
+            eval_results = self.evaluator.evaluate_generations(response_texts)
+            stats["eval/toxicity_prob"] = eval_results["mean_toxicity_prob"]
+            stats["eval/toxicity_rate"] = eval_results["toxicity_rate"]
+            stats["eval/toxicity_logit"] = eval_results["mean_toxicity_logit"]
+
+        return stats
+
+    def _update_history(
+        self,
+        history: Dict[str, List[float]],
+        stats: Dict[str, float],
+        is_full_eval: bool = False,
+        global_step: Optional[int] = None,
+    ):
+        """
+        Update training history with statistics.
+
+        Args:
+            history: History dictionary to update
+            stats: Statistics to add
+            is_full_eval: Whether this is from a full evaluation
+            global_step: Current step (required for full_eval)
+        """
+        if is_full_eval:
+            if "full_eval_toxicity_prob" not in history:
+                history["full_eval_toxicity_prob"] = []
+                history["full_eval_toxicity_rate"] = []
+                history["full_eval_steps"] = []
+            history["full_eval_toxicity_prob"].append(stats["mean_toxicity_prob"])
+            history["full_eval_toxicity_rate"].append(stats["toxicity_rate"])
+            history["full_eval_steps"].append(global_step)
+        else:
+            history["loss"].append(stats["loss/total"])
+            history["reward"].append(stats["reward/mean"])
+            history["kl"].append(stats["objective/kl"])
+
+            if "eval/toxicity_prob" in stats:
+                if "toxicity_prob" not in history:
+                    history["toxicity_prob"] = []
+                    history["toxicity_rate"] = []
+                history["toxicity_prob"].append(stats["eval/toxicity_prob"])
+                history["toxicity_rate"].append(stats["eval/toxicity_rate"])
+
+    def _check_kl_warning(self, mean_kl: float):
+        """Warn if KL divergence becomes negative (pathological state)."""
+        if mean_kl < -1.0:
+            warnings.warn(
+                f"KL divergence is starting to become negative: {mean_kl:.2f} - "
+                "this might be a precursor for failed training. "
+                "Consider using kl_penalty='abs' to prevent reward bonus from negative KL, "
+                "or review your training hyperparameters (try increasing mini_batch_size)."
+            )
+
     def train(
         self,
         train_dataloader,
@@ -1283,9 +1573,6 @@ class StreamingPPOTrainer:
     ) -> Dict[str, List[float]]:
         """
         Main training loop with self-referencing validation (Snapshot/IIF style).
-
-        For selection methods (Streaming/GREATS), validation gradients are captured
-        from the training rollout buffer itself, following the IIF algorithm.
 
         Args:
             train_dataloader: DataLoader for training prompts
@@ -1307,242 +1594,67 @@ class StreamingPPOTrainer:
         for epoch in range(num_epochs):
             self.model.train()
             epoch_stats = []
-
-            # Training loop
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}")
+
             for batch in pbar:
-                # Get queries (left-pad for decoder-only generation)
-                query_ids = batch["input_ids"]
-                if isinstance(query_ids, list):
-                    max_len = max(t.shape[0] if t.dim() == 1 else t.shape[1] for t in query_ids)
-                    query_ids = torch.stack([
-                        F.pad(t.flatten(), (max_len - t.numel(), 0), value=self.tokenizer.pad_token_id)
-                        for t in query_ids
-                    ]).to(self.device)
-                else:
-                    query_ids = query_ids.to(self.device)
+                # Prepare batch and generate rollout data
+                query_ids, query_mask = self._prepare_batch(batch)
+                rollout_data = self._generate_rollout_data(query_ids, query_mask)
+                response_mask = rollout_data["response_mask"]
 
-                query_mask = (query_ids != self.tokenizer.pad_token_id).long()
-
-                # Generate rollouts
-                response_ids, response_mask, response_texts = self.generate_rollouts(
-                    query_ids, query_mask
-                )
-
-                # Compute rewards from reward model
-                with torch.no_grad():
-                    query_texts = self.tokenizer.batch_decode(query_ids, skip_special_tokens=True)
-                    raw_rewards = self.reward_model.compute_rewards(query_texts, response_texts)
-
-                # Set model to eval mode for old_logprobs computation
-                # (matching reference: ppo_trainer.py line 771)
-                self.model.eval()
-
-                with torch.no_grad():
-                    # Compute old log probs and values in batches (model in eval mode)
-                    old_logprobs, _, old_values = self.batched_forward_pass(
-                        query_ids, response_ids, query_mask, response_mask,
-                        batch_size=self.mini_batch_size,
-                    )
-
-                    # Compute reference log probs for KL penalty in batches
-                    # For PEFT: uses disable_adapter() on same model
-                    # For non-PEFT: uses separate frozen reference model
-                    ref_logprobs = self.batched_ref_forward_pass(
-                        query_ids, response_ids, query_mask, response_mask,
-                        batch_size=self.mini_batch_size,
-                    )
-
-                    # Create per-token reward tensor (sparse - only at last token)
-                    # Reference: ppo_trainer.py compute_rewards method
-                    rewards = torch.zeros_like(response_mask, dtype=torch.float, device=self.device)
-                    for i in range(len(response_texts)):
-                        last_idx = response_mask[i].sum().item() - 1
-                        if last_idx >= 0:
-                            rewards[i, last_idx] = raw_rewards[i]
-
-                    # ========================================
-                    # KL PENALTY VIA REWARD SHAPING
-                    # Reference: ppo_trainer.py compute_rewards lines 3304-3314
-                    # ========================================
-                    # KL penalty is subtracted from rewards BEFORE computing GAE
-                    # Uses configured kl_penalty mode (kl/abs/mse/full)
-                    kl_penalty = self._kl_penalty(old_logprobs, ref_logprobs)
-                    non_score_rewards = -self.kl_ctl.value * kl_penalty
-                    rewards = rewards + non_score_rewards * response_mask.float()
-
-                    # Compute advantages and returns using KL-shaped rewards
-                    # Reference: ppo_trainer.py compute_advantages lines 3333-3356
-                    advantages, returns = compute_gae(
-                        rewards, old_values, response_mask.float(),
-                        self.gamma, self.gae_lambda
-                    )
-
-                    # Normalize advantages using masked_whiten (reference line 3354)
-                    adv_mean = (advantages * response_mask).sum() / response_mask.sum().clamp(min=1)
-                    adv_var = ((advantages - adv_mean) ** 2 * response_mask).sum() / response_mask.sum().clamp(min=1)
-                    advantages = ((advantages - adv_mean) / (adv_var.sqrt() + 1e-8)) * response_mask.float()
-                    advantages = advantages.detach()  # Reference line 3355
-
-                # ========================================
-                # INITIAL STATS LOGGING (Step 0)
-                # Log all statistics before any training updates
-                # ========================================
+                # Log initial stats (Step 0) before any training
                 if not logged_initial_stats:
                     initial_stats = self._compute_initial_stats(
-                        query_ids, response_ids, query_mask, response_mask,
-                        old_logprobs, advantages, returns, old_values,
-                        raw_rewards, kl_penalty, response_texts,
+                        query_ids, rollout_data["response_ids"], query_mask, response_mask,
+                        rollout_data["old_logprobs"], rollout_data["advantages"],
+                        rollout_data["returns"], rollout_data["old_values"],
+                        rollout_data["raw_rewards"], rollout_data["kl_penalty"],
+                        rollout_data["response_texts"],
                     )
                     logger.info(f"Step 0 (initial): {initial_stats}")
-
-                    # Update history with initial stats
-                    history["loss"].append(initial_stats["loss/total"])
-                    history["reward"].append(initial_stats["reward/mean"])
-                    history["kl"].append(initial_stats["objective/kl"])
-
-                    if "eval/toxicity_prob" in initial_stats:
-                        if "toxicity_prob" not in history:
-                            history["toxicity_prob"] = []
-                            history["toxicity_rate"] = []
-                        history["toxicity_prob"].append(initial_stats["eval/toxicity_prob"])
-                        history["toxicity_rate"].append(initial_stats["eval/toxicity_rate"])
-
+                    self._update_history(history, initial_stats)
                     logged_initial_stats = True
 
-                # ========================================
-                # SELF-REFERENCING VALIDATION (Snapshot/IIF style)
-                # Capture validation gradients from training buffer itself
-                # This is done per-step since the buffer changes each step
-                # ========================================
+                # Capture validation gradients for selection methods
                 if self.method != "NA":
                     self.capture_validation_gradients_from_buffer(
-                        query_ids, response_ids, query_mask, response_mask, advantages
+                        query_ids, rollout_data["response_ids"], query_mask,
+                        response_mask, rollout_data["advantages"]
                     )
 
-                # PPO epochs with mini-batching (matching reference implementation)
-                # old_logprobs stays fixed, new_logprobs recomputed each mini-batch
-                batch_size = query_ids.shape[0]
-                all_mini_batch_stats = []
+                # Run PPO training epochs
+                ppo_stats = self._run_ppo_epochs(query_ids, query_mask, rollout_data)
 
-                # Set model back to train mode for PPO epochs (backward passes)
-                self.model.train()
+                # Build complete step statistics
+                stats = self._build_step_stats(ppo_stats, rollout_data, response_mask)
 
-                for ppo_epoch in range(self.ppo_epochs):
-                    # Shuffle indices at the start of each epoch
-                    perm = torch.randperm(batch_size, device=query_ids.device)
-
-                    # Iterate over mini-batches
-                    for mb_start in range(0, batch_size, self.mini_batch_size):
-                        mb_end = min(mb_start + self.mini_batch_size, batch_size)
-                        mb_inds = perm[mb_start:mb_end]
-
-                        # Extract mini-batch
-                        mb_query_ids = query_ids[mb_inds]
-                        mb_response_ids = response_ids[mb_inds]
-                        mb_query_mask = query_mask[mb_inds]
-                        mb_response_mask = response_mask[mb_inds]
-                        mb_old_logprobs = old_logprobs[mb_inds].detach()
-                        mb_advantages = advantages[mb_inds].detach()
-                        mb_returns = returns[mb_inds].detach()
-                        mb_old_values = old_values[mb_inds].detach()
-
-                        # Training step on mini-batch
-                        mb_stats = self.training_step(
-                            mb_query_ids, mb_response_ids, mb_query_mask, mb_response_mask,
-                            mb_old_logprobs, mb_advantages, mb_returns, mb_old_values,
-                        )
-                        all_mini_batch_stats.append(mb_stats)
-
-                # Aggregate stats from all mini-batches (use last for simplicity, average key metrics)
-                stats = all_mini_batch_stats[-1].copy()
-                if len(all_mini_batch_stats) > 1:
-                    for key in ["loss/total", "loss/policy", "loss/value", "policy/ratio_mean", "policy/clipfrac"]:
-                        if key in stats:
-                            stats[key] = float(np.mean([s[key] for s in all_mini_batch_stats if key in s]))
-
-                # Add reward and KL stats
-                stats["reward/mean"] = raw_rewards.mean().item()
-                stats["reward/std"] = raw_rewards.std().item()
-
-                # Compute KL divergence (sum over sequence, mean over batch)
-                # Reference: ppo_trainer.py record_step_stats lines 3467-3470
-                kl_per_seq = (kl_penalty * response_mask).sum(dim=-1)
-                mean_kl = kl_per_seq.mean().item()
-                stats["objective/kl"] = mean_kl
-                stats["objective/kl_coef"] = self.kl_ctl.value
-
-                # Warning for negative KL (reference: ppo_trainer.py lines 3474-3480)
-                # This indicates the policy assigns lower probability to its own
-                # generated tokens than the reference - a pathological state
-                if mean_kl < -1.0:
-                    warnings.warn(
-                        f"KL divergence is starting to become negative: {mean_kl:.2f} - "
-                        "this might be a precursor for failed training. "
-                        "Consider using kl_penalty='abs' to prevent reward bonus from negative KL, "
-                        "or review your training hyperparameters (try increasing mini_batch_size)."
-                    )
-
-                # Update KL controller (reference line 933-936)
-                # multiply batch_size by num_processes for distributed training
-                self.kl_ctl.update(mean_kl, batch_size)
-
-                # ========================================
-                # TOXICITY EVALUATION ON STEP GENERATIONS
-                # Evaluate toxicity using independent classifier (DaNLP model)
-                # This provides per-step feedback without extra generation cost
-                # ========================================
-                if self.evaluator is not None and getattr(self.args, 'eval_on_step_generations', True):
-                    eval_results = self.evaluator.evaluate_generations(response_texts)
-                    stats["eval/toxicity_prob"] = eval_results["mean_toxicity_prob"]
-                    stats["eval/toxicity_rate"] = eval_results["toxicity_rate"]
-                    stats["eval/toxicity_logit"] = eval_results["mean_toxicity_logit"]
+                # Update KL controller and check for warnings
+                mean_kl = stats["objective/kl"]
+                self._check_kl_warning(mean_kl)
+                self.kl_ctl.update(mean_kl, query_ids.shape[0])
 
                 epoch_stats.append(stats)
                 global_step += 1
 
-                # LR scheduler step (must be per-step, not per-epoch, for warmup to work)
+                # LR scheduler step
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
 
                 # Update progress bar
-                postfix = {
-                    "loss": f"{stats['loss/total']:.4f}",
-                    "reward": f"{stats['reward/mean']:.2f}",
-                }
+                postfix = {"loss": f"{stats['loss/total']:.4f}", "reward": f"{stats['reward/mean']:.2f}"}
                 if "eval/toxicity_prob" in stats:
                     postfix["tox"] = f"{stats['eval/toxicity_prob']:.3f}"
                 pbar.set_postfix(postfix)
 
-                # Logging
+                # Periodic logging
                 if global_step % log_interval == 0:
-                    avg_stats = {
-                        k: float(np.mean([s[k] for s in epoch_stats[-log_interval:]]))
-                        for k in epoch_stats[-1].keys()
-                    }
+                    avg_stats = {k: float(np.mean([s[k] for s in epoch_stats[-log_interval:]])) for k in stats.keys()}
                     logger.info(f"Step {global_step}: {avg_stats}")
+                    self._update_history(history, avg_stats)
 
-                    # Update history
-                    history["loss"].append(avg_stats["loss/total"])
-                    history["reward"].append(avg_stats["reward/mean"])
-                    history["kl"].append(avg_stats["objective/kl"])
-
-                    # Track toxicity evaluation in history
-                    if "eval/toxicity_prob" in avg_stats:
-                        if "toxicity_prob" not in history:
-                            history["toxicity_prob"] = []
-                            history["toxicity_rate"] = []
-                        history["toxicity_prob"].append(avg_stats["eval/toxicity_prob"])
-                        history["toxicity_rate"].append(avg_stats["eval/toxicity_rate"])
-
-                # ========================================
-                # PERIODIC FULL TOXICITY EVALUATION
-                # Run comprehensive evaluation at specified intervals
-                # ========================================
+                # Periodic full evaluation
                 eval_interval = getattr(self.args, 'eval_interval', 1)
-                if (self.evaluator is not None and
-                    eval_interval > 0 and
-                    global_step % eval_interval == 0):
+                if self.evaluator is not None and eval_interval > 0 and global_step % eval_interval == 0:
                     self._run_full_evaluation(global_step, history)
 
                 # Check max steps
@@ -1550,10 +1662,7 @@ class StreamingPPOTrainer:
                     logger.info(f"Reached max_steps ({max_steps})")
                     break
 
-            # ========================================
-            # END OF EPOCH EVALUATION
-            # Run full evaluation at the end of each epoch
-            # ========================================
+            # End of epoch evaluation
             if self.evaluator is not None and getattr(self.args, 'eval_interval', 0) == 0:
                 self._run_full_evaluation(global_step, history)
 

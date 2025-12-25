@@ -342,7 +342,7 @@ def topk_selection(scores, k: int):
     return selected_indices
 
 
-def negative_filtering(scores, filter_frac: float = 1.0):
+def negative_filtering(scores, filter_frac: float = 1.0, allow_empty: bool = True):
     """
     Filter out negative-influence samples.
 
@@ -354,7 +354,8 @@ def negative_filtering(scores, filter_frac: float = 1.0):
     2. From samples with negative scores, DROP the bottom filter_frac
        (most negative samples)
     3. Return indices of: all positive + kept negative samples
-    4. Always keep at least 1 sample (the best one) to avoid empty batches
+    4. If allow_empty=True and all samples are filtered, return empty tensor
+       If allow_empty=False, always keep at least 1 sample (the best one)
 
     Arguments:
     - scores: A tensor of influence scores for each data point.
@@ -362,9 +363,12 @@ def negative_filtering(scores, filter_frac: float = 1.0):
                    - 0.0: Keep all samples (no filtering)
                    - 1.0: Drop all negative-influence samples
                    - 0.5: Drop only the most negative 50%
+    - allow_empty: If True, allow returning empty selection when all samples
+                   have negative influence. If False, always keep at least 1.
 
     Returns:
     - selected_indices: Tensor of indices of the kept data points (on same device as scores).
+                       May be empty if allow_empty=True and all samples filtered.
     """
     n_samples = scores.shape[0]
     device = scores.device
@@ -393,11 +397,15 @@ def negative_filtering(scores, filter_frac: float = 1.0):
 
     if n_to_drop >= n_negative:
         # Drop all negative samples (filter_frac = 1.0 or very high)
-        # But ensure at least 1 sample is kept if no positive samples exist
         if positive_indices.shape[0] == 0:
-            # All samples are negative - keep the least negative one
-            best_idx = torch.argmax(scores)
-            return best_idx.unsqueeze(0)
+            # All samples are negative
+            if allow_empty:
+                # Return empty tensor - caller should handle this
+                return torch.tensor([], dtype=torch.long, device=device)
+            else:
+                # Keep the least negative one
+                best_idx = torch.argmax(scores)
+                return best_idx.unsqueeze(0)
         return positive_indices
 
     # Keep the top (100 - filter_frac)% of negative samples (less negative ones)
@@ -413,8 +421,8 @@ def negative_filtering(scores, filter_frac: float = 1.0):
     # Combine positive and kept negative indices
     selected_indices = torch.cat([positive_indices, kept_negative_indices])
 
-    # Final safety check: ensure at least 1 sample
-    if selected_indices.shape[0] == 0:
+    # Safety check when allow_empty=False
+    if not allow_empty and selected_indices.shape[0] == 0:
         best_idx = torch.argmax(scores)
         return best_idx.unsqueeze(0)
 

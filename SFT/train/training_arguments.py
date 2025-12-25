@@ -154,6 +154,15 @@ class TrainingArguments(TA):
             )
         },
     )
+    debug_gradient_scaling: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to log gradient magnitudes for debugging scaling issues. "
+                "Logs gradient norms after each backward pass."
+            )
+        },
+    )
 
     def __post_init__(self):
         if isinstance(self.fsdp_config, str):

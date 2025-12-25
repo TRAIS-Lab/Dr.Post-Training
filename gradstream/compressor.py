@@ -520,22 +520,25 @@ class Compressor(ProjectionContainer):
             )
 
             # Stage 1.5: Compute Kronecker product (outer product)
+            # NOTE: No batch_size scaling here - the compressor is agnostic to loss scaling.
+            # Any scaling to recover per-sample magnitude should be handled at the point of use
+            # (e.g., in the backward function after selection).
             if is_3d:
                 # Reshape back to 3D for proper outer product computation
                 component1_sparse_3d = component1_sparse.reshape(batch_size, seq_length, -1)
                 component2_sparse_3d = component2_sparse.reshape(batch_size, seq_length, -1)
 
-                # Compute outer product with batch scaling
+                # Compute outer product (raw, no scaling)
                 outer_product = torch.einsum(
                     'bsi,bsj->bij',
-                    component1_sparse_3d * batch_size,
+                    component1_sparse_3d,
                     component2_sparse_3d
                 )
             else:
-                # Compute outer product for 2D case with batch scaling
+                # Compute outer product for 2D case (raw, no scaling)
                 outer_product = torch.einsum(
                     'bi,bj->bij',
-                    component1_sparse * batch_size,
+                    component1_sparse,
                     component2_sparse
                 )
 

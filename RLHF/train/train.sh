@@ -31,7 +31,7 @@ export base_training_args="--bf16=True \
 --weight_decay=0.0 \
 --logging_steps=1 \
 --report_to=none \
---filter_frac=1.0"
+--filter_frac=0.5"
 
 # Default values
 task="toxicity"
@@ -40,20 +40,20 @@ model="EleutherAI/gpt-neo-2.7B"
 reward_model="facebook/roberta-hate-speech-dynabench-r4-target"
 
 # Training hyperparameters
-batch_size=1024  # Reference uses 256 for stable gradients
+batch_size=512  # Reference uses 256 for stable gradients
 lr=""  # Learning rate (looked up from config if not specified)
 lr_override=""  # Set when --lr is explicitly passed
-filter_frac=1.0
+filter_frac=0.5
 max_steps=-1  # -1 means no step limit (use epochs instead)
-epochs=8  # Number of training epochs (used when max_steps <= 0)
+epochs=2  # Number of training epochs (used when max_steps <= 0)
 seed=42
-min_batch_size_for_selection=2  # Skip selection when mini-batch size is too small
+min_batch_size_for_selection=1  # Skip selection when mini-batch size is too small
 
 # LR configuration
 # Reference: archive/LDA-ORL-main/rlhf-toxicity/scripts/run_train_std.sh uses 1e-5
 lr_config_file="RLHF/train/lr/config.json"
 fallback_lr_full="1e-5"
-fallback_lr_lora="1e-5"
+fallback_lr_lora="5e-6"
 
 # LoRA settings
 use_lora=false
@@ -70,9 +70,9 @@ update_compressor_freq=200
 
 # PPO settings
 ppo_epochs=4
-mini_batch_size=8
+mini_batch_size=4
 init_kl_coef=0.2
-kl_penalty="full"  # Options: kl, abs, mse, full
+kl_penalty="full"  # Options: kl, abs, mse, full (use "kl" for token-level stability)
 adap_kl_ctrl=true
 target_kl=0.1
 max_new_tokens=30
@@ -313,7 +313,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --batch_size <size>        Training batch size (default: 256)"
             echo "  --lr <lr>                  Learning rate override (ignores config file)"
             echo "  --lr_config <path>         LR config file (default: RLHF/train/lr/config.json)"
-            echo "  --filter_frac <frac>       Fraction of negative samples to drop (default: 1.0)"
+            echo "  --filter_frac <frac>       Fractio∂n of negative samples to drop (default: 1.0)"
             echo "  --min_batch_size_for_selection <n>  Min batch size for selection (default: 2)"
             echo "  --max_steps <steps>        Maximum training steps (default: -1, meaning no limit)"
             echo "  --epochs <n>               Number of training epochs (default: 1, used when max_steps <= 0)"
