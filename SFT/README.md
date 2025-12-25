@@ -288,15 +288,15 @@ Run LR sweep before full training to find optimal learning rates:
 ```bash
 # Alpaca -> SAMSum
 bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --train alpaca --task samsum \
-    --batch_size 8 --n_val 4 --sweep_percentage 0.04 --seed 2
+    --batch_size 8 --n_val 8 --sweep_percentage 0.04 --seed 2
 
 # Tulu3 -> TydiQA
 bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --train tulu3 --task tydiqa \
-    --batch_size 8 --n_val 4 --sweep_percentage 0.001 --seed 2
+    --batch_size 8 --n_val 8 --sweep_percentage 0.001 --seed 2
 
 # LESS -> MMLU/BBH
 bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --train less --task mmlu --subject sociology \
-    --batch_size 8 --n_val 4 --sweep_percentage 0.005 --seed 2 --lora_r 128
+    --batch_size 8 --n_val 8 --sweep_percentage 0.005 --seed 2 --lora_r 128
 ```
 
 ### Training Commands

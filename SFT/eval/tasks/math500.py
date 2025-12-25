@@ -46,8 +46,10 @@ def load_math500_test_data(data_dir: str, k: int = -1) -> List[Tuple[str, str, s
             full_solution = messages[1]['content']
             metadata = example.get('metadata', {})
 
-            # Extract final answer from \boxed{} format
-            final_answer = extract_boxed_answer(full_solution)
+            # Use answer from metadata if available, otherwise extract from \boxed{} format
+            final_answer = metadata.get('answer', '')
+            if not final_answer:
+                final_answer = extract_boxed_answer(full_solution)
             if final_answer is None:
                 continue
 

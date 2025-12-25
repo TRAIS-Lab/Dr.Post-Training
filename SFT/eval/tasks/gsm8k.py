@@ -44,9 +44,12 @@ def load_gsm8k_test_data(data_dir: str, k: int = -1) -> List[Tuple[str, str, str
 
             user_content = messages[0]['content']
             full_solution = messages[1]['content']
+            metadata = example.get('metadata', {})
 
-            # Extract final answer from #### format
-            final_answer = extract_answer(full_solution)
+            # Use answer from metadata if available, otherwise extract from #### format
+            final_answer = metadata.get('answer', '')
+            if not final_answer:
+                final_answer = extract_answer(full_solution)
             if final_answer is None:
                 continue
 

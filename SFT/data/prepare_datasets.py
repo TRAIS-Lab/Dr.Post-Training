@@ -48,6 +48,20 @@ def ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
+def extract_gsm8k_answer(answer_text):
+    """Extract the final numerical answer from GSM8K format (after ####)."""
+    if "####" in answer_text:
+        # Split on #### and get the part after it
+        parts = answer_text.split("####")
+        if len(parts) > 1:
+            # Clean up the answer (remove whitespace, commas in numbers)
+            final_answer = parts[-1].strip()
+            # Remove commas from numbers (e.g., "1,234" -> "1234")
+            final_answer = final_answer.replace(",", "")
+            return final_answer
+    return ""
+
+
 def prepare_gsm8k_train(output_dir):
     """Prepare GSM8K training data."""
     print("Preparing GSM8K training data...")
@@ -60,6 +74,7 @@ def prepare_gsm8k_train(output_dir):
         for idx, example in enumerate(tqdm(dataset)):
             question = example['question']
             answer = example['answer']
+            final_answer = extract_gsm8k_answer(answer)
 
             data = {
                 "dataset": "gsm8k",
@@ -67,7 +82,10 @@ def prepare_gsm8k_train(output_dir):
                 "messages": [
                     {"role": "user", "content": f"Solve the following math problem step by step:\n{question}"},
                     {"role": "assistant", "content": answer}
-                ]
+                ],
+                "metadata": {
+                    "answer": final_answer
+                }
             }
             f.write(json.dumps(data, ensure_ascii=False) + '\n')
 
@@ -98,13 +116,17 @@ def prepare_gsm8k_test(output_dir):
     val_file = os.path.join(output_dir_gsm8k, "gsm8k_validation_data.jsonl")
     with open(val_file, 'w', encoding='utf-8') as f:
         for idx, example in enumerate(val_examples):
+            final_answer = extract_gsm8k_answer(example['answer'])
             data = {
                 "dataset": "gsm8k",
                 "id": f"gsm8k_val_{idx}",
                 "messages": [
                     {"role": "user", "content": f"Solve the following math problem step by step:\n{example['question']}"},
                     {"role": "assistant", "content": example['answer']}
-                ]
+                ],
+                "metadata": {
+                    "answer": final_answer
+                }
             }
             f.write(json.dumps(data, ensure_ascii=False) + '\n')
 
@@ -112,13 +134,17 @@ def prepare_gsm8k_test(output_dir):
     test_file = os.path.join(output_dir_gsm8k, "gsm8k_test_data.jsonl")
     with open(test_file, 'w', encoding='utf-8') as f:
         for idx, example in enumerate(test_examples):
+            final_answer = extract_gsm8k_answer(example['answer'])
             data = {
                 "dataset": "gsm8k",
                 "id": f"gsm8k_test_{idx}",
                 "messages": [
                     {"role": "user", "content": f"Solve the following math problem step by step:\n{example['question']}"},
                     {"role": "assistant", "content": example['answer']}
-                ]
+                ],
+                "metadata": {
+                    "answer": final_answer
+                }
             }
             f.write(json.dumps(data, ensure_ascii=False) + '\n')
 
@@ -275,7 +301,8 @@ def prepare_math500(output_dir):
                 ],
                 "metadata": {
                     "level": example.get('level', 'unknown'),
-                    "type": example.get('type', 'unknown')
+                    "type": example.get('type', 'unknown'),
+                    "answer": example.get('answer', '')
                 }
             }
             f.write(json.dumps(data, ensure_ascii=False) + '\n')
@@ -293,7 +320,8 @@ def prepare_math500(output_dir):
                 ],
                 "metadata": {
                     "level": example.get('level', 'unknown'),
-                    "type": example.get('type', 'unknown')
+                    "type": example.get('type', 'unknown'),
+                    "answer": example.get('answer', '')
                 }
             }
             f.write(json.dumps(data, ensure_ascii=False) + '\n')
