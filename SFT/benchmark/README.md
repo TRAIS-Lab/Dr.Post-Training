@@ -88,11 +88,18 @@ bash benchmark.sh --methods GREATS_LoGra_Full --use-second-order
    - `--batch-size <n>` - Training batch size (default: 64)
    - `--seq-length <n>` - Sequence length (default: 64)
    - `--val-batch-size <n>` - Validation batch size for selection (default: 1)
-4. Benchmark Configuration
+4. Dataset Configuration
+   - `--dataset <name>` - Dataset for benchmarking (default: `alpaca`)
+     - `dummy` - Synthetic repeated sentence (fast, for debugging)
+     - `alpaca` - Stanford Alpaca instruction dataset
+     - `gsm8k` - Grade school math problems
+     - `dolly` - Databricks Dolly 15k
+     - `openhermes` - OpenHermes 2.5 conversations
+5. Benchmark Configuration
    - `--num-warmup <n>` - Warmup iterations (default: 10)
    - `--num-iterations <n>` - Timed iterations (default: 10)
    - `--use-second-order` - Enable second-order selection (greedy, slower)
-5. Output
+6. Output
    - `--output <file>` - Save results to JSON file
    - `--results-file <file>` - Append results to JSONL file (for aggregation)
    - `--print-summary <file>` - Print summary from results file and exit
@@ -107,29 +114,29 @@ Model: meta-llama/Llama-3.2-1B | Batch: 16 | Val Batch: 1 | Seq: 512 | Dtype: bf
 ==============================================================================================================
 Method                       Peak Mem     Setup Mem    Time/Iter      Throughput       Total Time
 --------------------------------------------------------------------------------------------------------------
-NA_NA_Full                   34.11 GB     2.30 GB      976.7 ms       16.38 samp/s     19.5 s
-NA_NA_LoRA                   28.79 GB     2.51 GB      844.2 ms       18.95 samp/s     16.9 s
-NA_NA_Full_gc                21.25 GB     2.30 GB      1190.9 ms      13.44 samp/s     23.8 s
-NA_NA_LoRA_gc                17.19 GB     2.51 GB      1125.8 ms      14.21 samp/s     22.5 s
-Streaming_NA_Full            35.80 GB     2.31 GB      1228.3 ms      13.03 samp/s     24.6 s
-Streaming_NA_LoRA            30.01 GB     2.41 GB      850.8 ms       18.81 samp/s     17.0 s
-Streaming_NA_Full_gc         22.14 GB     2.31 GB      1449.0 ms      11.04 samp/s     29.0 s
-Streaming_NA_LoRA_gc         17.78 GB     2.41 GB      1111.4 ms      14.40 samp/s     22.2 s
-Streaming_LoGra_Full         32.11 GB     3.11 GB      889.1 ms       18.00 samp/s     17.8 s
-Streaming_LoGra_Full_gc      18.45 GB     3.11 GB      1110.5 ms      14.41 samp/s     22.2 s
-GREATS_NA_Full               36.66 GB     2.31 GB      1413.0 ms      11.32 samp/s     28.3 s
-GREATS_NA_LoRA               30.26 GB     2.41 GB      1260.8 ms      12.69 samp/s     25.2 s
-GREATS_NA_Full_gc            23.00 GB     2.31 GB      1753.4 ms      9.12 samp/s      35.1 s
-GREATS_NA_LoRA_gc            18.04 GB     2.41 GB      1655.7 ms      9.66 samp/s      33.1 s
-GREATS_LoGra_Full            32.11 GB     3.11 GB      1291.2 ms      12.39 samp/s     25.8 s
-GREATS_LoGra_Full_gc         18.45 GB     3.11 GB      1626.1 ms      9.84 samp/s      32.5 s
-Full_sgd                     29.50 GB     2.30 GB      897.7 ms       17.82 samp/s     18.0 s
-Full_sgd_momentum            31.80 GB     2.30 GB      909.3 ms       17.60 samp/s     18.2 s
-LoRA_sgd                     28.38 GB     2.51 GB      839.0 ms       19.07 samp/s     16.8 s
-LoRA_sgd_momentum            28.59 GB     2.51 GB      840.8 ms       19.03 samp/s     16.8 s
-Full_sgd_gc                  16.64 GB     2.30 GB      1117.7 ms      14.32 samp/s     22.4 s
-Full_sgd_momentum_gc         18.95 GB     2.30 GB      1123.9 ms      14.24 samp/s     22.5 s
-LoRA_sgd_gc                  16.78 GB     2.51 GB      1120.1 ms      14.28 samp/s     22.4 s
-LoRA_sgd_momentum_gc         16.99 GB     2.51 GB      1120.7 ms      14.28 samp/s     22.4 s
+NA_NA_Full                   34.11 GB     2.30 GB      981.0 ms       16.31 samp/s     19.6 s
+NA_NA_LoRA                   27.90 GB     2.32 GB      828.0 ms       19.32 samp/s     16.6 s
+NA_NA_Full_gc                21.25 GB     2.30 GB      1195.8 ms      13.38 samp/s     23.9 s
+NA_NA_LoRA_gc                16.62 GB     2.32 GB      1110.0 ms      14.41 samp/s     22.2 s
+Streaming_NA_Full            33.45 GB     2.31 GB      1074.6 ms      14.89 samp/s     21.5 s
+Streaming_NA_LoRA            27.12 GB     2.32 GB      873.6 ms       18.31 samp/s     17.5 s
+Streaming_NA_Full_gc         20.06 GB     2.31 GB      1295.7 ms      12.35 samp/s     25.9 s
+Streaming_NA_LoRA_gc         15.41 GB     2.32 GB      1118.3 ms      14.31 samp/s     22.4 s
+Streaming_LoGra_Full         29.76 GB     3.11 GB      903.3 ms       17.71 samp/s     18.1 s
+Streaming_LoGra_Full_gc      16.37 GB     3.11 GB      1128.2 ms      14.18 samp/s     22.6 s
+GREATS_NA_Full               30.69 GB     2.31 GB      1333.8 ms      12.00 samp/s     26.7 s
+GREATS_NA_LoRA               27.13 GB     2.32 GB      1218.9 ms      13.13 samp/s     24.4 s
+GREATS_NA_Full_gc            17.30 GB     2.31 GB      1667.2 ms      9.60 samp/s      33.3 s
+GREATS_NA_LoRA_gc            15.42 GB     2.32 GB      1621.4 ms      9.87 samp/s      32.4 s
+GREATS_LoGra_Full            29.76 GB     3.11 GB      1296.7 ms      12.34 samp/s     25.9 s
+GREATS_LoGra_Full_gc         16.37 GB     3.11 GB      1634.7 ms      9.79 samp/s      32.7 s
+Full_sgd                     29.50 GB     2.30 GB      900.4 ms       17.77 samp/s     18.0 s
+Full_sgd_momentum            31.80 GB     2.30 GB      909.5 ms       17.59 samp/s     18.2 s
+LoRA_sgd                     27.87 GB     2.32 GB      828.4 ms       19.31 samp/s     16.6 s
+LoRA_sgd_momentum            27.89 GB     2.32 GB      828.0 ms       19.32 samp/s     16.6 s
+Full_sgd_gc                  16.64 GB     2.30 GB      1114.9 ms      14.35 samp/s     22.3 s
+Full_sgd_momentum_gc         18.95 GB     2.30 GB      1125.0 ms      14.22 samp/s     22.5 s
+LoRA_sgd_gc                  16.59 GB     2.32 GB      1102.7 ms      14.51 samp/s     22.1 s
+LoRA_sgd_momentum_gc         16.61 GB     2.32 GB      1107.9 ms      14.44 samp/s     22.2 s
 ==============================================================================================================
 ```

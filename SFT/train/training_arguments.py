@@ -150,7 +150,7 @@ class TrainingArguments(TA):
             "help": (
                 "Whether to use second-order interactions for data selection. "
                 "If True, uses greedy selection considering sample similarities (O(k*n) complexity). "
-                "If False (default), uses simple top-k selection based on scores (~200x faster)."
+                "If False (default), uses simple top-k selection based on scores."
             )
         },
     )

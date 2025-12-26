@@ -210,6 +210,8 @@ class GREATSStrategy(SelectionStrategy):
         # Get globally selected indices
         state: GREATSState = self.grad_hook.selection_state
         selected_indices = state.get_final_selection()
+        # Sort indices for sequential memory access (better cache locality)
+        selected_indices = selected_indices.sort()[0]
 
         self._cleanup()
 
@@ -474,6 +476,8 @@ class StoredValGREATSStrategy(StoredValStrategy):
 
         # Get globally selected indices
         selected_indices = self.grad_hook.selection_state.get_final_selection()
+        # Sort indices for sequential memory access (better cache locality)
+        selected_indices = selected_indices.sort()[0]
         n_selected = len(selected_indices)
 
         self._cleanup()

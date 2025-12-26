@@ -26,7 +26,7 @@ Design principles:
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq
 from peft import LoraConfig, get_peft_model, TaskType
 import json
 import argparse
@@ -41,7 +41,9 @@ warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
 from gradstream.hook import GradientHook
 from gradstream.compressor import setup_model_compressors
 from gradstream.optimizer import MeSOAdamW
-from gradstream.utils import greedy_selection
+from gradstream.selection.strategies import StreamingStrategy, GREATSStrategy
+
+from datasets import load_dataset
 
 
 # =============================================================================
@@ -60,6 +62,10 @@ class BenchmarkConfig:
     batch_size: int = 128
     seq_length: int = 256
     val_batch_size: int = 1
+
+    # Dataset config
+    # Options: 'dummy', 'alpaca', 'gsm8k', 'dolly', 'openhermes'
+    dataset: str = 'alpaca'
 
     # Benchmark
     num_warmup: int = 10
@@ -96,8 +102,76 @@ class BenchmarkResult:
 
 
 # =============================================================================
-# Dummy Dataset for Benchmarking
+# Dataset Classes for Benchmarking
 # =============================================================================
+
+def concat_messages(messages, tokenizer):
+    """
+    Concatenate messages into a single string with role delimiters.
+    Matches the format used in SFT/data/get_train_dataset.py
+    """
+    message_text = ""
+    for message in messages:
+        if message["role"] == "system":
+            message_text += "<|system|>\n" + message["content"].strip() + "\n"
+        elif message["role"] == "user":
+            message_text += "<|user|>\n" + message["content"].strip() + "\n"
+        elif message["role"] == "assistant":
+            message_text += "<|assistant|>\n" + \
+                message["content"].strip() + tokenizer.eos_token + "\n"
+        else:
+            raise ValueError("Invalid role: {}".format(message["role"]))
+    return message_text
+
+
+def encode_with_messages_format(example, tokenizer, max_seq_length):
+    """
+    Encode an example with messages format.
+    Matches the encoding used in SFT/data/get_train_dataset.py
+    """
+    messages = example['messages']
+    if len(messages) == 0:
+        return None
+
+    example_text = concat_messages(messages, tokenizer)
+    tokenized_example = tokenizer(
+        example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
+    input_ids = tokenized_example.input_ids
+    labels = input_ids.clone()
+
+    # mask the non-assistant part for avoiding loss
+    for message_idx, message in enumerate(messages):
+        if message["role"] != "assistant":
+            if message_idx == 0:
+                message_start_idx = 0
+            else:
+                message_start_idx = tokenizer(
+                    concat_messages(messages[:message_idx], tokenizer), return_tensors='pt', max_length=max_seq_length, truncation=True
+                ).input_ids.shape[1]
+            if message_idx < len(messages) - 1 and messages[message_idx+1]["role"] == "assistant":
+                messages_so_far = concat_messages(
+                    messages[:message_idx+1], tokenizer) + "<|assistant|>\n"
+            else:
+                messages_so_far = concat_messages(
+                    messages[:message_idx+1], tokenizer)
+            message_end_idx = tokenizer(
+                messages_so_far,
+                return_tensors='pt',
+                max_length=max_seq_length,
+                truncation=True
+            ).input_ids.shape[1]
+            labels[:, message_start_idx:message_end_idx] = -100
+
+            if message_end_idx >= max_seq_length:
+                break
+
+    attention_mask = torch.ones_like(input_ids)
+    return {
+        'input_ids': input_ids.flatten(),
+        'labels': labels.flatten(),
+        'attention_mask': attention_mask.flatten(),
+    }
+
 
 class DummyDataset(Dataset):
     """Dummy dataset that generates random tokens for benchmarking."""
@@ -107,7 +181,7 @@ class DummyDataset(Dataset):
         self.seq_length = seq_length
         self.size = size
         # Pre-tokenize a dummy sentence
-        self.dummy_text = "This is a test sentence for memory and performance benchmarking. " * 20
+        self.dummy_text = "This is a test sentence for memory and performance benchmarking." * 128
 
     def __len__(self):
         return self.size
@@ -125,6 +199,212 @@ class DummyDataset(Dataset):
             'attention_mask': tokens['attention_mask'].squeeze(0),
             'labels': tokens['input_ids'].squeeze(0).clone(),
         }
+
+
+class RealDataset(Dataset):
+    """
+    Dataset that loads real training data from HuggingFace.
+    Uses the same encoding format as the actual training code.
+    """
+
+    # Mapping of dataset names to HuggingFace dataset info
+    DATASET_INFO = {
+        'alpaca': {
+            'path': 'tatsu-lab/alpaca',
+            'split': 'train',
+            'format': 'alpaca',  # instruction, input, output format
+        },
+        'gsm8k': {
+            'path': 'openai/gsm8k',
+            'name': 'main',
+            'split': 'train',
+            'format': 'gsm8k',  # question, answer format
+        },
+        'dolly': {
+            'path': 'databricks/databricks-dolly-15k',
+            'split': 'train',
+            'format': 'dolly',  # instruction, context, response format
+        },
+        'openhermes': {
+            'path': 'teknium/OpenHermes-2.5',
+            'split': 'train',
+            'format': 'sharegpt',  # conversations format
+        },
+    }
+
+    def __init__(self, dataset_name: str, tokenizer, seq_length: int, size: int = 10000):
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+        self.size = size
+
+        if dataset_name not in self.DATASET_INFO:
+            raise ValueError(f"Unknown dataset: {dataset_name}. Available: {list(self.DATASET_INFO.keys())}")
+
+        info = self.DATASET_INFO[dataset_name]
+        print(f"Loading dataset: {info['path']}...")
+
+        # Load dataset from HuggingFace
+        if 'name' in info:
+            raw_dataset = load_dataset(info['path'], info['name'], split=info['split'])
+        else:
+            raw_dataset = load_dataset(info['path'], split=info['split'])
+
+        # Convert to messages format and encode
+        self.encoded_examples = []
+        for i, example in enumerate(raw_dataset):
+            if len(self.encoded_examples) >= size:
+                break
+
+            messages = self._convert_to_messages(example, info['format'])
+            if messages is None:
+                continue
+
+            encoded = encode_with_messages_format(
+                {'messages': messages}, tokenizer, seq_length)
+            if encoded is not None:
+                self.encoded_examples.append(encoded)
+
+        print(f"Loaded {len(self.encoded_examples)} examples from {dataset_name}")
+
+    def _convert_to_messages(self, example, format_type):
+        """Convert different dataset formats to unified messages format."""
+        try:
+            if format_type == 'alpaca':
+                # Alpaca format: instruction, input, output
+                instruction = example.get('instruction', '')
+                input_text = example.get('input', '')
+                output = example.get('output', '')
+
+                if input_text:
+                    user_content = f"{instruction}\n\n{input_text}"
+                else:
+                    user_content = instruction
+
+                return [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": output}
+                ]
+
+            elif format_type == 'gsm8k':
+                # GSM8K format: question, answer
+                question = example.get('question', '')
+                answer = example.get('answer', '')
+
+                user_content = f"Solve the following math problem step by step.\n\n{question}"
+
+                return [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": answer}
+                ]
+
+            elif format_type == 'dolly':
+                # Dolly format: instruction, context, response
+                instruction = example.get('instruction', '')
+                context = example.get('context', '')
+                response = example.get('response', '')
+
+                if context:
+                    user_content = f"{instruction}\n\nContext: {context}"
+                else:
+                    user_content = instruction
+
+                return [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": response}
+                ]
+
+            elif format_type == 'sharegpt':
+                # ShareGPT/OpenHermes format: conversations list
+                conversations = example.get('conversations', [])
+                messages = []
+                for conv in conversations:
+                    role = conv.get('from', '')
+                    content = conv.get('value', '')
+                    if role == 'human':
+                        messages.append({"role": "user", "content": content})
+                    elif role == 'gpt':
+                        messages.append({"role": "assistant", "content": content})
+                    elif role == 'system':
+                        messages.append({"role": "system", "content": content})
+                return messages if messages else None
+
+            else:
+                return None
+        except Exception:
+            return None
+
+    def __len__(self):
+        return len(self.encoded_examples)
+
+    def __getitem__(self, idx):
+        return self.encoded_examples[idx % len(self.encoded_examples)]
+
+
+def get_benchmark_dataset(config: BenchmarkConfig, tokenizer, size: int = 10000) -> Dataset:
+    """Get the appropriate dataset based on config."""
+    if config.dataset == 'dummy':
+        return DummyDataset(tokenizer, config.seq_length, size)
+    else:
+        return RealDataset(config.dataset, tokenizer, config.seq_length, size)
+
+
+def get_data_collator(tokenizer, config: BenchmarkConfig):
+    """Get the appropriate data collator based on config."""
+    if config.dataset == 'dummy':
+        # Dummy dataset already pads to max_length, use default collator
+        return None
+    else:
+        # Real datasets have variable lengths, need padding collator
+        return DataCollatorForSeq2Seq(tokenizer=tokenizer, padding="longest")
+
+
+def pad_and_merge_batches(batch1: Dict[str, torch.Tensor], batch2: Dict[str, torch.Tensor], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
+    """
+    Pad two batches to the same sequence length and concatenate them.
+
+    Args:
+        batch1: First batch (train batch)
+        batch2: Second batch (validation batch)
+        pad_token_id: Token ID to use for padding (default: 0)
+
+    Returns:
+        Merged batch with both batches padded to the same length
+    """
+    merged_batch = {}
+
+    for key in batch1.keys():
+        if key not in batch2:
+            merged_batch[key] = batch1[key]
+            continue
+
+        t1, t2 = batch1[key], batch2[key]
+
+        # Get sequence lengths
+        seq_len1 = t1.shape[1] if t1.dim() > 1 else t1.shape[0]
+        seq_len2 = t2.shape[1] if t2.dim() > 1 else t2.shape[0]
+        max_len = max(seq_len1, seq_len2)
+
+        # Determine padding value based on key
+        if key == 'labels':
+            pad_value = -100  # Ignore index for loss
+        elif key == 'attention_mask':
+            pad_value = 0  # No attention to padding
+        else:
+            pad_value = pad_token_id
+
+        # Pad if needed
+        if t1.dim() > 1:
+            # 2D tensor (batch_size, seq_len)
+            if seq_len1 < max_len:
+                padding = torch.full((t1.shape[0], max_len - seq_len1), pad_value, dtype=t1.dtype, device=t1.device)
+                t1 = torch.cat([t1, padding], dim=1)
+            if seq_len2 < max_len:
+                padding = torch.full((t2.shape[0], max_len - seq_len2), pad_value, dtype=t2.dtype, device=t2.device)
+                t2 = torch.cat([t2, padding], dim=1)
+
+        merged_batch[key] = torch.cat([t1, t2], dim=0)
+
+    return merged_batch
 
 
 # =============================================================================
@@ -206,9 +486,10 @@ class Benchmark:
         memory_after_setup = self._get_current_memory_gb()
         print(f"Memory after setup: {memory_after_setup:.3f} GB")
 
-        # Create dataloader
-        dataset = DummyDataset(tokenizer, self.config.seq_length)
-        dataloader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
+        # Create dataloader with real or dummy data based on config
+        dataset = get_benchmark_dataset(self.config, tokenizer)
+        collator = get_data_collator(tokenizer, self.config)
+        dataloader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True, collate_fn=collator)
         data_iter = iter(dataloader)
 
         # Reset memory stats before training
@@ -323,18 +604,24 @@ class SelectionStepHelper:
     This creates and manages a validation dataloader for selection.
     """
 
-    def __init__(self, tokenizer, seq_length: int, batch_size: int, device: str):
+    def __init__(self, tokenizer, seq_length: int, batch_size: int, device: str, config: BenchmarkConfig = None):
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.batch_size = batch_size
         self.device = device
+        self.config = config
         self._val_iter = None
         self._val_dataloader = None
 
     def _create_val_dataloader(self):
         """Create validation dataloader for selection."""
-        dataset = DummyDataset(self.tokenizer, self.seq_length, size=1000)
-        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        if self.config is not None and self.config.dataset != 'dummy':
+            dataset = RealDataset(self.config.dataset, self.tokenizer, self.seq_length, size=1000)
+            collator = DataCollatorForSeq2Seq(tokenizer=self.tokenizer, padding="longest")
+        else:
+            dataset = DummyDataset(self.tokenizer, self.seq_length, size=1000)
+            collator = None
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, collate_fn=collator)
 
     def get_val_batch(self) -> Dict[str, torch.Tensor]:
         """Get a validation batch for selection."""
@@ -355,8 +642,8 @@ def make_step_streaming(selection_helper: SelectionStepHelper, selection_frac: f
     """
     Create a step function for Streaming (per-layer) selection.
 
-    Streaming mode: Single-pass approach with per-layer selection.
-    Each layer independently selects samples based on that layer's gradient alignment.
+    Uses StreamingStrategy from gradstream.selection.strategies to ensure
+    consistency with the main codebase and avoid benchmark bias.
 
     Args:
         selection_helper: SelectionStepHelper instance for validation batches
@@ -368,40 +655,45 @@ def make_step_streaming(selection_helper: SelectionStepHelper, selection_frac: f
     Returns:
         Step function for Streaming selection
     """
+    # Strategy will be initialized on first call when grad_hook is available
+    strategy = None
+
     def step_fn(model, optimizer, batch, grad_hook):
+        nonlocal strategy
+
+        # Initialize strategy on first call
+        if strategy is None:
+            strategy = StreamingStrategy(
+                grad_hook=grad_hook,
+                frac=selection_frac,
+                use_second_order=use_second_order
+            )
+
         model.train()
 
-        # Get validation batch
+        # Get validation batch and merge with train batch
         val_batch = selection_helper.get_val_batch()
         train_batch_size = batch['input_ids'].shape[0]
 
-        # Merge batches: [train_samples, val_samples]
-        merged_batch = {}
-        for key in batch.keys():
-            if key in val_batch:
-                merged_batch[key] = torch.cat([batch[key], val_batch[key]], dim=0)
-            else:
-                merged_batch[key] = batch[key]
+        # Merge batches with proper padding for variable-length sequences
+        merged_batch = pad_and_merge_batches(batch, val_batch)
 
         lr = optimizer.param_groups[0].get("lr", 5e-5)
 
-        # Streaming mode: single pass with per-layer selection and aggregation
-        grad_hook.setup_selection(
-            train_batch_size=train_batch_size,
-            selection_method='Streaming',
-            frac=selection_frac,
-            lr=lr,
-            compute_scores_only=False,  # Per-layer selection and aggregation
-            use_second_order=use_second_order
-        )
+        # Define compute_loss_fn for strategy
+        def compute_loss_fn(model, batch):
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = model(**batch)
+                return outputs.loss
 
         optimizer.zero_grad()
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            outputs = model(**merged_batch)
-            loss = outputs.loss
-        loss.backward()
-
-        grad_hook.clear_selection()
+        loss = strategy.execute_training_step(
+            model=model,
+            merged_batch=merged_batch,
+            train_batch_size=train_batch_size,
+            compute_loss_fn=compute_loss_fn,
+            lr=lr
+        )
         optimizer.step()
 
         return loss.item()
@@ -413,9 +705,8 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
     """
     Create a step function for GREATS (global) selection.
 
-    GREATS mode: Two-pass approach with global selection.
-    1. First pass: Accumulate scores across all layers
-    2. Second pass: Compute gradients on globally selected samples
+    Uses GREATSStrategy from gradstream.selection.strategies to ensure
+    consistency with the main codebase and avoid benchmark bias.
 
     Args:
         selection_helper: SelectionStepHelper instance for validation batches
@@ -427,64 +718,46 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
     Returns:
         Step function for GREATS selection
     """
+    # Strategy will be initialized on first call when grad_hook is available
+    strategy = None
+
     def step_fn(model, optimizer, batch, grad_hook):
+        nonlocal strategy
+
+        # Initialize strategy on first call
+        if strategy is None:
+            strategy = GREATSStrategy(
+                grad_hook=grad_hook,
+                frac=selection_frac,
+                use_second_order=use_second_order
+            )
+
         model.train()
 
-        # Get validation batch
+        # Get validation batch and merge with train batch
         val_batch = selection_helper.get_val_batch()
         train_batch_size = batch['input_ids'].shape[0]
 
-        # Merge batches: [train_samples, val_samples]
-        merged_batch = {}
-        for key in batch.keys():
-            if key in val_batch:
-                merged_batch[key] = torch.cat([batch[key], val_batch[key]], dim=0)
-            else:
-                merged_batch[key] = batch[key]
+        # Merge batches with proper padding for variable-length sequences
+        merged_batch = pad_and_merge_batches(batch, val_batch)
 
         lr = optimizer.param_groups[0].get("lr", 5e-5)
 
-        # Pass 1: Compute selection scores (accumulate across all layers)
-        grad_hook.setup_selection(
+        # Define compute_loss_fn for strategy
+        def compute_loss_fn(model, batch):
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = model(**batch)
+                return outputs.loss
+
+        optimizer.zero_grad()
+        loss = strategy.execute_training_step(
+            model=model,
+            merged_batch=merged_batch,
             train_batch_size=train_batch_size,
-            selection_method='GREATS',
-            frac=selection_frac,
+            compute_loss_fn=compute_loss_fn,
             lr=lr,
-            compute_scores_only=True,
-            use_second_order=use_second_order
+            batch_train=batch  # Original train batch for pass 2
         )
-
-        optimizer.zero_grad()
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            outputs = model(**merged_batch)
-            loss_for_scoring = outputs.loss
-        loss_for_scoring.backward()
-
-        # Get globally selected indices
-        selected_indices = grad_hook.selection_state.get_final_selection()
-        grad_hook.clear_selection()
-
-        # Pass 2: Compute gradients on selected samples
-        filtered_batch = {
-            'input_ids': batch['input_ids'][selected_indices],
-            'attention_mask': batch['attention_mask'][selected_indices],
-            'labels': batch['labels'][selected_indices]
-        }
-
-        optimizer.zero_grad()
-
-        if not has_compression:
-            # GREATS-NA: Disable hooks for full gradient computation
-            grad_hook.disable_hooks()
-
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            outputs = model(**filtered_batch)
-            loss = outputs.loss
-        loss.backward()
-
-        if not has_compression:
-            grad_hook.enable_hooks()
-
         optimizer.step()
 
         return loss.item()
@@ -1353,7 +1626,7 @@ def run_benchmark(methods: List[str], config: BenchmarkConfig, output_file: Opti
             def make_streaming_setup(base_setup, sel_frac, has_comp):
                 def wrapped_setup(cfg):
                     model, optimizer, tokenizer, grad_hook = base_setup(cfg)
-                    helper = SelectionStepHelper(tokenizer, cfg.seq_length, cfg.val_batch_size, cfg.device)
+                    helper = SelectionStepHelper(tokenizer, cfg.seq_length, cfg.val_batch_size, cfg.device, cfg)
                     step = make_step_streaming(helper, sel_frac, use_second_order=cfg.use_second_order, has_compression=has_comp)
                     return model, optimizer, tokenizer, grad_hook, step
                 return wrapped_setup
@@ -1372,7 +1645,7 @@ def run_benchmark(methods: List[str], config: BenchmarkConfig, output_file: Opti
             def make_greats_setup(base_setup, sel_frac, has_comp):
                 def wrapped_setup(cfg):
                     model, optimizer, tokenizer, grad_hook = base_setup(cfg)
-                    helper = SelectionStepHelper(tokenizer, cfg.seq_length, cfg.val_batch_size, cfg.device)
+                    helper = SelectionStepHelper(tokenizer, cfg.seq_length, cfg.val_batch_size, cfg.device, cfg)
                     step = make_step_greats(helper, sel_frac, use_second_order=cfg.use_second_order, has_compression=has_comp)
                     return model, optimizer, tokenizer, grad_hook, step
                 return wrapped_setup
@@ -1407,9 +1680,9 @@ def run_benchmark(methods: List[str], config: BenchmarkConfig, output_file: Opti
 
     # Print summary table
     if results:
-        print("\n" + "=" * 110)
+        print("\n" + "=" * 120)
         print("BENCHMARK SUMMARY")
-        print(f"Model: {config.model_name} | Batch: {config.batch_size} | Val Batch: {config.val_batch_size} | Seq: {config.seq_length} | Dtype: {config.dtype}")
+        print(f"Model: {config.model_name} | Dataset: {config.dataset} | Batch: {config.batch_size} | Val Batch: {config.val_batch_size} | Seq: {config.seq_length} | Dtype: {config.dtype}")
         print("=" * 110)
         print(f"{'Method':<28} {'Peak Mem':<12} {'Setup Mem':<12} {'Time/Iter':<14} {'Throughput':<16} {'Total Time':<12}")
         print("-" * 110)
@@ -1467,9 +1740,9 @@ def print_summary_from_file(results_file: str):
         print("No results found in file.")
         return
 
-    print("\n" + "=" * 110)
+    print("\n" + "=" * 120)
     print("BENCHMARK SUMMARY (Aggregated)")
-    print(f"Model: {config['model_name']} | Batch: {config['batch_size']} | Val Batch: {config['val_batch_size']} | Seq: {config['seq_length']} | Dtype: {config['dtype']}")
+    print(f"Model: {config['model_name']} | Dataset: {config.get('dataset', 'N/A')} | Batch: {config['batch_size']} | Val Batch: {config['val_batch_size']} | Seq: {config['seq_length']} | Dtype: {config['dtype']}")
     print("=" * 110)
     print(f"{'Method':<28} {'Peak Mem':<12} {'Setup Mem':<12} {'Time/Iter':<14} {'Throughput':<16} {'Total Time':<12}")
     print("-" * 110)
@@ -1514,10 +1787,16 @@ Examples:
     parser.add_argument('--no-flash-attention', action='store_true', help='Disable flash attention')
 
     # Training config
-    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--seq-length', type=int, default=512)
     parser.add_argument('--val-batch-size', type=int, default=1,
                         help='Validation batch size for data selection (Streaming/GREATS)')
+
+    # Dataset config
+    parser.add_argument('--dataset', type=str, default='alpaca',
+                        choices=['dummy', 'alpaca', 'gsm8k', 'dolly', 'openhermes'],
+                        help='Dataset to use for benchmarking. "dummy" uses synthetic data, '
+                             'others load real data from HuggingFace with proper tokenization.')
 
     # Benchmark config
     parser.add_argument('--num-warmup', type=int, default=20)
@@ -1585,6 +1864,7 @@ Examples:
         batch_size=args.batch_size,
         seq_length=args.seq_length,
         val_batch_size=args.val_batch_size,
+        dataset=args.dataset,
         num_warmup=args.num_warmup,
         num_iterations=args.num_iterations,
         use_second_order=args.use_second_order,
@@ -1599,6 +1879,7 @@ Examples:
     print(f"  Batch Size: {config.batch_size}")
     print(f"  Val Batch Size: {config.val_batch_size}")
     print(f"  Seq Length: {config.seq_length}")
+    print(f"  Dataset: {config.dataset}")
     print(f"  Warmup Iterations: {config.num_warmup}")
     print(f"  Timed Iterations: {config.num_iterations}")
     print(f"  Use Second Order: {config.use_second_order}")

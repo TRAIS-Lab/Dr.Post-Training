@@ -198,6 +198,8 @@ class StreamingState(SelectionState):
 
         # Step 3: Select indices
         selected_indices = self._select_indices(scores, similarity)
+        # Sort indices for sequential memory access (better cache locality)
+        selected_indices = selected_indices.sort()[0]
         self._last_selected_indices = selected_indices
         num_selected = selected_indices.shape[0]
 

@@ -48,30 +48,7 @@ def _split_merged_train_val_batch(
     return train_portion, val_portion
 
 
-def _compute_val_gradient_full(
-    val_grad_output: Tensor,
-    val_input: Tensor
-) -> Tensor:
-    """Compute mean validation gradient for full gradient mode.
-
-    Uses matmul instead of einsum for better performance:
-    einsum('bso,bsi->oi') -> reshape to [B*S, O] and [B*S, I], then matmul.T @ X
-    """
-    if val_grad_output.dim() == 3:
-        # Reshape: [V, S, O] -> [V*S, O] and [V, S, I] -> [V*S, I]
-        O = val_grad_output.shape[-1]
-        I = val_input.shape[-1]
-        go_flat = val_grad_output.reshape(-1, O)  # [V*S, O]
-        inp_flat = val_input.reshape(-1, I)       # [V*S, I]
-        # matmul: [O, V*S] @ [V*S, I] -> [O, I]
-        val_grad_full = go_flat.T @ inp_flat
-    else:
-        # 2D case: [V, O] @ [V, I].T -> matmul is the same as einsum
-        val_grad_full = val_grad_output.T @ val_input
-    return val_grad_full / val_grad_output.shape[0]
-
-
-def _compute_scores_ghost(
+def _compute_scores(
     train_grad_output: Tensor,
     train_input: Tensor,
     val_grad_full: Tensor,
@@ -80,11 +57,14 @@ def _compute_scores_ghost(
     """
     Compute per-sample scores using ghost inner product (without materializing full gradients).
 
+    This version takes a pre-computed val_grad_full [O, I] and is used when:
+    - Validation gradients are stored (RLHF mode)
+    - val_grad_full is already available
+
     Returns:
         (scores, similarity) tuple where similarity is None if not use_second_order
     """
     similarity = None
-
     if train_grad_output.dim() == 3:
         # 3D case: [batch, seq, features]
         temp = train_input @ val_grad_full.T
@@ -109,40 +89,80 @@ def _compute_scores_ghost(
     return scores, similarity
 
 
-def _compute_selected_gradients_full(
+@torch.compile
+def _compute_scores_factorized(
+    train_grad_output: Tensor,
+    train_input: Tensor,
+    val_grad_output: Tensor,
+    val_input: Tensor,
+    use_second_order: bool
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """
+    Compute per-sample scores WITHOUT materializing the [O, I] validation gradient.
+
+    Uses a single fused einsum that contracts all 4 tensors at once:
+        score_b = mean_v sum_{s,t,o,i} go_b[s,o] * go_v[t,o] * x_b[s,i] * x_v[t,i]
+
+    Returns:
+        (scores, similarity) tuple where similarity is None if not use_second_order
+    """
+    similarity = None
+    # for testing, return a random scores
+    V = val_grad_output.shape[0]
+
+    if train_grad_output.dim() == 3:
+        # 3D case: [B, S, O] and [B, S, I]
+        # Fused 4-way einsum: contracts over v, s', o, i simultaneously
+        # score_b = sum_{v,s,t,o,i} go_b[s,o] * go_v[t,o] * x_b[s,i] * x_v[t,i] / V
+        scores = torch.einsum(
+            'bso,vto,bsi,vti->b',
+            train_grad_output, val_grad_output, train_input, val_input
+        ) / V
+
+        if use_second_order:
+            contracted = torch.bmm(
+                train_grad_output.permute(0, 2, 1),
+                train_input
+            ).flatten(start_dim=1)
+            similarity = torch.matmul(contracted, contracted.T)
+    else:
+        # 2D case: [B, O] and [B, I]
+        # Fused: score_b = sum_{v,o,i} go_b[o] * go_v[o] * x_b[i] * x_v[i] / V
+        scores = torch.einsum(
+            'bo,vo,bi,vi->b',
+            train_grad_output, val_grad_output, train_input, val_input
+        ) / V
+
+        if use_second_order:
+            dot_g = torch.matmul(train_grad_output, train_grad_output.T)
+            dot_x = torch.matmul(train_input, train_input.T)
+            similarity = dot_g * dot_x
+
+    return scores, similarity
+
+
+def _compute_selected_gradients(
     train_grad_output: Tensor,
     train_input: Tensor,
     selected_indices: Tensor,
     has_bias: bool,
     scale_factor: float
 ) -> Tuple[Tensor, Optional[Tensor]]:
-    """Compute gradients for selected samples in full gradient mode.
-
-    Uses matmul instead of einsum for better performance:
-    einsum('kso,ksi->oi') -> reshape to [K*S, O] and [K*S, I], then matmul.T @ X
     """
+    Compute gradients for selected samples in full gradient mode.
+    """
+    # selected_indices = selected_indices.sort()[0]
     selected_grad_output = train_grad_output[selected_indices]
     selected_input = train_input[selected_indices]
 
     if selected_grad_output.dim() == 3:
-        # Reshape: [K, S, O] -> [K*S, O] and [K, S, I] -> [K*S, I]
-        O = selected_grad_output.shape[-1]
-        I = selected_input.shape[-1]
-        go_flat = selected_grad_output.reshape(-1, O)  # [K*S, O]
-        inp_flat = selected_input.reshape(-1, I)       # [K*S, I]
-        # matmul: [O, K*S] @ [K*S, I] -> [O, I]
-        grad_weight = (go_flat.T @ inp_flat) * scale_factor
-        if has_bias:
-            grad_bias = selected_grad_output.sum(dim=(0, 1)) * scale_factor
-        else:
-            grad_bias = None
+        # 3D case: [K, S, O] x [K, S, I] -> [O, I]
+        grad_weight = torch.einsum('kso,ksi->oi', selected_grad_output, selected_input) * scale_factor
+        grad_bias = selected_grad_output.sum(dim=(0, 1)) * scale_factor if has_bias else None
     else:
-        # 2D case: [K, O].T @ [K, I] -> [O, I]
-        grad_weight = (selected_grad_output.T @ selected_input) * scale_factor
-        if has_bias:
-            grad_bias = selected_grad_output.sum(dim=0) * scale_factor
-        else:
-            grad_bias = None
+        # 2D case: [K, O] x [K, I] -> [O, I]
+        grad_weight = torch.einsum('ko,ki->oi', selected_grad_output, selected_input) * scale_factor
+        grad_bias = selected_grad_output.sum(dim=0) * scale_factor if has_bias else None
 
     return grad_weight, grad_bias
 
@@ -377,7 +397,6 @@ class StreamingLinearBackward(Function):
         use_stored_val: bool
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
         """Handle full gradient path for Streaming."""
-
         if capture_val_mode:
             # RLHF val capture: accumulate mean full gradient
             if grad_output.dim() == 3:
@@ -403,6 +422,12 @@ class StreamingLinearBackward(Function):
             train_input = input
             train_batch_size = state.train_batch_size
             val_grad_full = hook_manager.val_grad_buffer[layer_idx]
+            if val_grad_full is None:
+                return None, None
+            # Use original ghost computation with pre-materialized val_grad
+            scores, similarity = _compute_scores(
+                train_grad_output, train_input, val_grad_full, state.use_second_order
+            )
         else:
             train_batch_size = state.train_batch_size
             train_grad_output, val_grad_output = _split_merged_train_val_batch(
@@ -412,16 +437,10 @@ class StreamingLinearBackward(Function):
                 input, train_batch_size
             )
 
-        if not use_stored_val:
-            val_grad_full = _compute_val_gradient_full(val_grad_output, val_input)
-
-        if val_grad_full is None:
-            return None, None
-
-        # Compute scores using ghost inner product
-        scores, similarity = _compute_scores_ghost(
-            train_grad_output, train_input, val_grad_full, state.use_second_order
-        )
+            scores, similarity = _compute_scores_factorized(
+                train_grad_output, train_input, val_grad_output, val_input,
+                state.use_second_order
+            )
 
         # Per-layer selection
         selected_indices = state._select_indices(scores, similarity)
@@ -433,13 +452,13 @@ class StreamingLinearBackward(Function):
 
         # Compute scale factor
         if state.tokens_per_sample is not None and state.total_tokens is not None:
-            selected_tokens = state.tokens_per_sample[selected_indices].sum().item()
+            selected_tokens = state.tokens_per_sample[selected_indices].sum()
             scale_factor = state.total_tokens / selected_tokens if selected_tokens > 0 else 1.0
         else:
             scale_factor = train_batch_size / num_selected
 
         # Compute selected gradients
-        grad_weight, grad_bias = _compute_selected_gradients_full(
+        grad_weight, grad_bias = _compute_selected_gradients(
             train_grad_output, train_input, selected_indices,
             bias is not None, scale_factor
         )
@@ -565,6 +584,12 @@ class GREATSLinearBackward(Function):
             train_grad_output = grad_output
             train_input = input
             val_grad_full = hook_manager.val_grad_buffer[layer_idx]
+            if val_grad_full is None:
+                return
+            # Use original ghost computation with pre-materialized val_grad
+            scores, similarity = _compute_scores(
+                train_grad_output, train_input, val_grad_full, state.use_second_order
+            )
         else:
             train_batch_size = state.train_batch_size
             train_grad_output, val_grad_output = _split_merged_train_val_batch(
@@ -573,17 +598,11 @@ class GREATSLinearBackward(Function):
             train_input, val_input = _split_merged_train_val_batch(
                 input, train_batch_size
             )
-
-        if not use_stored_val:
-            val_grad_full = _compute_val_gradient_full(val_grad_output, val_input)
-
-        if val_grad_full is None:
-            return
-
-        # Compute scores
-        scores, similarity = _compute_scores_ghost(
-            train_grad_output, train_input, val_grad_full, state.use_second_order
-        )
+            # Fused computation: optimal for 2D (no sequence), same as original for 3D
+            scores, similarity = _compute_scores_factorized(
+                train_grad_output, train_input, val_grad_output, val_input,
+                state.use_second_order
+            )
 
         # Directly update accumulators (more efficient than process_layer_gradients for full grad)
         state.grad_dot_scores += scores.to(state.dtype)

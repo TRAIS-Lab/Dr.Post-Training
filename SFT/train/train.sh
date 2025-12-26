@@ -81,16 +81,17 @@ fallback_lr_full="5e-05"
 fallback_lr_lora="2e-04"
 
 # Experiment definitions
-# Format: "NAME:data_selection:compression:use_lora:use_second_order"
+# Format: "NAME:data_selection:compression:use_lora"
+# Note: use_second_order is controlled by the --use_second_order flag, not per-experiment
 declare -A EXPERIMENT_DEFS=(
-    ["NA-NA-Full"]="NA::false:false"
-    ["NA-NA-LoRA"]="NA::true:false"
-    ["Streaming-NA-Full"]="Streaming::false:true"
-    ["Streaming-NA-LoRA"]="Streaming::true:true"
-    ["GREATS-NA-Full"]="GREATS::false:true"
-    ["GREATS-NA-LoRA"]="GREATS::true:true"
-    ["Streaming-LoGra-Full"]="Streaming:LoGra:false:true"
-    ["GREATS-LoGra-Full"]="GREATS:LoGra:false:true"
+    ["NA-NA-Full"]="NA::false"
+    ["NA-NA-LoRA"]="NA::true"
+    ["Streaming-NA-Full"]="Streaming::false"
+    ["Streaming-NA-LoRA"]="Streaming::true"
+    ["GREATS-NA-Full"]="GREATS::false"
+    ["GREATS-NA-LoRA"]="GREATS::true"
+    ["Streaming-LoGra-Full"]="Streaming:LoGra:false"
+    ["GREATS-LoGra-Full"]="GREATS:LoGra:false"
 )
 
 # Category mappings
@@ -624,7 +625,8 @@ if [[ -n "$experiments" ]]; then
         exp_data_selection="${exp_parts[0]}"
         exp_compression="${exp_parts[1]}"
         exp_use_lora="${exp_parts[2]}"
-        exp_use_second_order="${exp_parts[3]}"
+        # use_second_order is controlled globally via --use_second_order flag
+        exp_use_second_order="$use_second_order"
 
         # Build config key for LR lookup (includes subject for mmlu/bbh)
         train_str="${train_dataset:-default}"
