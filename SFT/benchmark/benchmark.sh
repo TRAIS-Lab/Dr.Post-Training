@@ -9,9 +9,9 @@
 #   bash benchmark.sh [OPTIONS]
 #
 # Examples:
-#   bash benchmark.sh --methods NA_NA_full Streaming_LoGra_full
+#   bash benchmark.sh --methods NA_NA_Full Streaming_LoGra_Full
 #   bash benchmark.sh --all
-#   bash benchmark.sh --methods GREATS_LoGra_full --batch-size 32 --num-iterations 20
+#   bash benchmark.sh --methods GREATS_LoGra_Full --batch-size 32 --num-iterations 20
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -63,7 +63,7 @@ done
 
 # If no methods specified, use defaults
 if [ ${#METHODS[@]} -eq 0 ]; then
-    METHODS=("NA_NA_full" "Streaming_LoGra_full")
+    METHODS=("NA_NA_Full" "Streaming_LoGra_Full")
 fi
 
 # Create a temp file for aggregating results

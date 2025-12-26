@@ -9,16 +9,14 @@ This module provides two distinct state classes:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from typing import Optional, Tuple
+    from torch import Tensor
 
 import torch
-from torch import Tensor
 
 from ..utils import greedy_selection, topk_selection, negative_filtering
-
-if TYPE_CHECKING:
-    pass
-
 
 class SelectionState(ABC):
     """

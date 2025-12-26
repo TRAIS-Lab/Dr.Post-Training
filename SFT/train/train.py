@@ -210,7 +210,7 @@ def main():
     # 2. Compression enabled (implies MeSO optimizer)
     has_compression = (training_args.sparsification is not None or training_args.projection is not None)
     should_register_hooks = (
-        training_args.method == 'Streaming' or has_compression
+        training_args.method in ('Streaming', 'GREATS') or has_compression
     )
     logger.info(f"Training method: {training_args.method} - Hooks will be {'registered' if should_register_hooks else 'NOT registered'}")
     if has_compression:

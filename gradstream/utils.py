@@ -437,6 +437,11 @@ def greedy_selection(scores, interaction_matrix, k: int):
     This is O(k*n) and accounts for second-order interactions between samples.
     For faster selection without interactions, use topk_selection instead.
 
+    Note: When used with Streaming (per-layer selection), this is called once per
+    layer, making second-order Streaming slower than GREATS which only calls this
+    once globally. Consider using topk_selection (first-order) with Streaming for
+    better performance.
+
     Arguments:
     - scores: A tensor of initial scores for each data point.
     - interaction_matrix: A tensor of pairwise interactions between data points.

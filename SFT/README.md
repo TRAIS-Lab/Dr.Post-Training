@@ -1,6 +1,6 @@
 # SFT Experiments
 
-This folder contains the training and evaluation code and experiment configurations for Supervised Fine-Tuning with **Gradient Streaming**.
+This folder contains the training and evaluation code and experiment configurations for Supervised Fine-Tuning.
 
 ## Data Preparation
 
@@ -20,9 +20,10 @@ python SFT/data/prepare_datasets.py --datasets mmlu bbh tydiqa gsm8k math500 sam
 python SFT/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
 ```
 
-### Available Datasets
+<details>
+  <summary>Available Datasets</summary>
 
-#### Evaluation Datasets
+### Evaluation Datasets
 
 | Dataset   | Task Type          | Description                                              |
 | --------- | ------------------ | -------------------------------------------------------- |
@@ -33,7 +34,7 @@ python SFT/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
 | `gsm8k`   | Math               | Grade School Math (8K problems)                          |
 | `math500` | Math               | MATH benchmark (500 competition problems)                |
 
-#### Training Datasets
+### Training Datasets
 
 | Dataset      | Size | Description                           |
 | ------------ | ---- | ------------------------------------- |
@@ -47,226 +48,7 @@ python SFT/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
 | `vicuna`     | 125K | ShareGPT-based conversations          |
 | `wizardlm`   | 196K | WizardLM evolved instructions         |
 | `openhermes` | 1M   | OpenHermes 2.5 diverse instructions   |
-
-## Naming Convention
-
-Experiments follow the pattern: `{train}_{task}-{selection}-{compression}-{model}-{training_type}-p{pct}-lr{lr}-b{batch}-v{nval}-s{seed}`
-
-| Component       | Options                     | Description                                   |
-| --------------- | --------------------------- | --------------------------------------------- |
-| `selection`     | `NA`, `Streaming`, `GREATS` | Data selection method                         |
-| `compression`   | `NA`, `LoGra`               | Gradient compression (implies MeSO optimizer) |
-| `training_type` | `full`, `lora`              | Full fine-tuning or LoRA                      |
-
-> **Note:** GraSS compression is also available (`--compression GraSS`) but not used in default experiments.
-
-### Selection Modes
-- **NA**: No data selection (baseline)
-- **Streaming**: Per-layer selection - each layer independently selects samples (single-pass)
-- **GREATS**: Global selection - accumulates scores across all layers (two-pass)
-
-### Compression Methods
-- **NA**: No compression - uses full gradients and standard AdamW optimizer
-- **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer
-- **GraSS**: Gradient Sparsification with Sketching (available but not used in default experiments)
-
-## Experiment Configurations
-
-### Full Configuration Matrix (8 experiments)
-
-| #   | Selection | Compression | Training | Description                               |
-| --- | --------- | ----------- | -------- | ----------------------------------------- |
-| 1a  | NA        | NA          | full     | Baseline full fine-tuning                 |
-| 1b  | NA        | NA          | lora     | Baseline LoRA fine-tuning                 |
-| 2a  | Streaming | NA          | full     | Per-layer selection, full gradients       |
-| 2b  | Streaming | NA          | lora     | Per-layer selection, full gradients, LoRA |
-| 3a  | GREATS    | NA          | full     | Global selection, full gradients          |
-| 3b  | GREATS    | NA          | lora     | Global selection, full gradients, LoRA    |
-| 4   | Streaming | LoGra       | full     | Per-layer selection + MeSO                |
-| 5   | GREATS    | LoGra       | full     | Global selection + MeSO                   |
-
-> [!Note]
-> Second-order interaction is enabled by default for all data selection methods (Streaming and GREATS).
-
-## Learning Rate Configuration
-
-The `SFT/train/lr/` folder contains tools for finding optimal learning rates, where learning rates are managed via `SFT/train/lr/config.json`.
-
-### Recommended Workflow
-
-1. **Run LR sweep** using either Grid Search or Binary Search:
-
-```bash
-# Grid Search (default) - tests multiple discrete LRs
-bash SFT/train/lr/lr_sweep.sh --mode grid --experiments all --task samsum --train alpaca
-
-# Binary Search - efficient search using golden section method
-bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --task samsum --train alpaca
-```
-
-## Running Experiments
-
-All experiments are launched using the unified `train.sh` script.
-
-### Multi-Experiment Mode
-
-Run multiple experiments with the `--experiments` flag:
-
-```bash
-# Run all 8 experiments
-bash SFT/train/train.sh --experiments all --task mmlu --subject sociology
-
-# Run by category
-bash SFT/train/train.sh --experiments baseline --task mmlu      # NA-NA-full, NA-NA-lora
-bash SFT/train/train.sh --experiments streaming --task mmlu     # All Streaming-* variants
-bash SFT/train/train.sh --experiments greats --task mmlu        # All GREATS-* variants
-bash SFT/train/train.sh --experiments compression --task mmlu   # *-LoGra-* variants
-bash SFT/train/train.sh --experiments lora --task mmlu          # All *-lora variants
-bash SFT/train/train.sh --experiments full --task mmlu          # All *-full variants
-
-# Run specific experiments
-bash SFT/train/train.sh --experiments "NA-NA-full,Streaming-LoGra-full" --task mmlu
-
-# Combine categories
-bash SFT/train/train.sh --experiments "baseline,streaming" --task mmlu
-
-# Dry run - preview commands without executing
-bash SFT/train/train.sh --experiments all --task mmlu --dry-run
-
-# Submit to SLURM
-bash SFT/train/train.sh --experiments all --task mmlu --sbatch
-```
-
-#### Available Categories
-
-| Category         | Experiments                                                |
-| ---------------- | ---------------------------------------------------------- |
-| `all`            | All 8 experiments                                          |
-| `baseline`       | NA-NA-full, NA-NA-lora                                     |
-| `streaming`      | Streaming-NA-full, Streaming-NA-lora, Streaming-LoGra-full |
-| `greats`         | GREATS-NA-full, GREATS-NA-lora, GREATS-LoGra-full          |
-| `full`           | All *-full experiments (5 total)                           |
-| `lora`           | All *-lora experiments (3 total)                           |
-| `compression`    | Streaming-LoGra-full, GREATS-LoGra-full                    |
-| `no-compression` | All experiments without compression (6 total)              |
-
-### Single Experiment Mode
-
-Run a single experiment by specifying individual options:
-
-```bash
-# From project root
-bash SFT/train/train.sh [options]
-
-# Or with SLURM
-sbatch SFT/train/train.sh [options]
-```
-
-#### Examples
-
-```bash
-# NA-NA-full: Baseline full fine-tuning
-bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b
-
-# NA-NA-lora: Baseline LoRA fine-tuning
-bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b --lora
-
-# Streaming-NA-full: Per-layer selection with full gradients (second-order enabled)
-bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --data_selection Streaming --use_second_order
-
-# GREATS-NA-full: Global selection with full gradients (second-order enabled)
-bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --data_selection GREATS --use_second_order
-
-# Streaming-LoGra-full: Per-layer selection + MeSO (second-order enabled by default)
-bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --data_selection Streaming --compression LoGra --use_second_order
-
-# GREATS-LoGra-full: Global selection + MeSO (second-order enabled by default)
-bash SFT/train/train.sh --task mmlu --subject sociology --model llama3-1b \
-    --data_selection GREATS --compression LoGra --use_second_order
-
-# Custom training dataset (with compression, second-order enabled)
-bash SFT/train/train.sh --task samsum --model llama3-1b \
-    --train openhermes --data_selection Streaming --compression LoGra --use_second_order
-```
-
-### Parameters
-
-The unified training script accepts the following arguments:
-
-#### Task Arguments
-
-- `--task <task>` - Evaluation task: `mmlu`, `bbh`, `tydiqa`, `gsm8k`, `math500`, `samsum`
-- `--subject <subject>` - Subject for MMLU/BBH (default: `sociology`)
-- `--train <dataset>` - Training dataset (optional, overrides task-based default):
-  - `alpaca`, `dolly`, `flan_v2`, `cot`, `oasst1` - Instruction tuning
-  - `gsm8k` - Math training data
-  - `vicuna`, `wizardlm`, `openhermes`, `tulu3`, `less` - Large-scale instruction data
-
-#### Data Selection Arguments
-
-- `--data_selection <method>` - Data selection method:
-  - `NA` - No selection (baseline, default)
-  - `Streaming` - Per-layer selection (single-pass)
-  - `GREATS` - Global selection (two-pass)
-- `--use_second_order` - Enable greedy selection with second-order interactions (enabled by default for all selection methods)
-
-#### Compression Arguments
-
-- `--compression <method>` - Gradient compression method (implies MeSO optimizer):
-  - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
-  - `GraSS` - Gradient Sparsification with Sketching (available but not used in default experiments)
-  - If not specified, uses full gradients and standard AdamW optimizer
-- `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
-
-#### Core Training Arguments
-
-- `--model <model>` - Model: `llama3-1b`, `llama2-7b`, `llama2-13b`, `mistral-7b` (default: `llama3-1b`)
-- `--lr <lr>` - Learning rate override (if not specified, looked up from `lr_config.json`; fallback: `5e-05` for full, `2e-04` for LoRA)
-- `--lr_config <path>` - LR config file path (default: `SFT/train/lr/config.json`)
-- `--batch_size <size>` - Batch size (default: `8`)
-- `--seed <seed>` - Random seed (default: `42`)
-- `--gradient_accumulation_steps <steps>` - Gradient accumulation (default: `1`)
-
-#### Data Arguments
-
-- `--percentage <pct>` - Data sampling, e.g., `0.05` for 5% (default: `0.05`)
-- `--n_val <n>` - Validation examples for data selection (default: `8`)
-- `--n_eval <n>` - Evaluation examples (default: `500`)
-- `--val_batch_size <size>` - Validation batch size for data selection (default: `1`)
-- `--data_dir <dir>` - Data directory (default: `SFT/data`)
-
-#### LoRA Arguments
-
-- `--lora` - Enable LoRA fine-tuning (flag, omit for full fine-tuning)
-- `--lora_alpha <alpha>` - LoRA alpha (default: `1`)
-- `--lora_r <r>` - LoRA rank (default: `32`)
-- `--lora_dropout <dropout>` - LoRA dropout (default: `0.1`)
-- `--lora_target_modules <modules>` - Target modules for LoRA (default: `q_proj k_proj v_proj o_proj`)
-
-#### Model Arguments
-
-- `--flash_attention` - Enable Flash Attention 2 (default: enabled)
-
-## Evaluation
-
-Trained models are automatically evaluated after training. Results are saved in the output directory.
-
-### Manual Evaluation
-
-For standalone evaluation of trained models:
-
-```bash
-# MMLU evaluation
-python SFT/eval/eval.py --task mmlu --model_path <path_to_model> \
-    --subject sociology --n_val 5 --n_eval 500
-
-# TyDiQA evaluation
-python SFT/eval/eval.py --task tydiqa --model_path <path_to_model> \
-    --n_test 100
-```
+</details>
 
 ## Experiment Summary
 
@@ -279,11 +61,38 @@ The following experiments have been run and can be rerun with the commands below
 | LESS          | MMLU      | 0.05       | 8     | 32       | 128       |
 | LESS          | BBH       | 0.05       | 8     | 32       | 128       |
 
-> **Note:** Learning rates are managed via `SFT/train/lr/config.json`. Run `lr_sweep.sh` to find optimal LRs before training.
+### Experiment Configurations
+
+We consider the following 8 experiments for each of the training datasets above:
+
+| #   | Selection | Compression | Training | Description                               |
+| --- | --------- | ----------- | -------- | ----------------------------------------- |
+| 1a  | NA        | NA          | Full     | Baseline full fine-tuning                 |
+| 1b  | NA        | NA          | LoRA     | Baseline LoRA fine-tuning                 |
+| 2a  | Streaming | NA          | Full     | Per-layer selection, full gradients       |
+| 2b  | Streaming | NA          | LoRA     | Per-layer selection, full gradients, LoRA |
+| 3a  | GREATS    | NA          | Full     | Global selection, full gradients          |
+| 3b  | GREATS    | NA          | LoRA     | Global selection, full gradients, LoRA    |
+| 4   | Streaming | LoGra       | Full     | Per-layer selection + MeSO                |
+| 5   | GREATS    | LoGra       | Full     | Global selection + MeSO                   |
+
+> Experiments follow the pattern: `{train}_{task}-{model}-{selection}-{compression}-{training_type}-p{pct}-lr{lr}-b{batch}-v{nval}-s{seed}`
+
+1. Selection Modes
+   - **NA**: No data selection (baseline)
+   - **Streaming**: Per-layer selection - each layer independently selects samples (single-pass)
+   - **GREATS**: Global selection - accumulates scores across all layers (two-pass)
+2. Compression Methods
+   - **NA**: No compression - uses full gradients and standard AdamW optimizer
+   - **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer
+   - **GraSS**: Gradient Sparsification with Sketching (available but not used in default experiments)
+3. Training Types
+   - **Full**: Full fine-tuning of all model parameters
+   - **LoRA**: LoRA fine-tuning of low-rank adapters only
 
 ### LR Sweep Commands
 
-Run LR sweep before full training to find optimal learning rates:
+The `SFT/train/lr/` folder contains tools for finding optimal learning rates, where learning rates are managed via `SFT/train/lr/config.json`. Run LR sweep before full training to find optimal learning rates:
 
 ```bash
 # Alpaca -> SAMSum
@@ -299,9 +108,11 @@ bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --train less --tas
     --batch_size 8 --n_val 8 --sweep_percentage 0.005 --seed 2 --lora_r 128
 ```
 
+You can also run grid search via `--mode grid`.
+
 ### Training Commands
 
-Training commands for each experiment (LRs loaded from lr_config.json):
+All experiments are launched using the unified `train.sh` script. Training commands for each experiment (LRs loaded from lr_config.json):
 
 ```bash
 # Alpaca -> SAMSum
@@ -317,6 +128,98 @@ bash SFT/train/train.sh --experiments all --train less --task mmlu --subject soc
     --batch_size 8 --n_val 32 --percentage 0.05 --seed 42 --lora_r 128
 ```
 
+
+<details>
+  <summary>Detailed Training Script Configuration</summary>
+
+#### Run Multiple Experiments
+Run multiple experiments with the `--experiments` flag:
+
+```bash
+# Run all 8 experiments
+bash SFT/train/train.sh --experiments all --task mmlu --subject sociology
+
+# Run by category
+bash SFT/train/train.sh --experiments baseline --task mmlu      # NA-NA-Full, NA-NA-LoRA
+bash SFT/train/train.sh --experiments streaming --task mmlu     # All Streaming-* variants
+bash SFT/train/train.sh --experiments greats --task mmlu        # All GREATS-* variants
+bash SFT/train/train.sh --experiments compression --task mmlu   # *-LoGra-* variants
+bash SFT/train/train.sh --experiments lora --task mmlu          # All *-LoRA variants
+bash SFT/train/train.sh --experiments full --task mmlu          # All *-Full variants
+
+# Run specific experiments
+bash SFT/train/train.sh --experiments "NA-NA-Full,Streaming-LoGra-Full" --task mmlu
+
+# Combine categories
+bash SFT/train/train.sh --experiments "baseline,streaming" --task mmlu
+
+# Dry run - preview commands without executing
+bash SFT/train/train.sh --experiments all --task mmlu --dry-run
+
+# Submit to SLURM
+bash SFT/train/train.sh --experiments all --task mmlu --sbatch
+```
+
+Available Categories:
+
+| Category         | Experiments                                                |
+| ---------------- | ---------------------------------------------------------- |
+| `all`            | All 8 experiments                                          |
+| `baseline`       | NA-NA-Full, NA-NA-LoRA                                     |
+| `streaming`      | Streaming-NA-Full, Streaming-NA-LoRA, Streaming-LoGra-Full |
+| `greats`         | GREATS-NA-Full, GREATS-NA-LoRA, GREATS-LoGra-Full          |
+| `full`           | All *-Full experiments (5 total)                           |
+| `lora`           | All *-LoRA experiments (3 total)                           |
+| `compression`    | Streaming-LoGra-Full, GREATS-LoGra-Full                    |
+| `no-compression` | All experiments without compression (6 total)              |
+
+#### Parameters
+
+The unified training script accepts the following arguments:
+
+1. Task Arguments
+   - `--task <task>` - Evaluation task: `mmlu`, `bbh`, `tydiqa`, `gsm8k`, `math500`, `samsum`
+   - `--subject <subject>` - Subject for MMLU/BBH (default: `sociology`)
+   - `--train <dataset>` - Training dataset (optional, overrides task-based default):
+     - `alpaca`, `dolly`, `flan_v2`, `cot`, `oasst1` - Instruction tuning
+     - `gsm8k` - Math training data
+     - `vicuna`, `wizardlm`, `openhermes`, `tulu3`, `less` - Large-scale instruction data
+2. Data Selection Arguments
+   - `--data_selection <method>` - Data selection method:
+     - `NA` - No selection (baseline, default)
+     - `Streaming` - Per-layer selection (single-pass)
+     - `GREATS` - Global selection (two-pass)
+   - `--use_second_order` - Enable greedy selection with second-order interactions (enabled by default for all selection methods)
+3. Compression Arguments
+   - `--compression <method>` - Gradient compression method (implies MeSO optimizer):
+     - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
+     - `GraSS` - Gradient Sparsification with Sketching (available but not used in default experiments)
+     - If not specified, uses full gradients and standard AdamW optimizer
+   - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
+4. Core Training Arguments
+   - `--model <model>` - HuggingFace model path (default: `meta-llama/Llama-3.2-1B`)
+   - `--lr <lr>` - Learning rate override (if not specified, looked up from `lr_config.json`; fallback: `5e-05` for full, `2e-04` for LoRA)
+   - `--lr_config <path>` - LR config file path (default: `SFT/train/lr/config.json`)
+   - `--batch_size <size>` - Batch size (default: `8`)
+   - `--seed <seed>` - Random seed (default: `42`)
+   - `--gradient_accumulation_steps <steps>` - Gradient accumulation (default: `1`)
+5. Data Arguments
+   - `--percentage <pct>` - Data sampling, e.g., `0.05` for 5% (default: `0.05`)
+   - `--n_val <n>` - Validation examples for data selection (default: `8`)
+   - `--n_eval <n>` - Evaluation examples (default: `500`)
+   - `--val_batch_size <size>` - Validation batch size for data selection (default: `1`)
+   - `--data_dir <dir>` - Data directory (default: `SFT/data`)
+6. LoRA Arguments
+   - `--lora` - Enable LoRA fine-tuning (flag, omit for full fine-tuning)
+   - `--lora_alpha <alpha>` - LoRA alpha (default: `1`)
+   - `--lora_r <r>` - LoRA rank (default: `32`)
+   - `--lora_dropout <dropout>` - LoRA dropout (default: `0.1`)
+   - `--lora_target_modules <modules>` - Target modules for LoRA (default: `q_proj k_proj v_proj o_proj`)
+7. Model Arguments
+   - `--flash_attention` - Enable Flash Attention 2 (default: enabled)
+</details>
+
+### Evaluation Commands
 Evaluation commands for each experiment:
 
 ```bash

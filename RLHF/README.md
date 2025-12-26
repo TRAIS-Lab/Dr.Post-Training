@@ -10,7 +10,7 @@ Experiments follow the pattern: `{task}-{selection}-{compression}-{model}-{train
 | --------------- | --------------------------- | --------------------------------------------- |
 | `selection`     | `NA`, `Streaming`, `GREATS` | Data selection method                         |
 | `compression`   | `NA`, `LoGra`               | Gradient compression (implies MeSO optimizer) |
-| `training_type` | `full`, `lora`              | Full fine-tuning or LoRA                      |
+| `training_type` | `Full`, `LoRA`              | Full fine-tuning or LoRA                      |
 
 > **Note:** GraSS compression is also available (`--compression GraSS`) but not used in default experiments.
 
@@ -30,14 +30,14 @@ Experiments follow the pattern: `{task}-{selection}-{compression}-{model}-{train
 
 | #   | Selection | Compression | Training | Description                               |
 | --- | --------- | ----------- | -------- | ----------------------------------------- |
-| 1a  | NA        | NA          | full     | Baseline PPO full fine-tuning             |
-| 1b  | NA        | NA          | lora     | Baseline PPO LoRA fine-tuning             |
-| 2a  | Streaming | NA          | full     | Per-layer selection, full gradients       |
-| 2b  | Streaming | NA          | lora     | Per-layer selection, full gradients, LoRA |
-| 3a  | GREATS    | NA          | full     | Global selection, full gradients          |
-| 3b  | GREATS    | NA          | lora     | Global selection, full gradients, LoRA    |
-| 4   | Streaming | LoGra       | full     | Per-layer selection + MeSO                |
-| 5   | GREATS    | LoGra       | full     | Global selection + MeSO                   |
+| 1a  | NA        | NA          | Full     | Baseline PPO full fine-tuning             |
+| 1b  | NA        | NA          | LoRA     | Baseline PPO LoRA fine-tuning             |
+| 2a  | Streaming | NA          | Full     | Per-layer selection, full gradients       |
+| 2b  | Streaming | NA          | LoRA     | Per-layer selection, full gradients, LoRA |
+| 3a  | GREATS    | NA          | Full     | Global selection, full gradients          |
+| 3b  | GREATS    | NA          | LoRA     | Global selection, full gradients, LoRA    |
+| 4   | Streaming | LoGra       | Full     | Per-layer selection + MeSO                |
+| 5   | GREATS    | LoGra       | Full     | Global selection + MeSO                   |
 
 > [!Note]
 > Second-order interaction is enabled by default for all data selection methods (Streaming and GREATS).
@@ -77,15 +77,15 @@ Run multiple experiments with the `--experiments` flag:
 bash RLHF/train/train.sh --experiments all --task toxicity
 
 # Run by category
-bash RLHF/train/train.sh --experiments baseline --task toxicity      # NA-NA-full, NA-NA-lora
+bash RLHF/train/train.sh --experiments baseline --task toxicity      # NA-NA-Full, NA-NA-LoRA
 bash RLHF/train/train.sh --experiments streaming --task toxicity     # All Streaming-* variants
 bash RLHF/train/train.sh --experiments greats --task toxicity        # All GREATS-* variants
 bash RLHF/train/train.sh --experiments compression --task toxicity   # *-LoGra-* variants
-bash RLHF/train/train.sh --experiments lora --task toxicity          # All *-lora variants
-bash RLHF/train/train.sh --experiments full --task toxicity          # All *-full variants
+bash RLHF/train/train.sh --experiments lora --task toxicity          # All *-LoRA variants
+bash RLHF/train/train.sh --experiments full --task toxicity          # All *-Full variants
 
 # Run specific experiments
-bash RLHF/train/train.sh --experiments "NA-NA-full,Streaming-LoGra-full" --task toxicity
+bash RLHF/train/train.sh --experiments "NA-NA-Full,Streaming-LoGra-Full" --task toxicity
 
 # Combine categories
 bash RLHF/train/train.sh --experiments "baseline,streaming" --task toxicity
@@ -102,12 +102,12 @@ bash RLHF/train/train.sh --experiments all --task toxicity --sbatch
 | Category         | Experiments                                                |
 | ---------------- | ---------------------------------------------------------- |
 | `all`            | All 8 experiments                                          |
-| `baseline`       | NA-NA-full, NA-NA-lora                                     |
-| `streaming`      | Streaming-NA-full, Streaming-NA-lora, Streaming-LoGra-full |
-| `greats`         | GREATS-NA-full, GREATS-NA-lora, GREATS-LoGra-full          |
-| `full`           | All *-full experiments (5 total)                           |
-| `lora`           | All *-lora experiments (3 total)                           |
-| `compression`    | Streaming-LoGra-full, GREATS-LoGra-full                    |
+| `baseline`       | NA-NA-Full, NA-NA-LoRA                                     |
+| `streaming`      | Streaming-NA-Full, Streaming-NA-LoRA, Streaming-LoGra-Full |
+| `greats`         | GREATS-NA-Full, GREATS-NA-LoRA, GREATS-LoGra-Full          |
+| `full`           | All *-Full experiments (5 total)                           |
+| `lora`           | All *-LoRA experiments (3 total)                           |
+| `compression`    | Streaming-LoGra-Full, GREATS-LoGra-Full                    |
 | `no-compression` | All experiments without compression (6 total)              |
 
 ### Single Experiment Mode
@@ -125,25 +125,25 @@ sbatch RLHF/train/train.sh [options]
 #### Examples
 
 ```bash
-# NA-NA-full: Baseline PPO full fine-tuning
+# NA-NA-Full: Baseline PPO full fine-tuning
 bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m
 
-# NA-NA-lora: Baseline PPO LoRA fine-tuning
+# NA-NA-LoRA: Baseline PPO LoRA fine-tuning
 bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m --lora
 
-# Streaming-NA-full: Per-layer selection with full gradients (second-order enabled)
+# Streaming-NA-Full: Per-layer selection with full gradients (second-order enabled)
 bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m \
     --method Streaming --use_second_order
 
-# GREATS-NA-full: Global selection with full gradients (second-order enabled)
+# GREATS-NA-Full: Global selection with full gradients (second-order enabled)
 bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m \
     --method GREATS --use_second_order
 
-# Streaming-LoGra-full: Per-layer selection + MeSO (second-order enabled)
+# Streaming-LoGra-Full: Per-layer selection + MeSO (second-order enabled)
 bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m \
     --method Streaming --compression LoGra --use_second_order
 
-# GREATS-LoGra-full: Global selection + MeSO (second-order enabled)
+# GREATS-LoGra-Full: Global selection + MeSO (second-order enabled)
 bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m \
     --method GREATS --compression LoGra --use_second_order
 ```

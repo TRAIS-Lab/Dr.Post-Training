@@ -57,28 +57,6 @@ from gradstream.selection import create_selection_strategy
 logger = logging.getLogger(__name__)
 
 
-def _log_gradient_stats(model, grad_hook, step, mode, has_compression):
-    """Log gradient statistics for debugging scaling issues."""
-    stats = []
-
-    if has_compression and grad_hook is not None:
-        # Log compressed gradient stats
-        for idx, layer_name in enumerate(grad_hook.layer_names[:3]):  # First 3 layers
-            compressed_grad = grad_hook._get_compressed_grad(idx)
-            if compressed_grad is not None:
-                stats.append(f"{layer_name}: norm={compressed_grad.norm().item():.6e}")
-    else:
-        # Log full gradient stats
-        for name, param in model.named_parameters():
-            if param.grad is not None and 'layers.0.' in name and 'weight' in name:
-                stats.append(f"{name}: norm={param.grad.norm().item():.6e}")
-                if len(stats) >= 3:
-                    break
-
-    if stats:
-        logger.info(f"[Step {step}] {mode} gradient stats: {', '.join(stats)}")
-
-
 class StreamingTrainer(Trainer):
     """
     Trainer supporting gradient-based data selection with optional compression.
@@ -174,7 +152,6 @@ class StreamingTrainer(Trainer):
             frac=getattr(self.args, 'selection_frac', 0.5),
             use_second_order=getattr(self.args, 'use_second_order', False),
             selection_mode="topk",  # SFT uses top-k selection
-            use_stored_val=False    # SFT uses merged batch, not stored val
         )
 
         logger.info("="*60)
@@ -372,7 +349,7 @@ class StreamingTrainer(Trainer):
                 lr = args.learning_rate
 
             # Execute selection strategy
-            loss, stats = self.selection_strategy.execute_training_step(
+            loss = self.selection_strategy.execute_training_step(
                 model=model,
                 merged_batch=merged_batch,
                 train_batch_size=train_batch_size,
@@ -380,18 +357,6 @@ class StreamingTrainer(Trainer):
                 lr=lr,
                 batch_train=batch_train  # For GREATS pass 2
             )
-
-            # Debug gradient scaling
-            if getattr(args, 'debug_gradient_scaling', False):
-                frac = stats.get('selection/frac', args.selection_frac)
-                _log_gradient_stats(model, self.grad_hook, self.state.global_step,
-                                   f"{args.method}(frac={frac:.2f})", self.has_compression)
-
-            # For Streaming, compute train-only loss for reporting
-            if args.method == 'Streaming':
-                # Recompute outputs for loss reporting (already done in forward)
-                # Actually, we can return the loss from strategy which is already detached
-                pass
 
             return loss
 
@@ -433,12 +398,6 @@ class StreamingTrainer(Trainer):
             loss = loss / args.gradient_accumulation_steps
 
         loss.backward()
-
-        # Debug gradient scaling
-        if getattr(args, 'debug_gradient_scaling', False):
-            mode = "MeSO" if self.has_compression else "Baseline"
-            _log_gradient_stats(model, self.grad_hook, self.state.global_step,
-                               mode, self.has_compression)
 
         # Re-enable hooks if they were disabled
         if not self.has_compression and self.grad_hook is not None and self.grad_hook.hooks_registered:

@@ -103,26 +103,26 @@ use_sbatch=false
 # ========================================
 # Format: "method:compression:use_lora:use_second_order"
 declare -A EXPERIMENT_DEFS=(
-    ["NA-NA-full"]="NA::false:false"
-    ["NA-NA-lora"]="NA::true:false"
-    ["Streaming-NA-full"]="Streaming::false:true"
-    ["Streaming-NA-lora"]="Streaming::true:true"
-    ["GREATS-NA-full"]="GREATS::false:true"
-    ["GREATS-NA-lora"]="GREATS::true:true"
-    ["Streaming-LoGra-full"]="Streaming:LoGra:false:true"
-    ["GREATS-LoGra-full"]="GREATS:LoGra:false:true"
+    ["NA-NA-Full"]="NA::false:false"
+    ["NA-NA-LoRA"]="NA::true:false"
+    ["Streaming-NA-Full"]="Streaming::false:true"
+    ["Streaming-NA-LoRA"]="Streaming::true:true"
+    ["GREATS-NA-Full"]="GREATS::false:true"
+    ["GREATS-NA-LoRA"]="GREATS::true:true"
+    ["Streaming-LoGra-Full"]="Streaming:LoGra:false:true"
+    ["GREATS-LoGra-Full"]="GREATS:LoGra:false:true"
 )
 
 # Category mappings (matching SFT)
 declare -A CATEGORY_EXPERIMENTS=(
-    ["all"]="NA-NA-full,NA-NA-lora,Streaming-NA-full,Streaming-NA-lora,GREATS-NA-full,GREATS-NA-lora,Streaming-LoGra-full,GREATS-LoGra-full"
-    ["baseline"]="NA-NA-full,NA-NA-lora"
-    ["streaming"]="Streaming-NA-full,Streaming-NA-lora,Streaming-LoGra-full"
-    ["greats"]="GREATS-NA-full,GREATS-NA-lora,GREATS-LoGra-full"
-    ["full"]="NA-NA-full,Streaming-NA-full,GREATS-NA-full,Streaming-LoGra-full,GREATS-LoGra-full"
-    ["lora"]="NA-NA-lora,Streaming-NA-lora,GREATS-NA-lora"
-    ["compression"]="Streaming-LoGra-full,GREATS-LoGra-full"
-    ["no-compression"]="NA-NA-full,NA-NA-lora,Streaming-NA-full,Streaming-NA-lora,GREATS-NA-full,GREATS-NA-lora"
+    ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["baseline"]="NA-NA-Full,NA-NA-LoRA"
+    ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
+    ["greats"]="GREATS-NA-Full,GREATS-NA-LoRA,GREATS-LoGra-Full"
+    ["full"]="NA-NA-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["lora"]="NA-NA-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
+    ["compression"]="Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["no-compression"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
 )
 
 # Parse named arguments
@@ -287,10 +287,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --sbatch                   Use sbatch instead of bash"
             echo ""
             echo "  Experiment names:"
-            echo "    NA-NA-full, NA-NA-lora, Streaming-NA-full, Streaming-NA-lora,"
-            echo "    GREATS-NA-full, GREATS-NA-lora, Streaming-LoGra-full, GREATS-LoGra-full"
+            echo "    NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, Streaming-NA-LoRA,"
+            echo "    GREATS-NA-Full, GREATS-NA-LoRA, Streaming-LoGra-Full, GREATS-LoGra-Full"
             echo ""
-            echo "  Categories: all, baseline, streaming, greats, full, lora, compression, no-compression"
+            echo "  Categories: all, baseline, streaming, greats, Full, LoRA, compression, no-compression"
             echo ""
             echo "Single Experiment Options:"
             echo "  --task <task>              Task: toxicity, imdb (default: toxicity)"
@@ -485,9 +485,9 @@ run_single_experiment() {
 
     local training_type
     if [[ "$exp_use_lora" == "true" ]]; then
-        training_type="lora"
+        training_type="LoRA"
     else
-        training_type="full"
+        training_type="Full"
     fi
 
     local JOB_NAME="${task}-${exp_method}-${compression_name}-${model_short}-${training_type}-lr${exp_lr}-b${batch_size}-s${seed}"
@@ -734,9 +734,9 @@ else
     fi
 
     if [[ "$use_lora" == "true" ]]; then
-        exp_name="${method}-${local_compression:-NA}-lora"
+        exp_name="${method}-${local_compression:-NA}-LoRA"
     else
-        exp_name="${method}-${local_compression:-NA}-full"
+        exp_name="${method}-${local_compression:-NA}-Full"
     fi
 
     # Look up learning rate

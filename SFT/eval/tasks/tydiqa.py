@@ -1,4 +1,6 @@
-from typing import List, Tuple
+import json
+import os
+from typing import Dict, List, Tuple
 
 import evaluate
 metric = evaluate.load("squad")
@@ -9,13 +11,59 @@ from ..utils import generate_completions
 # llama-chat model's instruction format
 B_INST, E_INST = "[INST]", "[/INST]"
 
+# Language-specific templates for TyDiQA
+# Same template as https://github.com/allenai/open-instruct/blob/main/eval/tydiqa/run_eval.py#L17
+ENCODING_TEMPLATES_WITH_CONTEXT = {
+    "english": ("Answer the following question based on the information in the given passage.", "Passage:", "Question:", "Answer:"),
+    "arabic": ("أجب على السؤال التالي بناءً على المعلومات في المقطع المعطى.", "المقطع:", "السؤال:", "الإجابة:"),
+    "bengali": ("প্রদত্ত অধ্যায়ের তথ্যের উপর ভিত্তি করে নিম্নলিখিত প্রশ্নের উত্তর দিন।", "অধ্যায়:", "প্রশ্ন:", "উত্তর:"),
+    "finnish": ("Vastaa seuraavaan kysymykseen annetun kappaleen tiedon perusteella.", "Kappale:", "Kysymys:", "Vastaus:"),
+    "indonesian": ("Jawab pertanyaan berikut berdasarkan informasi di bagian yang diberikan.", "Bagian:", "Pertanyaan:", "Jawaban:"),
+    "korean": ("주어진 문단의 정보에 기반하여 다음 질문에 답하십시오.", "문단:", "질문:", "답변:"),
+    "russian": ("Ответьте на следующий вопрос на основе информации в данном отрывке.", "Отрывок:", "Вопрос:", "Ответ:"),
+    "swahili": ("Jibu swali lifuatalo kulingana na habari kwenye kifungu kilichotolewa.", "Kifungu:", "Swali:", "Jibu:"),
+    "telugu": ("ఇచ్చిన పేరాలోని సమాచారం ఆధారంగా కింది ప్రశ్నకు సమాధానం ఇవ్వండి.", "పేరా:", "ప్రశ్న:", "సమాధానం:")
+}
+
+
+def load_oneshot_examples(data_dir: str) -> Dict:
+    """Load one-shot examples from the fewshot JSON file."""
+    # Try different possible file names
+    possible_files = [
+        os.path.join(data_dir, "eval", "tydiqa", "tydiqa_fewshot.json"),
+        os.path.join(data_dir, "eval", "tydiqa", "tydiqa-one-shot.json"),
+    ]
+
+    for fewshot_file in possible_files:
+        if os.path.exists(fewshot_file):
+            with open(fewshot_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+
+    print(f"Warning: No one-shot file found. Tried: {possible_files}")
+    return {}
+
+
+def format_oneshot_prompt(example: Dict, language: str) -> str:
+    """Format a one-shot example into a prompt string with answer."""
+    templates = ENCODING_TEMPLATES_WITH_CONTEXT.get(language, ENCODING_TEMPLATES_WITH_CONTEXT["english"])
+    task_prompt, p_template, q_template, a_template = templates
+
+    context = example.get("context", "")
+    question = example.get("question", "")
+    answers = example.get("answers", [])
+    answer = answers[0]["text"] if answers else ""
+
+    prompt = f"{task_prompt}\n{p_template} {context}\n{q_template} {question}\n{a_template} {answer}\n\n"
+    return prompt
+
 
 def get_tydiqa_dataset_df(
         data_dir: str,
         validation: bool = False,
         use_chat_format: bool = True,
         chat_format: str = "tulu",
-        k: int = 100
+        k: int = 100,
+        oneshot_examples: Dict = None
     ) -> List[Tuple[str, str, str]]:
     """
     Get TyDiQA dataset as a list of tuples for evaluation.
@@ -29,6 +77,7 @@ def get_tydiqa_dataset_df(
         use_chat_format: Whether to format prompts with chat template.
         chat_format: The chat format to use ("tulu" or "llama2").
         k: Number of examples to load.
+        oneshot_examples: Dictionary of one-shot examples by language.
 
     Returns:
         List of (formatted_prompt, answer, language) tuples
@@ -45,14 +94,27 @@ def get_tydiqa_dataset_df(
         answer = messages[1]['content']
         language = example.get('metadata', {}).get('language', 'unknown')
 
-        # Format the prompt
+        # Build prompt with one-shot example if available
+        if oneshot_examples:
+            # Get one-shot example for this language, fallback to English
+            lang_examples = oneshot_examples.get(language) or oneshot_examples.get("english", [])
+            if lang_examples:
+                oneshot_prompt = format_oneshot_prompt(lang_examples[0], language)
+                # Prepend one-shot example to the user content
+                full_content = oneshot_prompt + user_content
+            else:
+                full_content = user_content
+        else:
+            full_content = user_content
+
+        # Format the prompt with chat template
         if use_chat_format:
             if chat_format == "tulu":
-                prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+                prompt = f"<|user|>\n{full_content}\n<|assistant|>\n"
             else:
-                prompt = f"<s> {B_INST} {user_content} {E_INST} "
+                prompt = f"<s> {B_INST} {full_content} {E_INST} "
         else:
-            prompt = f"{user_content}\nAnswer: "
+            prompt = f"{full_content}\nAnswer: "
 
         results.append((prompt, answer, language))
 
@@ -60,7 +122,7 @@ def get_tydiqa_dataset_df(
 
 def compute_accuracy(args, model, tokenizer):
     """
-    Compute F1 and exact match scores for TyDiQA evaluation.
+    Compute F1 and exact match scores for TyDiQA evaluation (1-shot).
 
     Args:
         args: Arguments containing n_test and data_dir
@@ -76,7 +138,14 @@ def compute_accuracy(args, model, tokenizer):
     if n_test <= 0:
         n_test = 10000  # Load all available
 
-    # Load test dataset
+    # Load one-shot examples
+    oneshot_examples = load_oneshot_examples(data_dir)
+    if oneshot_examples:
+        print(f"Loaded one-shot examples for {len(oneshot_examples)} languages")
+    else:
+        print("Warning: No one-shot examples found, using 0-shot evaluation")
+
+    # Load test dataset with one-shot prompting
     # Note: get_tydiqa_dataset_df returns list of tuples: (formatted_prompt, answer, lang)
     # where formatted_prompt already contains the full prompt with context and question
     test_dataset = get_tydiqa_dataset_df(
@@ -84,10 +153,11 @@ def compute_accuracy(args, model, tokenizer):
         validation=False,
         use_chat_format=True,  # This controls the format returned by get_tydiqa_dataset_df
         chat_format="tulu",
-        k=n_test
+        k=n_test,
+        oneshot_examples=oneshot_examples
     )
 
-    print(f'Loaded {len(test_dataset)} test examples')
+    print(f'Loaded {len(test_dataset)} test examples (1-shot evaluation)')
 
     # Extract prompts from the dataset (they're already formatted)
     prompts = [prompt for prompt, answer, lang in test_dataset]

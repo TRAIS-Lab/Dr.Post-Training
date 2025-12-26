@@ -65,7 +65,7 @@ data_dir="SFT/data"
 sweep_percentage=0.05  # Use 5% of data for LR sweep
 n_val=8
 n_eval=100  # Fewer eval examples for speed
-model="llama3-1b"
+model="meta-llama/Llama-3.2-1B"
 batch_size=8
 val_batch_size="1"
 seed=42
@@ -74,7 +74,7 @@ task="mmlu"
 train_dataset=""
 subject="sociology"
 compression=""
-use_second_order=false
+use_second_order=true
 use_lora=false
 use_flash_attention=true
 
@@ -111,26 +111,26 @@ update_compressor_freq=200
 
 # Experiment definitions (same as train.sh)
 declare -A EXPERIMENT_DEFS=(
-    ["NA-NA-full"]="NA::false:false"
-    ["NA-NA-lora"]="NA::true:false"
-    ["Streaming-NA-full"]="Streaming::false:true"
-    ["Streaming-NA-lora"]="Streaming::true:true"
-    ["GREATS-NA-full"]="GREATS::false:true"
-    ["GREATS-NA-lora"]="GREATS::true:true"
-    ["Streaming-LoGra-full"]="Streaming:LoGra:false:true"
-    ["GREATS-LoGra-full"]="GREATS:LoGra:false:true"
+    ["NA-NA-Full"]="NA::false:false"
+    ["NA-NA-LoRA"]="NA::true:false"
+    ["Streaming-NA-Full"]="Streaming::false:true"
+    ["Streaming-NA-LoRA"]="Streaming::true:true"
+    ["GREATS-NA-Full"]="GREATS::false:true"
+    ["GREATS-NA-LoRA"]="GREATS::true:true"
+    ["Streaming-LoGra-Full"]="Streaming:LoGra:false:true"
+    ["GREATS-LoGra-Full"]="GREATS:LoGra:false:true"
 )
 
 # Category mappings (same as train.sh)
 declare -A CATEGORY_EXPERIMENTS=(
-    ["all"]="NA-NA-full,NA-NA-lora,Streaming-NA-full,Streaming-NA-lora,GREATS-NA-full,GREATS-NA-lora,Streaming-LoGra-full,GREATS-LoGra-full"
-    ["baseline"]="NA-NA-full,NA-NA-lora"
-    ["streaming"]="Streaming-NA-full,Streaming-NA-lora,Streaming-LoGra-full"
-    ["greats"]="GREATS-NA-full,GREATS-NA-lora,GREATS-LoGra-full"
-    ["full"]="NA-NA-full,Streaming-NA-full,GREATS-NA-full,Streaming-LoGra-full,GREATS-LoGra-full"
-    ["lora"]="NA-NA-lora,Streaming-NA-lora,GREATS-NA-lora"
-    ["compression"]="Streaming-LoGra-full,GREATS-LoGra-full"
-    ["no-compression"]="NA-NA-full,NA-NA-lora,Streaming-NA-full,Streaming-NA-lora,GREATS-NA-full,GREATS-NA-lora"
+    ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["baseline"]="NA-NA-Full,NA-NA-LoRA"
+    ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
+    ["greats"]="GREATS-NA-Full,GREATS-NA-LoRA,GREATS-LoGra-Full"
+    ["full"]="NA-NA-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["lora"]="NA-NA-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
+    ["compression"]="Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["no-compression"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
 )
 
 # Parse named arguments
@@ -297,11 +297,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --experiments <list>                   Run sweep for multiple experiments"
             echo "  --dry-run                              Print commands without executing"
             echo ""
-            echo "  Experiment names: NA-NA-full, NA-NA-lora, Streaming-NA-full, etc."
-            echo "  Categories: all, baseline, streaming, greats, full, lora, compression"
+            echo "  Experiment names: NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, etc."
+            echo "  Categories: all, baseline, streaming, greats, Full, LoRA, compression"
             echo ""
             echo "Shared Options (same as train.sh):"
-            echo "  --model <model>                        Model: llama3-1b, llama2-7b, etc."
+            echo "  --model <model>                        HuggingFace model path (default: meta-llama/Llama-3.2-1B)"
             echo "  --task <task>                          Task: mmlu, bbh, tydiqa, samsum, gsm8k"
             echo "  --train <dataset>                      Training dataset"
             echo "  --subject <subject>                    MMLU/BBH subject"
@@ -322,6 +322,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Extract model name from path for use in output directories
+# e.g., "meta-llama/Llama-3.2-1B" -> "Llama-3.2-1B"
+model_name=$(basename "$model")
 
 # ========================================
 # Resolve experiment names from categories
@@ -481,20 +485,17 @@ run_lr_trial() {
         esac
     fi
 
-    # Map model to path
-    local MODEL_PATH
-    case $model in
-        llama3-1b) MODEL_PATH="meta-llama/Llama-3.2-1B" ;;
-        llama2-7b) MODEL_PATH="meta-llama/Llama-2-7b-hf" ;;
-        llama2-13b)
-            MODEL_PATH="meta-llama/Llama-2-13b-hf"
+    # Use model path directly
+    local MODEL_PATH="$model"
+
+    # Model-specific configurations (match by path pattern)
+    case "$model" in
+        *Llama-2-13b*|*llama-2-13b*)
             exp_base_training_args="$exp_base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config llama2_13b_finetune"
             ;;
-        mistral-7b)
-            MODEL_PATH="mistralai/Mistral-7B-v0.1"
+        *Mistral-7B*|*mistral-7b*)
             exp_base_training_args="$exp_base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config mistral_7b_finetune"
             ;;
-        *) MODEL_PATH="$model" ;;
     esac
 
     local DATA_SEED=$((seed + 1))
@@ -600,7 +601,7 @@ config[config_key][exp_name] = {
     "eval_loss": best_eval_loss,
     "sweep_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
     "sweep_percentage": float("$sweep_percentage"),
-    "model": "$model"
+    "model": "$model_name"
 }
 
 with open(config_file, 'w') as f:
@@ -634,10 +635,10 @@ echo "Sweep percentage: $sweep_percentage"
 echo "Sweep mode: $sweep_mode"
 echo ""
 if [[ "$sweep_mode" == "grid" ]]; then
-    echo "LR grid (full): $lr_grid"
+    echo "LR grid (Full): $lr_grid"
     echo "LR grid (LoRA): $lr_grid_lora"
 elif [[ "$sweep_mode" == "binary" ]]; then
-    echo "LR range (full): $binary_lr_min -> $binary_lr_max"
+    echo "LR range (Full): $binary_lr_min -> $binary_lr_max"
     echo "LR range (LoRA): $binary_lr_min_lora -> $binary_lr_max_lora"
     echo "Max iterations: $binary_max_iters"
 fi
@@ -906,7 +907,7 @@ else
     echo "ERROR: Please specify experiments with --experiments"
     echo "Example: --experiments all"
     echo "         --experiments baseline"
-    echo "         --experiments NA-NA-full,Streaming-NA-full"
+    echo "         --experiments NA-NA-Full,Streaming-NA-Full"
     exit 1
 fi
 

@@ -99,26 +99,26 @@ update_compressor_freq=200
 # Experiment Definitions (8 experiments, matching SFT)
 # ========================================
 declare -A EXPERIMENT_DEFS=(
-    ["NA-NA-full"]="NA::false:false"
-    ["NA-NA-lora"]="NA::true:false"
-    ["Streaming-NA-full"]="Streaming::false:true"
-    ["Streaming-NA-lora"]="Streaming::true:true"
-    ["GREATS-NA-full"]="GREATS::false:true"
-    ["GREATS-NA-lora"]="GREATS::true:true"
-    ["Streaming-LoGra-full"]="Streaming:LoGra:false:true"
-    ["GREATS-LoGra-full"]="GREATS:LoGra:false:true"
+    ["NA-NA-Full"]="NA::false:false"
+    ["NA-NA-LoRA"]="NA::true:false"
+    ["Streaming-NA-Full"]="Streaming::false:true"
+    ["Streaming-NA-LoRA"]="Streaming::true:true"
+    ["GREATS-NA-Full"]="GREATS::false:true"
+    ["GREATS-NA-LoRA"]="GREATS::true:true"
+    ["Streaming-LoGra-Full"]="Streaming:LoGra:false:true"
+    ["GREATS-LoGra-Full"]="GREATS:LoGra:false:true"
 )
 
 # Category mappings (matching SFT)
 declare -A CATEGORY_EXPERIMENTS=(
-    ["all"]="NA-NA-full,NA-NA-lora,Streaming-NA-full,Streaming-NA-lora,GREATS-NA-full,GREATS-NA-lora,Streaming-LoGra-full,GREATS-LoGra-full"
-    ["baseline"]="NA-NA-full,NA-NA-lora"
-    ["streaming"]="Streaming-NA-full,Streaming-NA-lora,Streaming-LoGra-full"
-    ["greats"]="GREATS-NA-full,GREATS-NA-lora,GREATS-LoGra-full"
-    ["full"]="NA-NA-full,Streaming-NA-full,GREATS-NA-full,Streaming-LoGra-full,GREATS-LoGra-full"
-    ["lora"]="NA-NA-lora,Streaming-NA-lora,GREATS-NA-lora"
-    ["compression"]="Streaming-LoGra-full,GREATS-LoGra-full"
-    ["no-compression"]="NA-NA-full,NA-NA-lora,Streaming-NA-full,Streaming-NA-lora,GREATS-NA-full,GREATS-NA-lora"
+    ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["baseline"]="NA-NA-Full,NA-NA-LoRA"
+    ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
+    ["greats"]="GREATS-NA-Full,GREATS-NA-LoRA,GREATS-LoGra-Full"
+    ["full"]="NA-NA-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["lora"]="NA-NA-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
+    ["compression"]="Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["no-compression"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
 )
 
 # ========================================
@@ -463,10 +463,10 @@ echo "Sweep max steps: $sweep_max_steps"
 echo "Sweep mode: $sweep_mode"
 echo ""
 if [[ "$sweep_mode" == "grid" ]]; then
-    echo "LR grid (full): $lr_grid"
+    echo "LR grid (Full): $lr_grid"
     echo "LR grid (LoRA): $lr_grid_lora"
 elif [[ "$sweep_mode" == "binary" ]]; then
-    echo "LR range (full): $binary_lr_min -> $binary_lr_max"
+    echo "LR range (Full): $binary_lr_min -> $binary_lr_max"
     echo "LR range (LoRA): $binary_lr_min_lora -> $binary_lr_max_lora"
     echo "Max iterations: $binary_max_iters"
 fi

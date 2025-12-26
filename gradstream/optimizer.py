@@ -727,6 +727,12 @@ class MeSOAdamW(Optimizer):
                 if p.grad is None:
                     continue
                 self._step_standard(p, group)
+
+        # Clear all compressed gradients after step to free memory
+        # Done at end of step() because both weight and bias params need access
+        # to the same _compressed_grad during processing
+        self.grad_hook.clear_all_compressed_grads()
+
         return loss
 
     def _step_compressed(self, param, compressed_grad, group, layer_name):
@@ -975,14 +981,10 @@ class MeSOSGD(Optimizer):
                         # because it contains both weight and bias gradients combined
                         if param_type == 'weight':
                             compressed_grad = getattr(p, '_compressed_grad', None)
-                            if compressed_grad is not None:
-                                # Free memory immediately after retrieval
-                                p._compressed_grad = None
                         else:
                             # For bias, get compressed grad from the weight of the same layer
                             module = self.grad_hook.layer_name_to_module.get(layer_name)
                             compressed_grad = getattr(module.weight, '_compressed_grad', None) if module else None
-                            # Note: Don't clear here - the weight param will clear it
 
                         if compressed_grad is not None:
                             # Use compressed gradient pathway (layer-by-layer decompression)
@@ -993,6 +995,11 @@ class MeSOSGD(Optimizer):
                 if p.grad is None:
                     continue
                 self._step_standard(p, group)
+
+        # Clear all compressed gradients after step to free memory
+        # Done at end of step() because both weight and bias params need access
+        # to the same _compressed_grad during processing
+        self.grad_hook.clear_all_compressed_grads()
 
         return loss
 

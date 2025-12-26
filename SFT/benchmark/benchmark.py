@@ -12,7 +12,7 @@ Naming convention follows the experimental configurations:
 
   selection: NA (baseline), Streaming (per-layer), GREATS (global)
   compression: NA (standard optimizer), LoGra (MeSO optimizer)
-  training_type: full, lora
+  training_type: Full, LoRA
 
 Note: GraSS compression is also available but LoGra is used in default experiments.
 
@@ -66,7 +66,7 @@ class BenchmarkConfig:
     num_iterations: int = 10
 
     # LoRA config
-    lora_rank: int = 256
+    lora_rank: int = 16
     lora_alpha: int = 1
 
     # Selection config
@@ -461,7 +461,7 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
         loss_for_scoring.backward()
 
         # Get globally selected indices
-        selected_indices = grad_hook.selection_state.get_selected_indices()
+        selected_indices = grad_hook.selection_state.get_final_selection()
         grad_hook.clear_selection()
 
         # Pass 2: Compute gradients on selected samples
@@ -821,7 +821,7 @@ def _setup_compression(model, config: BenchmarkConfig, use_meso_optimizer: bool 
 
 
 def setup_NA_GraSS_full(config: BenchmarkConfig):
-    """NA-GraSS-full: MeSO only (no selection, compressed optimizer)."""
+    """NA-GraSS-Full: MeSO only (no selection, compressed optimizer)."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -835,7 +835,7 @@ def setup_NA_GraSS_full(config: BenchmarkConfig):
 
 
 def setup_NA_GraSS_full_gc(config: BenchmarkConfig):
-    """NA-GraSS-full with gradient checkpointing."""
+    """NA-GraSS-Full with gradient checkpointing."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -850,7 +850,7 @@ def setup_NA_GraSS_full_gc(config: BenchmarkConfig):
 
 
 def setup_Streaming_NA_full(config: BenchmarkConfig):
-    """Streaming-NA-full: Per-layer selection with full gradients (standard optimizer)."""
+    """Streaming-NA-Full: Per-layer selection with full gradients (standard optimizer)."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -867,7 +867,7 @@ def setup_Streaming_NA_full(config: BenchmarkConfig):
 
 
 def setup_Streaming_NA_full_gc(config: BenchmarkConfig):
-    """Streaming-NA-full with gradient checkpointing."""
+    """Streaming-NA-Full with gradient checkpointing."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -883,7 +883,7 @@ def setup_Streaming_NA_full_gc(config: BenchmarkConfig):
 
 
 def setup_GREATS_NA_full(config: BenchmarkConfig):
-    """GREATS-NA-full: Global selection with full gradients (standard optimizer)."""
+    """GREATS-NA-Full: Global selection with full gradients (standard optimizer)."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -898,7 +898,7 @@ def setup_GREATS_NA_full(config: BenchmarkConfig):
 
 
 def setup_GREATS_NA_full_gc(config: BenchmarkConfig):
-    """GREATS-NA-full with gradient checkpointing."""
+    """GREATS-NA-Full with gradient checkpointing."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -913,7 +913,7 @@ def setup_GREATS_NA_full_gc(config: BenchmarkConfig):
 
 
 def setup_Streaming_GraSS_full(config: BenchmarkConfig):
-    """Streaming-GraSS-full: Per-layer selection + MeSO (GraSS)."""
+    """Streaming-GraSS-Full: Per-layer selection + MeSO (GraSS)."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -927,7 +927,7 @@ def setup_Streaming_GraSS_full(config: BenchmarkConfig):
 
 
 def setup_GREATS_GraSS_full(config: BenchmarkConfig):
-    """GREATS-GraSS-full: Global selection + MeSO (GraSS)."""
+    """GREATS-GraSS-Full: Global selection + MeSO (GraSS)."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -1018,7 +1018,7 @@ def _setup_logra_compression(model, config: BenchmarkConfig, use_meso_optimizer:
 
 
 def setup_NA_LoGra_full(config: BenchmarkConfig):
-    """NA-LoGra-full: MeSO only with LoGra compression (no selection)."""
+    """NA-LoGra-Full: MeSO only with LoGra compression (no selection)."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -1032,7 +1032,7 @@ def setup_NA_LoGra_full(config: BenchmarkConfig):
 
 
 def setup_Streaming_LoGra_full(config: BenchmarkConfig):
-    """Streaming-LoGra-full: Per-layer selection + MeSO (LoGra)."""
+    """Streaming-LoGra-Full: Per-layer selection + MeSO (LoGra)."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -1046,7 +1046,7 @@ def setup_Streaming_LoGra_full(config: BenchmarkConfig):
 
 
 def setup_Streaming_LoGra_full_gc(config: BenchmarkConfig):
-    """Streaming-LoGra-full with gradient checkpointing."""
+    """Streaming-LoGra-Full with gradient checkpointing."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -1061,7 +1061,7 @@ def setup_Streaming_LoGra_full_gc(config: BenchmarkConfig):
 
 
 def setup_GREATS_LoGra_full(config: BenchmarkConfig):
-    """GREATS-LoGra-full: Global selection + MeSO (LoGra)."""
+    """GREATS-LoGra-Full: Global selection + MeSO (LoGra)."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -1075,7 +1075,7 @@ def setup_GREATS_LoGra_full(config: BenchmarkConfig):
 
 
 def setup_GREATS_LoGra_full_gc(config: BenchmarkConfig):
-    """GREATS-LoGra-full with gradient checkpointing."""
+    """GREATS-LoGra-Full with gradient checkpointing."""
     model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
     if config.use_flash_attention:
         model_kwargs['attn_implementation'] = "flash_attention_2"
@@ -1187,7 +1187,7 @@ def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_meso_optimizer: bool
 
 
 def setup_Streaming_NA_lora(config: BenchmarkConfig):
-    """Streaming-NA-lora: Per-layer selection with full gradients, LoRA."""
+    """Streaming-NA-LoRA: Per-layer selection with full gradients, LoRA."""
     model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False)
     # Clear compressors to use full gradients for the actual update
     grad_hook.compressors = [None] * len(grad_hook.layer_names)
@@ -1195,32 +1195,32 @@ def setup_Streaming_NA_lora(config: BenchmarkConfig):
 
 
 def setup_Streaming_NA_lora_gc(config: BenchmarkConfig):
-    """Streaming-NA-lora with gradient checkpointing."""
+    """Streaming-NA-LoRA with gradient checkpointing."""
     model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False, use_gc=True)
     grad_hook.compressors = [None] * len(grad_hook.layer_names)
     return model, optimizer, tokenizer, grad_hook
 
 
 def setup_GREATS_NA_lora(config: BenchmarkConfig):
-    """GREATS-NA-lora: Global selection with full gradients, LoRA."""
+    """GREATS-NA-LoRA: Global selection with full gradients, LoRA."""
     model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False)
     return model, optimizer, tokenizer, grad_hook
 
 
 def setup_GREATS_NA_lora_gc(config: BenchmarkConfig):
-    """GREATS-NA-lora with gradient checkpointing."""
+    """GREATS-NA-LoRA with gradient checkpointing."""
     model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False, use_gc=True)
     return model, optimizer, tokenizer, grad_hook
 
 
 def setup_Streaming_GraSS_lora(config: BenchmarkConfig):
-    """Streaming-GraSS-lora: Per-layer selection + MeSO, LoRA."""
+    """Streaming-GraSS-LoRA: Per-layer selection + MeSO, LoRA."""
     model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=True)
     return model, optimizer, tokenizer, grad_hook
 
 
 def setup_GREATS_GraSS_lora(config: BenchmarkConfig):
-    """GREATS-GraSS-lora: Global selection + MeSO, LoRA."""
+    """GREATS-GraSS-LoRA: Global selection + MeSO, LoRA."""
     model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=True)
     return model, optimizer, tokenizer, grad_hook
 
@@ -1250,20 +1250,20 @@ def setup_full_adamw_gc(config: BenchmarkConfig):
 # Naming convention: {selection}_{compression}_{training}
 #   selection: NA (baseline), Streaming (per-layer), GREATS (global)
 #   compression: NA (standard optimizer), GraSS, LoGra (MeSO optimizer)
-#   training: full, lora
+#   training: Full, LoRA
 
 # === Baseline Methods (NA-NA-*) ===
 # No selection, no compression, standard optimizer
 BASELINE_METHODS = {
-    'NA_NA_full': setup_full_adamw,              # Standard full fine-tuning
-    'NA_NA_lora': setup_lora_adamw,              # Standard LoRA fine-tuning
-    'NA_NA_full_gc': setup_full_adamw_gc,        # With gradient checkpointing
-    'NA_NA_lora_gc': setup_lora_adamw_gc,
+    'NA_NA_Full': setup_full_adamw,              # Standard full fine-tuning
+    'NA_NA_LoRA': setup_lora_adamw,              # Standard LoRA fine-tuning
+    'NA_NA_Full_gc': setup_full_adamw_gc,        # With gradient checkpointing
+    'NA_NA_LoRA_gc': setup_lora_adamw_gc,
 }
 
 # === MeSO Only Methods (NA-{compression}-*) ===
 # Note: Compression without selection doesn't provide meaningful benefit,
-# so we don't include NA-LoGra-full or NA-GraSS-full configurations.
+# so we don't include NA-LoGra-Full or NA-GraSS-Full configurations.
 # These would just add compression overhead without the selection benefit.
 MESO_ONLY_METHODS = {
 }
@@ -1271,46 +1271,46 @@ MESO_ONLY_METHODS = {
 # === Streaming Selection Methods (Streaming-*-*) ===
 # Per-layer selection (single-pass)
 # Format: method_name -> (setup_fn, selection_frac, has_compression)
-# Note: LoRA doesn't need compression (already low-rank), so no Streaming_LoGra_lora
+# Note: LoRA doesn't need compression (already low-rank), so no Streaming_LoGra_LoRA
 # Note: We use LoGra (not GraSS) as the compression method
 STREAMING_METHODS = {
     # Streaming-NA: Per-layer selection with full gradients
-    'Streaming_NA_full': (setup_Streaming_NA_full, 0.5, False),
-    'Streaming_NA_lora': (setup_Streaming_NA_lora, 0.5, False),
-    'Streaming_NA_full_gc': (setup_Streaming_NA_full_gc, 0.5, False),
-    'Streaming_NA_lora_gc': (setup_Streaming_NA_lora_gc, 0.5, False),
+    'Streaming_NA_Full': (setup_Streaming_NA_full, 0.5, False),
+    'Streaming_NA_LoRA': (setup_Streaming_NA_lora, 0.5, False),
+    'Streaming_NA_Full_gc': (setup_Streaming_NA_full_gc, 0.5, False),
+    'Streaming_NA_LoRA_gc': (setup_Streaming_NA_lora_gc, 0.5, False),
     # Streaming-LoGra: Per-layer selection with MeSO (full fine-tuning only)
-    'Streaming_LoGra_full': (setup_Streaming_LoGra_full, 0.5, True),
-    'Streaming_LoGra_full_gc': (setup_Streaming_LoGra_full_gc, 0.5, True),
+    'Streaming_LoGra_Full': (setup_Streaming_LoGra_full, 0.5, True),
+    'Streaming_LoGra_Full_gc': (setup_Streaming_LoGra_full_gc, 0.5, True),
 }
 
 # === GREATS Selection Methods (GREATS-*-*) ===
 # Global selection (two-pass)
 # Format: method_name -> (setup_fn, selection_frac, has_compression)
-# Note: LoRA doesn't need compression (already low-rank), so no GREATS_LoGra_lora
+# Note: LoRA doesn't need compression (already low-rank), so no GREATS_LoGra_LoRA
 # Note: We use LoGra (not GraSS) as the compression method
 GREATS_METHODS = {
     # GREATS-NA: Global selection with full gradients
-    'GREATS_NA_full': (setup_GREATS_NA_full, 0.5, False),
-    'GREATS_NA_lora': (setup_GREATS_NA_lora, 0.5, False),
-    'GREATS_NA_full_gc': (setup_GREATS_NA_full_gc, 0.5, False),
-    'GREATS_NA_lora_gc': (setup_GREATS_NA_lora_gc, 0.5, False),
+    'GREATS_NA_Full': (setup_GREATS_NA_full, 0.5, False),
+    'GREATS_NA_LoRA': (setup_GREATS_NA_lora, 0.5, False),
+    'GREATS_NA_Full_gc': (setup_GREATS_NA_full_gc, 0.5, False),
+    'GREATS_NA_LoRA_gc': (setup_GREATS_NA_lora_gc, 0.5, False),
     # GREATS-LoGra: Global selection with MeSO (full fine-tuning only)
-    'GREATS_LoGra_full': (setup_GREATS_LoGra_full, 0.5, True),
-    'GREATS_LoGra_full_gc': (setup_GREATS_LoGra_full_gc, 0.5, True),
+    'GREATS_LoGra_Full': (setup_GREATS_LoGra_full, 0.5, True),
+    'GREATS_LoGra_Full_gc': (setup_GREATS_LoGra_full_gc, 0.5, True),
 }
 
 # === External Baselines ===
 # Other methods for comparison (SGD variants)
 EXTERNAL_BASELINES = {
-    'full_sgd': setup_full_sgd,
-    'full_sgd_momentum': setup_full_sgd_momentum,
-    'lora_sgd': setup_lora_sgd,
-    'lora_sgd_momentum': setup_lora_sgd_momentum,
-    'full_sgd_gc': setup_full_sgd_gc,
-    'full_sgd_momentum_gc': setup_full_sgd_momentum_gc,
-    'lora_sgd_gc': setup_lora_sgd_gc,
-    'lora_sgd_momentum_gc': setup_lora_sgd_momentum_gc,
+    'Full_sgd': setup_full_sgd,
+    'Full_sgd_momentum': setup_full_sgd_momentum,
+    'LoRA_sgd': setup_lora_sgd,
+    'LoRA_sgd_momentum': setup_lora_sgd_momentum,
+    'Full_sgd_gc': setup_full_sgd_gc,
+    'Full_sgd_momentum_gc': setup_full_sgd_momentum_gc,
+    'LoRA_sgd_gc': setup_lora_sgd_gc,
+    'LoRA_sgd_momentum_gc': setup_lora_sgd_momentum_gc,
 }
 
 # Combined list for CLI help
@@ -1496,33 +1496,32 @@ Naming Convention: {selection}_{compression}_{training}
 Note: GraSS compression is also available but LoGra is used in default experiments.
 
 Examples:
-  NA_NA_full           - Baseline full fine-tuning
-  Streaming_LoGra_full - Per-layer selection with MeSO
-  GREATS_NA_full       - Global selection with standard optimizer
+  NA_NA_Full           - Baseline full fine-tuning
+  Streaming_LoGra_Full - Per-layer selection with MeSO
+  GREATS_NA_Full       - Global selection with standard optimizer
         """
     )
 
     # Method selection
-    parser.add_argument('--methods', nargs='+', default=['NA_NA_full', 'Streaming_LoGra_full'],
+    parser.add_argument('--methods', nargs='+', default=['NA_NA_Full', 'Streaming_LoGra_Full'],
                         help=f'Methods to benchmark. Use --list to see all available methods.')
     parser.add_argument('--all', action='store_true', help='Run all methods')
     parser.add_argument('--list', action='store_true', help='List all available methods and exit')
 
     # Model config
-    parser.add_argument('--model', type=str, default='meta-llama/Llama-3.2-3B',
-                        help='Model name')
+    parser.add_argument('--model', type=str, default='meta-llama/Llama-3.2-1B', help='Model name')
     parser.add_argument('--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16', 'float16'])
     parser.add_argument('--no-flash-attention', action='store_true', help='Disable flash attention')
 
     # Training config
-    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--seq-length', type=int, default=512)
     parser.add_argument('--val-batch-size', type=int, default=1,
                         help='Validation batch size for data selection (Streaming/GREATS)')
 
     # Benchmark config
-    parser.add_argument('--num-warmup', type=int, default=10)
-    parser.add_argument('--num-iterations', type=int, default=10)
+    parser.add_argument('--num-warmup', type=int, default=20)
+    parser.add_argument('--num-iterations', type=int, default=20)
 
     # Selection config
     parser.add_argument('--use-second-order', action='store_true',

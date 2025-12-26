@@ -10,7 +10,7 @@ Methods:
 import logging
 import time
 import warnings
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Callable
 
 import numpy as np
 import torch
@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
+
+from gradstream.selection import create_stored_val_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +213,14 @@ class StreamingPPOTrainer:
         self.use_second_order = args.use_second_order
         self.min_batch_size_for_selection = getattr(args, 'min_batch_size_for_selection', 2)
 
+        # Create selection strategy for clean separation of selection methods
+        self.selection_strategy = create_stored_val_strategy(
+            method=self.method,
+            grad_hook=self.grad_hook,
+            frac=self.filter_frac,
+            use_second_order=self.use_second_order,
+        )
+
         # Logging
         self._log_config()
 
@@ -222,6 +232,9 @@ class StreamingPPOTrainer:
         For Streaming/GREATS, policy gradients should match NA baseline if
         normalization is correct.
 
+        Supports both compressed gradients (stored in _compressed_grad on weight params)
+        and standard gradients (param.grad).
+
         Returns:
             Dictionary with policy_grad_norm, vhead_grad_norm, and per-layer norms
         """
@@ -231,7 +244,22 @@ class StreamingPPOTrainer:
         lora_b_grad_norm_sq = 0.0
 
         for name, param in self.model.named_parameters():
-            if param.grad is not None:
+            # Check for compressed gradient first (stored on weight parameters only)
+            # _compressed_grad contains both weight and bias gradients combined
+            compressed_grad = getattr(param, '_compressed_grad', None)
+
+            if compressed_grad is not None:
+                # Use compressed gradient norm (represents layer's gradient in compressed space)
+                grad_norm_sq = compressed_grad.norm().item() ** 2
+                # Only weight params have _compressed_grad, so categorize based on weight name
+                if "lora" in name.lower():
+                    policy_grad_norm_sq += grad_norm_sq
+                    if "lora_A" in name or "lora_a" in name:
+                        lora_a_grad_norm_sq += grad_norm_sq
+                    elif "lora_B" in name or "lora_b" in name:
+                        lora_b_grad_norm_sq += grad_norm_sq
+            elif param.grad is not None:
+                # Use standard gradient (for non-compressed layers like v_head)
                 grad_norm_sq = param.grad.norm().item() ** 2
                 if "v_head" in name:
                     vhead_grad_norm_sq += grad_norm_sq
@@ -1137,7 +1165,7 @@ class StreamingPPOTrainer:
         """
         Perform one training step with optional selection.
 
-        Handles all three methods:
+        Uses the selection strategy pattern for clean separation of methods:
         - NA: Standard PPO update
         - Streaming: Per-layer selection during backward (uses stored val grads)
         - GREATS: Global selection (two-pass for training)
@@ -1158,168 +1186,76 @@ class StreamingPPOTrainer:
         batch_size = query_ids.shape[0]
         lr = self.optimizer.param_groups[0]["lr"]
 
-        # ========================================
-        # MINI-BATCH SIZE SAFEGUARD
-        # When batch size is too small, selection becomes unstable
-        # Fall back to NA (no selection) for small batches
-        # ========================================
-        effective_method = self.method
+        # Determine effective strategy (fall back to NA for small batches)
+        strategy = self._get_effective_strategy(batch_size)
+
+        # Zero gradients before training step
+        self.optimizer.zero_grad()
+
+        # Create compute_loss_fn closure for the current batch
+        def compute_loss_fn() -> Tuple[Tensor, Dict]:
+            return self.compute_ppo_loss(
+                query_ids, response_ids, query_mask, response_mask,
+                old_logprobs, advantages, returns, old_values,
+            )
+
+        # For GREATS, create filter_batch_fn to get filtered compute_loss_fn
+        def filter_batch_fn(selected_indices: Tensor) -> Callable[[], Tuple[Tensor, Dict]]:
+            def filtered_compute_loss_fn() -> Tuple[Tensor, Dict]:
+                return self.compute_ppo_loss(
+                    query_ids[selected_indices],
+                    response_ids[selected_indices],
+                    query_mask[selected_indices],
+                    response_mask[selected_indices],
+                    old_logprobs[selected_indices],
+                    advantages[selected_indices],
+                    returns[selected_indices],
+                    old_values[selected_indices],
+                )
+            return filtered_compute_loss_fn
+
+        # Execute selection strategy
+        loss, stats = strategy.execute_training_step(
+            model=self.model,
+            batch_size=batch_size,
+            compute_loss_fn=compute_loss_fn,
+            lr=lr,
+            filter_batch_fn=filter_batch_fn,
+        )
+
+        # Compute gradient norms
+        grad_norms = self._compute_gradient_norms()
+        stats.update(grad_norms)
+
+        # Add learning rate to stats
+        stats["ppo/learning_rate"] = lr
+
+        # Optimizer step (skip if accumulating gradients)
+        if not accumulate:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+        return stats
+
+    def _get_effective_strategy(self, batch_size: int):
+        """
+        Get the effective strategy for the current batch size.
+
+        Falls back to NA strategy when batch size is too small for stable selection.
+        """
         if batch_size < self.min_batch_size_for_selection and self.method != "NA":
             logger.debug(
                 f"Batch size {batch_size} < min_batch_size_for_selection "
-                f"{self.min_batch_size_for_selection}, skipping selection"
+                f"{self.min_batch_size_for_selection}, using NA strategy"
             )
-            effective_method = "NA"
-
-        # ========================================
-        # Method: NA (baseline, no selection)
-        # ========================================
-        if effective_method == "NA":
-            # Only zero grad if not accumulating (first call of accumulation cycle)
-            if not accumulate:
-                self.optimizer.zero_grad()
-
-            # Disable hooks for baseline
-            if self.grad_hook is not None:
-                self.grad_hook.disable_hooks()
-
-            loss, stats = self.compute_ppo_loss(
-                query_ids, response_ids, query_mask, response_mask,
-                old_logprobs, advantages, returns, old_values,
-            )
-
-            # Scale loss for gradient accumulation
-            scaled_loss = loss * loss_scale
-            scaled_loss.backward()
-
-            # Compute gradient norms before optimizer step
-            grad_norms = self._compute_gradient_norms()
-            stats.update(grad_norms)
-
-            # Only step optimizer if not accumulating
-            if not accumulate:
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-
-            if self.grad_hook is not None:
-                self.grad_hook.enable_hooks()
-
-            # Add learning rate to stats
-            stats["ppo/learning_rate"] = lr
-
-            return stats
-
-        # ========================================
-        # Method: Streaming (per-layer selection with stored val grads)
-        # ========================================
-        if effective_method == "Streaming":
-            self.optimizer.zero_grad()
-
-            # Setup selection using pre-captured validation gradients
-            self.grad_hook.setup_selection_with_stored_val(
-                train_batch_size=batch_size,
-                selection_method="Streaming",
+            # Create temporary NA strategy for this step
+            return create_stored_val_strategy(
+                method="NA",
+                grad_hook=self.grad_hook,
                 frac=self.filter_frac,
-                lr=lr,
-                compute_scores_only=False,  # Per-layer selection during backward
                 use_second_order=self.use_second_order,
-                selection_mode="filtering",  # RLHF: drop negative samples
             )
-
-            loss, stats = self.compute_ppo_loss(
-                query_ids, response_ids, query_mask, response_mask,
-                old_logprobs, advantages, returns, old_values,
-            )
-
-            # Backward with per-layer selection using stored val grads
-            loss.backward()
-
-            # Compute gradient norms before optimizer step
-            grad_norms = self._compute_gradient_norms()
-            stats.update(grad_norms)
-
-            # Get selection stats
-            if self.grad_hook.selection_state is not None:
-                n_selected = self.grad_hook.selection_state.num_selected
-                stats["selection/n_selected"] = n_selected
-                stats["selection/frac"] = n_selected / batch_size
-
-            self.grad_hook.clear_selection()
-
-            # Optimizer step (uses MeSO if compression enabled)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-            return stats
-
-        # ========================================
-        # Method: GREATS (global selection, two-pass for training)
-        # ========================================
-        if effective_method == "GREATS":
-            # Pass 1: Compute selection scores using stored val grads
-            self.optimizer.zero_grad()
-            self.grad_hook.setup_selection_with_stored_val(
-                train_batch_size=batch_size,
-                selection_method="GREATS",
-                frac=self.filter_frac,
-                lr=lr,
-                compute_scores_only=True,  # Only accumulate scores
-                use_second_order=self.use_second_order,
-                selection_mode="filtering",  # RLHF: drop negative samples
-            )
-
-            loss_for_scoring, _ = self.compute_ppo_loss(
-                query_ids, response_ids, query_mask, response_mask,
-                old_logprobs, advantages, returns, old_values,
-            )
-
-            loss_for_scoring.backward()
-
-            # Get selected indices
-            selected_indices = self.grad_hook.selection_state.get_selected_indices()
-            n_selected = len(selected_indices)
-
-            self.grad_hook.clear_selection()
-
-            # Pass 2: Full gradients on selected samples
-            self.grad_hook.disable_hooks()
-            self.optimizer.zero_grad()
-
-            # Filter to selected samples
-            query_ids_sel = query_ids[selected_indices]
-            response_ids_sel = response_ids[selected_indices]
-            query_mask_sel = query_mask[selected_indices]
-            response_mask_sel = response_mask[selected_indices]
-            old_logprobs_sel = old_logprobs[selected_indices]
-            advantages_sel = advantages[selected_indices]
-            returns_sel = returns[selected_indices]
-            old_values_sel = old_values[selected_indices]
-
-            loss, stats = self.compute_ppo_loss(
-                query_ids_sel, response_ids_sel, query_mask_sel, response_mask_sel,
-                old_logprobs_sel, advantages_sel, returns_sel, old_values_sel,
-            )
-
-            loss.backward()
-
-            # Compute gradient norms before optimizer step
-            grad_norms = self._compute_gradient_norms()
-            stats.update(grad_norms)
-
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-            # Re-enable hooks for next step
-            self.grad_hook.enable_hooks()
-
-            # Add selection stats
-            stats["selection/n_selected"] = n_selected
-            stats["selection/n_total"] = batch_size
-            stats["selection/frac"] = n_selected / batch_size
-
-            return stats
-
-        raise ValueError(f"Unknown method: {effective_method}")
+        return self.selection_strategy
 
     def _prepare_batch(self, batch: Dict) -> Tuple[Tensor, Tensor]:
         """

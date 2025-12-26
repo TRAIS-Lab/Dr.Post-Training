@@ -52,7 +52,7 @@ data_dir="SFT/data"
 percentage=0.05
 n_val=8
 n_eval=500
-model="llama3-1b"
+model="meta-llama/Llama-3.2-1B"
 batch_size=8
 val_batch_size="1"  # Defaults to batch_size if not specified
 lr=""  # Learning rate (looked up from lr_config.json if not specified)
@@ -83,26 +83,26 @@ fallback_lr_lora="2e-04"
 # Experiment definitions
 # Format: "NAME:data_selection:compression:use_lora:use_second_order"
 declare -A EXPERIMENT_DEFS=(
-    ["NA-NA-full"]="NA::false:false"
-    ["NA-NA-lora"]="NA::true:false"
-    ["Streaming-NA-full"]="Streaming::false:true"
-    ["Streaming-NA-lora"]="Streaming::true:true"
-    ["GREATS-NA-full"]="GREATS::false:true"
-    ["GREATS-NA-lora"]="GREATS::true:true"
-    ["Streaming-LoGra-full"]="Streaming:LoGra:false:true"
-    ["GREATS-LoGra-full"]="GREATS:LoGra:false:true"
+    ["NA-NA-Full"]="NA::false:false"
+    ["NA-NA-LoRA"]="NA::true:false"
+    ["Streaming-NA-Full"]="Streaming::false:true"
+    ["Streaming-NA-LoRA"]="Streaming::true:true"
+    ["GREATS-NA-Full"]="GREATS::false:true"
+    ["GREATS-NA-LoRA"]="GREATS::true:true"
+    ["Streaming-LoGra-Full"]="Streaming:LoGra:false:true"
+    ["GREATS-LoGra-Full"]="GREATS:LoGra:false:true"
 )
 
 # Category mappings
 declare -A CATEGORY_EXPERIMENTS=(
-    ["all"]="NA-NA-full,NA-NA-lora,Streaming-NA-full,Streaming-NA-lora,GREATS-NA-full,GREATS-NA-lora,Streaming-LoGra-full,GREATS-LoGra-full"
-    ["baseline"]="NA-NA-full,NA-NA-lora"
-    ["streaming"]="Streaming-NA-full,Streaming-NA-lora,Streaming-LoGra-full"
-    ["greats"]="GREATS-NA-full,GREATS-NA-lora,GREATS-LoGra-full"
-    ["full"]="NA-NA-full,Streaming-NA-full,GREATS-NA-full,Streaming-LoGra-full,GREATS-LoGra-full"
-    ["lora"]="NA-NA-lora,Streaming-NA-lora,GREATS-NA-lora"
-    ["compression"]="Streaming-LoGra-full,GREATS-LoGra-full"
-    ["no-compression"]="NA-NA-full,NA-NA-lora,Streaming-NA-full,Streaming-NA-lora,GREATS-NA-full,GREATS-NA-lora"
+    ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["baseline"]="NA-NA-Full,NA-NA-LoRA"
+    ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
+    ["greats"]="GREATS-NA-Full,GREATS-NA-LoRA,GREATS-LoGra-Full"
+    ["full"]="NA-NA-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["lora"]="NA-NA-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
+    ["compression"]="Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["no-compression"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
 )
 
 # LoRA-specific defaults (only used if --lora is passed)
@@ -243,16 +243,16 @@ while [[ $# -gt 0 ]]; do
             echo "  --dry-run                              Print commands without executing"
             echo "  --sbatch                               Use sbatch instead of bash"
             echo ""
-            echo "  Experiment names: NA-NA-full, NA-NA-lora, Streaming-NA-full, Streaming-NA-lora,"
-            echo "                    GREATS-NA-full, GREATS-NA-lora, Streaming-LoGra-full, GREATS-LoGra-full"
+            echo "  Experiment names: NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, Streaming-NA-LoRA,"
+            echo "                    GREATS-NA-Full, GREATS-NA-LoRA, Streaming-LoGra-Full, GREATS-LoGra-Full"
             echo ""
-            echo "  Categories: all, baseline, streaming, greats, full, lora, compression, no-compression"
+            echo "  Categories: all, baseline, streaming, greats, Full, LoRA, compression, no-compression"
             echo ""
             echo "  Examples:"
             echo "    --experiments all                    Run all 8 experiments"
-            echo "    --experiments baseline               Run NA-NA-full and NA-NA-lora"
+            echo "    --experiments baseline               Run NA-NA-Full and NA-NA-LoRA"
             echo "    --experiments \"streaming,greats\"     Run all Streaming and GREATS experiments"
-            echo "    --experiments \"NA-NA-full,Streaming-LoGra-full\"  Run specific experiments"
+            echo "    --experiments \"NA-NA-Full,Streaming-LoGra-Full\"  Run specific experiments"
             echo ""
             echo "Single Experiment Options:"
             echo "  --data_selection <method>              Data selection: NA, Streaming, GREATS (default: NA)"
@@ -266,7 +266,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --lora_target_modules <modules>        Target modules (default: q_proj k_proj v_proj o_proj)"
             echo ""
             echo "Shared Options (apply to all experiments):"
-            echo "  --model <model>                        Model: llama3-1b, llama2-7b, etc. (default: llama3-1b)"
+            echo "  --model <model>                        HuggingFace model path (default: meta-llama/Llama-3.2-1B)"
             echo "  --task <task>                          Task: mmlu, bbh, tydiqa, samsum, gsm8k (default: mmlu)"
             echo "  --train <dataset>                      Training dataset (default: task-based)"
             echo "  --subject <subject>                    MMLU/BBH subject (default: world_religions)"
@@ -292,7 +292,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --data_dir <dir>                       Data directory (default: SFT/data)"
             echo ""
             echo "Naming convention: {selection}-{compression}-{training_type}"
-            echo "  Examples: Streaming-NA-full, GREATS-LoGra-full, NA-NA-lora"
+            echo "  Examples: Streaming-NA-Full, GREATS-LoGra-Full, NA-NA-LoRA"
             exit 0
             ;;
         *)
@@ -302,6 +302,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Extract model name from path for use in output directories
+# e.g., "meta-llama/Llama-3.2-1B" -> "Llama-3.2-1B"
+model_name=$(basename "$model")
 
 # ========================================
 # Resolve experiment names from categories
@@ -346,7 +350,7 @@ resolve_experiments() {
 # ========================================
 lookup_lr() {
     local config_key="$1"  # e.g., "alpaca_samsum"
-    local exp_name="$2"    # e.g., "NA-NA-full"
+    local exp_name="$2"    # e.g., "NA-NA-Full"
     local is_lora="$3"     # "true" or "false"
 
     # If lr_override is set, use it
@@ -441,9 +445,9 @@ run_single_experiment() {
     # ========================================
     local job_type
     if [ "$exp_use_lora" = true ]; then
-        job_type="lora"
+        job_type="LoRA"
     else
-        job_type="full"
+        job_type="Full"
     fi
 
     local method_str="${exp_data_selection}-${exp_compression:-NA}"
@@ -454,9 +458,9 @@ run_single_experiment() {
     local train_str="${train_dataset:-default}"
     local JOB_NAME
     if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
-        JOB_NAME="${train_str}_${task}_${subject}-${method_str}-${model}-${job_type}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
+        JOB_NAME="${train_str}_${task}_${subject}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
     else
-        JOB_NAME="${train_str}_${task}-${method_str}-${model}-${job_type}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
+        JOB_NAME="${train_str}_${task}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
     fi
 
     local output_dir=/scratch/pbb/Project/Gradient-Streaming/SFT/${JOB_NAME}
@@ -490,25 +494,16 @@ run_single_experiment() {
 
     local DATA_SEED=$((seed + 1))
 
-    # Map model shorthand to full path
-    local MODEL_PATH
-    case $model in
-        llama3-1b)
-            MODEL_PATH="meta-llama/Llama-3.2-1B"
-            ;;
-        llama2-7b)
-            MODEL_PATH="meta-llama/Llama-2-7b-hf"
-            ;;
-        llama2-13b)
-            MODEL_PATH="meta-llama/Llama-2-13b-hf"
+    # Use model path directly
+    local MODEL_PATH="$model"
+
+    # Model-specific configurations (match by path pattern)
+    case "$model" in
+        *Llama-2-13b*|*llama-2-13b*)
             exp_base_training_args="$exp_base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config llama2_13b_finetune"
             ;;
-        mistral-7b)
-            MODEL_PATH="mistralai/Mistral-7B-v0.1"
+        *Mistral-7B*|*mistral-7b*)
             exp_base_training_args="$exp_base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config mistral_7b_finetune"
-            ;;
-        *)
-            MODEL_PATH="$model"
             ;;
     esac
 
@@ -604,7 +599,7 @@ if [[ -n "$experiments" ]]; then
     echo "Training Settings:"
     echo "  Batch size: $batch_size"
     echo "  Val batch size: ${val_batch_size:-same as batch_size}"
-    echo "  Learning rate (full): $lr"
+    echo "  Learning rate (Full): $lr"
     echo "  Learning rate (LoRA): $lr_lora"
     echo "  N_val: $n_val"
     echo ""
@@ -706,12 +701,12 @@ fi
 # Build Job Name
 # ========================================
 # Naming convention: {selection}-{compression}-{training_type}
-# Examples: Streaming-NA-full, GREATS-GraSS-lora, NA-LoGra-full
+# Examples: Streaming-NA-Full, GREATS-GraSS-LoRA, NA-LoGra-Full
 
 if [ "$use_lora" = true ]; then
-    job_type="lora"
+    job_type="LoRA"
 else
-    job_type="full"
+    job_type="Full"
 fi
 
 # Validate data_selection
@@ -752,9 +747,9 @@ lr=$(lookup_lr "$config_key" "$exp_name" "$use_lora")
 
 # For MMLU/BBH, include subject in job name
 if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
-    JOB_NAME="${train_str}_${task}_${subject}-${method_str}-${model}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
+    JOB_NAME="${train_str}_${task}_${subject}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
 else
-    JOB_NAME="${train_str}_${task}-${method_str}-${model}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
+    JOB_NAME="${train_str}_${task}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
 fi
 
 output_dir=/scratch/pbb/Project/Gradient-Streaming/SFT/${JOB_NAME}
@@ -803,25 +798,16 @@ echo "==============================="
 
 DATA_SEED=$((seed + 1))
 
-# Map model shorthand to full path
-case $model in
-    llama3-1b)
-        MODEL_PATH="meta-llama/Llama-3.2-1B"
+# Use model path directly
+MODEL_PATH="$model"
+
+# Model-specific configurations (match by path pattern)
+case "$model" in
+    *Llama-2-13b*|*llama-2-13b*)
+        base_training_args="$base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config llama2_13b_finetune"
         ;;
-    llama2-7b)
-        MODEL_PATH="meta-llama/Llama-2-7b-hf"
-        ;;
-    llama2-13b)
-        MODEL_PATH="meta-llama/Llama-2-13b-hf"
-    	base_training_args="$base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config llama2_13b_finetune"
-        ;;
-    mistral-7b)
-        MODEL_PATH="mistralai/Mistral-7B-v0.1"
-    	base_training_args="$base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config mistral_7b_finetune"
-        ;;
-    *)
-        # Assume it's a full path
-        MODEL_PATH="$model"
+    *Mistral-7B*|*mistral-7b*)
+        base_training_args="$base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config mistral_7b_finetune"
         ;;
 esac
 
