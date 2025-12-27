@@ -23,11 +23,13 @@ Design principles:
 - Minimal custom code
 """
 
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq
 from peft import LoraConfig, get_peft_model, TaskType
+import numpy as np
 import json
 import argparse
 import os
@@ -38,10 +40,23 @@ from dataclasses import dataclass, asdict
 
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
 
+
+def set_seed(seed: int):
+    """Set random seed for reproducibility across all random sources."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # For deterministic behavior (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 from gradstream.hook import GradientHook
 from gradstream.compressor import setup_model_compressors
 from gradstream.optimizer import MeSOAdamW
-from gradstream.selection.strategies import StreamingStrategy, GREATSStrategy
+from gradstream.selection.strategies import CachedValStreamingStrategy, CachedValGREATSStrategy
 
 from datasets import load_dataset
 
@@ -77,6 +92,9 @@ class BenchmarkConfig:
 
     # Selection config
     use_second_order: bool = False  # If True, use greedy selection with O(k*n) complexity
+
+    # Reproducibility
+    seed: int = 42
 
     # Device
     device: str = 'cuda'
@@ -468,6 +486,9 @@ class Benchmark:
         print(f"Benchmarking: {method_name}")
         print("=" * 80)
 
+        # Set seed for reproducibility
+        set_seed(self.config.seed)
+
         self._reset_memory()
 
         # Setup
@@ -642,8 +663,8 @@ def make_step_streaming(selection_helper: SelectionStepHelper, selection_frac: f
     """
     Create a step function for Streaming (per-layer) selection.
 
-    Uses StreamingStrategy from gradstream.selection.strategies to ensure
-    consistency with the main codebase and avoid benchmark bias.
+    Uses CachedValStreamingStrategy with separate val/train passes to avoid
+    padding overhead when batches have different sequence lengths.
 
     Args:
         selection_helper: SelectionStepHelper instance for validation batches
@@ -663,38 +684,49 @@ def make_step_streaming(selection_helper: SelectionStepHelper, selection_frac: f
 
         # Initialize strategy on first call
         if strategy is None:
-            strategy = StreamingStrategy(
+            strategy = CachedValStreamingStrategy(
                 grad_hook=grad_hook,
                 frac=selection_frac,
-                use_second_order=use_second_order
+                use_second_order=use_second_order,
+                selection_mode="topk"  # SFT uses top-k selection
             )
 
         model.train()
 
-        # Get validation batch and merge with train batch
+        # Get validation batch (no merging - separate passes avoid padding overhead)
         val_batch = selection_helper.get_val_batch()
         train_batch_size = batch['input_ids'].shape[0]
 
-        # Merge batches with proper padding for variable-length sequences
-        merged_batch = pad_and_merge_batches(batch, val_batch)
-
         lr = optimizer.param_groups[0].get("lr", 5e-5)
 
-        # Define compute_loss_fn for strategy
-        def compute_loss_fn(model, batch):
+        # === PASS 1: Capture validation gradients ===
+        # SFT uses factorized mode (small external validation set)
+        grad_hook.start_val_capture(use_factorized=True)
+        optimizer.zero_grad()
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            val_outputs = model(**val_batch)
+            val_loss = val_outputs.loss
+        val_loss.backward()
+        grad_hook.end_val_capture()
+
+        # === PASS 2: Train with selection using stored val gradients ===
+        def compute_train_loss():
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 outputs = model(**batch)
-                return outputs.loss
+                loss = outputs.loss
+            return loss, {}  # StoredValStrategy expects (loss, stats) tuple
 
         optimizer.zero_grad()
-        loss = strategy.execute_training_step(
+        loss, _ = strategy.execute_training_step(
             model=model,
-            merged_batch=merged_batch,
-            train_batch_size=train_batch_size,
-            compute_loss_fn=compute_loss_fn,
+            batch_size=train_batch_size,
+            compute_loss_fn=compute_train_loss,
             lr=lr
         )
         optimizer.step()
+
+        # Cleanup val buffer
+        grad_hook.clear_val_buffer()
 
         return loss.item()
 
@@ -705,8 +737,8 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
     """
     Create a step function for GREATS (global) selection.
 
-    Uses GREATSStrategy from gradstream.selection.strategies to ensure
-    consistency with the main codebase and avoid benchmark bias.
+    Uses CachedValGREATSStrategy with separate val/train passes to avoid
+    padding overhead when batches have different sequence lengths.
 
     Args:
         selection_helper: SelectionStepHelper instance for validation batches
@@ -726,39 +758,64 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
 
         # Initialize strategy on first call
         if strategy is None:
-            strategy = GREATSStrategy(
+            strategy = CachedValGREATSStrategy(
                 grad_hook=grad_hook,
                 frac=selection_frac,
-                use_second_order=use_second_order
+                use_second_order=use_second_order,
+                selection_mode="topk"  # SFT uses top-k selection
             )
 
         model.train()
 
-        # Get validation batch and merge with train batch
+        # Get validation batch (no merging - separate passes avoid padding overhead)
         val_batch = selection_helper.get_val_batch()
         train_batch_size = batch['input_ids'].shape[0]
 
-        # Merge batches with proper padding for variable-length sequences
-        merged_batch = pad_and_merge_batches(batch, val_batch)
-
         lr = optimizer.param_groups[0].get("lr", 5e-5)
 
-        # Define compute_loss_fn for strategy
-        def compute_loss_fn(model, batch):
+        # === PASS 1: Capture validation gradients ===
+        # SFT uses factorized mode (small external validation set)
+        grad_hook.start_val_capture(use_factorized=True)
+        optimizer.zero_grad()
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            val_outputs = model(**val_batch)
+            val_loss = val_outputs.loss
+        val_loss.backward()
+        grad_hook.end_val_capture()
+
+        # === PASS 2 & 3: Score accumulation + gradient computation on selected ===
+        def compute_train_loss():
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 outputs = model(**batch)
-                return outputs.loss
+                loss = outputs.loss
+            return loss, {}  # StoredValStrategy expects (loss, stats) tuple
+
+        # For GREATS pass 2, provide filter function for selected samples
+        def filter_batch_fn(indices):
+            def filtered_loss_fn():
+                filtered_batch = {
+                    'input_ids': batch['input_ids'][indices],
+                    'attention_mask': batch['attention_mask'][indices],
+                    'labels': batch['labels'][indices],
+                }
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    outputs = model(**filtered_batch)
+                    loss = outputs.loss
+                return loss, {}
+            return filtered_loss_fn
 
         optimizer.zero_grad()
-        loss = strategy.execute_training_step(
+        loss, _ = strategy.execute_training_step(
             model=model,
-            merged_batch=merged_batch,
-            train_batch_size=train_batch_size,
-            compute_loss_fn=compute_loss_fn,
+            batch_size=train_batch_size,
+            compute_loss_fn=compute_train_loss,
             lr=lr,
-            batch_train=batch  # Original train batch for pass 2
+            filter_batch_fn=filter_batch_fn
         )
         optimizer.step()
+
+        # Cleanup val buffer
+        grad_hook.clear_val_buffer()
 
         return loss.item()
 
@@ -1047,7 +1104,7 @@ def _setup_compression(model, config: BenchmarkConfig, use_meso_optimizer: bool 
     sparsifier_kwargs = {
         "proj_dim": 1024,  # Factorized: 1024*1024, so each dimension is 1024
         "proj_max_batch_size": 64,  # Match train.py default
-        "proj_seed": 42,
+        "proj_seed": config.seed,
         "device": str(config.device),
         "proj_type": "random_mask",
     }
@@ -1055,7 +1112,7 @@ def _setup_compression(model, config: BenchmarkConfig, use_meso_optimizer: bool 
     projector_kwargs = {
         "proj_dim": 256,  # SJLT projection dimension
         "proj_max_batch_size": 64,  # Match train.py default
-        "proj_seed": 42,
+        "proj_seed": config.seed,
         "device": str(config.device),
         "proj_type": "sjlt",
     }
@@ -1243,7 +1300,7 @@ def _setup_logra_compression(model, config: BenchmarkConfig, use_meso_optimizer:
     sparsifier_kwargs = {
         "proj_dim": 512,  # Factorized: 512*512, so each dimension is 512
         "proj_max_batch_size": 64,  # Match train.py default
-        "proj_seed": 42,
+        "proj_seed": config.seed,
         "device": str(config.device),
         "proj_type": "normal",  # Gaussian random projection
     }
@@ -1252,7 +1309,7 @@ def _setup_logra_compression(model, config: BenchmarkConfig, use_meso_optimizer:
     projector_kwargs = {
         "proj_dim": -1,  # Identity projection
         "proj_max_batch_size": 64,
-        "proj_seed": 42,
+        "proj_seed": config.seed,
         "device": str(config.device),
         "proj_type": "identity",
     }
@@ -1413,7 +1470,7 @@ def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_meso_optimizer: bool
     sparsifier_kwargs = {
         "proj_dim": 1024,  # Factorized: 1024*1024, so each dimension is 1024
         "proj_max_batch_size": 64,  # Match train.py default
-        "proj_seed": 42,
+        "proj_seed": config.seed,
         "device": str(config.device),
         "proj_type": "random_mask",
     }
@@ -1421,7 +1478,7 @@ def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_meso_optimizer: bool
     projector_kwargs = {
         "proj_dim": 256,  # SJLT projection dimension
         "proj_max_batch_size": 64,  # Match train.py default
-        "proj_seed": 42,
+        "proj_seed": config.seed,
         "device": str(config.device),
         "proj_type": "sjlt",
     }
@@ -1806,6 +1863,9 @@ Examples:
     parser.add_argument('--use-second-order', action='store_true',
                         help='Use second-order interactions for selection (greedy, slower but more accurate)')
 
+    # Reproducibility
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+
     # Output
     parser.add_argument('--output', type=str, default=None, help='Output JSON file')
     parser.add_argument('--results-file', type=str, default=None,
@@ -1868,6 +1928,7 @@ Examples:
         num_warmup=args.num_warmup,
         num_iterations=args.num_iterations,
         use_second_order=args.use_second_order,
+        seed=args.seed,
     )
 
     methods = ALL_METHODS if args.all else args.methods
@@ -1883,6 +1944,7 @@ Examples:
     print(f"  Warmup Iterations: {config.num_warmup}")
     print(f"  Timed Iterations: {config.num_iterations}")
     print(f"  Use Second Order: {config.use_second_order}")
+    print(f"  Seed: {config.seed}")
     print(f"  Methods: {methods}")
     print()
 

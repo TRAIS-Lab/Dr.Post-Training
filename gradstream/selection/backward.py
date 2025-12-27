@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import Optional, Tuple
     from torch import Tensor
-    from torch.autograd import Function
     from .state import StreamingState, GREATSState
     from ..hook import GradientHook
     from ..compressor import Compressor
@@ -23,159 +22,55 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Function
 
-
-def _augment_input_for_bias(input: Tensor, has_bias: bool) -> Tensor:
-    """Augment input with ones column for bias gradient computation."""
-    if not has_bias:
-        return input
-
-    batch_size = input.shape[0]
-    if input.dim() == 3:
-        _, seq_length, in_features = input.shape
-        ones = torch.ones(batch_size, seq_length, 1, device=input.device, dtype=input.dtype)
-    else:
-        ones = torch.ones(batch_size, 1, device=input.device, dtype=input.dtype)
-    return torch.cat([input, ones], dim=-1)
+from .utils import (
+    augment_input_for_bias,
+    split_train_val_batch,
+    compute_total_gradient,
+    compute_scores_and_similarity,
+    compute_selected_gradients,
+)
 
 
-def _split_merged_train_val_batch(
-    tensor: Tensor,
-    train_batch_size: int
-) -> Tuple[Tensor, Tensor]:
-    """Split merged batch tensor into train and val portions."""
-    train_portion = tensor[:train_batch_size]
-    val_portion = tensor[train_batch_size:]
-    return train_portion, val_portion
+# =============================================================================
+# Helper functions for backward passes
+# =============================================================================
 
-
-def _compute_scores(
-    train_grad_output: Tensor,
-    train_input: Tensor,
-    val_grad_full: Tensor,
-    use_second_order: bool
-) -> Tuple[Tensor, Optional[Tensor]]:
+def _get_val_components(
+    hook_manager: "GradientHook",
+    layer_idx: int
+) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     """
-    Compute per-sample scores using ghost inner product (without materializing full gradients).
-
-    This version takes a pre-computed val_grad_full [O, I] and is used when:
-    - Validation gradients are stored (RLHF mode)
-    - val_grad_full is already available
+    Get validation gradient components from hook manager.
 
     Returns:
-        (scores, similarity) tuple where similarity is None if not use_second_order
+        (val_grad_output, val_input, val_grad_total) tuple.
+        Either (val_grad_output, val_input, None) for factorized mode,
+        or (None, None, val_grad_total) for full gradient mode.
     """
-    similarity = None
-    if train_grad_output.dim() == 3:
-        # 3D case: [batch, seq, features]
-        temp = train_input @ val_grad_full.T
-        scores = (train_grad_output * temp).sum(dim=(1, 2))
+    val_grad_output = hook_manager.val_grad_output_buffer[layer_idx]
+    val_input = hook_manager.val_input_buffer[layer_idx]
 
-        if use_second_order:
-            contracted = torch.bmm(
-                train_grad_output.permute(0, 2, 1),
-                train_input
-            ).flatten(start_dim=1)
-            similarity = torch.matmul(contracted, contracted.T)
-    else:
-        # 2D case: [batch, features]
-        temp = train_input @ val_grad_full.T
-        scores = (train_grad_output * temp).sum(dim=1)
+    if val_grad_output is not None and val_input is not None:
+        return val_grad_output, val_input, None
 
-        if use_second_order:
-            dot_g = torch.matmul(train_grad_output, train_grad_output.T)
-            dot_x = torch.matmul(train_input, train_input.T)
-            similarity = dot_g * dot_x
-
-    return scores, similarity
+    val_grad_total = hook_manager.val_grad_buffer[layer_idx]
+    return None, None, val_grad_total
 
 
-@torch.compile
-def _compute_scores_factorized(
-    train_grad_output: Tensor,
-    train_input: Tensor,
-    val_grad_output: Tensor,
-    val_input: Tensor,
-    use_second_order: bool
-) -> Tuple[Tensor, Optional[Tensor]]:
-    """
-    Compute per-sample scores WITHOUT materializing the [O, I] validation gradient.
-
-    Uses a single fused einsum that contracts all 4 tensors at once:
-        score_b = mean_v sum_{s,t,o,i} go_b[s,o] * go_v[t,o] * x_b[s,i] * x_v[t,i]
-
-    Returns:
-        (scores, similarity) tuple where similarity is None if not use_second_order
-    """
-    similarity = None
-    # for testing, return a random scores
-    V = val_grad_output.shape[0]
-
-    if train_grad_output.dim() == 3:
-        # 3D case: [B, S, O] and [B, S, I]
-        # Fused 4-way einsum: contracts over v, s', o, i simultaneously
-        # score_b = sum_{v,s,t,o,i} go_b[s,o] * go_v[t,o] * x_b[s,i] * x_v[t,i] / V
-        scores = torch.einsum(
-            'bso,vto,bsi,vti->b',
-            train_grad_output, val_grad_output, train_input, val_input
-        ) / V
-
-        if use_second_order:
-            contracted = torch.bmm(
-                train_grad_output.permute(0, 2, 1),
-                train_input
-            ).flatten(start_dim=1)
-            similarity = torch.matmul(contracted, contracted.T)
-    else:
-        # 2D case: [B, O] and [B, I]
-        # Fused: score_b = sum_{v,o,i} go_b[o] * go_v[o] * x_b[i] * x_v[i] / V
-        scores = torch.einsum(
-            'bo,vo,bi,vi->b',
-            train_grad_output, val_grad_output, train_input, val_input
-        ) / V
-
-        if use_second_order:
-            dot_g = torch.matmul(train_grad_output, train_grad_output.T)
-            dot_x = torch.matmul(train_input, train_input.T)
-            similarity = dot_g * dot_x
-
-    return scores, similarity
+def _compute_scale_factor(state: "StreamingState", selected_indices: "Tensor") -> float:
+    """Compute token-based gradient scale factor for selected samples."""
+    return state._compute_scale_factor(selected_indices)
 
 
-def _compute_selected_gradients(
-    train_grad_output: Tensor,
-    train_input: Tensor,
-    selected_indices: Tensor,
-    has_bias: bool,
-    scale_factor: float
-) -> Tuple[Tensor, Optional[Tensor]]:
-    """
-    Compute gradients for selected samples in full gradient mode.
-    """
-    # selected_indices = selected_indices.sort()[0]
-    selected_grad_output = train_grad_output[selected_indices]
-    selected_input = train_input[selected_indices]
-
-    if selected_grad_output.dim() == 3:
-        # 3D case: [K, S, O] x [K, S, I] -> [O, I]
-        grad_weight = torch.einsum('kso,ksi->oi', selected_grad_output, selected_input) * scale_factor
-        grad_bias = selected_grad_output.sum(dim=(0, 1)) * scale_factor if has_bias else None
-    else:
-        # 2D case: [K, O] x [K, I] -> [O, I]
-        grad_weight = torch.einsum('ko,ki->oi', selected_grad_output, selected_input) * scale_factor
-        grad_bias = selected_grad_output.sum(dim=0) * scale_factor if has_bias else None
-
-    return grad_weight, grad_bias
-
+# =============================================================================
+# Autograd Functions
+# =============================================================================
 
 class CompressedLinearBackward(Function):
     """
     Autograd Function for pure gradient compression (no data selection).
 
-    This is used when:
-    - Compression is enabled (MeSO optimizer with compressors)
-    - No data selection is active (selection_state is None)
-
-    Simply compresses per-sample gradients, sums them, and stores for MeSO.
+    Used when compression is enabled (MeSO optimizer) but no data selection is active.
     """
 
     @staticmethod
@@ -199,11 +94,7 @@ class CompressedLinearBackward(Function):
         ctx,
         grad_output: Tensor
     ) -> Tuple[Tensor, None, None, None, None]:
-        """
-        Backward pass: compress gradients and store for MeSO optimizer.
-
-        No selection logic - just compress and sum.
-        """
+        """Backward pass: compress gradients and store for MeSO optimizer."""
         input, weight, bias = ctx.saved_tensors
         layer_idx = ctx.layer_idx
 
@@ -211,23 +102,16 @@ class CompressedLinearBackward(Function):
         if hook_manager is None:
             raise RuntimeError("Hook manager was garbage collected before backward pass")
 
-        # Cast input to match grad_output dtype
         if input.dtype != grad_output.dtype:
             input = input.to(grad_output.dtype)
 
-        # Compute grad_input (always needed for backprop)
         grad_input = grad_output @ weight.to(grad_output.dtype)
 
         compressor = hook_manager.compressors[layer_idx]
 
         with torch.no_grad():
-            # Augment input for bias gradient computation
-            input_for_compressor = _augment_input_for_bias(input, bias is not None)
-
-            # Compress per-sample gradients
-            compressed_grad = compressor.forward((grad_output, input_for_compressor))
-
-            # Sum across batch dimension and store
+            input_aug = augment_input_for_bias(input, bias is not None)
+            compressed_grad = compressor.forward((grad_output, input_aug))
             compressed_grad = compressed_grad.sum(dim=0, keepdim=True)
             hook_manager._store_compressed_grad(layer_idx, compressed_grad)
 
@@ -240,11 +124,6 @@ class StreamingLinearBackward(Function):
 
     Single-pass: At each layer, computes scores, selects samples,
     and aggregates gradients immediately.
-
-    Supports:
-    - Compressed mode (with MeSO): stores compressed gradients
-    - Full gradient mode: returns grad_weight/grad_bias
-    - Merged batch (SFT) and stored val (RLHF) validation modes
     """
 
     @staticmethod
@@ -253,13 +132,12 @@ class StreamingLinearBackward(Function):
         input: Tensor,
         weight: Tensor,
         bias: Optional[Tensor],
-        hook_manager: GradientHook,
+        hook_manager: "GradientHook",
         layer_idx: int
     ) -> Tensor:
         """Forward pass: standard linear transformation."""
         input_compute = input.to(weight.dtype) if input.dtype != weight.dtype else input
         ctx.save_for_backward(input_compute, weight, bias)
-        # Store weakref to avoid preventing garbage collection
         ctx.hook_manager_ref = weakref.ref(hook_manager)
         ctx.layer_idx = layer_idx
         return F.linear(input_compute, weight, bias)
@@ -269,14 +147,7 @@ class StreamingLinearBackward(Function):
         ctx,
         grad_output: Tensor
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], None, None]:
-        """
-        Backward pass with per-layer selection.
-
-        For each layer:
-        1. Compute scores (train_grad @ val_grad)
-        2. Select samples based on scores
-        3. Aggregate selected gradients
-        """
+        """Backward pass with per-layer selection."""
         input, weight, bias = ctx.saved_tensors
         layer_idx = ctx.layer_idx
 
@@ -284,37 +155,26 @@ class StreamingLinearBackward(Function):
         if hook_manager is None:
             raise RuntimeError("Hook manager was garbage collected before backward pass")
 
-        # Cast input to match grad_output dtype
         if input.dtype != grad_output.dtype:
             input = input.to(grad_output.dtype)
 
-        # Compute grad_input (always needed for backprop)
         grad_input = grad_output @ weight.to(grad_output.dtype)
-
-        grad_weight = None
-        grad_bias = None
 
         compressor = hook_manager.compressors[layer_idx]
         state: Optional[StreamingState] = hook_manager.selection_state
-
-        # Validation capture mode (RLHF)
         capture_val_mode = hook_manager.capture_val_mode
         use_stored_val = (
             state is not None and
-            hasattr(state, '_use_stored_val') and
-            state._use_stored_val
+            getattr(state, '_use_stored_val', False)
         )
 
         with torch.no_grad():
             if compressor is not None:
-                # === COMPRESSED MODE ===
                 grad_weight, grad_bias = StreamingLinearBackward._backward_compressed(
                     hook_manager, compressor, state, layer_idx,
-                    input, grad_output, bias,
-                    capture_val_mode, use_stored_val
+                    input, grad_output, bias, capture_val_mode, use_stored_val
                 )
             else:
-                # === FULL GRADIENT MODE ===
                 grad_weight, grad_bias = StreamingLinearBackward._backward_full(
                     hook_manager, state, layer_idx,
                     input, weight, bias, grad_output,
@@ -325,9 +185,9 @@ class StreamingLinearBackward(Function):
 
     @staticmethod
     def _backward_compressed(
-        hook_manager: GradientHook,
+        hook_manager: "GradientHook",
         compressor: "Compressor",
-        state: Optional[StreamingState],
+        state: Optional["StreamingState"],
         layer_idx: int,
         input: Tensor,
         grad_output: Tensor,
@@ -335,59 +195,51 @@ class StreamingLinearBackward(Function):
         capture_val_mode: bool,
         use_stored_val: bool
     ) -> Tuple[None, None]:
-        """Handle compressed gradient path for Streaming."""
-        # Augment input for bias
-        input_for_compressor = _augment_input_for_bias(input, bias is not None)
-
-        # Compress gradients
-        compressed_grad = compressor.forward((grad_output, input_for_compressor))
+        """Handle compressed gradient path."""
+        input_aug = augment_input_for_bias(input, bias is not None)
+        compressed_grad = compressor.forward((grad_output, input_aug))
 
         if capture_val_mode:
-            # RLHF val capture: accumulate mean gradient
-            mean_grad = compressed_grad.mean(dim=0)
+            # Val capture: accumulate total compressed gradient (sum, not mean)
+            total_grad = compressed_grad.sum(dim=0)
             if hook_manager.val_grad_buffer[layer_idx] is None:
-                hook_manager.val_grad_buffer[layer_idx] = mean_grad
+                hook_manager.val_grad_buffer[layer_idx] = total_grad
             else:
-                hook_manager.val_grad_buffer[layer_idx] = (
-                    hook_manager.val_grad_buffer[layer_idx] + mean_grad
-                )
+                hook_manager.val_grad_buffer[layer_idx] += total_grad
             return None, None
 
         if state is None:
-            # Baseline: sum compressed gradients
-            compressed_grad = compressed_grad.sum(dim=0, keepdim=True)
-            hook_manager._store_compressed_grad(layer_idx, compressed_grad)
+            # No selection: sum and store
+            hook_manager._store_compressed_grad(layer_idx, compressed_grad.sum(dim=0, keepdim=True))
             return None, None
 
-        # Get train grads and val grad
+        # Get train/val gradients
         if use_stored_val:
-            # RLHF: use stored validation gradients
             train_grads = compressed_grad
             val_grad = hook_manager.val_grad_buffer[layer_idx]
+            # Cached mode: gradients already correctly scaled
+            score_correction = 1.0
         else:
-            # SFT: split merged batch
-            train_grads, val_grads = _split_merged_train_val_batch(
-                compressed_grad, state.train_batch_size
-            )
-            val_grad = val_grads.mean(dim=0)
+            train_grads, val_grads = split_train_val_batch(compressed_grad, state.train_batch_size)
+            val_grad = val_grads.sum(dim=0)  # Sum, not mean, for token-weighted semantics
+            # Joint batch needs correction: T_total²/(T_train × T_val)
+            score_correction = state.score_correction
 
         if val_grad is None:
-            # No val grad, just average
             hook_manager._store_compressed_grad(layer_idx, compressed_grad.mean(dim=0, keepdim=True))
             return None, None
 
-        # Per-layer selection and reduction
-        reduced_grad, num_selected = state.process_layer_gradients(
-            train_grads, val_grad, layer_idx
+        # Per-layer selection and reduction (with score correction for joint batch)
+        reduced_grad, _ = state.process_layer_gradients(
+            train_grads, val_grad, layer_idx, score_correction
         )
-
         hook_manager._store_compressed_grad(layer_idx, reduced_grad)
         return None, None
 
     @staticmethod
     def _backward_full(
-        hook_manager: GradientHook,
-        state: Optional[StreamingState],
+        hook_manager: "GradientHook",
+        state: Optional["StreamingState"],
         layer_idx: int,
         input: Tensor,
         weight: Tensor,
@@ -396,51 +248,49 @@ class StreamingLinearBackward(Function):
         capture_val_mode: bool,
         use_stored_val: bool
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
-        """Handle full gradient path for Streaming."""
+        """Handle full gradient path."""
         if capture_val_mode:
-            # RLHF val capture: accumulate mean full gradient
-            if grad_output.dim() == 3:
-                val_grad_full = torch.einsum('bso,bsi->oi', grad_output, input) / grad_output.shape[0]
+            # Val capture: store gradients for later use
+            if hook_manager.use_factorized_val:
+                hook_manager.val_grad_output_buffer[layer_idx] = grad_output.detach()
+                hook_manager.val_input_buffer[layer_idx] = input.detach()
             else:
-                val_grad_full = torch.einsum('bo,bi->oi', grad_output, input) / grad_output.shape[0]
-
-            if hook_manager.val_grad_buffer[layer_idx] is None:
-                hook_manager.val_grad_buffer[layer_idx] = val_grad_full
-            else:
-                hook_manager.val_grad_buffer[layer_idx] = (
-                    hook_manager.val_grad_buffer[layer_idx] + val_grad_full
-                )
+                val_grad_total = compute_total_gradient(grad_output, input)
+                if hook_manager.val_grad_buffer[layer_idx] is None:
+                    hook_manager.val_grad_buffer[layer_idx] = val_grad_total
+                else:
+                    hook_manager.val_grad_buffer[layer_idx] += val_grad_total
             return None, None
 
         if state is None:
-            # Baseline: let PyTorch compute gradients
             return None, None
 
-        # Get train/val split
+        # Get train/val components and compute scores
         if use_stored_val:
-            train_grad_output = grad_output
-            train_input = input
-            train_batch_size = state.train_batch_size
-            val_grad_full = hook_manager.val_grad_buffer[layer_idx]
-            if val_grad_full is None:
+            train_grad_output, train_input = grad_output, input
+            val_grad_output, val_input, val_grad_total = _get_val_components(hook_manager, layer_idx)
+            if val_grad_output is None and val_grad_total is None:
                 return None, None
-            # Use original ghost computation with pre-materialized val_grad
-            scores, similarity = _compute_scores(
-                train_grad_output, train_input, val_grad_full, state.use_second_order
-            )
+            # Cached mode: gradients already correctly scaled, no correction needed
+            score_correction = 1.0
         else:
-            train_batch_size = state.train_batch_size
-            train_grad_output, val_grad_output = _split_merged_train_val_batch(
-                grad_output, train_batch_size
-            )
-            train_input, val_input = _split_merged_train_val_batch(
-                input, train_batch_size
-            )
+            # Joint batch mode: split merged batch
+            train_grad_output, val_grad_output = split_train_val_batch(grad_output, state.train_batch_size)
+            train_input, val_input = split_train_val_batch(input, state.train_batch_size)
+            val_grad_total = None
+            # Joint batch needs correction: T_total²/(T_train × T_val)
+            score_correction = state.score_correction
 
-            scores, similarity = _compute_scores_factorized(
-                train_grad_output, train_input, val_grad_output, val_input,
-                state.use_second_order
-            )
+        scores, similarity = compute_scores_and_similarity(
+            train_grad_output, train_input, val_grad_output, val_input, val_grad_total,
+            state.use_second_order
+        )
+
+        # Apply correction for joint batch mode
+        if score_correction != 1.0:
+            scores = scores * score_correction
+            if similarity is not None:
+                similarity = similarity * (score_correction ** 2)
 
         # Per-layer selection
         selected_indices = state._select_indices(scores, similarity)
@@ -450,17 +300,9 @@ class StreamingLinearBackward(Function):
         if num_selected == 0:
             return torch.zeros_like(weight), torch.zeros_like(bias) if bias is not None else None
 
-        # Compute scale factor
-        if state.tokens_per_sample is not None and state.total_tokens is not None:
-            selected_tokens = state.tokens_per_sample[selected_indices].sum()
-            scale_factor = state.total_tokens / selected_tokens if selected_tokens > 0 else 1.0
-        else:
-            scale_factor = train_batch_size / num_selected
-
-        # Compute selected gradients
-        grad_weight, grad_bias = _compute_selected_gradients(
-            train_grad_output, train_input, selected_indices,
-            bias is not None, scale_factor
+        scale_factor = _compute_scale_factor(state, selected_indices)
+        grad_weight, grad_bias = compute_selected_gradients(
+            train_grad_output, train_input, selected_indices, bias is not None, scale_factor
         )
 
         return grad_weight, grad_bias
@@ -470,8 +312,8 @@ class GREATSLinearBackward(Function):
     """
     Autograd Function for GREATS method (global selection).
 
-    Pass 1 (score accumulation): Accumulates scores across all layers
-    Pass 2 (gradient computation): Standard forward/backward on selected samples
+    Pass 1: Accumulates scores across all layers (no gradient output)
+    Pass 2: Standard forward/backward on selected samples (hooks disabled)
     """
 
     @staticmethod
@@ -480,13 +322,12 @@ class GREATSLinearBackward(Function):
         input: Tensor,
         weight: Tensor,
         bias: Optional[Tensor],
-        hook_manager: GradientHook,
+        hook_manager: "GradientHook",
         layer_idx: int
     ) -> Tensor:
         """Forward pass: standard linear transformation."""
         input_compute = input.to(weight.dtype) if input.dtype != weight.dtype else input
         ctx.save_for_backward(input_compute, weight, bias)
-        # Store weakref to avoid preventing garbage collection
         ctx.hook_manager_ref = weakref.ref(hook_manager)
         ctx.layer_idx = layer_idx
         return F.linear(input_compute, weight, bias)
@@ -496,12 +337,7 @@ class GREATSLinearBackward(Function):
         ctx,
         grad_output: Tensor
     ) -> Tuple[Tensor, None, None, None, None]:
-        """
-        Backward pass: accumulate scores only, no gradient output.
-
-        For GREATS pass 1, we only accumulate scores across layers.
-        The actual gradient computation happens in pass 2 with hooks disabled.
-        """
+        """Backward pass: accumulate scores only."""
         input, weight, bias = ctx.saved_tensors
         layer_idx = ctx.layer_idx
 
@@ -509,45 +345,38 @@ class GREATSLinearBackward(Function):
         if hook_manager is None:
             raise RuntimeError("Hook manager was garbage collected before backward pass")
 
-        # Cast input to match grad_output dtype
         if input.dtype != grad_output.dtype:
             input = input.to(grad_output.dtype)
 
-        # Compute grad_input (always needed for backprop)
         grad_input = grad_output @ weight.to(grad_output.dtype)
 
         compressor = hook_manager.compressors[layer_idx]
         state: Optional[GREATSState] = hook_manager.selection_state
 
-        # Skip if no state (shouldn't happen for GREATS)
         if state is None:
             return grad_input, None, None, None, None
 
-        use_stored_val = (
-            hasattr(state, '_use_stored_val') and
-            state._use_stored_val
-        )
+        use_stored_val = getattr(state, '_use_stored_val', False)
 
         with torch.no_grad():
             if compressor is not None:
-                GREATSLinearBackward._accumulate_scores_compressed(
+                GREATSLinearBackward._accumulate_compressed(
                     hook_manager, compressor, state, layer_idx,
                     input, grad_output, bias, use_stored_val
                 )
             else:
-                GREATSLinearBackward._accumulate_scores_full(
+                GREATSLinearBackward._accumulate_full(
                     hook_manager, state, layer_idx,
                     input, grad_output, use_stored_val
                 )
 
-        # GREATS pass 1: only accumulate scores, no gradient output
         return grad_input, None, None, None, None
 
     @staticmethod
-    def _accumulate_scores_compressed(
-        hook_manager: GradientHook,
+    def _accumulate_compressed(
+        hook_manager: "GradientHook",
         compressor: "Compressor",
-        state: GREATSState,
+        state: "GREATSState",
         layer_idx: int,
         input: Tensor,
         grad_output: Tensor,
@@ -555,25 +384,27 @@ class GREATSLinearBackward(Function):
         use_stored_val: bool
     ) -> None:
         """Accumulate scores from compressed gradients."""
-        input_for_compressor = _augment_input_for_bias(input, bias is not None)
-        compressed_grad = compressor.forward((grad_output, input_for_compressor))
+        input_aug = augment_input_for_bias(input, bias is not None)
+        compressed_grad = compressor.forward((grad_output, input_aug))
 
         if use_stored_val:
             train_grads = compressed_grad
             val_grad = hook_manager.val_grad_buffer[layer_idx]
+            # Cached mode: gradients already correctly scaled
+            score_correction = 1.0
         else:
-            train_grads, val_grads = _split_merged_train_val_batch(
-                compressed_grad, state.train_batch_size
-            )
-            val_grad = val_grads.mean(dim=0)
+            train_grads, val_grads = split_train_val_batch(compressed_grad, state.train_batch_size)
+            val_grad = val_grads.sum(dim=0)  # Sum, not mean, for token-weighted semantics
+            # Joint batch needs correction: T_total²/(T_train × T_val)
+            score_correction = state.score_correction
 
         if val_grad is not None:
-            state.process_layer_gradients(train_grads, val_grad, layer_idx)
+            state.process_layer_gradients(train_grads, val_grad, layer_idx, score_correction)
 
     @staticmethod
-    def _accumulate_scores_full(
-        hook_manager: GradientHook,
-        state: GREATSState,
+    def _accumulate_full(
+        hook_manager: "GradientHook",
+        state: "GREATSState",
         layer_idx: int,
         input: Tensor,
         grad_output: Tensor,
@@ -581,30 +412,24 @@ class GREATSLinearBackward(Function):
     ) -> None:
         """Accumulate scores from full gradients."""
         if use_stored_val:
-            train_grad_output = grad_output
-            train_input = input
-            val_grad_full = hook_manager.val_grad_buffer[layer_idx]
-            if val_grad_full is None:
+            train_grad_output, train_input = grad_output, input
+            val_go, val_inp, val_grad_total = _get_val_components(hook_manager, layer_idx)
+            if val_go is None and val_grad_total is None:
                 return
-            # Use original ghost computation with pre-materialized val_grad
-            scores, similarity = _compute_scores(
-                train_grad_output, train_input, val_grad_full, state.use_second_order
-            )
+            # Cached mode: gradients already correctly scaled, no correction needed
+            score_correction = 1.0
         else:
-            train_batch_size = state.train_batch_size
-            train_grad_output, val_grad_output = _split_merged_train_val_batch(
-                grad_output, train_batch_size
-            )
-            train_input, val_input = _split_merged_train_val_batch(
-                input, train_batch_size
-            )
-            # Fused computation: optimal for 2D (no sequence), same as original for 3D
-            scores, similarity = _compute_scores_factorized(
-                train_grad_output, train_input, val_grad_output, val_input,
-                state.use_second_order
-            )
+            # Joint batch mode: split merged batch
+            train_grad_output, val_go = split_train_val_batch(grad_output, state.train_batch_size)
+            train_input, val_inp = split_train_val_batch(input, state.train_batch_size)
+            val_grad_total = None
+            # Joint batch needs correction: T_total²/(T_train × T_val)
+            score_correction = state.score_correction
 
-        # Directly update accumulators (more efficient than process_layer_gradients for full grad)
-        state.grad_dot_scores += scores.to(state.dtype)
-        if state.similarity_matrix is not None and similarity is not None:
-            state.similarity_matrix += similarity.to(state.dtype)
+        scores, similarity = compute_scores_and_similarity(
+            train_grad_output, train_input, val_go, val_inp, val_grad_total,
+            state.use_second_order
+        )
+
+        # Accumulate scores using the state method (handles correction internally)
+        state.accumulate_precomputed_scores(scores, similarity, score_correction)

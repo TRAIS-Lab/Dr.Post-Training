@@ -16,16 +16,23 @@ from .compressor import setup_model_compressors
 from .optimizer import MeSOAdamW
 from .utils import create_sample_inputs
 
-# New selection module exports
+# Selection module exports
 from .selection import (
     SelectionState,
     StreamingState,
     GREATSState,
-    SelectionStrategy,
-    NoSelectionStrategy,
-    StreamingStrategy,
-    GREATSStrategy,
-    create_selection_strategy,
+    # JointBatch strategies
+    JointBatchStrategy,
+    JointBatchNoSelectionStrategy,
+    JointBatchStreamingStrategy,
+    JointBatchGREATSStrategy,
+    create_joint_batch_strategy,
+    # CachedVal strategies
+    CachedValStrategy,
+    CachedValNoSelectionStrategy,
+    CachedValStreamingStrategy,
+    CachedValGREATSStrategy,
+    create_cached_val_strategy,
 )
 
 __all__ = [
@@ -38,10 +45,16 @@ __all__ = [
     "SelectionState",
     "StreamingState",
     "GREATSState",
-    # Selection strategy classes
-    "SelectionStrategy",
-    "NoSelectionStrategy",
-    "StreamingStrategy",
-    "GREATSStrategy",
-    "create_selection_strategy",
+    # JointBatch strategy classes
+    "JointBatchStrategy",
+    "JointBatchNoSelectionStrategy",
+    "JointBatchStreamingStrategy",
+    "JointBatchGREATSStrategy",
+    "create_joint_batch_strategy",
+    # CachedVal strategy classes
+    "CachedValStrategy",
+    "CachedValNoSelectionStrategy",
+    "CachedValStreamingStrategy",
+    "CachedValGREATSStrategy",
+    "create_cached_val_strategy",
 ]

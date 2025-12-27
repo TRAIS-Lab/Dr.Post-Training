@@ -1,17 +1,25 @@
 """
 Selection module for gradient-based data selection.
 
-This module provides two families of strategies:
+This module provides two families of strategies for computing validation gradients:
 
-1. **Merged Batch Strategies** (for SFT):
+1. **JointBatch Strategies**:
    - Train and val samples are merged into a single batch
    - Val gradients computed during the same forward/backward pass
-   - Factory: create_selection_strategy()
+   - Factory: create_joint_batch_strategy()
+   - Note: Has padding overhead when val/train have different sequence lengths
 
-2. **Stored Val Strategies** (for RLHF):
-   - Val gradients are pre-captured and stored before training
-   - Training uses stored val gradients for selection scoring
-   - Factory: create_stored_val_strategy()
+2. **CachedVal Strategies**:
+   - Val gradients are pre-captured and cached before training
+   - Training uses cached val gradients for selection scoring
+   - Factory: create_cached_val_strategy()
+   - Avoids padding overhead - val and train can have different seq lengths
+   - Supports two caching modes via start_val_capture(use_factorized=...):
+     * Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
+       Better when validation batch is large (e.g., self-reference validation in RLHF).
+     * Cached factors mode (use_factorized=True): Stores [V, S, O] and [V, S, I] components.
+       More memory-efficient during training as it avoids materializing [B_train, O, I].
+       Better when validation batch is small (e.g., external validation set in SFT).
 """
 
 from .state import SelectionState, StreamingState, GREATSState
@@ -21,18 +29,18 @@ from .backward import (
     GREATSLinearBackward,
 )
 from .strategies import (
-    # Merged batch strategies (SFT)
-    SelectionStrategy,
-    NoSelectionStrategy,
-    StreamingStrategy,
-    GREATSStrategy,
-    create_selection_strategy,
-    # Stored val strategies (RLHF)
-    StoredValStrategy,
-    StoredValNoSelectionStrategy,
-    StoredValStreamingStrategy,
-    StoredValGREATSStrategy,
-    create_stored_val_strategy,
+    # JointBatch strategies
+    JointBatchStrategy,
+    JointBatchNoSelectionStrategy,
+    JointBatchStreamingStrategy,
+    JointBatchGREATSStrategy,
+    create_joint_batch_strategy,
+    # CachedVal strategies
+    CachedValStrategy,
+    CachedValNoSelectionStrategy,
+    CachedValStreamingStrategy,
+    CachedValGREATSStrategy,
+    create_cached_val_strategy,
 )
 
 __all__ = [
@@ -44,16 +52,16 @@ __all__ = [
     "CompressedLinearBackward",
     "StreamingLinearBackward",
     "GREATSLinearBackward",
-    # Merged batch strategies (SFT)
-    "SelectionStrategy",
-    "NoSelectionStrategy",
-    "StreamingStrategy",
-    "GREATSStrategy",
-    "create_selection_strategy",
-    # Stored val strategies (RLHF)
-    "StoredValStrategy",
-    "StoredValNoSelectionStrategy",
-    "StoredValStreamingStrategy",
-    "StoredValGREATSStrategy",
-    "create_stored_val_strategy",
+    # JointBatch strategies
+    "JointBatchStrategy",
+    "JointBatchNoSelectionStrategy",
+    "JointBatchStreamingStrategy",
+    "JointBatchGREATSStrategy",
+    "create_joint_batch_strategy",
+    # CachedVal strategies
+    "CachedValStrategy",
+    "CachedValNoSelectionStrategy",
+    "CachedValStreamingStrategy",
+    "CachedValGREATSStrategy",
+    "create_cached_val_strategy",
 ]

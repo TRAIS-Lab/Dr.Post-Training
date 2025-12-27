@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
 
-from gradstream.selection import create_stored_val_strategy
+from gradstream.selection import create_cached_val_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -214,11 +214,13 @@ class StreamingPPOTrainer:
         self.min_batch_size_for_selection = getattr(args, 'min_batch_size_for_selection', 2)
 
         # Create selection strategy for clean separation of selection methods
-        self.selection_strategy = create_stored_val_strategy(
+        # RLHF uses filtering mode: keep positive + drop bottom frac of negative
+        self.selection_strategy = create_cached_val_strategy(
             method=self.method,
             grad_hook=self.grad_hook,
             frac=self.filter_frac,
             use_second_order=self.use_second_order,
+            selection_mode="filtering",
         )
 
         # Logging
@@ -916,7 +918,9 @@ class StreamingPPOTrainer:
         t_start = time.time()
 
         # Start validation capture mode
-        self.grad_hook.start_val_capture()
+        # Use use_factorized=False because RLHF captures from the full training batch
+        # which is large - storing mean gradient [O, I] is more memory efficient
+        self.grad_hook.start_val_capture(use_factorized=False)
         self.grad_hook.enable_hooks()
 
         # Compute sequence-level advantage (sum over response tokens)
@@ -1249,7 +1253,7 @@ class StreamingPPOTrainer:
                 f"{self.min_batch_size_for_selection}, using NA strategy"
             )
             # Create temporary NA strategy for this step
-            return create_stored_val_strategy(
+            return create_cached_val_strategy(
                 method="NA",
                 grad_hook=self.grad_hook,
                 frac=self.filter_frac,

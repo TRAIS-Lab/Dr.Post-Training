@@ -192,7 +192,6 @@ def main():
 
     # Find trainable layers (LoRA layers or all Linear layers)
     layer_names = find_trainable_layers(model, lora_only=model_args.lora)
-    logger.info(f"Found {len(layer_names)} trainable layers for hook attachment")
 
     # Log layer names for verification
     if len(layer_names) > 0:

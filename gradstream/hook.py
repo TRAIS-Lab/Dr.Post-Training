@@ -77,11 +77,16 @@ class GradientHook:
         # Selection state (set by trainer before forward/backward)
         self.selection_state: Optional[SelectionState] = None
 
-        # RLHF-specific: Validation gradient buffer for separate val/train passes
-        # In RLHF, val and train use different loss functions, so we can't merge batches
-        # Instead, we capture val gradients first, then use them for selection during train
+        # Validation gradient buffer for separate val/train passes
+        # Two storage modes:
+        # 1. Full gradient mode: store val_grad_total [O, I] per layer
+        # 2. Factorized mode: store val_grad_output [B, S, O] and val_input [B, S, I]
+        #    This enables using _compute_scores_factorized which never materializes [B, O, I]
         self.val_grad_buffer: List[Optional[Tensor]] = [None] * len(layer_names)
+        self.val_grad_output_buffer: List[Optional[Tensor]] = [None] * len(layer_names)
+        self.val_input_buffer: List[Optional[Tensor]] = [None] * len(layer_names)
         self.capture_val_mode: bool = False  # True when capturing validation gradients
+        self.use_factorized_val: bool = True  # If True, store factorized components instead of full grad
 
         # Token count tracking for proper gradient scaling
         # The loss is averaged over valid tokens (where labels != -100), not samples.
@@ -90,6 +95,10 @@ class GradientHook:
         # - tokens_per_sample: valid tokens per sample [batch_size]
         self.total_tokens: Optional[int] = None
         self.tokens_per_sample: Optional[Tensor] = None
+
+        # Validation token count (for cached mode score scaling)
+        # Set during end_val_capture() to enable proper score scaling
+        self.val_total_tokens: Optional[int] = None
 
         # Register hooks if requested
         if register_hooks:
@@ -138,6 +147,7 @@ class GradientHook:
         Routes to appropriate autograd function based on selection state type:
         - GREATSState -> GREATSLinearBackward (score accumulation only)
         - StreamingState -> StreamingLinearBackward (per-layer selection)
+        - capture_val_mode -> StreamingLinearBackward (captures val gradients)
         - None -> original forward (no interception needed)
         """
         if not self.hooks_enabled:
@@ -153,6 +163,12 @@ class GradientHook:
             )
         elif isinstance(state, StreamingState):
             # Streaming: per-layer selection
+            return StreamingLinearBackward.apply(
+                input, module.weight, module.bias, self, idx
+            )
+        elif self.capture_val_mode:
+            # Val capture mode: use StreamingLinearBackward to capture gradients
+            # (even without selection state, it handles capture_val_mode)
             return StreamingLinearBackward.apply(
                 input, module.weight, module.bias, self, idx
             )
@@ -273,12 +289,11 @@ class GradientHook:
         self.total_tokens = tokens_per_sample.sum().item()
         self.tokens_per_sample = tokens_per_sample
 
-        # If train_batch_size is provided, also track train-specific counts
+        # If train_batch_size is provided, set token counts for gradient scaling and score correction
         if train_batch_size is not None and self.selection_state is not None:
             train_tokens = tokens_per_sample[:train_batch_size]
-            self.selection_state.tokens_per_sample = train_tokens
-            self.selection_state.total_train_tokens = train_tokens.sum().item()
-            self.selection_state.total_tokens = self.total_tokens
+            total_train_tokens = train_tokens.sum().item()
+            self.selection_state.set_token_counts(train_tokens, total_train_tokens, self.total_tokens)
 
         logger.debug(f"Set token counts: total={self.total_tokens}, per_sample={tokens_per_sample.tolist()}")
 
@@ -288,38 +303,70 @@ class GradientHook:
         self.tokens_per_sample = None
 
     # ========================================
-    # RLHF-specific methods for separate val/train passes
+    # Methods for separate val/train passes
     # ========================================
 
-    def start_val_capture(self) -> None:
+    def start_val_capture(self, use_factorized: bool = True) -> None:
         """
-        Start capturing validation gradients (RLHF mode).
+        Start capturing validation gradients.
 
-        In RLHF, validation and training use different loss functions:
-        - Validation: sequence-level reward-weighted log probs
-        - Training: PPO loss (policy + value + KL)
+        Args:
+            use_factorized: If True (default), store factorized components
+                           (val_grad_output [V, S, O] and val_input [V, S, I]).
+                           If False, store total gradient [O, I] per layer.
 
-        This mode captures compressed gradients during backward and stores them
-        in val_grad_buffer for later use during training selection.
+        Mode selection guidelines:
+        - use_factorized=True (default): Better when validation batch is small.
+          Stores more per validation sample but enables efficient score computation
+          during training without materializing [B_train, O, I] per-sample gradients.
+        - use_factorized=False: Better when validation batch is large (e.g., when
+          using the full training batch as self-reference validation). Stores only
+          the total gradient [O, I] per layer, significantly reducing memory for
+          large validation batches.
         """
         self.capture_val_mode = True
-        # Clear the buffer for fresh capture
+        self.use_factorized_val = use_factorized
+        # Clear all buffers for fresh capture
         self.val_grad_buffer = [None] * len(self.layer_names)
-        logger.debug("Started validation gradient capture mode")
+        self.val_grad_output_buffer = [None] * len(self.layer_names)
+        self.val_input_buffer = [None] * len(self.layer_names)
+        logger.debug(f"Started validation gradient capture mode (factorized={use_factorized})")
 
-    def end_val_capture(self) -> None:
+    def end_val_capture(self, val_total_tokens: Optional[int] = None) -> None:
         """
         End validation gradient capture mode.
 
-        After calling this, the val_grad_buffer contains the mean compressed
-        validation gradients per layer, ready for use in selection.
+        After calling this, the validation gradients are stored and ready for
+        use in selection. In factorized mode, val_grad_output_buffer and
+        val_input_buffer contain the raw components. In legacy mode,
+        val_grad_buffer contains the total gradient [O, I] per layer.
+
+        Args:
+            val_total_tokens: Total valid tokens in validation batch. If not provided,
+                uses self.total_tokens if set (from set_token_counts called during val).
+                This is used for score scaling in cached mode.
         """
         self.capture_val_mode = False
-        logger.debug(f"Ended validation gradient capture, captured {sum(1 for g in self.val_grad_buffer if g is not None)} layers")
+
+        # Store validation token count for score scaling
+        if val_total_tokens is not None:
+            self.val_total_tokens = val_total_tokens
+        elif self.total_tokens is not None:
+            self.val_total_tokens = self.total_tokens
+
+        if self.use_factorized_val:
+            num_captured = sum(1 for g in self.val_grad_output_buffer if g is not None)
+            logger.debug(f"Ended validation gradient capture (factorized), captured {num_captured} layers, val_tokens={self.val_total_tokens}")
+        else:
+            num_captured = sum(1 for g in self.val_grad_buffer if g is not None)
+            logger.debug(f"Ended validation gradient capture (full), captured {num_captured} layers, val_tokens={self.val_total_tokens}")
 
     def clear_val_buffer(self) -> None:
-        """Clear the validation gradient buffer."""
+        """Clear all validation gradient buffers."""
         self.val_grad_buffer = [None] * len(self.layer_names)
+        self.val_grad_output_buffer = [None] * len(self.layer_names)
+        self.val_input_buffer = [None] * len(self.layer_names)
+        self.val_total_tokens = None
         self.capture_val_mode = False
 
     def setup_selection_with_stored_val(
@@ -333,11 +380,11 @@ class GradientHook:
         selection_mode: str = "topk"
     ) -> None:
         """
-        Set up selection state using pre-captured validation gradients (RLHF mode).
+        Set up selection state using pre-captured validation gradients.
 
-        This is like setup_selection but uses the stored val_grad_buffer instead
-        of expecting merged batches. The backward pass will only process training
-        samples and compute scores against stored validation gradients.
+        Uses stored validation gradients instead of expecting merged batches.
+        The backward pass will only process training samples and compute scores
+        against stored validation gradients.
 
         Args:
             train_batch_size: Number of training samples
@@ -349,12 +396,13 @@ class GradientHook:
             compute_scores_only: If True, only compute scores (for GREATS first pass)
             use_second_order: If True, use greedy selection with second-order
             selection_mode: How to select samples based on scores:
-                           - "topk": Select top frac samples by score (SFT style)
-                           - "filtering": Keep all positive + drop bottom frac of negative (RLHF style)
+                           - "topk": Select top frac samples by score
+                           - "filtering": Keep all positive + drop bottom frac of negative
         """
-        # Verify we have captured validation gradients
-        num_captured = sum(1 for g in self.val_grad_buffer if g is not None)
-        if num_captured == 0:
+        # Verify we have captured validation gradients (either factorized or full)
+        num_factorized = sum(1 for g in self.val_grad_output_buffer if g is not None)
+        num_full = sum(1 for g in self.val_grad_buffer if g is not None)
+        if num_factorized == 0 and num_full == 0:
             raise RuntimeError(
                 "No validation gradients captured. Call start_val_capture(), "
                 "run forward/backward on validation data, then end_val_capture() first."
@@ -393,9 +441,11 @@ class GradientHook:
 
         # Mark that we're using stored validation gradients (train_batch_size = actual batch size)
         self.selection_state._use_stored_val = True
+        num_captured = num_factorized if num_factorized > 0 else num_full
         logger.debug(
             f"Set up selection with stored val gradients: {train_batch_size} train samples, "
-            f"{num_captured} layers with val gradients, selection_mode={selection_mode}, frac={frac}"
+            f"{num_captured} layers with val gradients (factorized={num_factorized > 0}), "
+            f"selection_mode={selection_mode}, frac={frac}"
         )
 
     def _get_layer_name_from_idx(self, layer_idx: int) -> str:

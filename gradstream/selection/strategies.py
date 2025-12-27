@@ -2,7 +2,24 @@
 Selection strategies for gradient-based data selection in trainers.
 
 This module provides two families of strategies based on how validation
-gradients are obtained (merged validation batch vs. separate pass).
+gradients are obtained:
+
+1. **JointBatch Strategies**:
+   - Train and val samples are merged into a single batch
+   - Val gradients computed during the same forward/backward pass
+   - Factory: create_joint_batch_strategy()
+   - Note: Has padding overhead when val/train have different sequence lengths
+
+2. **CachedVal Strategies**:
+   - Val gradients are pre-captured and cached before training
+   - Training uses cached val gradients for selection scoring
+   - Factory: create_cached_val_strategy()
+   - Supports two caching modes via start_val_capture(use_factorized=...):
+     * Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
+       Better when validation batch is large (e.g., self-reference validation in RLHF).
+     * Cached factors mode (use_factorized=True): Stores [V, S, O] and [V, S, I] components.
+       More memory-efficient during training as it avoids materializing [B_train, O, I].
+       Better when validation batch is small (e.g., external validation set in SFT).
 """
 
 from __future__ import annotations
@@ -20,16 +37,18 @@ from .state import StreamingState, GREATSState
 
 
 # ============================================================
-# MERGED BATCH STRATEGIES for when target function = train loss
+# JOINT BATCH STRATEGIES
 # Val gradients computed from merged train+val batch
 # ============================================================
 
-class SelectionStrategy(ABC):
+class JointBatchStrategy(ABC):
     """
-    Abstract strategy for merged-batch data selection.
+    Abstract strategy for joint-batch data selection.
 
     Used when train and val samples are merged into a single batch,
     and val gradients are computed during the same forward/backward pass.
+
+    Note: Has padding overhead when val/train have different sequence lengths.
     """
 
     def __init__(
@@ -46,7 +65,7 @@ class SelectionStrategy(ABC):
             grad_hook: GradientHook instance (can be None for NoSelection)
             frac: Selection fraction / filter fraction
             use_second_order: Use greedy selection with second-order
-            selection_mode: "topk" (SFT) or "filtering" (RLHF)
+            selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
         """
         self.grad_hook = grad_hook
         self.frac = frac
@@ -85,7 +104,7 @@ class SelectionStrategy(ABC):
         pass
 
 
-class NoSelectionStrategy(SelectionStrategy):
+class JointBatchNoSelectionStrategy(JointBatchStrategy):
     """
     Baseline strategy: no data selection, standard training.
 
@@ -119,9 +138,9 @@ class NoSelectionStrategy(SelectionStrategy):
         return loss.detach()
 
 
-class StreamingStrategy(SelectionStrategy):
+class JointBatchStreamingStrategy(JointBatchStrategy):
     """
-    Streaming strategy: single-pass, per-layer selection.
+    Streaming strategy with joint batch: single-pass, per-layer selection.
 
     Selection and gradient aggregation happen layer-by-layer
     during the backward pass.
@@ -177,9 +196,9 @@ class StreamingStrategy(SelectionStrategy):
         self.grad_hook.clear_token_counts()
 
 
-class GREATSStrategy(SelectionStrategy):
+class JointBatchGREATSStrategy(JointBatchStrategy):
     """
-    GREATS strategy: two-pass, global selection.
+    GREATS strategy with joint batch: two-pass, global selection.
 
     Pass 1: Compute selection scores across all layers
     Pass 2: Forward/backward only on globally selected samples
@@ -268,49 +287,60 @@ class GREATSStrategy(SelectionStrategy):
         self.grad_hook.clear_token_counts()
 
 
-def create_selection_strategy(
+def create_joint_batch_strategy(
     method: str,
     grad_hook: Optional[GradientHook],
     frac: float = 0.5,
     use_second_order: bool = False,
     selection_mode: str = "topk",
-) -> SelectionStrategy:
+) -> JointBatchStrategy:
     """
-    Factory function to create merged-batch selection strategy.
+    Factory function to create joint-batch selection strategy.
+
+    Note: Has padding overhead when val/train have different sequence lengths.
 
     Args:
         method: Selection method ("NA", "Streaming", "GREATS")
         grad_hook: GradientHook instance
         frac: Selection/filter fraction
         use_second_order: Use greedy selection with second-order
-        selection_mode: "topk" (SFT) or "filtering" (RLHF)
+        selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
 
     Returns:
-        Appropriate SelectionStrategy instance
+        Appropriate JointBatchStrategy instance
     """
     if method == "NA":
-        return NoSelectionStrategy(grad_hook, frac, use_second_order, selection_mode)
+        return JointBatchNoSelectionStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     if method == "Streaming":
-        return StreamingStrategy(grad_hook, frac, use_second_order, selection_mode)
+        return JointBatchStreamingStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     if method == "GREATS":
-        return GREATSStrategy(grad_hook, frac, use_second_order, selection_mode)
+        return JointBatchGREATSStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     raise ValueError(f"Unknown selection method: {method}")
 
 
+
+
 # ============================================================
-# STORED VAL STRATEGIES (for RLHF)
-# Val gradients pre-captured and stored before training
+# CACHED VAL STRATEGIES
+# Val gradients pre-captured and cached before training
+# Avoids padding overhead when val/train have different seq lengths
 # ============================================================
 
-class StoredValStrategy(ABC):
+class CachedValStrategy(ABC):
     """
-    Abstract strategy for stored-val data selection.
+    Abstract strategy for cached-val data selection.
 
-    Used when val gradients are pre-captured and stored before training,
+    Used when val gradients are pre-captured and cached before training,
     rather than computed from a merged batch during the same forward pass.
+
+    Supports two caching modes via start_val_capture(use_factorized=...):
+    - Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
+      Better when validation batch is large (e.g., self-reference validation in RLHF).
+    - Cached factors mode (use_factorized=True): Stores [V, S, O] and [V, S, I] components.
+      More memory-efficient during training. Better when validation batch is small.
     """
 
     def __init__(
@@ -318,18 +348,23 @@ class StoredValStrategy(ABC):
         grad_hook: Optional[GradientHook],
         frac: float,
         use_second_order: bool = False,
+        selection_mode: str = "topk",
     ):
         """
         Initialize stored-val selection strategy.
 
         Args:
             grad_hook: GradientHook instance (can be None for NoSelection)
-            frac: Fraction of negative-influence samples to DROP (0-1)
+            frac: Fraction parameter. Meaning depends on selection_mode:
+                  - "topk": Fraction of samples to select (top frac by score)
+                  - "filtering": Fraction of negative-influence samples to DROP
             use_second_order: Use greedy selection with second-order
+            selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
         """
         self.grad_hook = grad_hook
         self.frac = frac
         self.use_second_order = use_second_order
+        self.selection_mode = selection_mode
 
     @property
     def has_compression(self) -> bool:
@@ -363,7 +398,7 @@ class StoredValStrategy(ABC):
         pass
 
 
-class StoredValNoSelectionStrategy(StoredValStrategy):
+class CachedValNoSelectionStrategy(CachedValStrategy):
     """
     Baseline strategy: no data selection, standard training.
     """
@@ -392,9 +427,9 @@ class StoredValNoSelectionStrategy(StoredValStrategy):
         return loss.detach(), stats
 
 
-class StoredValStreamingStrategy(StoredValStrategy):
+class CachedValStreamingStrategy(CachedValStrategy):
     """
-    Streaming strategy with stored val: per-layer selection.
+    Streaming strategy with cached val: per-layer selection.
 
     Selection and gradient aggregation happen layer-by-layer during backward,
     using pre-captured validation gradients.
@@ -408,9 +443,25 @@ class StoredValStreamingStrategy(StoredValStrategy):
         lr: float,
         **kwargs
     ) -> Tuple[Tensor, Dict]:
-        """Training step with per-layer selection using stored val grads."""
+        """Training step with per-layer selection using stored val grads.
+
+        Args:
+            model: The model to train
+            batch_size: Number of samples in the batch
+            compute_loss_fn: Zero-arg function that computes loss and returns (loss, stats)
+            lr: Learning rate for score scaling
+            **kwargs:
+                labels: Optional label tensor for token-based gradient scaling.
+                        If provided, enables proper score scaling across modes.
+        """
         # Set up streaming state with stored validation gradients
         self._setup_state(batch_size, lr)
+
+        # Set token counts for gradient scaling (if labels provided)
+        # In CachedVal mode, entire batch is train, so pass batch_size as train_batch_size
+        labels = kwargs.get('labels')
+        if labels is not None:
+            self.grad_hook.set_token_counts(labels, batch_size)
 
         model.zero_grad()
         loss, stats = compute_loss_fn()
@@ -436,7 +487,7 @@ class StoredValStreamingStrategy(StoredValStrategy):
             lr=lr,
             compute_scores_only=False,
             use_second_order=self.use_second_order,
-            selection_mode="filtering",  # Drop negative samples
+            selection_mode=self.selection_mode,
         )
 
     def _cleanup(self) -> None:
@@ -444,9 +495,9 @@ class StoredValStreamingStrategy(StoredValStrategy):
         self.grad_hook.clear_selection()
 
 
-class StoredValGREATSStrategy(StoredValStrategy):
+class CachedValGREATSStrategy(CachedValStrategy):
     """
-    GREATS strategy with stored val: global selection.
+    GREATS strategy with cached val: global selection.
 
     Pass 1: Compute selection scores across all layers
     Pass 2: Forward/backward only on globally selected samples
@@ -510,7 +561,7 @@ class StoredValGREATSStrategy(StoredValStrategy):
             lr=lr,
             compute_scores_only=True,  # Only accumulate scores in pass 1
             use_second_order=self.use_second_order,
-            selection_mode="filtering",  # Drop negative samples
+            selection_mode=self.selection_mode,
         )
 
     def _cleanup(self) -> None:
@@ -518,31 +569,39 @@ class StoredValGREATSStrategy(StoredValStrategy):
         self.grad_hook.clear_selection()
 
 
-def create_stored_val_strategy(
+def create_cached_val_strategy(
     method: str,
     grad_hook: Optional[GradientHook],
     frac: float = 0.5,
     use_second_order: bool = False,
-) -> StoredValStrategy:
+    selection_mode: str = "topk",
+) -> CachedValStrategy:
     """
-    Factory function to create stored-val selection strategy.
+    Factory function to create cached-val selection strategy.
+
+    Avoids padding overhead when val/train have different sequence lengths.
 
     Args:
         method: Selection method ("NA", "Streaming", "GREATS")
         grad_hook: GradientHook instance
-        frac: Fraction of negative-influence samples to DROP
+        frac: Fraction parameter. Meaning depends on selection_mode:
+              - "topk": Fraction of samples to select (top frac by score)
+              - "filtering": Fraction of negative-influence samples to DROP
         use_second_order: Use greedy selection with second-order
+        selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
 
     Returns:
-        Appropriate StoredValStrategy instance
+        Appropriate CachedValStrategy instance
     """
     if method == "NA":
-        return StoredValNoSelectionStrategy(grad_hook, frac, use_second_order)
+        return CachedValNoSelectionStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     if method == "Streaming":
-        return StoredValStreamingStrategy(grad_hook, frac, use_second_order)
+        return CachedValStreamingStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     if method == "GREATS":
-        return StoredValGREATSStrategy(grad_hook, frac, use_second_order)
+        return CachedValGREATSStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     raise ValueError(f"Unknown selection method: {method}")
+
+

@@ -154,6 +154,33 @@ class TrainingArguments(TA):
             )
         },
     )
+    val_strategy: str = field(
+        default="cached_factorized",
+        metadata={
+            "help": (
+                "Validation gradient strategy for data selection: "
+                "'cached_factorized' (default): Separate val pass, store [V,S,O] and [V,S,I] factors. "
+                "'cached_full': Separate val pass, store mean gradient [O,I] per layer. "
+                "'joint_batch': Merge train+val into single batch, compute val grad in same pass. "
+                "All modes should produce identical gradients when selection_frac=1.0."
+            )
+        },
+    )
+
+    # Profiling
+    profile: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable PyTorch profiler. Profiles first 10 steps and saves trace to output_dir/profile/. "
+                "View with: tensorboard --logdir=output_dir/profile/ or chrome://tracing"
+            )
+        },
+    )
+    profile_steps: int = field(
+        default=10,
+        metadata={"help": "Number of steps to profile (default: 10)"},
+    )
 
     def __post_init__(self):
         if isinstance(self.fsdp_config, str):

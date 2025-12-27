@@ -55,8 +55,7 @@ export base_training_args="--do_train=True \
 --report_to=none \
 --seed=0 \
 --percentage=1.0 \
---selection_frac=0.5 \
---use_flash_attention=True"
+--selection_frac=0.5"
 
 # Default values
 data_selection="NA"
@@ -74,7 +73,9 @@ task="mmlu"
 train_dataset=""
 subject="sociology"
 compression=""
-use_second_order=true
+use_second_order=false  # If true, use greedy selection with second-order interactions
+selection_frac="0.5"  # Fraction of samples to select (for Streaming/GREATS)
+val_strategy="cached_factorized"  # Validation strategy: cached_factorized, cached_full, joint_batch
 use_lora=false
 use_flash_attention=true
 
@@ -83,14 +84,14 @@ lr_grid="1e-6,5e-6,1e-5,5e-5,1e-4"
 lr_grid_lora="5e-5,1e-4,2e-4,5e-4,1e-3"
 
 # Sweep mode
-sweep_mode="grid"  # "grid" or "binary"
+sweep_mode="binary"  # "grid" or "binary"
 
 # Binary search defaults
 binary_lr_min="1e-7"
 binary_lr_max="1e-3"
 binary_lr_min_lora="1e-6"
 binary_lr_max_lora="1e-2"
-binary_max_iters=7  # ~6 iterations narrows range by ~10x
+binary_max_iters=8  # ~6 iterations narrows range by ~10x
 
 # Stability margin: prefer smaller LR unless larger LR is significantly better
 lr_margin=0.05  # 5% - larger LR must have loss at least 5% lower to be preferred
@@ -110,15 +111,17 @@ lora_dropout=0.1
 update_compressor_freq=200
 
 # Experiment definitions (same as train.sh)
+# Format: "NAME:data_selection:compression:use_lora"
+# Note: use_second_order is controlled by the --use_second_order flag, not per-experiment
 declare -A EXPERIMENT_DEFS=(
-    ["NA-NA-Full"]="NA::false:false"
-    ["NA-NA-LoRA"]="NA::true:false"
-    ["Streaming-NA-Full"]="Streaming::false:true"
-    ["Streaming-NA-LoRA"]="Streaming::true:true"
-    ["GREATS-NA-Full"]="GREATS::false:true"
-    ["GREATS-NA-LoRA"]="GREATS::true:true"
-    ["Streaming-LoGra-Full"]="Streaming:LoGra:false:true"
-    ["GREATS-LoGra-Full"]="GREATS:LoGra:false:true"
+    ["NA-NA-Full"]="NA::false"
+    ["NA-NA-LoRA"]="NA::true"
+    ["Streaming-NA-Full"]="Streaming::false"
+    ["Streaming-NA-LoRA"]="Streaming::true"
+    ["GREATS-NA-Full"]="GREATS::false"
+    ["GREATS-NA-LoRA"]="GREATS::true"
+    ["Streaming-LoGra-Full"]="Streaming:LoGra:false"
+    ["GREATS-LoGra-Full"]="GREATS:LoGra:false"
 )
 
 # Category mappings (same as train.sh)
@@ -199,6 +202,14 @@ while [[ $# -gt 0 ]]; do
         --use_second_order)
             use_second_order=true
             shift 1
+            ;;
+        --selection_frac)
+            selection_frac="$2"
+            shift 2
+            ;;
+        --val_strategy)
+            val_strategy="$2"
+            shift 2
             ;;
         --update_compressor_freq)
             update_compressor_freq="$2"
@@ -521,7 +532,10 @@ run_lr_trial() {
 --learning_rate $trial_lr \
 --gradient_accumulation_steps $gradient_accumulation_steps \
 --seed $seed \
---optim $optim"
+--optim $optim \
+--selection_frac $selection_frac \
+--val_strategy $val_strategy \
+--use_flash_attention $use_flash_attention"
 
     if [[ -n "$train_dataset" ]]; then
         training_args="$training_args --train_dataset_names $train_dataset"
@@ -678,7 +692,8 @@ if [[ -n "$experiments" ]]; then
         exp_data_selection="${exp_parts[0]}"
         exp_compression="${exp_parts[1]}"
         exp_use_lora="${exp_parts[2]}"
-        exp_use_second_order="${exp_parts[3]}"
+        # use_second_order is controlled globally via --use_second_order flag
+        exp_use_second_order="$use_second_order"
 
         echo "" >> "$summary_file"
         echo "=== $exp_name ===" >> "$summary_file"

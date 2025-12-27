@@ -13,7 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 import torch.nn as nn
-from typing import Dict
+from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
+from typing import Dict, Optional
 from torch import Tensor
 
 from transformers import Trainer
@@ -52,7 +53,7 @@ def compute_train_loss_from_merged(logits, labels, train_batch_size):
 
 from gradstream.optimizer import MeSOAdamW
 from gradstream.hook import GradientHook
-from gradstream.selection import create_selection_strategy
+from gradstream.selection import create_cached_val_strategy, create_joint_batch_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -146,18 +147,36 @@ class StreamingTrainer(Trainer):
         )
 
         # Create selection strategy for clean separation of selection methods
-        self.selection_strategy = create_selection_strategy(
-            method=self.args.method,
-            grad_hook=self.grad_hook,
-            frac=getattr(self.args, 'selection_frac', 0.5),
-            use_second_order=getattr(self.args, 'use_second_order', False),
-            selection_mode="topk",  # SFT uses top-k selection
-        )
+        # SFT uses topk mode: select top frac samples by alignment score
+        # Strategy is determined by val_strategy argument:
+        # - cached_factorized: Separate val pass, store factorized components (default)
+        # - cached_full: Separate val pass, store mean gradient
+        # - joint_batch: Merge train+val into single batch
+        val_strategy = getattr(self.args, 'val_strategy', 'cached_factorized')
+        if val_strategy == 'joint_batch':
+            self.selection_strategy = create_joint_batch_strategy(
+                method=self.args.method,
+                grad_hook=self.grad_hook,
+                frac=getattr(self.args, 'selection_frac', 0.5),
+                use_second_order=getattr(self.args, 'use_second_order', False),
+                selection_mode="topk",
+            )
+        else:
+            # cached_factorized or cached_full
+            self.selection_strategy = create_cached_val_strategy(
+                method=self.args.method,
+                grad_hook=self.grad_hook,
+                frac=getattr(self.args, 'selection_frac', 0.5),
+                use_second_order=getattr(self.args, 'use_second_order', False),
+                selection_mode="topk",
+            )
+        self.val_strategy = val_strategy
 
         logger.info("="*60)
         logger.info("Initialized StreamingTrainer")
         selection_frac = getattr(self.args, 'selection_frac', None)
         logger.info(f"  Method: {self.args.method} (selection fraction: {selection_frac})")
+        logger.info(f"  Validation strategy: {self.val_strategy}")
         logger.info(f"  Compression: {self.has_compression}")
         logger.info(f"  Validation set size: {len(val_dataset) if val_dataset is not None else 0}")
         logger.info(f"  Evaluation set size: {len(eval_dataset) if eval_dataset is not None else 0}")
@@ -177,6 +196,32 @@ class StreamingTrainer(Trainer):
             logger.info(f"  Mode: Baseline (full gradients, no selection)")
 
         logger.info("="*60)
+
+        # Set up profiler if enabled
+        self.profiler = None
+        self.profile_step_count = 0
+        if getattr(self.args, 'profile', False):
+            profile_dir = os.path.join(self.args.output_dir, 'profile')
+            os.makedirs(profile_dir, exist_ok=True)
+            profile_steps = getattr(self.args, 'profile_steps', 10)
+
+            self.profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(
+                    wait=1,      # Skip first step (warmup)
+                    warmup=1,    # Warmup step
+                    active=profile_steps,  # Profile these steps
+                    repeat=1     # Only one cycle
+                ),
+                on_trace_ready=tensorboard_trace_handler(profile_dir),
+                record_shapes=True,
+                profile_memory=True,  # Disable for lower overhead
+                with_stack=True,      # Disable for lower overhead (stacks are expensive)
+                with_flops=True,      # Disable for lower overhead
+            )
+            self.profiler.start()
+            logger.info(f"Profiler enabled: will profile {profile_steps} steps, output to {profile_dir}")
+            logger.info("  View with: tensorboard --logdir=" + profile_dir)
 
     def _get_unwrapped_optimizer(self):
         """
@@ -236,6 +281,10 @@ class StreamingTrainer(Trainer):
     def _merge_batches(self, batch_train: Dict[str, Tensor], batch_val: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """
         Merge training and validation batches along batch dimension.
+
+        NOTE: This method is kept for backward compatibility but is no longer used
+        by default. The trainer now uses separate val/train passes via StoredValStrategy
+        to avoid padding overhead when batches have different sequence lengths.
 
         Handles the case where batches have different sequence lengths by padding
         to the maximum length across both batches.
@@ -340,29 +389,91 @@ class StreamingTrainer(Trainer):
             batch_val = self._prepare_inputs(val_batch)
             train_batch_size = batch_train['input_ids'].shape[0]
 
-            # Merge batches: [train_samples, val_samples]
-            merged_batch = self._merge_batches(batch_train, batch_val)
-
             # Get current learning rate
             lr = self.optimizer.param_groups[0]["lr"] if hasattr(self, 'optimizer') and self.optimizer else args.learning_rate
             if lr is None or lr == 0:
                 lr = args.learning_rate
 
-            # Execute selection strategy
-            loss = self.selection_strategy.execute_training_step(
-                model=model,
-                merged_batch=merged_batch,
-                train_batch_size=train_batch_size,
-                compute_loss_fn=self._compute_loss_for_selection,
-                lr=lr,
-                batch_train=batch_train  # For GREATS pass 2
-            )
+            if self.val_strategy == 'joint_batch':
+                # === JOINT BATCH MODE: Merge train+val, single forward/backward ===
+                merged_batch = self._merge_batches(batch_train, batch_val)
+
+                def compute_loss(model, batch):
+                    return self._compute_loss_for_selection(model, batch)
+
+                loss = self.selection_strategy.execute_training_step(
+                    model=model,
+                    merged_batch=merged_batch,
+                    train_batch_size=train_batch_size,
+                    compute_loss_fn=compute_loss,
+                    lr=lr,
+                    batch_train=batch_train,  # For GREATS pass 2
+                )
+            else:
+                # === CACHED VAL MODE: Separate val pass, then train with stored grads ===
+                # cached_factorized: store [V,S,O] and [V,S,I] factors
+                # cached_full: store mean gradient [O,I] per layer
+                use_factorized = (self.val_strategy == 'cached_factorized')
+
+                # PASS 1: Capture validation gradients
+                self.grad_hook.start_val_capture(use_factorized=use_factorized)
+                model.zero_grad()
+                val_loss = self._compute_loss_for_selection(model, batch_val)
+                val_loss.backward()
+                self.grad_hook.end_val_capture()
+
+                # PASS 2: Train with selection using stored val gradients
+                def compute_train_loss():
+                    loss = self._compute_loss_for_selection(model, batch_train)
+                    return loss, {}  # CachedValStrategy expects (loss, stats) tuple
+
+                loss, _ = self.selection_strategy.execute_training_step(
+                    model=model,
+                    batch_size=train_batch_size,
+                    compute_loss_fn=compute_train_loss,
+                    lr=lr,
+                    # Pass labels for token-based gradient scaling
+                    labels=batch_train.get('labels'),
+                    # For GREATS pass 2, provide filter function
+                    filter_batch_fn=lambda indices: (
+                        lambda: (self._compute_loss_for_selection(model, {
+                            'input_ids': batch_train['input_ids'][indices],
+                            'attention_mask': batch_train['attention_mask'][indices],
+                            'labels': batch_train['labels'][indices],
+                        }), {})
+                    )
+                )
+
+                # Cleanup val buffer
+                self.grad_hook.clear_val_buffer()
+
+            # Step profiler if enabled
+            if self.profiler is not None:
+                self.profiler.step()
+                self.profile_step_count += 1
+                profile_steps = getattr(self.args, 'profile_steps', 10)
+                if self.profile_step_count == profile_steps + 2:  # wait + warmup + active
+                    self.profiler.stop()
+                    logger.info(f"Profiler stopped after {profile_steps} steps. Check output_dir/profile/")
+                    self.profiler = None
 
             return loss
 
         # === BASELINE MODE (no data selection) ===
         else:
-            return self._training_step_baseline(model, inputs)
+            loss = self._training_step_baseline(model, inputs)
+
+            # Step profiler if enabled
+            if self.profiler is not None:
+                self.profiler.step()
+                self.profile_step_count += 1
+                profile_steps = getattr(self.args, 'profile_steps', 10)
+                if self.profile_step_count == profile_steps + 2:  # wait + warmup + active
+                    self.profiler.stop()
+                    logger.info(f"Profiler stopped after {profile_steps} steps. Check output_dir/profile/")
+                    self.profiler = None
+
+            return loss
 
     def _compute_loss_for_selection(self, model, batch):
         """Compute loss for selection (handles multi-GPU and grad accumulation)."""
@@ -577,5 +688,11 @@ class StreamingTrainer(Trainer):
 
     def on_train_end(self):
         """Called at the end of training to save final results."""
+        # Stop profiler if still running
+        if self.profiler is not None:
+            self.profiler.stop()
+            logger.info("Profiler stopped at end of training. Check output_dir/profile/")
+            self.profiler = None
+
         self._save_evaluation_results()
         logger.info(f"Training completed. Final results saved to {self.args.output_dir}/evaluation_results.json")

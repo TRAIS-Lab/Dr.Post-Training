@@ -42,8 +42,7 @@ export base_training_args="--do_train=True \
 --report_to=none \
 --seed=0 \
 --percentage=1.0 \
---selection_frac=0.5 \
---use_flash_attention=True"
+--selection_frac=0.5"
 
 # Default values
 data_selection="NA"  # NA, Streaming (per-layer), or GREATS (global)
@@ -67,9 +66,12 @@ train_dataset=""  # Training dataset (if empty, uses task-based default)
 subject="sociology"
 compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer.
 use_second_order=false  # If true, use greedy selection with second-order interactions
-selection_frac="0.5"  # Fraction of samples to select (for Streaming/GREATS)
+selection_frac="1.0"  # Fraction of samples to select (for Streaming/GREATS)
+val_strategy="joint_batch"  # Validation strategy: cached_factorized, cached_full, joint_batch
 use_lora=false
 use_flash_attention=true
+enable_profile=false
+profile_steps=10
 
 # Multi-experiment mode
 experiments=""  # Comma-separated list of experiments or categories
@@ -188,6 +190,10 @@ while [[ $# -gt 0 ]]; do
             selection_frac="$2"
             shift 2
             ;;
+        --val_strategy)
+            val_strategy="$2"
+            shift 2
+            ;;
         --update_compressor_freq)
             update_compressor_freq="$2"
             shift 2
@@ -234,6 +240,14 @@ while [[ $# -gt 0 ]]; do
             use_sbatch=true
             shift
             ;;
+        --profile)
+            enable_profile=true
+            shift
+            ;;
+        --profile_steps)
+            profile_steps="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
@@ -259,6 +273,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --data_selection <method>              Data selection: NA, Streaming, GREATS (default: NA)"
             echo "  --compression <method>                 Compression: LoGra, GraSS (implies MeSO optimizer)"
             echo "  --use_second_order                     Use greedy selection with second-order interactions"
+            echo "  --val_strategy <strategy>              Validation strategy: cached_factorized (default), cached_full, joint_batch"
             echo ""
             echo "  --lora                                 Use LoRA fine-tuning (default: full fine-tuning)"
             echo "  --lora_alpha <alpha>                   LoRA alpha (default: 1)"
@@ -291,6 +306,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --update_compressor_freq <steps>       Projector refresh interval (default: 200)"
             echo "  --flash_attention                      Enable Flash Attention 2 (default: enabled)"
             echo "  --data_dir <dir>                       Data directory (default: SFT/data)"
+            echo ""
+            echo "Profiling:"
+            echo "  --profile                              Enable PyTorch profiler (profiles first N steps)"
+            echo "  --profile_steps <n>                    Number of steps to profile (default: 10)"
             echo ""
             echo "Naming convention: {selection}-{compression}-{training_type}"
             echo "  Examples: Streaming-NA-Full, GREATS-LoGra-Full, NA-NA-LoRA"
@@ -403,13 +422,7 @@ run_single_experiment() {
     local exp_lr="$5"
     local exp_name="$6"
 
-    # ========================================
-    # Update base_training_args with user-specified Flash Attention setting
-    # ========================================
     local exp_base_training_args="$base_training_args"
-    if [ "$use_flash_attention" = true ]; then
-        exp_base_training_args="${exp_base_training_args/--use_flash_attention=False/--use_flash_attention=True}"
-    fi
 
     # ========================================
     # Compression Configuration
@@ -530,7 +543,10 @@ run_single_experiment() {
 --learning_rate $exp_lr \
 --gradient_accumulation_steps $gradient_accumulation_steps \
 --seed $seed \
---optim $optim"
+--optim $optim \
+--selection_frac $selection_frac \
+--val_strategy $val_strategy \
+--use_flash_attention $use_flash_attention"
 
     if [[ -n "$train_dataset" ]]; then
         training_args="$training_args --train_dataset_names $train_dataset"
@@ -558,6 +574,11 @@ run_single_experiment() {
 
     if [[ "$exp_data_selection" != "NA" ]] && [ "$exp_use_second_order" = true ]; then
         training_args="$training_args --use_second_order True"
+    fi
+
+    # Add profiling arguments
+    if [ "$enable_profile" = true ]; then
+        training_args="$training_args --profile True --profile_steps $profile_steps"
     fi
 
     training_args="$training_args 2>&1 | tee $output_dir/train.log"
@@ -650,13 +671,6 @@ if [[ -n "$experiments" ]]; then
 
 else
     # Single experiment mode (original behavior)
-
-    # ========================================
-    # Update base_training_args with user-specified Flash Attention setting
-    # ========================================
-    if [ "$use_flash_attention" = true ]; then
-        base_training_args="${base_training_args/--use_flash_attention=False/--use_flash_attention=True}"
-    fi
 
     # ========================================
     # Compression Configuration
@@ -837,7 +851,9 @@ training_args="$base_training_args \
 --gradient_accumulation_steps $gradient_accumulation_steps \
 --seed $seed \
 --optim $optim \
---selection_frac $selection_frac"
+--selection_frac $selection_frac \
+--val_strategy $val_strategy \
+--use_flash_attention $use_flash_attention"
 
 # Add train_dataset_names if specified
 if [[ -n "$train_dataset" ]]; then
@@ -870,6 +886,11 @@ fi
 # Add use_second_order for data selection
 if [[ "$data_selection" != "NA" ]] && [ "$use_second_order" = true ]; then
     training_args="$training_args --use_second_order True"
+fi
+
+# Add profiling arguments
+if [ "$enable_profile" = true ]; then
+    training_args="$training_args --profile True --profile_steps $profile_steps"
 fi
 
 training_args="$training_args 2>&1 | tee $output_dir/train.log"
