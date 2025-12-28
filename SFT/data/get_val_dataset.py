@@ -331,7 +331,7 @@ def get_samsum_dataset(
         **kwargs
     ) -> Dataset:
     """
-    Get the SAMSum dataset in unified JSONL format.
+    Get the SamSUM dataset in unified JSONL format.
 
     Args:
         data_dir: The main data directory.
@@ -341,7 +341,7 @@ def get_samsum_dataset(
         k: Number of examples to use.
 
     Returns:
-        Dataset: The SAMSum dataset containing input_ids, attention_mask, and labels.
+        Dataset: The SamSUM dataset containing input_ids, attention_mask, and labels.
     """
     examples = load_unified_jsonl(data_dir, "samsum", validation, k)
 

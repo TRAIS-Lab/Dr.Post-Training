@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Script to download and prepare datasets for training and evaluation.
-Supports: MMLU, BBH, TyDiQA, MATH500, GSM8K, SAMSum (eval) + Alpaca, Dolly, FLAN-v2, CoT, OASST1, Vicuna, WizardLM, OpenHermes, Tulu3 (train)
+Supports: MMLU, BBH, TyDiQA, MATH500, GSM8K, SamSUM (eval) + Alpaca, Dolly, FLAN-v2, CoT, OASST1, Vicuna, WizardLM, OpenHermes, Tulu3 (train)
 """
 
 import json
@@ -802,11 +802,11 @@ def prepare_oasst1(output_dir):
 
 def prepare_samsum(output_dir):
     """
-    Prepare SAMSum dialogue summarization dataset.
+    Prepare SamSUM dialogue summarization dataset.
 
     Checks if data already exists in the expected format before downloading.
     """
-    print("Preparing SAMSum data...")
+    print("Preparing SamSUM data...")
 
     train_file = os.path.join(output_dir, "train", "samsum", "samsum_train_data.jsonl")
     val_file = os.path.join(output_dir, "eval", "samsum", "samsum_validation_data.jsonl")
@@ -814,7 +814,7 @@ def prepare_samsum(output_dir):
 
     # Check if data already exists
     if os.path.exists(val_file) and os.path.exists(test_file):
-        print(f"SAMSum evaluation data already exists:")
+        print(f"SamSUM evaluation data already exists:")
         print(f"  Validation: {val_file}")
         print(f"  Test: {test_file}")
 
@@ -827,7 +827,7 @@ def prepare_samsum(output_dir):
         return train_file if os.path.exists(train_file) else val_file
 
     # Try to download from HuggingFace
-    print("Downloading SAMSum from HuggingFace...")
+    print("Downloading SamSUM from HuggingFace...")
     ensure_dir(os.path.dirname(train_file))
     ensure_dir(os.path.dirname(val_file))
 
@@ -884,7 +884,7 @@ def prepare_samsum(output_dir):
             }
             f.write(json.dumps(data, ensure_ascii=False) + '\n')
 
-    print(f"SAMSum data saved:")
+    print(f"SamSUM data saved:")
     print(f"  Train: {train_file}")
     print(f"  Validation: {val_file}")
     print(f"  Test: {test_file}")
@@ -1057,7 +1057,7 @@ Available Datasets:
     tydiqa    - TyDiQA: Typologically Diverse QA (9 languages)
     gsm8k     - GSM8K: Grade School Math (includes train split)
     math500   - MATH500: Competition math problems
-    samsum    - SAMSum: Dialogue summarization (includes train split)
+    samsum    - SamSUM: Dialogue summarization (includes train split)
 
   Training Datasets:
     alpaca    - Stanford Alpaca (52K instruction-following examples)

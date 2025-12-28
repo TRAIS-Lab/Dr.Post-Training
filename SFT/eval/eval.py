@@ -3,7 +3,7 @@
 Unified evaluation script for SFT experiments.
 
 Supports:
-- SAMSum: Dialogue summarization (ROUGE-1, ROUGE-2, ROUGE-L)
+- SamSUM: Dialogue summarization (ROUGE-1, ROUGE-2, ROUGE-L)
 - TyDiQA: Multilingual QA (F1 score)
 - MMLU: Multiple-choice QA (Accuracy)
 - BBH: Big Bench Hard reasoning tasks (Accuracy)
@@ -207,10 +207,10 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None) -> List[st
 
 
 def evaluate_samsum(args, model, tokenizer) -> dict:
-    """Run SAMSum evaluation."""
+    """Run SamSUM evaluation."""
     from .tasks.samsum import compute_accuracy
 
-    logger.info("Evaluating on SAMSum")
+    logger.info("Evaluating on SamSUM")
     rouge_scores = compute_accuracy(
         args=args,
         model=model,
@@ -372,7 +372,7 @@ def evaluate_model(
 
     try:
         if task == "samsum":
-            logger.info(f"Evaluating {model_name} on SAMSum...")
+            logger.info(f"Evaluating {model_name} on SamSUM...")
             samsum_results = evaluate_samsum(args, model, tokenizer)
             results["samsum_rouge1"] = samsum_results["rouge1"]
             results["samsum_rouge2"] = samsum_results["rouge2"]
@@ -543,65 +543,65 @@ def main():
     print("Summary")
     print("=" * 100)
 
-    # SAMSum results
+    # SamSUM results
     samsum_results = [r for r in all_results if "samsum_rougeL" in r]
     if samsum_results:
-        print(f"\nSAMSum Results:")
-        print(f"{'Model':<50} {'Selection':<12} {'Compress':<12} {'R-1':>7} {'R-2':>7} {'R-L':>7}")
+        print(f"\nSamSUM Results:")
+        print(f"{'Model':<70} {'R-1':>7} {'R-2':>7} {'R-L':>7}")
         print("-" * 100)
         for r in sorted(samsum_results, key=lambda x: x.get("samsum_rougeL", 0), reverse=True):
-            print(f"{r['model_name'][:50]:<50} {r['selection']:<12} {r['compression']:<12} "
+            print(f"{r['model_name'][:70]:<70} "
                   f"{r['samsum_rouge1']:>7.4f} {r['samsum_rouge2']:>7.4f} {r['samsum_rougeL']:>7.4f}")
 
     # TyDiQA results
     tydiqa_results = [r for r in all_results if "tydiqa_f1" in r]
     if tydiqa_results:
         print(f"\nTyDiQA Results:")
-        print(f"{'Model':<60} {'Selection':<12} {'Compress':<12} {'F1':>7} {'EM':>7}")
+        print(f"{'Model':<80} {'F1':>8} {'EM':>8}")
         print("-" * 100)
         for r in sorted(tydiqa_results, key=lambda x: x.get("tydiqa_f1", 0), reverse=True):
-            print(f"{r['model_name'][:60]:<60} {r['selection']:<12} {r['compression']:<12} "
-                  f"{r['tydiqa_f1']:>7.4f} {r.get('tydiqa_em', 0):>7.4f}")
+            print(f"{r['model_name'][:80]:<80} "
+                  f"{r['tydiqa_f1']:>8.4f} {r.get('tydiqa_em', 0):>8.4f}")
 
     # MMLU results
     mmlu_results = [r for r in all_results if "mmlu_accuracy" in r]
     if mmlu_results:
         print(f"\nMMLU Results:")
-        print(f"{'Model':<60} {'Selection':<12} {'Compress':<12} {'Acc':>7}")
+        print(f"{'Model':<90} {'Acc':>8}")
         print("-" * 100)
         for r in sorted(mmlu_results, key=lambda x: x.get("mmlu_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:60]:<60} {r['selection']:<12} {r['compression']:<12} "
-                  f"{r['mmlu_accuracy']:>7.4f}")
+            print(f"{r['model_name'][:90]:<90} "
+                  f"{r['mmlu_accuracy']:>8.4f}")
 
     # BBH results
     bbh_results = [r for r in all_results if "bbh_accuracy" in r]
     if bbh_results:
         print(f"\nBBH Results:")
-        print(f"{'Model':<60} {'Selection':<12} {'Compress':<12} {'Acc':>7}")
+        print(f"{'Model':<90} {'Acc':>8}")
         print("-" * 100)
         for r in sorted(bbh_results, key=lambda x: x.get("bbh_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:60]:<60} {r['selection']:<12} {r['compression']:<12} "
-                  f"{r['bbh_accuracy']:>7.4f}")
+            print(f"{r['model_name'][:90]:<90} "
+                  f"{r['bbh_accuracy']:>8.4f}")
 
     # GSM8K results
     gsm8k_results = [r for r in all_results if "gsm8k_accuracy" in r]
     if gsm8k_results:
         print(f"\nGSM8K Results:")
-        print(f"{'Model':<60} {'Selection':<12} {'Compress':<12} {'Acc':>7}")
+        print(f"{'Model':<90} {'Acc':>8}")
         print("-" * 100)
         for r in sorted(gsm8k_results, key=lambda x: x.get("gsm8k_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:60]:<60} {r['selection']:<12} {r['compression']:<12} "
-                  f"{r['gsm8k_accuracy']:>7.4f}")
+            print(f"{r['model_name'][:90]:<90} "
+                  f"{r['gsm8k_accuracy']:>8.4f}")
 
     # MATH500 results
     math500_results = [r for r in all_results if "math500_accuracy" in r]
     if math500_results:
         print(f"\nMATH500 Results:")
-        print(f"{'Model':<60} {'Selection':<12} {'Compress':<12} {'Acc':>7}")
+        print(f"{'Model':<90} {'Acc':>8}")
         print("-" * 100)
         for r in sorted(math500_results, key=lambda x: x.get("math500_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:60]:<60} {r['selection']:<12} {r['compression']:<12} "
-                  f"{r['math500_accuracy']:>7.4f}")
+            print(f"{r['model_name'][:90]:<90} "
+                  f"{r['math500_accuracy']:>8.4f}")
 
     errors = [r for r in all_results if r.get("error")]
     if errors:

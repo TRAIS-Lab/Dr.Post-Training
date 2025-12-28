@@ -216,4 +216,3 @@ if [ "$dry_run" = false ]; then
     echo ""
     $PYTHON "$SCRIPT_DIR/benchmark.py" --print-summary "$RESULTS_FILE"
 fi
-echo "========================================================"

@@ -37,6 +37,7 @@ import time
 import warnings
 from typing import Optional, Callable, Any, List, Dict, Tuple
 from dataclasses import dataclass, asdict
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
 
@@ -56,7 +57,10 @@ def set_seed(seed: int):
 from gradstream.hook import GradientHook
 from gradstream.compressor import setup_model_compressors
 from gradstream.optimizer import MeSOAdamW
-from gradstream.selection.strategies import SeparateBatchStreamingStrategy, SeparateBatchGREATSStrategy
+from gradstream.selection.strategies import (
+    SeparateBatchStreamingStrategy, SeparateBatchGREATSStrategy,
+    MergedBatchStreamingStrategy, MergedBatchGREATSStrategy
+)
 
 from datasets import load_dataset
 
@@ -67,15 +71,20 @@ from datasets import load_dataset
 
 @dataclass
 class BenchmarkConfig:
-    """Benchmark configuration."""
+    """
+    Benchmark configuration.
+
+    This is the single source of truth for all configuration defaults.
+    CLI arguments override these defaults when specified.
+    """
     # Model
     model_name: str = 'meta-llama/Llama-3.2-1B'
     dtype: str = 'bfloat16'
     use_flash_attention: bool = True
 
     # Training
-    batch_size: int = 128
-    seq_length: int = 256
+    batch_size: int = 16
+    seq_length: int = 512
     val_batch_size: int = 1
 
     # Dataset config
@@ -83,15 +92,16 @@ class BenchmarkConfig:
     dataset: str = 'alpaca'
 
     # Benchmark
-    num_warmup: int = 10
-    num_iterations: int = 10
+    num_warmup: int = 50
+    num_iterations: int = 100
 
     # LoRA config
-    lora_rank: int = 16
+    lora_rank: int = 32
     lora_alpha: int = 1
 
     # Selection config
     use_second_order: bool = False  # If True, use greedy selection with O(k*n) complexity
+    val_strategy: str = 'merged'  # 'separate' or 'merged' - how to handle validation gradients
 
     # Reproducibility
     seed: int = 42
@@ -101,6 +111,36 @@ class BenchmarkConfig:
 
     def get_torch_dtype(self):
         return {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[self.dtype]
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> 'BenchmarkConfig':
+        """Create config from argparse namespace, using defaults for unspecified args."""
+        config = cls()
+        if args.model is not None:
+            config.model_name = args.model
+        if args.dtype is not None:
+            config.dtype = args.dtype
+        if args.no_flash_attention:
+            config.use_flash_attention = False
+        if args.batch_size is not None:
+            config.batch_size = args.batch_size
+        if args.seq_length is not None:
+            config.seq_length = args.seq_length
+        if args.val_batch_size is not None:
+            config.val_batch_size = args.val_batch_size
+        if args.dataset is not None:
+            config.dataset = args.dataset
+        if args.num_warmup is not None:
+            config.num_warmup = args.num_warmup
+        if args.num_iterations is not None:
+            config.num_iterations = args.num_iterations
+        if args.use_second_order:
+            config.use_second_order = True
+        if args.val_strategy is not None:
+            config.val_strategy = args.val_strategy
+        if args.seed is not None:
+            config.seed = args.seed
+        return config
 
 
 @dataclass
@@ -482,10 +522,6 @@ class Benchmark:
         Returns:
             BenchmarkResult with timing and memory metrics
         """
-        print("=" * 80)
-        print(f"Benchmarking: {method_name}")
-        print("=" * 80)
-
         # Set seed for reproducibility
         set_seed(self.config.seed)
 
@@ -517,8 +553,7 @@ class Benchmark:
         self._reset_memory()
 
         # Warmup phase
-        print(f"\nWarmup: {self.config.num_warmup} iterations...")
-        for i in range(self.config.num_warmup):
+        for _ in tqdm(range(self.config.num_warmup), desc="Warmup", leave=False):
             try:
                 batch = next(data_iter)
             except StopIteration:
@@ -527,20 +562,16 @@ class Benchmark:
 
             batch = {k: v.to(self.config.device) for k, v in batch.items()}
             step_fn(model, optimizer, batch, *extras)
-
-            if (i + 1) % 5 == 0:
-                print(f"  Warmup {i + 1}/{self.config.num_warmup} done")
 
         # Reset memory stats after warmup
         self._sync()
         self._reset_memory()
 
         # Timed phase
-        print(f"\nTiming: {self.config.num_iterations} iterations...")
         self._sync()
         start_time = time.time()
 
-        for i in range(self.config.num_iterations):
+        for _ in tqdm(range(self.config.num_iterations), desc="Benchmark", leave=False):
             try:
                 batch = next(data_iter)
             except StopIteration:
@@ -549,9 +580,6 @@ class Benchmark:
 
             batch = {k: v.to(self.config.device) for k, v in batch.items()}
             step_fn(model, optimizer, batch, *extras)
-
-            if (i + 1) % 5 == 0:
-                print(f"  Iteration {i + 1}/{self.config.num_iterations} done")
 
         self._sync()
         total_time = time.time() - start_time
@@ -562,14 +590,8 @@ class Benchmark:
         throughput = (self.config.num_iterations * self.config.batch_size) / total_time
 
         # Print results
-        print(f"\n{'=' * 80}")
-        print(f"Results: {method_name}")
-        print(f"{'=' * 80}")
-        print(f"Peak Memory:     {peak_memory:.3f} GB")
-        print(f"Avg Time/Iter:   {avg_iteration_time_ms:.1f} ms")
-        print(f"Throughput:      {throughput:.2f} samples/sec")
-        print(f"Total Time:      {total_time:.2f}s ({self.config.num_iterations} iterations)")
-        print(f"{'=' * 80}\n")
+        print(f"\nResults: Peak={peak_memory:.2f}GB | Time/Iter={avg_iteration_time_ms:.1f}ms | "
+              f"Throughput={throughput:.2f} samp/s | Total={total_time:.1f}s\n")
 
         # Cleanup
         del model, optimizer
@@ -816,6 +838,143 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
 
         # Cleanup val buffer
         grad_hook.clear_val_buffer()
+
+        return loss.item()
+
+    return step_fn
+
+
+def make_step_streaming_merged(selection_helper: SelectionStepHelper, selection_frac: float = 0.5, use_second_order: bool = False, has_compression: bool = True):
+    """
+    Create a step function for Streaming (per-layer) selection with MergedBatch strategy.
+
+    Uses MergedBatchStreamingStrategy where train and val samples are merged into
+    a single batch, and val gradients are computed during the same forward/backward pass.
+
+    Note: Has padding overhead when val/train have different sequence lengths.
+
+    Args:
+        selection_helper: SelectionStepHelper instance for validation batches
+        selection_frac: Fraction of samples to select
+        use_second_order: If True, use greedy selection with second-order interactions.
+        has_compression: If True, uses MeSO optimizer (compressed gradients stored in hook).
+                        If False, uses standard optimizer (full gradients returned).
+
+    Returns:
+        Step function for Streaming selection with merged batch
+    """
+    # Strategy will be initialized on first call when grad_hook is available
+    strategy = None
+
+    def step_fn(model, optimizer, batch, grad_hook):
+        nonlocal strategy
+
+        # Initialize strategy on first call
+        if strategy is None:
+            strategy = MergedBatchStreamingStrategy(
+                grad_hook=grad_hook,
+                frac=selection_frac,
+                use_second_order=use_second_order,
+                selection_mode="topk"
+            )
+
+        model.train()
+
+        # Get validation batch and merge with training batch
+        val_batch = selection_helper.get_val_batch()
+        train_batch_size = batch['input_ids'].shape[0]
+
+        # Merge train and val batches (pad to same length if needed)
+        merged_batch = pad_and_merge_batches(
+            batch, val_batch,
+            pad_token_id=selection_helper.tokenizer.pad_token_id or 0
+        )
+
+        lr = optimizer.param_groups[0].get("lr", 5e-5)
+
+        def compute_loss_fn(model, batch_dict):
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = model(**batch_dict)
+                return outputs.loss
+
+        optimizer.zero_grad()
+        loss = strategy.execute_training_step(
+            model=model,
+            merged_batch=merged_batch,
+            train_batch_size=train_batch_size,
+            compute_loss_fn=compute_loss_fn,
+            lr=lr
+        )
+        optimizer.step()
+
+        return loss.item()
+
+    return step_fn
+
+
+def make_step_greats_merged(selection_helper: SelectionStepHelper, selection_frac: float = 0.5, use_second_order: bool = False, has_compression: bool = True):
+    """
+    Create a step function for GREATS (global) selection with MergedBatch strategy.
+
+    Uses MergedBatchGREATSStrategy where train and val samples are merged into
+    a single batch for score computation.
+
+    Note: Has padding overhead when val/train have different sequence lengths.
+
+    Args:
+        selection_helper: SelectionStepHelper instance for validation batches
+        selection_frac: Fraction of samples to select
+        use_second_order: If True, use greedy selection with second-order interactions.
+        has_compression: If True, uses MeSO optimizer (compressed gradients stored in hook).
+                        If False, uses standard optimizer (full gradients returned).
+
+    Returns:
+        Step function for GREATS selection with merged batch
+    """
+    # Strategy will be initialized on first call when grad_hook is available
+    strategy = None
+
+    def step_fn(model, optimizer, batch, grad_hook):
+        nonlocal strategy
+
+        # Initialize strategy on first call
+        if strategy is None:
+            strategy = MergedBatchGREATSStrategy(
+                grad_hook=grad_hook,
+                frac=selection_frac,
+                use_second_order=use_second_order,
+                selection_mode="topk"
+            )
+
+        model.train()
+
+        # Get validation batch and merge with training batch
+        val_batch = selection_helper.get_val_batch()
+        train_batch_size = batch['input_ids'].shape[0]
+
+        # Merge train and val batches (pad to same length if needed)
+        merged_batch = pad_and_merge_batches(
+            batch, val_batch,
+            pad_token_id=selection_helper.tokenizer.pad_token_id or 0
+        )
+
+        lr = optimizer.param_groups[0].get("lr", 5e-5)
+
+        def compute_loss_fn(model, batch_dict):
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = model(**batch_dict)
+                return outputs.loss
+
+        optimizer.zero_grad()
+        loss = strategy.execute_training_step(
+            model=model,
+            merged_batch=merged_batch,
+            train_batch_size=train_batch_size,
+            compute_loss_fn=compute_loss_fn,
+            lr=lr,
+            batch_train=batch  # Pass original train batch for pass 2
+        )
+        optimizer.step()
 
         return loss.item()
 
@@ -1684,7 +1843,11 @@ def run_benchmark(methods: List[str], config: BenchmarkConfig, output_file: Opti
                 def wrapped_setup(cfg):
                     model, optimizer, tokenizer, grad_hook = base_setup(cfg)
                     helper = SelectionStepHelper(tokenizer, cfg.seq_length, cfg.val_batch_size, cfg.device, cfg)
-                    step = make_step_streaming(helper, sel_frac, use_second_order=cfg.use_second_order, has_compression=has_comp)
+                    # Choose step function based on val_strategy
+                    if cfg.val_strategy == 'merged':
+                        step = make_step_streaming_merged(helper, sel_frac, use_second_order=cfg.use_second_order, has_compression=has_comp)
+                    else:  # 'separate' (default)
+                        step = make_step_streaming(helper, sel_frac, use_second_order=cfg.use_second_order, has_compression=has_comp)
                     return model, optimizer, tokenizer, grad_hook, step
                 return wrapped_setup
 
@@ -1703,7 +1866,11 @@ def run_benchmark(methods: List[str], config: BenchmarkConfig, output_file: Opti
                 def wrapped_setup(cfg):
                     model, optimizer, tokenizer, grad_hook = base_setup(cfg)
                     helper = SelectionStepHelper(tokenizer, cfg.seq_length, cfg.val_batch_size, cfg.device, cfg)
-                    step = make_step_greats(helper, sel_frac, use_second_order=cfg.use_second_order, has_compression=has_comp)
+                    # Choose step function based on val_strategy
+                    if cfg.val_strategy == 'merged':
+                        step = make_step_greats_merged(helper, sel_frac, use_second_order=cfg.use_second_order, has_compression=has_comp)
+                    else:  # 'separate' (default)
+                        step = make_step_greats(helper, sel_frac, use_second_order=cfg.use_second_order, has_compression=has_comp)
                     return model, optimizer, tokenizer, grad_hook, step
                 return wrapped_setup
 
@@ -1737,12 +1904,12 @@ def run_benchmark(methods: List[str], config: BenchmarkConfig, output_file: Opti
 
     # Print summary table
     if results:
-        print("\n" + "=" * 120)
+        print("\n" + "=" * 130)
         print("BENCHMARK SUMMARY")
-        print(f"Model: {config.model_name} | Dataset: {config.dataset} | Batch: {config.batch_size} | Val Batch: {config.val_batch_size} | Seq: {config.seq_length} | Dtype: {config.dtype}")
-        print("=" * 110)
+        print(f"Model: {config.model_name} | Dataset: {config.dataset} | Batch: {config.batch_size} | Val Batch: {config.val_batch_size} | Seq: {config.seq_length} | Dtype: {config.dtype} | Val Strategy: {config.val_strategy}")
+        print("=" * 130)
         print(f"{'Method':<28} {'Peak Mem':<12} {'Setup Mem':<12} {'Time/Iter':<14} {'Throughput':<16} {'Total Time':<12}")
-        print("-" * 110)
+        print("-" * 130)
         for r in results:
             peak_mem = f"{r.peak_memory_gb:.2f} GB"
             setup_mem = f"{r.memory_after_setup_gb:.2f} GB"
@@ -1750,7 +1917,7 @@ def run_benchmark(methods: List[str], config: BenchmarkConfig, output_file: Opti
             throughput = f"{r.throughput_samples_per_sec:.2f} samp/s"
             total_time = f"{r.total_time_sec:.1f} s"
             print(f"{r.method_name:<28} {peak_mem:<12} {setup_mem:<12} {time_iter:<14} {throughput:<16} {total_time:<12}")
-        print("=" * 110)
+        print("=" * 130)
 
     # Save results
     if output_file:
@@ -1797,12 +1964,12 @@ def print_summary_from_file(results_file: str):
         print("No results found in file.")
         return
 
-    print("\n" + "=" * 120)
+    print("\n" + "=" * 130)
     print("BENCHMARK SUMMARY (Aggregated)")
-    print(f"Model: {config['model_name']} | Dataset: {config.get('dataset', 'N/A')} | Batch: {config['batch_size']} | Val Batch: {config['val_batch_size']} | Seq: {config['seq_length']} | Dtype: {config['dtype']}")
-    print("=" * 110)
+    print(f"Model: {config['model_name']} | Dataset: {config.get('dataset', 'N/A')} | Batch: {config['batch_size']} | Val Batch: {config['val_batch_size']} | Seq: {config['seq_length']} | Dtype: {config['dtype']} | Val Strategy: {config.get('val_strategy', 'N/A')}")
+    print("=" * 130)
     print(f"{'Method':<28} {'Peak Mem':<12} {'Setup Mem':<12} {'Time/Iter':<14} {'Throughput':<16} {'Total Time':<12}")
-    print("-" * 110)
+    print("-" * 130)
     for r in results:
         peak_mem = f"{r['peak_memory_gb']:.2f} GB"
         setup_mem = f"{r['memory_after_setup_gb']:.2f} GB"
@@ -1810,10 +1977,13 @@ def print_summary_from_file(results_file: str):
         throughput = f"{r['throughput_samples_per_sec']:.2f} samp/s"
         total_time = f"{r['total_time_sec']:.1f} s"
         print(f"{r['method_name']:<28} {peak_mem:<12} {setup_mem:<12} {time_iter:<14} {throughput:<16} {total_time:<12}")
-    print("=" * 110)
+    print("=" * 130)
 
 
 def main():
+    # Get defaults from BenchmarkConfig for help text
+    defaults = BenchmarkConfig()
+
     parser = argparse.ArgumentParser(
         description='Memory and Performance Benchmark for Gradient Streaming',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1834,37 +2004,45 @@ Examples:
 
     # Method selection
     parser.add_argument('--methods', nargs='+', default=['NA_NA_Full', 'Streaming_LoGra_Full'],
-                        help=f'Methods to benchmark. Use --list to see all available methods.')
+                        help='Methods to benchmark. Use --list to see all available methods.')
     parser.add_argument('--all', action='store_true', help='Run all methods')
     parser.add_argument('--list', action='store_true', help='List all available methods and exit')
 
-    # Model config
-    parser.add_argument('--model', type=str, default='meta-llama/Llama-3.2-1B', help='Model name')
-    parser.add_argument('--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16', 'float16'])
+    # Model config (defaults from BenchmarkConfig)
+    parser.add_argument('--model', type=str, default=None,
+                        help=f'Model name (default: {defaults.model_name})')
+    parser.add_argument('--dtype', type=str, default=None, choices=['float32', 'bfloat16', 'float16'],
+                        help=f'Data type (default: {defaults.dtype})')
     parser.add_argument('--no-flash-attention', action='store_true', help='Disable flash attention')
 
-    # Training config
-    parser.add_argument('--batch-size', type=int, default=8)
-    parser.add_argument('--seq-length', type=int, default=512)
-    parser.add_argument('--val-batch-size', type=int, default=1,
-                        help='Validation batch size for data selection (Streaming/GREATS)')
+    # Training config (defaults from BenchmarkConfig)
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help=f'Training batch size (default: {defaults.batch_size})')
+    parser.add_argument('--seq-length', type=int, default=None,
+                        help=f'Sequence length (default: {defaults.seq_length})')
+    parser.add_argument('--val-batch-size', type=int, default=None,
+                        help=f'Validation batch size for data selection (default: {defaults.val_batch_size})')
 
-    # Dataset config
-    parser.add_argument('--dataset', type=str, default='alpaca',
+    # Dataset config (defaults from BenchmarkConfig)
+    parser.add_argument('--dataset', type=str, default=None,
                         choices=['dummy', 'alpaca', 'gsm8k', 'dolly', 'openhermes'],
-                        help='Dataset to use for benchmarking. "dummy" uses synthetic data, '
-                             'others load real data from HuggingFace with proper tokenization.')
+                        help=f'Dataset to use. "dummy" uses synthetic data, others load from HuggingFace (default: {defaults.dataset})')
 
-    # Benchmark config
-    parser.add_argument('--num-warmup', type=int, default=20)
-    parser.add_argument('--num-iterations', type=int, default=20)
+    # Benchmark config (defaults from BenchmarkConfig)
+    parser.add_argument('--num-warmup', type=int, default=None,
+                        help=f'Number of warmup iterations (default: {defaults.num_warmup})')
+    parser.add_argument('--num-iterations', type=int, default=None,
+                        help=f'Number of timed iterations (default: {defaults.num_iterations})')
 
-    # Selection config
+    # Selection config (defaults from BenchmarkConfig)
     parser.add_argument('--use-second-order', action='store_true',
                         help='Use second-order interactions for selection (greedy, slower but more accurate)')
+    parser.add_argument('--val-strategy', type=str, default=None, choices=['separate', 'merged'],
+                        help=f'Validation gradient strategy (default: {defaults.val_strategy})')
 
-    # Reproducibility
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    # Reproducibility (defaults from BenchmarkConfig)
+    parser.add_argument('--seed', type=int, default=None,
+                        help=f'Random seed for reproducibility (default: {defaults.seed})')
 
     # Output
     parser.add_argument('--output', type=str, default=None, help='Output JSON file')
@@ -1917,20 +2095,7 @@ Examples:
         print(f"Total: {len(ALL_METHODS)} methods")
         return
 
-    config = BenchmarkConfig(
-        model_name=args.model,
-        dtype=args.dtype,
-        use_flash_attention=not args.no_flash_attention,
-        batch_size=args.batch_size,
-        seq_length=args.seq_length,
-        val_batch_size=args.val_batch_size,
-        dataset=args.dataset,
-        num_warmup=args.num_warmup,
-        num_iterations=args.num_iterations,
-        use_second_order=args.use_second_order,
-        seed=args.seed,
-    )
-
+    config = BenchmarkConfig.from_args(args)
     methods = ALL_METHODS if args.all else args.methods
 
     print("Benchmark Configuration:")
@@ -1944,6 +2109,7 @@ Examples:
     print(f"  Warmup Iterations: {config.num_warmup}")
     print(f"  Timed Iterations: {config.num_iterations}")
     print(f"  Use Second Order: {config.use_second_order}")
+    print(f"  Val Strategy: {config.val_strategy}")
     print(f"  Seed: {config.seed}")
     print(f"  Methods: {methods}")
     print()

@@ -6,31 +6,31 @@ Comprehensive benchmarking suite for comparing memory usage and throughput acros
 
 ### Gradient Streaming Methods
 
-| #   | Experiment                    | Description                               |
-| --- | ----------------------------- | ----------------------------------------- |
-| 1a  | `NA-NA-Full`                  | Baseline full fine-tuning (AdamW)         |
-| 1b  | `NA-NA-LoRA`                  | Baseline LoRA fine-tuning (AdamW)         |
-| 2a  | `Streaming-NA-Full`           | Per-layer selection, full gradients       |
-| 2b  | `Streaming-NA-LoRA`           | Per-layer selection, full gradients, LoRA |
-| 3a  | `GREATS-NA-Full`              | Global selection, full gradients          |
-| 3b  | `GREATS-NA-LoRA`              | Global selection, full gradients, LoRA    |
-| 4   | `Streaming-LoGra-Full`        | Per-layer selection + MeSO                |
-| 5   | `GREATS-LoGra-Full`           | Global selection + MeSO                   |
-| 6a  | `Streaming-LoGra-Full` + 2nd  | Per-layer + MeSO + second-order selection |
-| 6b  | `GREATS-LoGra-Full` + 2nd     | Global + MeSO + second-order selection    |
+| #   | Experiment                   | Description                               |
+| --- | ---------------------------- | ----------------------------------------- |
+| 1a  | `NA-NA-Full`                 | Baseline full fine-tuning (AdamW)         |
+| 1b  | `NA-NA-LoRA`                 | Baseline LoRA fine-tuning (AdamW)         |
+| 2a  | `Streaming-NA-Full`          | Per-layer selection, full gradients       |
+| 2b  | `Streaming-NA-LoRA`          | Per-layer selection, full gradients, LoRA |
+| 3a  | `GREATS-NA-Full`             | Global selection, full gradients          |
+| 3b  | `GREATS-NA-LoRA`             | Global selection, full gradients, LoRA    |
+| 4   | `Streaming-LoGra-Full`       | Per-layer selection + MeSO                |
+| 5   | `GREATS-LoGra-Full`          | Global selection + MeSO                   |
+| 6a  | `Streaming-LoGra-Full` + 2nd | Per-layer + MeSO + second-order selection |
+| 6b  | `GREATS-LoGra-Full` + 2nd    | Global + MeSO + second-order selection    |
 
 ### Gradient Checkpointing Variants
 
 All selection methods have `_gc` variants with gradient checkpointing enabled (use `--gc` flag):
 
-| Method                     | Description                     |
-| -------------------------- | ------------------------------- |
-| `Streaming-NA-Full` + gc   | Streaming + full gradients + GC |
-| `Streaming-NA-LoRA` + gc   | Streaming + LoRA + GC           |
-| `Streaming-LoGra-Full` + gc| Streaming + MeSO + GC           |
-| `GREATS-NA-Full` + gc      | GREATS + full gradients + GC    |
-| `GREATS-NA-LoRA` + gc      | GREATS + LoRA + GC              |
-| `GREATS-LoGra-Full` + gc   | GREATS + MeSO + GC              |
+| Method                      | Description                     |
+| --------------------------- | ------------------------------- |
+| `Streaming-NA-Full` + gc    | Streaming + full gradients + GC |
+| `Streaming-NA-LoRA` + gc    | Streaming + LoRA + GC           |
+| `Streaming-LoGra-Full` + gc | Streaming + MeSO + GC           |
+| `GREATS-NA-Full` + gc       | GREATS + full gradients + GC    |
+| `GREATS-NA-LoRA` + gc       | GREATS + LoRA + GC              |
+| `GREATS-LoGra-Full` + gc    | GREATS + MeSO + GC              |
 
 ### External Baselines (for comparison)
 
@@ -120,33 +120,17 @@ bash benchmark.sh --methods all --dry-run
 ```
 ==============================================================================================================
 BENCHMARK SUMMARY (Aggregated)
-Model: meta-llama/Llama-3.2-1B | Batch: 16 | Val Batch: 1 | Seq: 512 | Dtype: bfloat16
+Model: meta-llama/Llama-3.2-1B | Dataset: alpaca | Batch: 16 | Val Batch: 1 | Seq: 512 | Dtype: bfloat16 | Val Strategy: merged
 ==============================================================================================================
 Method                       Peak Mem     Setup Mem    Time/Iter      Throughput       Total Time
 --------------------------------------------------------------------------------------------------------------
-NA_NA_Full                   34.11 GB     2.30 GB      981.0 ms       16.31 samp/s     19.6 s
-NA_NA_LoRA                   27.90 GB     2.32 GB      828.0 ms       19.32 samp/s     16.6 s
-NA_NA_Full_gc                21.25 GB     2.30 GB      1195.8 ms      13.38 samp/s     23.9 s
-NA_NA_LoRA_gc                16.62 GB     2.32 GB      1110.0 ms      14.41 samp/s     22.2 s
-Streaming_NA_Full            33.45 GB     2.31 GB      1074.6 ms      14.89 samp/s     21.5 s
-Streaming_NA_LoRA            27.12 GB     2.32 GB      873.6 ms       18.31 samp/s     17.5 s
-Streaming_NA_Full_gc         20.06 GB     2.31 GB      1295.7 ms      12.35 samp/s     25.9 s
-Streaming_NA_LoRA_gc         15.41 GB     2.32 GB      1118.3 ms      14.31 samp/s     22.4 s
-Streaming_LoGra_Full         29.76 GB     3.11 GB      903.3 ms       17.71 samp/s     18.1 s
-Streaming_LoGra_Full_gc      16.37 GB     3.11 GB      1128.2 ms      14.18 samp/s     22.6 s
-GREATS_NA_Full               30.69 GB     2.31 GB      1333.8 ms      12.00 samp/s     26.7 s
-GREATS_NA_LoRA               27.13 GB     2.32 GB      1218.9 ms      13.13 samp/s     24.4 s
-GREATS_NA_Full_gc            17.30 GB     2.31 GB      1667.2 ms      9.60 samp/s      33.3 s
-GREATS_NA_LoRA_gc            15.42 GB     2.32 GB      1621.4 ms      9.87 samp/s      32.4 s
-GREATS_LoGra_Full            29.76 GB     3.11 GB      1296.7 ms      12.34 samp/s     25.9 s
-GREATS_LoGra_Full_gc         16.37 GB     3.11 GB      1634.7 ms      9.79 samp/s      32.7 s
-Full_sgd                     29.50 GB     2.30 GB      900.4 ms       17.77 samp/s     18.0 s
-Full_sgd_momentum            31.80 GB     2.30 GB      909.5 ms       17.59 samp/s     18.2 s
-LoRA_sgd                     27.87 GB     2.32 GB      828.4 ms       19.31 samp/s     16.6 s
-LoRA_sgd_momentum            27.89 GB     2.32 GB      828.0 ms       19.32 samp/s     16.6 s
-Full_sgd_gc                  16.64 GB     2.30 GB      1114.9 ms      14.35 samp/s     22.3 s
-Full_sgd_momentum_gc         18.95 GB     2.30 GB      1125.0 ms      14.22 samp/s     22.5 s
-LoRA_sgd_gc                  16.59 GB     2.32 GB      1102.7 ms      14.51 samp/s     22.1 s
-LoRA_sgd_momentum_gc         16.61 GB     2.32 GB      1107.9 ms      14.44 samp/s     22.2 s
+NA_NA_Full                   33.04 GB     2.30 GB      481.9 ms       33.20 samp/s     48.2 s
+NA_NA_LoRA                   27.59 GB     2.33 GB      384.0 ms       41.67 samp/s     38.4 s
+Streaming_NA_Full            32.34 GB     2.31 GB      591.9 ms       27.03 samp/s     59.2 s
+Streaming_NA_LoRA            26.76 GB     2.32 GB      388.3 ms       41.20 samp/s     38.8 s
+GREATS_NA_Full               29.57 GB     2.31 GB      696.0 ms       22.99 samp/s     69.6 s
+GREATS_NA_LoRA               26.77 GB     2.32 GB      583.9 ms       27.40 samp/s     58.4 s
+Streaming_LoGra_Full         28.64 GB     3.11 GB      430.8 ms       37.14 samp/s     43.1 s
+GREATS_LoGra_Full            28.64 GB     3.11 GB      612.7 ms       26.12 samp/s     61.3 s
 ==============================================================================================================
 ```

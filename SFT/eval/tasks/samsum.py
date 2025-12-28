@@ -1,5 +1,5 @@
 """
-SAMSum evaluation module for dialogue summarization.
+SamSUM evaluation module for dialogue summarization.
 
 Uses ROUGE metrics (ROUGE-1, ROUGE-2, ROUGE-L) for evaluation.
 """
@@ -19,7 +19,7 @@ rouge_metric = evaluate.load("rouge")
 
 def load_samsum_test_data(data_dir: str, k: int = -1) -> List[Tuple[str, str]]:
     """
-    Load SAMSum test data from unified JSONL format.
+    Load SamSUM test data from unified JSONL format.
 
     Args:
         data_dir: Base data directory containing eval/samsum/
@@ -32,7 +32,7 @@ def load_samsum_test_data(data_dir: str, k: int = -1) -> List[Tuple[str, str]]:
 
     if not os.path.exists(file_path):
         raise FileNotFoundError(
-            f"SAMSum test data not found: {file_path}\n"
+            f"SamSUM test data not found: {file_path}\n"
             f"Please run: python SFT/data/prepare_datasets.py --datasets samsum"
         )
 
@@ -91,7 +91,7 @@ def compute_accuracy(
     max_new_tokens: int = 128
 ) -> dict:
     """
-    Evaluate model on SAMSum test set using ROUGE metrics.
+    Evaluate model on SamSUM test set using ROUGE metrics.
 
     Args:
         args: Arguments containing n_test and data_dir
@@ -108,7 +108,7 @@ def compute_accuracy(
 
     # Load test data
     test_data = load_samsum_test_data(data_dir, k=n_test)
-    print(f"Loaded {len(test_data)} SAMSum test examples")
+    print(f"Loaded {len(test_data)} SamSUM test examples")
 
     # Extract prompts and references
     prompts = [prompt for prompt, _ in test_data]
@@ -144,7 +144,7 @@ def compute_accuracy(
     rouge_scores = compute_rouge_scores(cleaned_predictions, references)
 
     # Print results
-    print(f"\nSAMSum Evaluation Results:")
+    print(f"\nSamSUM Evaluation Results:")
     print(f"  ROUGE-1: {rouge_scores['rouge1']:.4f}")
     print(f"  ROUGE-2: {rouge_scores['rouge2']:.4f}")
     print(f"  ROUGE-L: {rouge_scores['rougeL']:.4f}")
@@ -162,7 +162,7 @@ def evaluate_samsum(
     max_new_tokens: int = 128
 ) -> dict:
     """
-    Standalone function to evaluate SAMSum without args object.
+    Standalone function to evaluate SamSUM without args object.
 
     Args:
         model: The model to evaluate

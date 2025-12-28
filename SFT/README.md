@@ -27,7 +27,7 @@ python SFT/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
 
 | Dataset   | Task Type          | Description                                              |
 | --------- | ------------------ | -------------------------------------------------------- |
-| `samsum`  | Summarization      | SAMSum dialogue summarization                            |
+| `samsum`  | Summarization      | SamSUM dialogue summarization                            |
 | `tydiqa`  | Question Answering | Typologically Diverse QA (9 languages)                   |
 | `mmlu`    | Multiple Choice    | Massive Multitask Language Understanding (57 subjects)   |
 | `bbh`     | Reasoning          | BIG-Bench Hard (23 challenging reasoning tasks with CoT) |
@@ -56,7 +56,7 @@ The following methods have been run and can be rerun with the commands below.
 
 | Train Dataset | Eval Task | Percentage | Batch | Val Size | LoRA Rank |
 | ------------- | --------- | ---------- | ----- | -------- | --------- |
-| Alpaca        | SAMSum    | 0.4        | 8     | 32       | 32        |
+| Alpaca        | SamSUM    | 0.4        | 8     | 32       | 32        |
 | Tulu3         | TydiQA    | 0.01       | 8     | 32       | 32        |
 | LESS          | MMLU      | 0.05       | 8     | 32       | 128       |
 | LESS          | BBH       | 0.05       | 8     | 32       | 128       |
@@ -95,7 +95,7 @@ We consider the following 8 methods for each of the training datasets above:
 The `SFT/train/lr/` folder contains tools for finding optimal learning rates, where learning rates are managed via `SFT/train/lr/config.json`. Run LR sweep before full training to find optimal learning rates:
 
 ```bash
-# Alpaca -> SAMSum
+# Alpaca -> SamSUM
 bash SFT/train/lr/lr_sweep.sh --mode binary --methods all --train alpaca --task samsum --batch_size 8 --n_val 8 --sweep_percentage 0.04 --seed 2
 
 # Tulu3 -> TydiQA
@@ -112,7 +112,7 @@ You can also run grid search via `--mode grid`.
 All methods are launched using the unified `train.sh` script. Training commands for each experiment (LRs loaded from lr_config.json):
 
 ```bash
-# Alpaca -> SAMSum
+# Alpaca -> SamSUM
 bash SFT/train/train.sh --methods all --train alpaca --task samsum --batch_size 8 --n_val 32 --percentage 0.4 --seed 42
 
 # Tulu3 -> TydiQA
@@ -158,14 +158,14 @@ Available Categories:
 
 | Category         | Experiments                                                |
 | ---------------- | ---------------------------------------------------------- |
-| `all`            | All 8 methods                                          |
+| `all`            | All 8 methods                                              |
 | `baseline`       | NA-NA-Full, NA-NA-LoRA                                     |
 | `streaming`      | Streaming-NA-Full, Streaming-NA-LoRA, Streaming-LoGra-Full |
 | `greats`         | GREATS-NA-Full, GREATS-NA-LoRA, GREATS-LoGra-Full          |
-| `full`           | All *-Full methods (5 total)                           |
-| `lora`           | All *-LoRA methods (3 total)                           |
+| `full`           | All *-Full methods (5 total)                               |
+| `lora`           | All *-LoRA methods (3 total)                               |
 | `compression`    | Streaming-LoGra-Full, GREATS-LoGra-Full                    |
-| `no-compression` | All methods without compression (6 total)              |
+| `no-compression` | All methods without compression (6 total)                  |
 
 #### Parameters
 
@@ -217,12 +217,12 @@ The unified training script accepts the following arguments:
 Evaluation commands for each experiment:
 
 ```bash
-# Alpaca -> SAMSum
-bash SFT/eval/eval.sh --train alpaca --task samsum --batch_size 64 --seed 82 --n_test 500
+# Alpaca -> SamSUM
+bash SFT/eval/eval.sh --train alpaca --task samsum --batch_size 64
 
 # Tulu3 -> TyDiQA
-bash SFT/eval/eval.sh --train tulu3 --task tydiqa --batch_size 64 --seed 82
+bash SFT/eval/eval.sh --train tulu3 --task tydiqa --batch_size 64 --n_test 500
 
 # LESS -> MMLU/BBH
-bash SFT/eval/eval.sh --train less --task mmlu --subject sociology --batch_size 64 --seed 82
+bash SFT/eval/eval.sh --train less --task mmlu --subject sociology --batch_size 64
 ```
