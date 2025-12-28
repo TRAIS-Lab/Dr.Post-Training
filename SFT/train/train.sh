@@ -67,14 +67,14 @@ subject="sociology"
 compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer.
 use_second_order=false  # If true, use greedy selection with second-order interactions
 selection_frac="0.5"  # Fraction of samples to select (for Streaming/GREATS)
-val_strategy="joint_batch"  # Validation strategy: cached_factorized, cached_full, joint_batch
+val_strategy="merged_batch"  # Validation strategy: separate_batch_factorized, separate_batch, merged_batch
 use_lora=false
 use_flash_attention=true
 enable_profile=false
 profile_steps=10
 
-# Multi-experiment mode
-experiments=""  # Comma-separated list of experiments or categories
+# Multi-method mode
+methods=""  # Comma-separated list of methods or categories
 dry_run=false
 use_sbatch=false
 
@@ -82,10 +82,10 @@ use_sbatch=false
 fallback_lr_full="5e-05"
 fallback_lr_lora="2e-04"
 
-# Experiment definitions
+# Method definitions
 # Format: "NAME:data_selection:compression:use_lora"
-# Note: use_second_order is controlled by the --use_second_order flag, not per-experiment
-declare -A EXPERIMENT_DEFS=(
+# Note: use_second_order is controlled by the --use_second_order flag, not per-method
+declare -A METHOD_DEFS=(
     ["NA-NA-Full"]="NA::false"
     ["NA-NA-LoRA"]="NA::true"
     ["Streaming-NA-Full"]="Streaming::false"
@@ -97,7 +97,7 @@ declare -A EXPERIMENT_DEFS=(
 )
 
 # Category mappings
-declare -A CATEGORY_EXPERIMENTS=(
+declare -A CATEGORY_METHODS=(
     ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
     ["baseline"]="NA-NA-Full,NA-NA-LoRA"
     ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
@@ -224,12 +224,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --lr_lora)
             # Deprecated: LRs are now managed via lr_config.json
-            # This sets the fallback LR for LoRA experiments
+            # This sets the fallback LR for LoRA methods
             fallback_lr_lora="$2"
             shift 2
             ;;
-        --experiments)
-            experiments="$2"
+        --methods)
+            methods="$2"
             shift 2
             ;;
         --dry-run)
@@ -251,29 +251,29 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
-            echo "Run single or multiple training experiments."
+            echo "Run single or multiple training methods."
             echo ""
-            echo "Multi-Experiment Mode:"
-            echo "  --experiments <list>                   Run multiple experiments (see below)"
+            echo "Multi-Method Mode:"
+            echo "  --methods <list>                       Run multiple methods (see below)"
             echo "  --dry-run                              Print commands without executing"
             echo "  --sbatch                               Use sbatch instead of bash"
             echo ""
-            echo "  Experiment names: NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, Streaming-NA-LoRA,"
-            echo "                    GREATS-NA-Full, GREATS-NA-LoRA, Streaming-LoGra-Full, GREATS-LoGra-Full"
+            echo "  Method names: NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, Streaming-NA-LoRA,"
+            echo "                GREATS-NA-Full, GREATS-NA-LoRA, Streaming-LoGra-Full, GREATS-LoGra-Full"
             echo ""
             echo "  Categories: all, baseline, streaming, greats, Full, LoRA, compression, no-compression"
             echo ""
             echo "  Examples:"
-            echo "    --experiments all                    Run all 8 experiments"
-            echo "    --experiments baseline               Run NA-NA-Full and NA-NA-LoRA"
-            echo "    --experiments \"streaming,greats\"     Run all Streaming and GREATS experiments"
-            echo "    --experiments \"NA-NA-Full,Streaming-LoGra-Full\"  Run specific experiments"
+            echo "    --methods all                        Run all 8 methods"
+            echo "    --methods baseline                   Run NA-NA-Full and NA-NA-LoRA"
+            echo "    --methods \"streaming,greats\"         Run all Streaming and GREATS methods"
+            echo "    --methods \"NA-NA-Full,Streaming-LoGra-Full\"  Run specific methods"
             echo ""
-            echo "Single Experiment Options:"
+            echo "Single Method Options:"
             echo "  --data_selection <method>              Data selection: NA, Streaming, GREATS (default: NA)"
             echo "  --compression <method>                 Compression: LoGra, GraSS (implies MeSO optimizer)"
             echo "  --use_second_order                     Use greedy selection with second-order interactions"
-            echo "  --val_strategy <strategy>              Validation strategy: cached_factorized (default), cached_full, joint_batch"
+            echo "  --val_strategy <strategy>              Validation strategy: separate_batch_factorized (default), separate_batch, merged_batch"
             echo ""
             echo "  --lora                                 Use LoRA fine-tuning (default: full fine-tuning)"
             echo "  --lora_alpha <alpha>                   LoRA alpha (default: 1)"
@@ -281,7 +281,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --lora_dropout <dropout>               LoRA dropout (default: 0.1)"
             echo "  --lora_target_modules <modules>        Target modules (default: q_proj k_proj v_proj o_proj)"
             echo ""
-            echo "Shared Options (apply to all experiments):"
+            echo "Shared Options (apply to all methods):"
             echo "  --model <model>                        HuggingFace model path (default: meta-llama/Llama-3.2-1B)"
             echo "  --task <task>                          Task: mmlu, bbh, tydiqa, samsum, gsm8k (default: mmlu)"
             echo "  --train <dataset>                      Training dataset (default: task-based)"
@@ -295,7 +295,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Learning Rate Resolution:"
             echo "  1. If --lr is specified, use that value"
-            echo "  2. Otherwise, look up from lr_config.json based on {train}_{task} + experiment"
+            echo "  2. Otherwise, look up from lr_config.json based on {train}_{task} + method"
             echo "  3. If not found, use fallback (5e-05 for full, 2e-04 for LoRA)"
             echo ""
             echo "  Run lr_sweep.sh first to populate lr_config.json with optimal LRs."
@@ -328,9 +328,9 @@ done
 model_name=$(basename "$model")
 
 # ========================================
-# Resolve experiment names from categories
+# Resolve method names from categories
 # ========================================
-resolve_experiments() {
+resolve_methods() {
     local input="$1"
     local resolved=""
 
@@ -340,23 +340,23 @@ resolve_experiments() {
         item=$(echo "$item" | xargs)  # trim whitespace
 
         # Check if it's a category
-        if [[ -n "${CATEGORY_EXPERIMENTS[$item]}" ]]; then
+        if [[ -n "${CATEGORY_METHODS[$item]}" ]]; then
             if [[ -n "$resolved" ]]; then
-                resolved="$resolved,${CATEGORY_EXPERIMENTS[$item]}"
+                resolved="$resolved,${CATEGORY_METHODS[$item]}"
             else
-                resolved="${CATEGORY_EXPERIMENTS[$item]}"
+                resolved="${CATEGORY_METHODS[$item]}"
             fi
-        # Check if it's a valid experiment name
-        elif [[ -n "${EXPERIMENT_DEFS[$item]}" ]]; then
+        # Check if it's a valid method name
+        elif [[ -n "${METHOD_DEFS[$item]}" ]]; then
             if [[ -n "$resolved" ]]; then
                 resolved="$resolved,$item"
             else
                 resolved="$item"
             fi
         else
-            echo "ERROR: Unknown experiment or category: $item"
-            echo "Valid experiments: ${!EXPERIMENT_DEFS[*]}"
-            echo "Valid categories: ${!CATEGORY_EXPERIMENTS[*]}"
+            echo "ERROR: Unknown method or category: $item"
+            echo "Valid methods: ${!METHOD_DEFS[*]}"
+            echo "Valid categories: ${!CATEGORY_METHODS[*]}"
             exit 1
         fi
     done
@@ -412,9 +412,9 @@ except:
 }
 
 # ========================================
-# Function to run a single experiment
+# Function to run a single method
 # ========================================
-run_single_experiment() {
+run_single_method() {
     local exp_data_selection="$1"
     local exp_compression="$2"
     local exp_use_lora="$3"
@@ -601,13 +601,13 @@ run_single_experiment() {
 # ========================================
 # Main execution logic
 # ========================================
-if [[ -n "$experiments" ]]; then
-    # Multi-experiment mode
-    resolved_experiments=$(resolve_experiments "$experiments")
+if [[ -n "$methods" ]]; then
+    # Multi-method mode
+    resolved_methods=$(resolve_methods "$methods")
 
     echo ""
     echo "========================================================"
-    echo "  Multi-Experiment Mode"
+    echo "  Multi-Method Mode"
     echo "========================================================"
     echo "Task: $task"
     echo "Training data: ${train_dataset:-default}"
@@ -625,24 +625,24 @@ if [[ -n "$experiments" ]]; then
     echo "  Learning rate (LoRA): $lr_lora"
     echo "  N_val: $n_val"
     echo ""
-    echo "Experiments to run: $resolved_experiments"
+    echo "Methods to run: $resolved_methods"
     echo "========================================================"
 
-    # Count experiments
-    exp_count=$(echo "$resolved_experiments" | tr ',' '\n' | wc -l)
+    # Count methods
+    method_count=$(echo "$resolved_methods" | tr ',' '\n' | wc -l)
     current=0
 
-    # Run each experiment
-    IFS=',' read -ra exp_list <<< "$resolved_experiments"
-    for exp_name in "${exp_list[@]}"; do
+    # Run each method
+    IFS=',' read -ra method_list <<< "$resolved_methods"
+    for method_name in "${method_list[@]}"; do
         current=$((current + 1))
         echo ""
         echo "========================================================"
-        echo "  [$current/$exp_count] $exp_name"
+        echo "  [$current/$method_count] $method_name"
         echo "========================================================"
 
-        # Parse experiment definition
-        IFS=':' read -ra exp_parts <<< "${EXPERIMENT_DEFS[$exp_name]}"
+        # Parse method definition
+        IFS=':' read -ra exp_parts <<< "${METHOD_DEFS[$method_name]}"
         exp_data_selection="${exp_parts[0]}"
         exp_compression="${exp_parts[1]}"
         exp_use_lora="${exp_parts[2]}"
@@ -658,19 +658,19 @@ if [[ -n "$experiments" ]]; then
         fi
 
         # Look up learning rate from config
-        exp_lr=$(lookup_lr "$config_key" "$exp_name" "$exp_use_lora")
+        exp_lr=$(lookup_lr "$config_key" "$method_name" "$exp_use_lora")
 
-        run_single_experiment "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$exp_lr" "$exp_name"
+        run_single_method "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$exp_lr" "$method_name"
     done
 
     echo ""
     echo "========================================================"
-    echo "  All experiments completed!"
+    echo "  All methods completed!"
     echo "========================================================"
-    echo "Total: $exp_count experiments"
+    echo "Total: $method_count methods"
 
 else
-    # Single experiment mode (original behavior)
+    # Single method mode (original behavior)
 
     # ========================================
     # Compression Configuration
@@ -695,7 +695,7 @@ if [[ -n "$compression" ]]; then
             ;;
         GraSS)
             # GraSS: Random mask sparsification + SJLT projection
-            # (Available but not used in default experiments)
+            # (Available but not used in default methods)
             if [ "$use_lora" = true ]; then
                 sparsification="random_mask-256*256"
                 projection="sjlt-16384"
@@ -742,7 +742,7 @@ esac
 # Build method string: {selection}-{compression}
 method_str="${data_selection}-${compression:-NA}"
 
-# Add second-order suffix for data selection experiments
+# Add second-order suffix for data selection methods
 if [[ "$data_selection" != "NA" ]] && [ "$use_second_order" = true ]; then
     method_str="${method_str}-2nd"
 fi
@@ -750,7 +750,7 @@ fi
 # Build train string for job name
 train_str="${train_dataset:-default}"
 
-# Build experiment name for LR lookup
+# Build method name for LR lookup
 exp_name="${data_selection}-${compression:-NA}-${job_type}"
 
 # Look up learning rate from config (includes subject for mmlu/bbh)
@@ -897,4 +897,4 @@ training_args="$training_args 2>&1 | tee $output_dir/train.log"
 
 eval "$header" "$training_args"
 
-fi  # End of single/multi experiment mode
+fi  # End of single/multi method mode

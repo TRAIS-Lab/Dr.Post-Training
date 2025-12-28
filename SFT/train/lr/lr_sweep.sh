@@ -20,11 +20,11 @@
 # =============================================================================
 # LR Sweep Script
 # =============================================================================
-# Performs learning rate grid search for SFT experiments.
+# Performs learning rate grid search for SFT methods.
 # Runs short training (default 5% of data) with multiple LRs and selects best.
 #
 # Usage:
-#   bash SFT/train/lr_sweep.sh --experiments all --task samsum --train alpaca
+#   bash SFT/train/lr_sweep.sh --methods all --task samsum --train alpaca
 #
 # Output:
 #   - Updates SFT/train/lr_config.json with best LRs
@@ -75,7 +75,7 @@ subject="sociology"
 compression=""
 use_second_order=false  # If true, use greedy selection with second-order interactions
 selection_frac="0.5"  # Fraction of samples to select (for Streaming/GREATS)
-val_strategy="joint_batch"  # Validation strategy: cached_factorized, cached_full, joint_batch
+val_strategy="merged_batch"  # Validation strategy: separate_batch_factorized, separate_batch, merged_batch
 use_lora=false
 use_flash_attention=true
 
@@ -96,8 +96,8 @@ binary_max_iters=8  # ~6 iterations narrows range by ~10x
 # Stability margin: prefer smaller LR unless larger LR is significantly better
 lr_margin=0.01  # 5% - larger LR must have loss at least 5% lower to be preferred
 
-# Multi-experiment mode
-experiments=""
+# Multi-method mode
+methods=""
 dry_run=false
 
 # Output paths
@@ -112,8 +112,8 @@ update_compressor_freq=200
 
 # Experiment definitions (same as train.sh)
 # Format: "NAME:data_selection:compression:use_lora"
-# Note: use_second_order is controlled by the --use_second_order flag, not per-experiment
-declare -A EXPERIMENT_DEFS=(
+# Note: use_second_order is controlled by the --use_second_order flag, not per-method
+declare -A METHOD_DEFS=(
     ["NA-NA-Full"]="NA::false"
     ["NA-NA-LoRA"]="NA::true"
     ["Streaming-NA-Full"]="Streaming::false"
@@ -125,7 +125,7 @@ declare -A EXPERIMENT_DEFS=(
 )
 
 # Category mappings (same as train.sh)
-declare -A CATEGORY_EXPERIMENTS=(
+declare -A CATEGORY_METHODS=(
     ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
     ["baseline"]="NA-NA-Full,NA-NA-LoRA"
     ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
@@ -239,8 +239,8 @@ while [[ $# -gt 0 ]]; do
             lr_config_file="$2"
             shift 2
             ;;
-        --experiments)
-            experiments="$2"
+        --methods)
+            methods="$2"
             shift 2
             ;;
         --dry-run)
@@ -278,7 +278,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
-            echo "Perform learning rate search for SFT experiments."
+            echo "Perform learning rate search for SFT methods."
             echo ""
             echo "Sweep Mode:"
             echo "  --mode <mode>                          Sweep mode: 'grid' (default) or 'binary'"
@@ -305,7 +305,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --lr_config <path>                     Output config file (default: SFT/train/lr/config.json)"
             echo ""
             echo "Multi-Experiment Mode:"
-            echo "  --experiments <list>                   Run sweep for multiple experiments"
+            echo "  --methods <list>                   Run sweep for multiple methods"
             echo "  --dry-run                              Print commands without executing"
             echo ""
             echo "  Experiment names: NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, etc."
@@ -322,7 +322,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --seed <seed>                          Random seed"
             echo ""
             echo "Output:"
-            echo "  - Updates lr_config.json with best LRs per experiment"
+            echo "  - Updates lr_config.json with best LRs per method"
             echo "  - Detailed results in SFT/lr_sweep_results/"
             exit 0
             ;;
@@ -339,28 +339,28 @@ done
 model_name=$(basename "$model")
 
 # ========================================
-# Resolve experiment names from categories
+# Resolve method names from categories
 # ========================================
-resolve_experiments() {
+resolve_methods() {
     local input="$1"
     local resolved=""
     IFS=',' read -ra items <<< "$input"
     for item in "${items[@]}"; do
         item=$(echo "$item" | xargs)
-        if [[ -n "${CATEGORY_EXPERIMENTS[$item]}" ]]; then
+        if [[ -n "${CATEGORY_METHODS[$item]}" ]]; then
             if [[ -n "$resolved" ]]; then
-                resolved="$resolved,${CATEGORY_EXPERIMENTS[$item]}"
+                resolved="$resolved,${CATEGORY_METHODS[$item]}"
             else
-                resolved="${CATEGORY_EXPERIMENTS[$item]}"
+                resolved="${CATEGORY_METHODS[$item]}"
             fi
-        elif [[ -n "${EXPERIMENT_DEFS[$item]}" ]]; then
+        elif [[ -n "${METHOD_DEFS[$item]}" ]]; then
             if [[ -n "$resolved" ]]; then
                 resolved="$resolved,$item"
             else
                 resolved="$item"
             fi
         else
-            echo "ERROR: Unknown experiment or category: $item"
+            echo "ERROR: Unknown method or category: $item"
             exit 1
         fi
     done
@@ -641,25 +641,34 @@ echo ""
 echo "========================================================"
 echo "  Learning Rate Sweep"
 echo "========================================================"
-echo "Config key: $config_key"
-echo "Task: $task"
-echo "Training data: ${train_dataset:-default}"
-echo "Model: $model"
-echo "Sweep percentage: $sweep_percentage"
-echo "Sweep mode: $sweep_mode"
-echo ""
-if [[ "$sweep_mode" == "grid" ]]; then
-    echo "LR grid (Full): $lr_grid"
-    echo "LR grid (LoRA): $lr_grid_lora"
-elif [[ "$sweep_mode" == "binary" ]]; then
-    echo "LR range (Full): $binary_lr_min -> $binary_lr_max"
-    echo "LR range (LoRA): $binary_lr_min_lora -> $binary_lr_max_lora"
-    echo "Max iterations: $binary_max_iters"
+echo "Config key:      $config_key"
+echo "Task:            $task"
+if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
+    echo "Subject:         $subject"
 fi
-echo "LR margin: $lr_margin (prefer smaller LR for stability)"
+echo "Training data:   ${train_dataset:-default}"
+echo "Model:           $model"
 echo ""
-echo "Output config: $lr_config_file"
-echo "Results dir: $sweep_results_dir"
+echo "Training:"
+echo "  Batch size:    $batch_size (val: ${val_batch_size:-$batch_size})"
+echo "  Sweep %:       $sweep_percentage"
+echo "  N val:         $n_val"
+echo "  N eval:        $n_eval"
+echo "  Seed:          $seed"
+echo ""
+echo "Sweep mode:      $sweep_mode"
+if [[ "$sweep_mode" == "grid" ]]; then
+    echo "  LR grid (Full): $lr_grid"
+    echo "  LR grid (LoRA): $lr_grid_lora"
+elif [[ "$sweep_mode" == "binary" ]]; then
+    echo "  LR range (Full): $binary_lr_min -> $binary_lr_max"
+    echo "  LR range (LoRA): $binary_lr_min_lora -> $binary_lr_max_lora"
+    echo "  Max iterations:  $binary_max_iters"
+fi
+echo "  LR margin:     $lr_margin (prefer smaller LR)"
+echo ""
+echo "Output config:   $lr_config_file"
+echo "Results dir:     $sweep_results_dir"
 echo "========================================================"
 
 # Create results directory
@@ -673,22 +682,27 @@ echo "Model: $model" >> "$summary_file"
 echo "Sweep percentage: $sweep_percentage" >> "$summary_file"
 echo "" >> "$summary_file"
 
-if [[ -n "$experiments" ]]; then
-    resolved_experiments=$(resolve_experiments "$experiments")
-    echo "Experiments: $resolved_experiments"
-    echo "Experiments: $resolved_experiments" >> "$summary_file"
+if [[ -n "$methods" ]]; then
+    resolved_methods=$(resolve_methods "$methods")
+    echo "Experiments: $resolved_methods"
+    echo "Experiments: $resolved_methods" >> "$summary_file"
     echo "" >> "$summary_file"
 
-    IFS=',' read -ra exp_list <<< "$resolved_experiments"
+    # Count methods
+    method_count=$(echo "$resolved_methods" | tr ',' '\n' | wc -l)
+    current=0
+
+    IFS=',' read -ra exp_list <<< "$resolved_methods"
 
     for exp_name in "${exp_list[@]}"; do
+        current=$((current + 1))
         echo ""
         echo "========================================================"
-        echo "  Sweeping LR for: $exp_name"
+        echo "  [$current/$method_count] $exp_name"
         echo "========================================================"
 
-        # Parse experiment definition
-        IFS=':' read -ra exp_parts <<< "${EXPERIMENT_DEFS[$exp_name]}"
+        # Parse method definition
+        IFS=':' read -ra exp_parts <<< "${METHOD_DEFS[$exp_name]}"
         exp_data_selection="${exp_parts[0]}"
         exp_compression="${exp_parts[1]}"
         exp_use_lora="${exp_parts[2]}"
@@ -725,7 +739,7 @@ if [[ -n "$experiments" ]]; then
             log_a=$(python3 -c "import math; print(math.log10($current_lr_min))")
             log_b=$(python3 -c "import math; print(math.log10($current_lr_max))")
 
-            # Track all evaluated points to find best (reset for each experiment)
+            # Track all evaluated points to find best (reset for each method)
             declare -A lr_losses
             lr_losses=()
 
@@ -919,10 +933,10 @@ else:
         fi
     done
 else
-    echo "ERROR: Please specify experiments with --experiments"
-    echo "Example: --experiments all"
-    echo "         --experiments baseline"
-    echo "         --experiments NA-NA-Full,Streaming-NA-Full"
+    echo "ERROR: Please specify methods with --methods"
+    echo "Example: --methods all"
+    echo "         --methods baseline"
+    echo "         --methods NA-NA-Full,Streaming-NA-Full"
     exit 1
 fi
 
@@ -930,9 +944,10 @@ echo ""
 echo "========================================================"
 echo "  LR Sweep Complete!"
 echo "========================================================"
+echo "Total: $method_count methods"
 echo "Summary: $summary_file"
 echo "Config updated: $lr_config_file"
 echo ""
 echo "To run full training with these LRs:"
-echo "  bash SFT/train/train.sh --experiments all --task $task --train ${train_dataset:-default}"
+echo "  bash SFT/train/train.sh --methods all --task $task --train ${train_dataset:-default}"
 echo "========================================================"

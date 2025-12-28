@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
 
-from gradstream.selection import create_cached_val_strategy
+from gradstream.selection import create_separate_batch_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +215,7 @@ class StreamingPPOTrainer:
 
         # Create selection strategy for clean separation of selection methods
         # RLHF uses filtering mode: keep positive + drop bottom frac of negative
-        self.selection_strategy = create_cached_val_strategy(
+        self.selection_strategy = create_separate_batch_strategy(
             method=self.method,
             grad_hook=self.grad_hook,
             frac=self.filter_frac,
@@ -1253,7 +1253,7 @@ class StreamingPPOTrainer:
                 f"{self.min_batch_size_for_selection}, using NA strategy"
             )
             # Create temporary NA strategy for this step
-            return create_cached_val_strategy(
+            return create_separate_batch_strategy(
                 method="NA",
                 grad_hook=self.grad_hook,
                 frac=self.filter_frac,

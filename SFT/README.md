@@ -1,6 +1,6 @@
 # SFT Experiments
 
-This folder contains the training and evaluation code and experiment configurations for Supervised Fine-Tuning.
+This folder contains the training and evaluation code and method configurations for Supervised Fine-Tuning.
 
 ## Data Preparation
 
@@ -52,7 +52,7 @@ python SFT/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
 
 ## Experiment Summary
 
-The following experiments have been run and can be rerun with the commands below.
+The following methods have been run and can be rerun with the commands below.
 
 | Train Dataset | Eval Task | Percentage | Batch | Val Size | LoRA Rank |
 | ------------- | --------- | ---------- | ----- | -------- | --------- |
@@ -63,7 +63,7 @@ The following experiments have been run and can be rerun with the commands below
 
 ### Experiment Configurations
 
-We consider the following 8 experiments for each of the training datasets above:
+We consider the following 8 methods for each of the training datasets above:
 
 | #   | Selection | Compression | Training | Description                               |
 | --- | --------- | ----------- | -------- | ----------------------------------------- |
@@ -85,7 +85,7 @@ We consider the following 8 experiments for each of the training datasets above:
 2. Compression Methods
    - **NA**: No compression - uses full gradients and standard AdamW optimizer
    - **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer
-   - **GraSS**: Gradient Sparsification with Sketching (available but not used in default experiments)
+   - **GraSS**: Gradient Sparsification with Sketching (available but not used in default methods)
 3. Training Types
    - **Full**: Full fine-tuning of all model parameters
    - **LoRA**: LoRA fine-tuning of low-rank adapters only
@@ -96,36 +96,30 @@ The `SFT/train/lr/` folder contains tools for finding optimal learning rates, wh
 
 ```bash
 # Alpaca -> SAMSum
-bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --train alpaca --task samsum \
-    --batch_size 8 --n_val 8 --sweep_percentage 0.04 --seed 2
+bash SFT/train/lr/lr_sweep.sh --mode binary --methods all --train alpaca --task samsum --batch_size 8 --n_val 8 --sweep_percentage 0.04 --seed 2
 
 # Tulu3 -> TydiQA
-bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --train tulu3 --task tydiqa \
-    --batch_size 8 --n_val 8 --sweep_percentage 0.001 --seed 2
+bash SFT/train/lr/lr_sweep.sh --mode binary --methods all --train tulu3 --task tydiqa --batch_size 8 --n_val 8 --sweep_percentage 0.001 --seed 2
 
 # LESS -> MMLU/BBH
-bash SFT/train/lr/lr_sweep.sh --mode binary --experiments all --train less --task mmlu --subject sociology \
-    --batch_size 8 --n_val 8 --sweep_percentage 0.005 --seed 2 --lora_r 128
+bash SFT/train/lr/lr_sweep.sh --mode binary --methods all --train less --task mmlu --subject sociology --batch_size 8 --n_val 8 --sweep_percentage 0.005 --seed 2 --lora_r 128
 ```
 
 You can also run grid search via `--mode grid`.
 
 ### Training Commands
 
-All experiments are launched using the unified `train.sh` script. Training commands for each experiment (LRs loaded from lr_config.json):
+All methods are launched using the unified `train.sh` script. Training commands for each experiment (LRs loaded from lr_config.json):
 
 ```bash
 # Alpaca -> SAMSum
-bash SFT/train/train.sh --experiments all --train alpaca --task samsum \
-    --batch_size 8 --n_val 32 --percentage 0.4 --seed 42
+bash SFT/train/train.sh --methods all --train alpaca --task samsum --batch_size 8 --n_val 32 --percentage 0.4 --seed 42
 
 # Tulu3 -> TydiQA
-bash SFT/train/train.sh --experiments all --train tulu3 --task tydiqa \
-    --batch_size 8 --n_val 32 --percentage 0.01 --seed 42
+bash SFT/train/train.sh --methods all --train tulu3 --task tydiqa --batch_size 8 --n_val 32 --percentage 0.01 --seed 42
 
 # LESS -> MMLU/BBH
-bash SFT/train/train.sh --experiments all --train less --task mmlu --subject sociology \
-    --batch_size 8 --n_val 32 --percentage 0.05 --seed 42 --lora_r 128
+bash SFT/train/train.sh --methods all --train less --task mmlu --subject sociology --batch_size 8 --n_val 32 --percentage 0.05 --seed 42 --lora_r 128
 ```
 
 
@@ -133,45 +127,45 @@ bash SFT/train/train.sh --experiments all --train less --task mmlu --subject soc
   <summary>Detailed Training Script Configuration</summary>
 
 #### Run Multiple Experiments
-Run multiple experiments with the `--experiments` flag:
+Run multiple methods with the `--methods` flag:
 
 ```bash
-# Run all 8 experiments
-bash SFT/train/train.sh --experiments all --task mmlu --subject sociology
+# Run all 8 methods
+bash SFT/train/train.sh --methods all --task mmlu --subject sociology
 
 # Run by category
-bash SFT/train/train.sh --experiments baseline --task mmlu      # NA-NA-Full, NA-NA-LoRA
-bash SFT/train/train.sh --experiments streaming --task mmlu     # All Streaming-* variants
-bash SFT/train/train.sh --experiments greats --task mmlu        # All GREATS-* variants
-bash SFT/train/train.sh --experiments compression --task mmlu   # *-LoGra-* variants
-bash SFT/train/train.sh --experiments lora --task mmlu          # All *-LoRA variants
-bash SFT/train/train.sh --experiments full --task mmlu          # All *-Full variants
+bash SFT/train/train.sh --methods baseline --task mmlu      # NA-NA-Full, NA-NA-LoRA
+bash SFT/train/train.sh --methods streaming --task mmlu     # All Streaming-* variants
+bash SFT/train/train.sh --methods greats --task mmlu        # All GREATS-* variants
+bash SFT/train/train.sh --methods compression --task mmlu   # *-LoGra-* variants
+bash SFT/train/train.sh --methods lora --task mmlu          # All *-LoRA variants
+bash SFT/train/train.sh --methods full --task mmlu          # All *-Full variants
 
-# Run specific experiments
-bash SFT/train/train.sh --experiments "NA-NA-Full,Streaming-LoGra-Full" --task mmlu
+# Run specific methods
+bash SFT/train/train.sh --methods "NA-NA-Full,Streaming-LoGra-Full" --task mmlu
 
 # Combine categories
-bash SFT/train/train.sh --experiments "baseline,streaming" --task mmlu
+bash SFT/train/train.sh --methods "baseline,streaming" --task mmlu
 
 # Dry run - preview commands without executing
-bash SFT/train/train.sh --experiments all --task mmlu --dry-run
+bash SFT/train/train.sh --methods all --task mmlu --dry-run
 
 # Submit to SLURM
-bash SFT/train/train.sh --experiments all --task mmlu --sbatch
+bash SFT/train/train.sh --methods all --task mmlu --sbatch
 ```
 
 Available Categories:
 
 | Category         | Experiments                                                |
 | ---------------- | ---------------------------------------------------------- |
-| `all`            | All 8 experiments                                          |
+| `all`            | All 8 methods                                          |
 | `baseline`       | NA-NA-Full, NA-NA-LoRA                                     |
 | `streaming`      | Streaming-NA-Full, Streaming-NA-LoRA, Streaming-LoGra-Full |
 | `greats`         | GREATS-NA-Full, GREATS-NA-LoRA, GREATS-LoGra-Full          |
-| `full`           | All *-Full experiments (5 total)                           |
-| `lora`           | All *-LoRA experiments (3 total)                           |
+| `full`           | All *-Full methods (5 total)                           |
+| `lora`           | All *-LoRA methods (3 total)                           |
 | `compression`    | Streaming-LoGra-Full, GREATS-LoGra-Full                    |
-| `no-compression` | All experiments without compression (6 total)              |
+| `no-compression` | All methods without compression (6 total)              |
 
 #### Parameters
 
@@ -193,7 +187,7 @@ The unified training script accepts the following arguments:
 3. Compression Arguments
    - `--compression <method>` - Gradient compression method (implies MeSO optimizer):
      - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
-     - `GraSS` - Gradient Sparsification with Sketching (available but not used in default experiments)
+     - `GraSS` - Gradient Sparsification with Sketching (available but not used in default methods)
      - If not specified, uses full gradients and standard AdamW optimizer
    - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
 4. Core Training Arguments
@@ -224,7 +218,7 @@ Evaluation commands for each experiment:
 
 ```bash
 # Alpaca -> SAMSum
-bash SFT/eval/eval.sh --train alpaca --task samsum --batch_size 64 --seed 82
+bash SFT/eval/eval.sh --train alpaca --task samsum --batch_size 64 --seed 82 --n_test 500
 
 # Tulu3 -> TyDiQA
 bash SFT/eval/eval.sh --train tulu3 --task tydiqa --batch_size 64 --seed 82

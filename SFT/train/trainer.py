@@ -53,7 +53,7 @@ def compute_train_loss_from_merged(logits, labels, train_batch_size):
 
 from gradstream.optimizer import MeSOAdamW
 from gradstream.hook import GradientHook
-from gradstream.selection import create_cached_val_strategy, create_joint_batch_strategy
+from gradstream.selection import create_separate_batch_strategy, create_merged_batch_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -149,12 +149,12 @@ class StreamingTrainer(Trainer):
         # Create selection strategy for clean separation of selection methods
         # SFT uses topk mode: select top frac samples by alignment score
         # Strategy is determined by val_strategy argument:
-        # - cached_factorized: Separate val pass, store factorized components (default)
-        # - cached_full: Separate val pass, store mean gradient
-        # - joint_batch: Merge train+val into single batch
-        val_strategy = getattr(self.args, 'val_strategy', 'cached_factorized')
-        if val_strategy == 'joint_batch':
-            self.selection_strategy = create_joint_batch_strategy(
+        # - separate_batch_factorized: Separate val pass, store factorized components (default)
+        # - separate_batch: Separate val pass, store mean gradient
+        # - merged_batch: Merge train+val into single batch
+        val_strategy = getattr(self.args, 'val_strategy', 'separate_batch_factorized')
+        if val_strategy == 'merged_batch':
+            self.selection_strategy = create_merged_batch_strategy(
                 method=self.args.method,
                 grad_hook=self.grad_hook,
                 frac=getattr(self.args, 'selection_frac', 0.5),
@@ -162,8 +162,8 @@ class StreamingTrainer(Trainer):
                 selection_mode="topk",
             )
         else:
-            # cached_factorized or cached_full
-            self.selection_strategy = create_cached_val_strategy(
+            # separate_batch_factorized or separate_batch
+            self.selection_strategy = create_separate_batch_strategy(
                 method=self.args.method,
                 grad_hook=self.grad_hook,
                 frac=getattr(self.args, 'selection_frac', 0.5),
@@ -394,8 +394,8 @@ class StreamingTrainer(Trainer):
             if lr is None or lr == 0:
                 lr = args.learning_rate
 
-            if self.val_strategy == 'joint_batch':
-                # === JOINT BATCH MODE: Merge train+val, single forward/backward ===
+            if self.val_strategy == 'merged_batch':
+                # === MERGED BATCH MODE: Merge train+val, single forward/backward ===
                 merged_batch = self._merge_batches(batch_train, batch_val)
 
                 def compute_loss(model, batch):
@@ -410,10 +410,10 @@ class StreamingTrainer(Trainer):
                     batch_train=batch_train,  # For GREATS pass 2
                 )
             else:
-                # === CACHED VAL MODE: Separate val pass, then train with stored grads ===
-                # cached_factorized: store [V,S,O] and [V,S,I] factors
-                # cached_full: store mean gradient [O,I] per layer
-                use_factorized = (self.val_strategy == 'cached_factorized')
+                # === SEPARATE BATCH MODE: Separate val pass, then train with stored grads ===
+                # separate_batch_factorized: store [V,S,O] and [V,S,I] factors
+                # separate_batch: store mean gradient [O,I] per layer
+                use_factorized = (self.val_strategy == 'separate_batch_factorized')
 
                 # PASS 1: Capture validation gradients
                 self.grad_hook.start_val_capture(use_factorized=use_factorized)
@@ -425,7 +425,7 @@ class StreamingTrainer(Trainer):
                 # PASS 2: Train with selection using stored val gradients
                 def compute_train_loss():
                     loss = self._compute_loss_for_selection(model, batch_train)
-                    return loss, {}  # CachedValStrategy expects (loss, stats) tuple
+                    return loss, {}  # SeparateBatchStrategy expects (loss, stats) tuple
 
                 loss, _ = self.selection_strategy.execute_training_step(
                     model=model,

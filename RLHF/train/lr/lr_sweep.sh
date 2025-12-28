@@ -20,11 +20,11 @@
 # =============================================================================
 # LR Sweep Script for RLHF
 # =============================================================================
-# Performs learning rate grid search for RLHF experiments.
+# Performs learning rate grid search for RLHF methods.
 # Runs short training with multiple LRs and selects best based on reward.
 #
 # Usage:
-#   bash RLHF/train/lr/lr_sweep.sh --experiments all --task toxicity
+#   bash RLHF/train/lr/lr_sweep.sh --methods all --task toxicity
 #
 # Output:
 #   - Updates RLHF/train/lr/config.json with best LRs
@@ -82,8 +82,8 @@ binary_max_iters=6
 # Stability margin
 lr_margin=0.05
 
-# Multi-experiment mode
-experiments=""
+# Multi-method mode
+methods=""
 dry_run=false
 
 # Output paths
@@ -96,9 +96,9 @@ projection=""
 update_compressor_freq=200
 
 # ========================================
-# Experiment Definitions (8 experiments, matching SFT)
+# Experiment Definitions (8 methods, matching SFT)
 # ========================================
-declare -A EXPERIMENT_DEFS=(
+declare -A METHOD_DEFS=(
     ["NA-NA-Full"]="NA::false:false"
     ["NA-NA-LoRA"]="NA::true:false"
     ["Streaming-NA-Full"]="Streaming::false:true"
@@ -110,7 +110,7 @@ declare -A EXPERIMENT_DEFS=(
 )
 
 # Category mappings (matching SFT)
-declare -A CATEGORY_EXPERIMENTS=(
+declare -A CATEGORY_METHODS=(
     ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
     ["baseline"]="NA-NA-Full,NA-NA-LoRA"
     ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
@@ -202,8 +202,8 @@ while [[ $# -gt 0 ]]; do
             lora_alpha="$2"
             shift 2
             ;;
-        --experiments)
-            experiments="$2"
+        --methods)
+            methods="$2"
             shift 2
             ;;
         --dry-run)
@@ -213,7 +213,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
-            echo "Perform learning rate search for RLHF experiments."
+            echo "Perform learning rate search for RLHF methods."
             echo ""
             echo "Sweep Mode:"
             echo "  --mode <mode>              Sweep mode: 'grid' (default) or 'binary'"
@@ -235,7 +235,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --lr_margin <pct>          Prefer smaller LR margin (default: 0.05)"
             echo ""
             echo "Multi-Experiment Mode:"
-            echo "  --experiments <list>       Run sweep for multiple experiments"
+            echo "  --methods <list>       Run sweep for multiple methods"
             echo "  --dry-run                  Print commands without executing"
             echo ""
             echo "  Categories: all, baseline, streaming, greats, lora, full, compression"
@@ -256,28 +256,28 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ========================================
-# Resolve experiment names from categories
+# Resolve method names from categories
 # ========================================
-resolve_experiments() {
+resolve_methods() {
     local input="$1"
     local resolved=""
     IFS=',' read -ra items <<< "$input"
     for item in "${items[@]}"; do
         item=$(echo "$item" | xargs)
-        if [[ -n "${CATEGORY_EXPERIMENTS[$item]}" ]]; then
+        if [[ -n "${CATEGORY_METHODS[$item]}" ]]; then
             if [[ -n "$resolved" ]]; then
-                resolved="$resolved,${CATEGORY_EXPERIMENTS[$item]}"
+                resolved="$resolved,${CATEGORY_METHODS[$item]}"
             else
-                resolved="${CATEGORY_EXPERIMENTS[$item]}"
+                resolved="${CATEGORY_METHODS[$item]}"
             fi
-        elif [[ -n "${EXPERIMENT_DEFS[$item]}" ]]; then
+        elif [[ -n "${METHOD_DEFS[$item]}" ]]; then
             if [[ -n "$resolved" ]]; then
                 resolved="$resolved,$item"
             else
                 resolved="$item"
             fi
         else
-            echo "ERROR: Unknown experiment or category: $item"
+            echo "ERROR: Unknown method or category: $item"
             exit 1
         fi
     done
@@ -456,24 +456,35 @@ echo ""
 echo "========================================================"
 echo "  RLHF Learning Rate Sweep"
 echo "========================================================"
-echo "Config key: $config_key"
-echo "Task: $task"
-echo "Model: $model"
-echo "Sweep max steps: $sweep_max_steps"
-echo "Sweep mode: $sweep_mode"
+echo "Config key:      $config_key"
+echo "Task:            $task"
+echo "Model:           $model"
+echo "Reward model:    $reward_model"
 echo ""
+echo "Training:"
+echo "  Batch size:    $batch_size"
+echo "  Sweep steps:   $sweep_max_steps"
+echo "  N val:         $n_val"
+echo "  Seed:          $seed"
+echo ""
+echo "PPO:"
+echo "  PPO epochs:    $ppo_epochs"
+echo "  KL coef:       $kl_coef"
+echo "  Max new tokens: $max_new_tokens"
+echo ""
+echo "Sweep mode:      $sweep_mode"
 if [[ "$sweep_mode" == "grid" ]]; then
-    echo "LR grid (Full): $lr_grid"
-    echo "LR grid (LoRA): $lr_grid_lora"
+    echo "  LR grid (Full): $lr_grid"
+    echo "  LR grid (LoRA): $lr_grid_lora"
 elif [[ "$sweep_mode" == "binary" ]]; then
-    echo "LR range (Full): $binary_lr_min -> $binary_lr_max"
-    echo "LR range (LoRA): $binary_lr_min_lora -> $binary_lr_max_lora"
-    echo "Max iterations: $binary_max_iters"
+    echo "  LR range (Full): $binary_lr_min -> $binary_lr_max"
+    echo "  LR range (LoRA): $binary_lr_min_lora -> $binary_lr_max_lora"
+    echo "  Max iterations:  $binary_max_iters"
 fi
-echo "LR margin: $lr_margin"
+echo "  LR margin:     $lr_margin (prefer smaller LR)"
 echo ""
-echo "Output config: $lr_config_file"
-echo "Results dir: $sweep_results_dir"
+echo "Output config:   $lr_config_file"
+echo "Results dir:     $sweep_results_dir"
 echo "========================================================"
 
 mkdir -p "$sweep_results_dir"
@@ -484,21 +495,26 @@ echo "Date: $(date)" >> "$summary_file"
 echo "Model: $model" >> "$summary_file"
 echo "" >> "$summary_file"
 
-if [[ -n "$experiments" ]]; then
-    resolved_experiments=$(resolve_experiments "$experiments")
-    echo "Experiments: $resolved_experiments"
-    echo "Experiments: $resolved_experiments" >> "$summary_file"
+if [[ -n "$methods" ]]; then
+    resolved_methods=$(resolve_methods "$methods")
+    echo "Experiments: $resolved_methods"
+    echo "Experiments: $resolved_methods" >> "$summary_file"
     echo "" >> "$summary_file"
 
-    IFS=',' read -ra exp_list <<< "$resolved_experiments"
+    # Count methods
+    method_count=$(echo "$resolved_methods" | tr ',' '\n' | wc -l)
+    current=0
+
+    IFS=',' read -ra exp_list <<< "$resolved_methods"
 
     for exp_name in "${exp_list[@]}"; do
+        current=$((current + 1))
         echo ""
         echo "========================================================"
-        echo "  Sweeping LR for: $exp_name"
+        echo "  [$current/$method_count] $exp_name"
         echo "========================================================"
 
-        IFS=':' read -ra exp_parts <<< "${EXPERIMENT_DEFS[$exp_name]}"
+        IFS=':' read -ra exp_parts <<< "${METHOD_DEFS[$exp_name]}"
         exp_method="${exp_parts[0]}"
         exp_compression="${exp_parts[1]}"
         exp_use_lora="${exp_parts[2]}"
@@ -652,8 +668,8 @@ else:
         fi
     done
 else
-    echo "ERROR: Please specify experiments with --experiments"
-    echo "Example: --experiments all"
+    echo "ERROR: Please specify methods with --methods"
+    echo "Example: --methods all"
     exit 1
 fi
 
@@ -661,9 +677,10 @@ echo ""
 echo "========================================================"
 echo "  LR Sweep Complete!"
 echo "========================================================"
+echo "Total: $method_count methods"
 echo "Summary: $summary_file"
 echo "Config updated: $lr_config_file"
 echo ""
 echo "To run full training with these LRs:"
-echo "  bash RLHF/train/train.sh --experiments all --task $task"
+echo "  bash RLHF/train/train.sh --methods all --task $task"
 echo "========================================================"

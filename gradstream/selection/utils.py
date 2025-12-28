@@ -128,7 +128,7 @@ def compute_scores_and_similarity(
             temp = train_input @ val_grad_total.T
             scores = (train_grad_output * temp).sum(dim=1)
     elif val_grad_total is not None:
-        # This is used in cached_full mode where we store the summed validation gradient
+        # This is used in separate_batch mode where we store the summed validation gradient
         if train_grad_output.dim() == 3:
             temp = train_input @ val_grad_total.T
             scores = (train_grad_output * temp).sum(dim=(1, 2))

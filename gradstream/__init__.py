@@ -21,18 +21,18 @@ from .selection import (
     SelectionState,
     StreamingState,
     GREATSState,
-    # JointBatch strategies
-    JointBatchStrategy,
-    JointBatchNoSelectionStrategy,
-    JointBatchStreamingStrategy,
-    JointBatchGREATSStrategy,
-    create_joint_batch_strategy,
-    # CachedVal strategies
-    CachedValStrategy,
-    CachedValNoSelectionStrategy,
-    CachedValStreamingStrategy,
-    CachedValGREATSStrategy,
-    create_cached_val_strategy,
+    # MergedBatch strategies
+    MergedBatchStrategy,
+    MergedBatchNoSelectionStrategy,
+    MergedBatchStreamingStrategy,
+    MergedBatchGREATSStrategy,
+    create_merged_batch_strategy,
+    # SeparateBatch strategies
+    SeparateBatchStrategy,
+    SeparateBatchNoSelectionStrategy,
+    SeparateBatchStreamingStrategy,
+    SeparateBatchGREATSStrategy,
+    create_separate_batch_strategy,
 )
 
 __all__ = [
@@ -45,16 +45,16 @@ __all__ = [
     "SelectionState",
     "StreamingState",
     "GREATSState",
-    # JointBatch strategy classes
-    "JointBatchStrategy",
-    "JointBatchNoSelectionStrategy",
-    "JointBatchStreamingStrategy",
-    "JointBatchGREATSStrategy",
-    "create_joint_batch_strategy",
-    # CachedVal strategy classes
-    "CachedValStrategy",
-    "CachedValNoSelectionStrategy",
-    "CachedValStreamingStrategy",
-    "CachedValGREATSStrategy",
-    "create_cached_val_strategy",
+    # MergedBatch strategy classes
+    "MergedBatchStrategy",
+    "MergedBatchNoSelectionStrategy",
+    "MergedBatchStreamingStrategy",
+    "MergedBatchGREATSStrategy",
+    "create_merged_batch_strategy",
+    # SeparateBatch strategy classes
+    "SeparateBatchStrategy",
+    "SeparateBatchNoSelectionStrategy",
+    "SeparateBatchStreamingStrategy",
+    "SeparateBatchGREATSStrategy",
+    "create_separate_batch_strategy",
 ]

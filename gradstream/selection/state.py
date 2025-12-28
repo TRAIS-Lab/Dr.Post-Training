@@ -133,7 +133,7 @@ class SelectionState(ABC):
         if self.tokens_per_sample is None:
             raise RuntimeError(
                 "Token counts not set. Call set_token_counts() before selection. "
-                "For CachedVal strategies, pass 'labels' in kwargs to execute_training_step()."
+                "For SeparateBatch strategies, pass 'labels' in kwargs to execute_training_step()."
             )
         selected_tokens = self.tokens_per_sample[selected_indices].sum()
         return self.train_total_tokens / selected_tokens

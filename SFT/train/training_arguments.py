@@ -155,13 +155,13 @@ class TrainingArguments(TA):
         },
     )
     val_strategy: str = field(
-        default="cached_factorized",
+        default="separate_batch_factorized",
         metadata={
             "help": (
                 "Validation gradient strategy for data selection: "
-                "'cached_factorized' (default): Separate val pass, store [V,S,O] and [V,S,I] factors. "
-                "'cached_full': Separate val pass, store mean gradient [O,I] per layer. "
-                "'joint_batch': Merge train+val into single batch, compute val grad in same pass. "
+                "'separate_batch_factorized' (default): Separate val pass, store [V,S,O] and [V,S,I] factors. "
+                "'separate_batch': Separate val pass, store mean gradient [O,I] per layer. "
+                "'merged_batch': Merge train+val into single batch, compute val grad in same pass. "
                 "All modes should produce identical gradients when selection_frac=1.0."
             )
         },

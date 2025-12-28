@@ -371,6 +371,11 @@ def main():
     else:
         logger.info("No hooks to remove (hooks were not registered)")
 
+    # Clean up distributed process group
+    if dist.is_initialized():
+        dist.destroy_process_group()
+        logger.info("Destroyed distributed process group")
+
     return train_result
 
 

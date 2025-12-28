@@ -4,16 +4,16 @@ Selection strategies for gradient-based data selection in trainers.
 This module provides two families of strategies based on how validation
 gradients are obtained:
 
-1. **JointBatch Strategies**:
+1. **MergedBatch Strategies**:
    - Train and val samples are merged into a single batch
    - Val gradients computed during the same forward/backward pass
-   - Factory: create_joint_batch_strategy()
+   - Factory: create_merged_batch_strategy()
    - Note: Has padding overhead when val/train have different sequence lengths
 
-2. **CachedVal Strategies**:
+2. **SeparateBatch Strategies**:
    - Val gradients are pre-captured and cached before training
    - Training uses cached val gradients for selection scoring
-   - Factory: create_cached_val_strategy()
+   - Factory: create_separate_batch_strategy()
    - Supports two caching modes via start_val_capture(use_factorized=...):
      * Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
        Better when validation batch is large (e.g., self-reference validation in RLHF).
@@ -41,9 +41,9 @@ from .state import StreamingState, GREATSState
 # Val gradients computed from merged train+val batch
 # ============================================================
 
-class JointBatchStrategy(ABC):
+class MergedBatchStrategy(ABC):
     """
-    Abstract strategy for joint-batch data selection.
+    Abstract strategy for merged-batch data selection.
 
     Used when train and val samples are merged into a single batch,
     and val gradients are computed during the same forward/backward pass.
@@ -104,7 +104,7 @@ class JointBatchStrategy(ABC):
         pass
 
 
-class JointBatchNoSelectionStrategy(JointBatchStrategy):
+class MergedBatchNoSelectionStrategy(MergedBatchStrategy):
     """
     Baseline strategy: no data selection, standard training.
 
@@ -138,9 +138,9 @@ class JointBatchNoSelectionStrategy(JointBatchStrategy):
         return loss.detach()
 
 
-class JointBatchStreamingStrategy(JointBatchStrategy):
+class MergedBatchStreamingStrategy(MergedBatchStrategy):
     """
-    Streaming strategy with joint batch: single-pass, per-layer selection.
+    Streaming strategy with merged batch: single-pass, per-layer selection.
 
     Selection and gradient aggregation happen layer-by-layer
     during the backward pass.
@@ -196,9 +196,9 @@ class JointBatchStreamingStrategy(JointBatchStrategy):
         self.grad_hook.clear_token_counts()
 
 
-class JointBatchGREATSStrategy(JointBatchStrategy):
+class MergedBatchGREATSStrategy(MergedBatchStrategy):
     """
-    GREATS strategy with joint batch: two-pass, global selection.
+    GREATS strategy with merged batch: two-pass, global selection.
 
     Pass 1: Compute selection scores across all layers
     Pass 2: Forward/backward only on globally selected samples
@@ -287,15 +287,15 @@ class JointBatchGREATSStrategy(JointBatchStrategy):
         self.grad_hook.clear_token_counts()
 
 
-def create_joint_batch_strategy(
+def create_merged_batch_strategy(
     method: str,
     grad_hook: Optional[GradientHook],
     frac: float = 0.5,
     use_second_order: bool = False,
     selection_mode: str = "topk",
-) -> JointBatchStrategy:
+) -> MergedBatchStrategy:
     """
-    Factory function to create joint-batch selection strategy.
+    Factory function to create merged-batch selection strategy.
 
     Note: Has padding overhead when val/train have different sequence lengths.
 
@@ -307,16 +307,16 @@ def create_joint_batch_strategy(
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
 
     Returns:
-        Appropriate JointBatchStrategy instance
+        Appropriate MergedBatchStrategy instance
     """
     if method == "NA":
-        return JointBatchNoSelectionStrategy(grad_hook, frac, use_second_order, selection_mode)
+        return MergedBatchNoSelectionStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     if method == "Streaming":
-        return JointBatchStreamingStrategy(grad_hook, frac, use_second_order, selection_mode)
+        return MergedBatchStreamingStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     if method == "GREATS":
-        return JointBatchGREATSStrategy(grad_hook, frac, use_second_order, selection_mode)
+        return MergedBatchGREATSStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     raise ValueError(f"Unknown selection method: {method}")
 
@@ -329,9 +329,9 @@ def create_joint_batch_strategy(
 # Avoids padding overhead when val/train have different seq lengths
 # ============================================================
 
-class CachedValStrategy(ABC):
+class SeparateBatchStrategy(ABC):
     """
-    Abstract strategy for cached-val data selection.
+    Abstract strategy for separate-batch data selection.
 
     Used when val gradients are pre-captured and cached before training,
     rather than computed from a merged batch during the same forward pass.
@@ -398,7 +398,7 @@ class CachedValStrategy(ABC):
         pass
 
 
-class CachedValNoSelectionStrategy(CachedValStrategy):
+class SeparateBatchNoSelectionStrategy(SeparateBatchStrategy):
     """
     Baseline strategy: no data selection, standard training.
     """
@@ -427,7 +427,7 @@ class CachedValNoSelectionStrategy(CachedValStrategy):
         return loss.detach(), stats
 
 
-class CachedValStreamingStrategy(CachedValStrategy):
+class SeparateBatchStreamingStrategy(SeparateBatchStrategy):
     """
     Streaming strategy with cached val: per-layer selection.
 
@@ -458,7 +458,7 @@ class CachedValStreamingStrategy(CachedValStrategy):
         self._setup_state(batch_size, lr)
 
         # Set token counts for gradient scaling (if labels provided)
-        # In CachedVal mode, entire batch is train, so pass batch_size as train_batch_size
+        # In SeparateBatch mode, entire batch is train, so pass batch_size as train_batch_size
         labels = kwargs.get('labels')
         if labels is not None:
             self.grad_hook.set_token_counts(labels, batch_size)
@@ -495,7 +495,7 @@ class CachedValStreamingStrategy(CachedValStrategy):
         self.grad_hook.clear_selection()
 
 
-class CachedValGREATSStrategy(CachedValStrategy):
+class SeparateBatchGREATSStrategy(SeparateBatchStrategy):
     """
     GREATS strategy with cached val: global selection.
 
@@ -569,15 +569,15 @@ class CachedValGREATSStrategy(CachedValStrategy):
         self.grad_hook.clear_selection()
 
 
-def create_cached_val_strategy(
+def create_separate_batch_strategy(
     method: str,
     grad_hook: Optional[GradientHook],
     frac: float = 0.5,
     use_second_order: bool = False,
     selection_mode: str = "topk",
-) -> CachedValStrategy:
+) -> SeparateBatchStrategy:
     """
-    Factory function to create cached-val selection strategy.
+    Factory function to create separate-batch selection strategy.
 
     Avoids padding overhead when val/train have different sequence lengths.
 
@@ -591,16 +591,16 @@ def create_cached_val_strategy(
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
 
     Returns:
-        Appropriate CachedValStrategy instance
+        Appropriate SeparateBatchStrategy instance
     """
     if method == "NA":
-        return CachedValNoSelectionStrategy(grad_hook, frac, use_second_order, selection_mode)
+        return SeparateBatchNoSelectionStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     if method == "Streaming":
-        return CachedValStreamingStrategy(grad_hook, frac, use_second_order, selection_mode)
+        return SeparateBatchStreamingStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     if method == "GREATS":
-        return CachedValGREATSStrategy(grad_hook, frac, use_second_order, selection_mode)
+        return SeparateBatchGREATSStrategy(grad_hook, frac, use_second_order, selection_mode)
 
     raise ValueError(f"Unknown selection method: {method}")
 

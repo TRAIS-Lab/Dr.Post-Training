@@ -22,7 +22,7 @@ cd $HOME/Project/Gradient-Streaming
 # Set PYTHONPATH to include project root for imports
 export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
 
-# Base training arguments (shared across all experiments, matching SFT)
+# Base training arguments (shared across all methods, matching SFT)
 # Note: warmup_ratio=0 for PPO (pretrained policy doesn't need warmup, and LR=0 breaks first batch)
 # Note: max_grad_norm removed to match reference (reference doesn't use gradient clipping)
 export base_training_args="--bf16=True \
@@ -93,16 +93,16 @@ eval_on_step_generations=true  # Evaluate toxicity on each step's generations
 # Output
 output_dir=""
 
-# Multi-experiment mode
-experiments=""
+# Multi-method mode
+methods=""
 dry_run=false
 use_sbatch=false
 
 # ========================================
-# Experiment Definitions (8 experiments, matching SFT)
+# Experiment Definitions (8 methods, matching SFT)
 # ========================================
 # Format: "method:compression:use_lora:use_second_order"
-declare -A EXPERIMENT_DEFS=(
+declare -A METHOD_DEFS=(
     ["NA-NA-Full"]="NA::false:false"
     ["NA-NA-LoRA"]="NA::true:false"
     ["Streaming-NA-Full"]="Streaming::false:true"
@@ -114,7 +114,7 @@ declare -A EXPERIMENT_DEFS=(
 )
 
 # Category mappings (matching SFT)
-declare -A CATEGORY_EXPERIMENTS=(
+declare -A CATEGORY_METHODS=(
     ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
     ["baseline"]="NA-NA-Full,NA-NA-LoRA"
     ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
@@ -264,8 +264,8 @@ while [[ $# -gt 0 ]]; do
             output_dir="$2"
             shift 2
             ;;
-        --experiments)
-            experiments="$2"
+        --methods)
+            methods="$2"
             shift 2
             ;;
         --dry-run)
@@ -279,10 +279,10 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
-            echo "Run single or multiple RLHF training experiments."
+            echo "Run single or multiple RLHF training methods."
             echo ""
             echo "Multi-Experiment Mode:"
-            echo "  --experiments <list>       Run multiple experiments (see below)"
+            echo "  --methods <list>       Run multiple methods (see below)"
             echo "  --dry-run                  Print commands without executing"
             echo "  --sbatch                   Use sbatch instead of bash"
             echo ""
@@ -342,7 +342,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Learning Rate Resolution:"
             echo "  1. If --lr is specified, use that value"
-            echo "  2. Otherwise, look up from lr/config.json based on task + experiment"
+            echo "  2. Otherwise, look up from lr/config.json based on task + method"
             echo "  3. If not found, use fallback (1e-5)"
             echo ""
             echo "  Run lr/lr_sweep.sh first to populate config.json with optimal LRs."
@@ -357,9 +357,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ========================================
-# Resolve experiment names from categories
+# Resolve method names from categories
 # ========================================
-resolve_experiments() {
+resolve_methods() {
     local input="$1"
     local resolved=""
 
@@ -367,22 +367,22 @@ resolve_experiments() {
     for item in "${items[@]}"; do
         item=$(echo "$item" | xargs)
 
-        if [[ -n "${CATEGORY_EXPERIMENTS[$item]}" ]]; then
+        if [[ -n "${CATEGORY_METHODS[$item]}" ]]; then
             if [[ -n "$resolved" ]]; then
-                resolved="$resolved,${CATEGORY_EXPERIMENTS[$item]}"
+                resolved="$resolved,${CATEGORY_METHODS[$item]}"
             else
-                resolved="${CATEGORY_EXPERIMENTS[$item]}"
+                resolved="${CATEGORY_METHODS[$item]}"
             fi
-        elif [[ -n "${EXPERIMENT_DEFS[$item]}" ]]; then
+        elif [[ -n "${METHOD_DEFS[$item]}" ]]; then
             if [[ -n "$resolved" ]]; then
                 resolved="$resolved,$item"
             else
                 resolved="$item"
             fi
         else
-            echo "ERROR: Unknown experiment or category: $item"
-            echo "Valid experiments: ${!EXPERIMENT_DEFS[*]}"
-            echo "Valid categories: ${!CATEGORY_EXPERIMENTS[*]}"
+            echo "ERROR: Unknown method or category: $item"
+            echo "Valid methods: ${!METHOD_DEFS[*]}"
+            echo "Valid categories: ${!CATEGORY_METHODS[*]}"
             exit 1
         fi
     done
@@ -437,9 +437,9 @@ except:
 }
 
 # ========================================
-# Function to run a single experiment
+# Function to run a single method
 # ========================================
-run_single_experiment() {
+run_single_method() {
     local exp_method="$1"
     local exp_compression="$2"
     local exp_use_lora="$3"
@@ -624,11 +624,11 @@ run_single_experiment() {
 # ========================================
 config_key="${task}"
 
-if [[ -n "$experiments" ]]; then
+if [[ -n "$methods" ]]; then
     # ========================================
-    # Multi-experiment mode
+    # Multi-method mode
     # ========================================
-    resolved_experiments=$(resolve_experiments "$experiments")
+    resolved_methods=$(resolve_methods "$methods")
 
     echo ""
     echo "========================================================"
@@ -663,21 +663,21 @@ if [[ -n "$experiments" ]]; then
     fi
     echo ""
     echo "LR Config: $lr_config_file"
-    echo "Experiments to run: $resolved_experiments"
+    echo "Experiments to run: $resolved_methods"
     echo "========================================================"
 
-    exp_count=$(echo "$resolved_experiments" | tr ',' '\n' | wc -l)
+    method_count=$(echo "$resolved_methods" | tr ',' '\n' | wc -l)
     current=0
 
-    IFS=',' read -ra exp_list <<< "$resolved_experiments"
+    IFS=',' read -ra exp_list <<< "$resolved_methods"
     for exp_name in "${exp_list[@]}"; do
         current=$((current + 1))
         echo ""
         echo "========================================================"
-        echo "  [$current/$exp_count] $exp_name"
+        echo "  [$current/$method_count] $exp_name"
         echo "========================================================"
 
-        IFS=':' read -ra exp_parts <<< "${EXPERIMENT_DEFS[$exp_name]}"
+        IFS=':' read -ra exp_parts <<< "${METHOD_DEFS[$exp_name]}"
         exp_method="${exp_parts[0]}"
         exp_compression="${exp_parts[1]}"
         exp_use_lora="${exp_parts[2]}"
@@ -686,18 +686,18 @@ if [[ -n "$experiments" ]]; then
         # Look up learning rate
         exp_lr=$(lookup_lr "$config_key" "$exp_name" "$exp_use_lora")
 
-        run_single_experiment "$exp_method" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$exp_lr" "$exp_name"
+        run_single_method "$exp_method" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$exp_lr" "$exp_name"
     done
 
     echo ""
     echo "========================================================"
-    echo "  All experiments completed!"
+    echo "  All methods completed!"
     echo "========================================================"
-    echo "Total: $exp_count experiments"
+    echo "Total: $method_count methods"
 
 else
     # ========================================
-    # Single experiment mode
+    # Single method mode
     # ========================================
 
     # Validate method
@@ -727,7 +727,7 @@ else
         esac
     fi
 
-    # Build experiment name for LR lookup
+    # Build method name for LR lookup
     local_compression=""
     if [[ -n "$compression" ]]; then
         local_compression="$compression"
@@ -742,6 +742,6 @@ else
     # Look up learning rate
     lr=$(lookup_lr "$config_key" "$exp_name" "$use_lora")
 
-    # Run single experiment
-    run_single_experiment "$method" "$local_compression" "$use_lora" "$use_second_order" "$lr" ""
+    # Run single method
+    run_single_method "$method" "$local_compression" "$use_lora" "$use_second_order" "$lr" ""
 fi

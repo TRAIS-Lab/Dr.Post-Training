@@ -12,7 +12,7 @@ Experiments follow the pattern: `{task}-{selection}-{compression}-{model}-{train
 | `compression`   | `NA`, `LoGra`               | Gradient compression (implies MeSO optimizer) |
 | `training_type` | `Full`, `LoRA`              | Full fine-tuning or LoRA                      |
 
-> **Note:** GraSS compression is also available (`--compression GraSS`) but not used in default experiments.
+> **Note:** GraSS compression is also available (`--compression GraSS`) but not used in default methods.
 
 ### Selection Methods
 - **NA**: No data selection (baseline PPO)
@@ -22,11 +22,11 @@ Experiments follow the pattern: `{task}-{selection}-{compression}-{model}-{train
 ### Compression Methods
 - **NA**: No compression - uses full gradients and standard AdamW optimizer
 - **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer
-- **GraSS**: Gradient Sparsification with Sketching (available but not used in default experiments)
+- **GraSS**: Gradient Sparsification with Sketching (available but not used in default methods)
 
 ## Experiment Configurations
 
-### Full Configuration Matrix (8 experiments)
+### Full Configuration Matrix (8 methods)
 
 | #   | Selection | Compression | Training | Description                               |
 | --- | --------- | ----------- | -------- | ----------------------------------------- |
@@ -52,67 +52,67 @@ The `RLHF/train/lr/` folder contains tools for finding optimal learning rates, w
 
 ```bash
 # Grid Search (default) - tests multiple discrete LRs
-bash RLHF/train/lr/lr_sweep.sh --mode grid --experiments all --task toxicity
+bash RLHF/train/lr/lr_sweep.sh --mode grid --methods all --task toxicity
 
 # Binary Search - efficient search using golden section method
-bash RLHF/train/lr/lr_sweep.sh --mode binary --experiments all --task toxicity
+bash RLHF/train/lr/lr_sweep.sh --mode binary --methods all --task toxicity
 ```
 
 2. **Run training** with optimal LRs (loaded automatically from config.json):
 
 ```bash
-bash RLHF/train/train.sh --experiments all --task toxicity
+bash RLHF/train/train.sh --methods all --task toxicity
 ```
 
 ## Running Experiments
 
-All experiments are launched using the unified `train.sh` script.
+All methods are launched using the unified `train.sh` script.
 
-### Multi-Experiment Mode
+### Multi-Method Mode
 
-Run multiple experiments with the `--experiments` flag:
+Run multiple methods with the `--methods` flag:
 
 ```bash
-# Run all 8 experiments
-bash RLHF/train/train.sh --experiments all --task toxicity
+# Run all 8 methods
+bash RLHF/train/train.sh --methods all --task toxicity
 
 # Run by category
-bash RLHF/train/train.sh --experiments baseline --task toxicity      # NA-NA-Full, NA-NA-LoRA
-bash RLHF/train/train.sh --experiments streaming --task toxicity     # All Streaming-* variants
-bash RLHF/train/train.sh --experiments greats --task toxicity        # All GREATS-* variants
-bash RLHF/train/train.sh --experiments compression --task toxicity   # *-LoGra-* variants
-bash RLHF/train/train.sh --experiments lora --task toxicity          # All *-LoRA variants
-bash RLHF/train/train.sh --experiments full --task toxicity          # All *-Full variants
+bash RLHF/train/train.sh --methods baseline --task toxicity      # NA-NA-Full, NA-NA-LoRA
+bash RLHF/train/train.sh --methods streaming --task toxicity     # All Streaming-* variants
+bash RLHF/train/train.sh --methods greats --task toxicity        # All GREATS-* variants
+bash RLHF/train/train.sh --methods compression --task toxicity   # *-LoGra-* variants
+bash RLHF/train/train.sh --methods lora --task toxicity          # All *-LoRA variants
+bash RLHF/train/train.sh --methods full --task toxicity          # All *-Full variants
 
-# Run specific experiments
-bash RLHF/train/train.sh --experiments "NA-NA-Full,Streaming-LoGra-Full" --task toxicity
+# Run specific methods
+bash RLHF/train/train.sh --methods "NA-NA-Full,Streaming-LoGra-Full" --task toxicity
 
 # Combine categories
-bash RLHF/train/train.sh --experiments "baseline,streaming" --task toxicity
+bash RLHF/train/train.sh --methods "baseline,streaming" --task toxicity
 
 # Dry run - preview commands without executing
-bash RLHF/train/train.sh --experiments all --task toxicity --dry-run
+bash RLHF/train/train.sh --methods all --task toxicity --dry-run
 
 # Submit to SLURM
-bash RLHF/train/train.sh --experiments all --task toxicity --sbatch
+bash RLHF/train/train.sh --methods all --task toxicity --sbatch
 ```
 
 #### Available Categories
 
 | Category         | Experiments                                                |
 | ---------------- | ---------------------------------------------------------- |
-| `all`            | All 8 experiments                                          |
+| `all`            | All 8 methods                                          |
 | `baseline`       | NA-NA-Full, NA-NA-LoRA                                     |
 | `streaming`      | Streaming-NA-Full, Streaming-NA-LoRA, Streaming-LoGra-Full |
 | `greats`         | GREATS-NA-Full, GREATS-NA-LoRA, GREATS-LoGra-Full          |
-| `full`           | All *-Full experiments (5 total)                           |
-| `lora`           | All *-LoRA experiments (3 total)                           |
+| `full`           | All *-Full methods (5 total)                           |
+| `lora`           | All *-LoRA methods (3 total)                           |
 | `compression`    | Streaming-LoGra-Full, GREATS-LoGra-Full                    |
-| `no-compression` | All experiments without compression (6 total)              |
+| `no-compression` | All methods without compression (6 total)              |
 
 ### Single Experiment Mode
 
-Run a single experiment by specifying individual options:
+Run a single method by specifying individual options:
 
 ```bash
 # From project root
@@ -170,7 +170,7 @@ The unified training script accepts the following arguments:
 
 - `--compression <method>` - Gradient compression method (implies MeSO optimizer):
   - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
-  - `GraSS` - Gradient Sparsification with Sketching (available but not used in default experiments)
+  - `GraSS` - Gradient Sparsification with Sketching (available but not used in default methods)
   - If not specified, uses full gradients and standard AdamW optimizer
 - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
 
@@ -248,7 +248,7 @@ Training-time toxicity evaluation uses a **different classifier** than the rewar
 
 ## Experiment Summary
 
-The following experiments can be run with the commands below.
+The following methods can be run with the commands below.
 
 | Task     | Model        | Batch | Val Size | Epochs | LoRA Rank |
 | -------- | ------------ | ----- | -------- | ------ | --------- |
@@ -262,7 +262,7 @@ Run LR sweep before full training to find optimal learning rates:
 
 ```bash
 # Toxicity task
-bash RLHF/train/lr/lr_sweep.sh --mode binary --experiments all --task toxicity \
+bash RLHF/train/lr/lr_sweep.sh --mode binary --methods all --task toxicity \
     --batch_size 256 --n_val 4 --sweep_max_steps 50 --seed 2
 ```
 
@@ -271,14 +271,14 @@ bash RLHF/train/lr/lr_sweep.sh --mode binary --experiments all --task toxicity \
 Training commands (LRs loaded from lr_config.json):
 
 ```bash
-# Toxicity task - all experiments
-bash RLHF/train/train.sh --experiments all --task toxicity
+# Toxicity task - all methods
+bash RLHF/train/train.sh --methods all --task toxicity
 
 # Toxicity task - baseline only
-bash RLHF/train/train.sh --experiments baseline --task toxicity
+bash RLHF/train/train.sh --methods baseline --task toxicity
 
 # Toxicity task - streaming methods
-bash RLHF/train/train.sh --experiments streaming --task toxicity
+bash RLHF/train/train.sh --methods streaming --task toxicity
 ```
 
 ### Evaluation Commands

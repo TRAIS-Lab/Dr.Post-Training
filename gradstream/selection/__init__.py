@@ -3,16 +3,16 @@ Selection module for gradient-based data selection.
 
 This module provides two families of strategies for computing validation gradients:
 
-1. **JointBatch Strategies**:
+1. **MergedBatch Strategies**:
    - Train and val samples are merged into a single batch
    - Val gradients computed during the same forward/backward pass
-   - Factory: create_joint_batch_strategy()
+   - Factory: create_merged_batch_strategy()
    - Note: Has padding overhead when val/train have different sequence lengths
 
-2. **CachedVal Strategies**:
+2. **SeparateBatch Strategies**:
    - Val gradients are pre-captured and cached before training
    - Training uses cached val gradients for selection scoring
-   - Factory: create_cached_val_strategy()
+   - Factory: create_separate_batch_strategy()
    - Avoids padding overhead - val and train can have different seq lengths
    - Supports two caching modes via start_val_capture(use_factorized=...):
      * Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
@@ -29,18 +29,18 @@ from .backward import (
     GREATSLinearBackward,
 )
 from .strategies import (
-    # JointBatch strategies
-    JointBatchStrategy,
-    JointBatchNoSelectionStrategy,
-    JointBatchStreamingStrategy,
-    JointBatchGREATSStrategy,
-    create_joint_batch_strategy,
-    # CachedVal strategies
-    CachedValStrategy,
-    CachedValNoSelectionStrategy,
-    CachedValStreamingStrategy,
-    CachedValGREATSStrategy,
-    create_cached_val_strategy,
+    # MergedBatch strategies
+    MergedBatchStrategy,
+    MergedBatchNoSelectionStrategy,
+    MergedBatchStreamingStrategy,
+    MergedBatchGREATSStrategy,
+    create_merged_batch_strategy,
+    # SeparateBatch strategies
+    SeparateBatchStrategy,
+    SeparateBatchNoSelectionStrategy,
+    SeparateBatchStreamingStrategy,
+    SeparateBatchGREATSStrategy,
+    create_separate_batch_strategy,
 )
 
 __all__ = [
@@ -52,16 +52,16 @@ __all__ = [
     "CompressedLinearBackward",
     "StreamingLinearBackward",
     "GREATSLinearBackward",
-    # JointBatch strategies
-    "JointBatchStrategy",
-    "JointBatchNoSelectionStrategy",
-    "JointBatchStreamingStrategy",
-    "JointBatchGREATSStrategy",
-    "create_joint_batch_strategy",
-    # CachedVal strategies
-    "CachedValStrategy",
-    "CachedValNoSelectionStrategy",
-    "CachedValStreamingStrategy",
-    "CachedValGREATSStrategy",
-    "create_cached_val_strategy",
+    # MergedBatch strategies
+    "MergedBatchStrategy",
+    "MergedBatchNoSelectionStrategy",
+    "MergedBatchStreamingStrategy",
+    "MergedBatchGREATSStrategy",
+    "create_merged_batch_strategy",
+    # SeparateBatch strategies
+    "SeparateBatchStrategy",
+    "SeparateBatchNoSelectionStrategy",
+    "SeparateBatchStreamingStrategy",
+    "SeparateBatchGREATSStrategy",
+    "create_separate_batch_strategy",
 ]

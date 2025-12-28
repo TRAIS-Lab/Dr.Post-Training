@@ -56,7 +56,7 @@ def set_seed(seed: int):
 from gradstream.hook import GradientHook
 from gradstream.compressor import setup_model_compressors
 from gradstream.optimizer import MeSOAdamW
-from gradstream.selection.strategies import CachedValStreamingStrategy, CachedValGREATSStrategy
+from gradstream.selection.strategies import SeparateBatchStreamingStrategy, SeparateBatchGREATSStrategy
 
 from datasets import load_dataset
 
@@ -663,7 +663,7 @@ def make_step_streaming(selection_helper: SelectionStepHelper, selection_frac: f
     """
     Create a step function for Streaming (per-layer) selection.
 
-    Uses CachedValStreamingStrategy with separate val/train passes to avoid
+    Uses SeparateBatchStreamingStrategy with separate val/train passes to avoid
     padding overhead when batches have different sequence lengths.
 
     Args:
@@ -684,7 +684,7 @@ def make_step_streaming(selection_helper: SelectionStepHelper, selection_frac: f
 
         # Initialize strategy on first call
         if strategy is None:
-            strategy = CachedValStreamingStrategy(
+            strategy = SeparateBatchStreamingStrategy(
                 grad_hook=grad_hook,
                 frac=selection_frac,
                 use_second_order=use_second_order,
@@ -737,7 +737,7 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
     """
     Create a step function for GREATS (global) selection.
 
-    Uses CachedValGREATSStrategy with separate val/train passes to avoid
+    Uses SeparateBatchGREATSStrategy with separate val/train passes to avoid
     padding overhead when batches have different sequence lengths.
 
     Args:
@@ -758,7 +758,7 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
 
         # Initialize strategy on first call
         if strategy is None:
-            strategy = CachedValGREATSStrategy(
+            strategy = SeparateBatchGREATSStrategy(
                 grad_hook=grad_hook,
                 frac=selection_frac,
                 use_second_order=use_second_order,

@@ -6,31 +6,31 @@ Comprehensive benchmarking suite for comparing memory usage and throughput acros
 
 ### Gradient Streaming Methods
 
-| #   | Method                       | Description                               |
-| --- | ---------------------------- | ----------------------------------------- |
-| 1a  | `NA_NA_Full`                 | Baseline full fine-tuning (AdamW)         |
-| 1b  | `NA_NA_LoRA`                 | Baseline LoRA fine-tuning (AdamW)         |
-| 2a  | `Streaming_NA_Full`          | Per-layer selection, full gradients       |
-| 2b  | `Streaming_NA_LoRA`          | Per-layer selection, full gradients, LoRA |
-| 3a  | `GREATS_NA_Full`             | Global selection, full gradients          |
-| 3b  | `GREATS_NA_LoRA`             | Global selection, full gradients, LoRA    |
-| 4   | `Streaming_LoGra_Full`       | Per-layer selection + MeSO                |
-| 5   | `GREATS_LoGra_Full`          | Global selection + MeSO                   |
-| 6a  | `Streaming_LoGra_Full` + 2nd | Per-layer + MeSO + second-order selection |
-| 6b  | `GREATS_LoGra_Full` + 2nd    | Global + MeSO + second-order selection    |
+| #   | Experiment                    | Description                               |
+| --- | ----------------------------- | ----------------------------------------- |
+| 1a  | `NA-NA-Full`                  | Baseline full fine-tuning (AdamW)         |
+| 1b  | `NA-NA-LoRA`                  | Baseline LoRA fine-tuning (AdamW)         |
+| 2a  | `Streaming-NA-Full`           | Per-layer selection, full gradients       |
+| 2b  | `Streaming-NA-LoRA`           | Per-layer selection, full gradients, LoRA |
+| 3a  | `GREATS-NA-Full`              | Global selection, full gradients          |
+| 3b  | `GREATS-NA-LoRA`              | Global selection, full gradients, LoRA    |
+| 4   | `Streaming-LoGra-Full`        | Per-layer selection + MeSO                |
+| 5   | `GREATS-LoGra-Full`           | Global selection + MeSO                   |
+| 6a  | `Streaming-LoGra-Full` + 2nd  | Per-layer + MeSO + second-order selection |
+| 6b  | `GREATS-LoGra-Full` + 2nd     | Global + MeSO + second-order selection    |
 
 ### Gradient Checkpointing Variants
 
-All selection methods have `_gc` variants with gradient checkpointing enabled:
+All selection methods have `_gc` variants with gradient checkpointing enabled (use `--gc` flag):
 
-| Method                    | Description                     |
-| ------------------------- | ------------------------------- |
-| `Streaming_NA_Full_gc`    | Streaming + full gradients + GC |
-| `Streaming_NA_LoRA_gc`    | Streaming + LoRA + GC           |
-| `Streaming_LoGra_Full_gc` | Streaming + MeSO + GC           |
-| `GREATS_NA_Full_gc`       | GREATS + full gradients + GC    |
-| `GREATS_NA_LoRA_gc`       | GREATS + LoRA + GC              |
-| `GREATS_LoGra_Full_gc`    | GREATS + MeSO + GC              |
+| Method                     | Description                     |
+| -------------------------- | ------------------------------- |
+| `Streaming-NA-Full` + gc   | Streaming + full gradients + GC |
+| `Streaming-NA-LoRA` + gc   | Streaming + LoRA + GC           |
+| `Streaming-LoGra-Full` + gc| Streaming + MeSO + GC           |
+| `GREATS-NA-Full` + gc      | GREATS + full gradients + GC    |
+| `GREATS-NA-LoRA` + gc      | GREATS + LoRA + GC              |
+| `GREATS-LoGra-Full` + gc   | GREATS + MeSO + GC              |
 
 ### External Baselines (for comparison)
 
@@ -57,29 +57,39 @@ We additionally compare full fine-tuning with other optimizers and LoRA variants
 # List available methods
 bash benchmark.sh --list
 
-# Run default methods (NA_NA_Full, Streaming_LoGra_Full)
+# Run default experiments (NA-NA-Full, Streaming-LoGra-Full)
 bash benchmark.sh
 
-# Run specific methods
-bash benchmark.sh --methods NA_NA_Full Streaming_LoGra_Full GREATS_LoGra_Full
+# Run specific methods (comma-separated)
+bash benchmark.sh --methods "NA-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
 
 # Run all methods
-bash benchmark.sh --all
+bash benchmark.sh --methods all
+
+# Run by category
+bash benchmark.sh --methods baseline      # NA-NA-Full, NA-NA-LoRA
+bash benchmark.sh --methods streaming     # All Streaming-* variants
+bash benchmark.sh --methods compression   # *-LoGra-* variants
 
 # Run with custom configuration
-bash benchmark.sh --methods GREATS_LoGra_Full --batch-size 32 --num-iterations 20
+bash benchmark.sh --methods GREATS-LoGra-Full --batch-size 32 --num-iterations 20
 
 # Run with second-order selection enabled
-bash benchmark.sh --methods GREATS_LoGra_Full --use-second-order
+bash benchmark.sh --methods GREATS-LoGra-Full --use-second-order
+
+# Dry run - preview commands without executing
+bash benchmark.sh --methods all --dry-run
 ```
 
 <details>
   <summary>Benchmark Configurations</summary>
 
 1. Method Selection
-   - `--methods <method1> <method2> ...` - Methods to benchmark (default: `NA_NA_Full Streaming_LoGra_Full`)
-   - `--all` - Run all available methods
+   - `--methods <list>` - Experiments to benchmark (comma-separated or category)
    - `--list` - List all available methods and exit
+   - `--dry-run` - Print commands without executing
+
+   Available categories: `all`, `baseline`, `streaming`, `greats`, `full`, `lora`, `compression`, `no-compression`
 2. Model Configuration
    - `--model <name>` - Model name (default: `meta-llama/Llama-3.2-3B`)
    - `--dtype <type>` - Data type: `float32`, `bfloat16`, `float16` (default: `bfloat16`)
