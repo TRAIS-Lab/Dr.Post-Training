@@ -75,7 +75,7 @@ subject="sociology"
 compression=""
 use_second_order=false  # If true, use greedy selection with second-order interactions
 selection_frac="0.5"  # Fraction of samples to select (for Streaming/GREATS)
-val_strategy="cached_factorized"  # Validation strategy: cached_factorized, cached_full, joint_batch
+val_strategy="joint_batch"  # Validation strategy: cached_factorized, cached_full, joint_batch
 use_lora=false
 use_flash_attention=true
 
@@ -94,7 +94,7 @@ binary_lr_max_lora="1e-2"
 binary_max_iters=8  # ~6 iterations narrows range by ~10x
 
 # Stability margin: prefer smaller LR unless larger LR is significantly better
-lr_margin=0.05  # 5% - larger LR must have loss at least 5% lower to be preferred
+lr_margin=0.01  # 5% - larger LR must have loss at least 5% lower to be preferred
 
 # Multi-experiment mode
 experiments=""

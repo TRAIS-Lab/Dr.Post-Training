@@ -41,7 +41,7 @@ export base_training_args="--do_train=True \
 --overwrite_output_dir=True \
 --report_to=none \
 --seed=0 \
---percentage=1.0 \
+--percentage=0.5 \
 --selection_frac=0.5"
 
 # Default values
@@ -66,7 +66,7 @@ train_dataset=""  # Training dataset (if empty, uses task-based default)
 subject="sociology"
 compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer.
 use_second_order=false  # If true, use greedy selection with second-order interactions
-selection_frac="1.0"  # Fraction of samples to select (for Streaming/GREATS)
+selection_frac="0.5"  # Fraction of samples to select (for Streaming/GREATS)
 val_strategy="joint_batch"  # Validation strategy: cached_factorized, cached_full, joint_batch
 use_lora=false
 use_flash_attention=true
