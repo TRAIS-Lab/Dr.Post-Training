@@ -25,13 +25,19 @@ class TrainingArguments(TA):
     """
 
     # ===================
-    # Override: LR Scheduler
+    # Learning Rate and Scheduler
     # ===================
-    # Reference implementation uses constant LR (no scheduler)
-    # See: archive/LDA-ORL-main/rlhf-toxicity/scripts/ppo_config.py
-    # The default in transformers is "linear" which decays LR over training
+    learning_rate: float = field(
+        default=1e-5,
+        metadata={
+            "help": (
+                "Learning rate for Adam optimizer (default: 1e-5, matching reference). "
+                "The transformers default is 5e-5 which is too high for PPO."
+            )
+        },
+    )
     lr_scheduler_type: str = field(
-        default="constant",
+        default="linear",
         metadata={
             "help": (
                 "Learning rate scheduler type. Default 'constant' matches reference "
@@ -70,17 +76,6 @@ class TrainingArguments(TA):
                 "1.0 = drop all negative samples, 0.5 = drop bottom 50% of negative samples. "
                 "All positive-influence samples are always kept. "
                 "Note: 1.0 is too aggressive and often leaves only 1-2 samples per batch."
-            )
-        },
-    )
-    min_batch_size_for_selection: int = field(
-        default=2,
-        metadata={
-            "help": (
-                "Minimum mini-batch size for selection to be applied. "
-                "When the mini-batch size is too small (e.g., 1), selection "
-                "becomes unstable. If mini_batch_size < this value, selection "
-                "is skipped for that batch and all samples are used. Default: 2."
             )
         },
     )
@@ -130,13 +125,12 @@ class TrainingArguments(TA):
         metadata={"help": "Number of PPO epochs per batch (default: 4)"},
     )
     mini_batch_size: int = field(
-        default=8,
+        default=1,
         metadata={
             "help": (
-                "Mini-batch size for PPO updates. With mini_batch_size=1 and ppo_epochs=4, "
-                "there are batch_size*4 optimizer steps per rollout, causing old_logprobs "
-                "to become stale and ratio to explode. Larger mini_batch_size (e.g., 8) "
-                "reduces the number of updates, keeping ratios stable."
+                "Mini-batch size for PPO updates (default: 1, matching reference). "
+                "With mini_batch_size=1 and ppo_epochs=4, each sample is updated 4 times "
+                "per rollout. Larger values reduce updates but may affect learning dynamics."
             )
         },
     )
@@ -146,16 +140,12 @@ class TrainingArguments(TA):
     )
 
     # KL Control
-    kl_coef: float = field(
-        default=0.1,
-        metadata={"help": "KL penalty coefficient (default: 0.1). Alias for init_kl_coef."},
-    )
     init_kl_coef: float = field(
-        default=0.1,
+        default=0.04,
         metadata={
             "help": (
-                "Initial KL penalty coefficient (default: 0.1). "
-                "With adaptive KL control, this value changes during training."
+                "Initial KL penalty coefficient (default: 0.04, matching reference). "
+                "With adaptive KL control, this value adjusts during training."
             )
         },
     )
@@ -181,11 +171,10 @@ class TrainingArguments(TA):
         },
     )
     target_kl: float = field(
-        default=6.0,
+        default=0.1,
         metadata={
             "help": (
-                "Target KL divergence for adaptive KL control (default: 6.0). "
-                "Matches TRL reference. Lower values (e.g., 0.1) are too restrictive."
+                "Target KL divergence for adaptive KL control (default: 0.1). "
             )
         },
     )

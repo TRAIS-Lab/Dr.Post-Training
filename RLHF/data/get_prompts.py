@@ -14,7 +14,7 @@ from datasets import Dataset, load_dataset
 def get_prompt_dataset(
     task: str,
     tokenizer,
-    input_min_length: int = 5,
+    input_min_length: int = 10,
     input_max_length: int = 15,
     seed: int = 42,
 ) -> Dataset:

@@ -54,12 +54,8 @@ n_eval=500
 model="meta-llama/Llama-3.2-1B"
 batch_size=8
 val_batch_size="1"  # Defaults to batch_size if not specified
-lr=""  # Learning rate (looked up from lr_config.json if not specified)
 seed=42
 
-# LR configuration
-lr_config_file="SFT/train/lr/config.json"
-lr_override=""  # Set when --lr is explicitly passed
 gradient_accumulation_steps=1
 task="mmlu"
 train_dataset=""  # Training dataset (if empty, uses task-based default)
@@ -73,14 +69,18 @@ use_flash_attention=true
 enable_profile=false
 profile_steps=10
 
+# LR configuration
+lr_config_file="SFT/train/lr/config.json"
+lr_override=""  # Set when --lr is explicitly passed
+# Default LRs (used when lr_config.json has no entry for the method)
+default_lr_full="5e-05"
+default_lr_lora="2e-04"
+
 # Multi-method mode
 methods=""  # Comma-separated list of methods or categories
 dry_run=false
 use_sbatch=false
 
-# Fallback LRs (used only when lr_config.json has no entry)
-fallback_lr_full="5e-05"
-fallback_lr_lora="2e-04"
 
 # Method definitions
 # Format: "NAME:data_selection:compression:use_lora"
@@ -224,8 +224,8 @@ while [[ $# -gt 0 ]]; do
             ;;
         --lr_lora)
             # Deprecated: LRs are now managed via lr_config.json
-            # This sets the fallback LR for LoRA methods
-            fallback_lr_lora="$2"
+            # This sets the default LR for LoRA methods when not found in config
+            default_lr_lora="$2"
             shift 2
             ;;
         --methods)
@@ -405,9 +405,9 @@ except:
 
     # Fallback to defaults
     if [ "$is_lora" = true ]; then
-        echo "$fallback_lr_lora"
+        echo "$default_lr_lora"
     else
-        echo "$fallback_lr_full"
+        echo "$default_lr_full"
     fi
 }
 

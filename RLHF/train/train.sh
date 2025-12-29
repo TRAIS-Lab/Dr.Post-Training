@@ -30,58 +30,30 @@ export base_training_args="--bf16=True \
 --warmup_ratio=0.03 \
 --weight_decay=0.0 \
 --logging_steps=1 \
---report_to=none \
---filter_frac=0.5"
+--report_to=none"
 
 # Default values
 task="toxicity"
 method="NA"  # NA, Streaming, or GREATS
 model="EleutherAI/gpt-neo-2.7B"
 reward_model="facebook/roberta-hate-speech-dynabench-r4-target"
-
-# Training hyperparameters
-batch_size=512  # Reference uses 256 for stable gradients
-lr=""  # Learning rate (looked up from config if not specified)
-lr_override=""  # Set when --lr is explicitly passed
-filter_frac=0.5
+batch_size=512
 max_steps=-1  # -1 means no step limit (use epochs instead)
-epochs=2  # Number of training epochs (used when max_steps <= 0)
+epochs=1  # Number of training epochs (used when max_steps <= 0)
 seed=42
-min_batch_size_for_selection=1  # Skip selection when mini-batch size is too small
-
-# LR configuration
-# Reference: archive/LDA-ORL-main/rlhf-toxicity/scripts/run_train_std.sh uses 1e-5
-lr_config_file="RLHF/train/lr/config.json"
-fallback_lr_full="1e-5"
-fallback_lr_lora="5e-6"
-
-# LoRA settings
-use_lora=false
-lora_r=16
-lora_alpha=32
-lora_target_modules="q_proj k_proj v_proj o_proj"
-
-# Flash attention
-use_flash_attention=true
-
-# Compression settings
-compression=""  # LoGra or GraSS
-update_compressor_freq=200
 
 # PPO settings
 ppo_epochs=4
 mini_batch_size=4
-init_kl_coef=0.2
+filter_frac=1.0
+init_kl_coef=0.04
 kl_penalty="full"  # Options: kl, abs, mse, full (use "kl" for token-level stability)
 adap_kl_ctrl=true
 target_kl=0.1
 max_new_tokens=30
-min_new_tokens=20
-
+min_new_tokens=10
 # Selection settings
-# Note: Uses self-referencing validation (training buffer as validation set)
 use_second_order=false
-
 # Toxicity evaluation settings
 # Uses a DIFFERENT classifier than reward model for unbiased evaluation
 enable_toxicity_eval=true
@@ -89,6 +61,25 @@ eval_interval=1  # 0 = end of epoch only, N > 0 = every N steps
 eval_n_samples=500
 eval_batch_size=256
 eval_on_step_generations=true  # Evaluate toxicity on each step's generations
+use_flash_attention=true
+
+# LR configuration
+lr_config_file="RLHF/train/lr/config.json"
+lr_override=""  # Set when --lr is explicitly passed
+# Default LRs (used when lr_config.json has no entry for the method)
+default_lr_full="1e-5"
+default_lr_lora="5e-6"
+
+# LoRA settings
+use_lora=false
+lora_r=16
+lora_alpha=32
+lora_target_modules="q_proj k_proj v_proj o_proj"
+
+
+# Compression settings
+compression=""  # LoGra or GraSS
+update_compressor_freq=200
 
 # Output
 output_dir=""
@@ -224,10 +215,6 @@ while [[ $# -gt 0 ]]; do
             max_new_tokens="$2"
             shift 2
             ;;
-        --min_batch_size_for_selection)
-            min_batch_size_for_selection="$2"
-            shift 2
-            ;;
         --use_second_order)
             use_second_order=true
             shift 1
@@ -313,8 +300,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --batch_size <size>        Training batch size (default: 256)"
             echo "  --lr <lr>                  Learning rate override (ignores config file)"
             echo "  --lr_config <path>         LR config file (default: RLHF/train/lr/config.json)"
-            echo "  --filter_frac <frac>       Fractio∂n of negative samples to drop (default: 1.0)"
-            echo "  --min_batch_size_for_selection <n>  Min batch size for selection (default: 2)"
+            echo "  --filter_frac <frac>       Fraction of negative samples to drop (default: 1.0)"
             echo "  --max_steps <steps>        Maximum training steps (default: -1, meaning no limit)"
             echo "  --epochs <n>               Number of training epochs (default: 1, used when max_steps <= 0)"
             echo "  --seed <seed>              Random seed (default: 42)"
@@ -430,9 +416,9 @@ except:
 
     # Fallback to defaults
     if [ "$is_lora" = "true" ]; then
-        echo "$fallback_lr_lora"
+        echo "$default_lr_lora"
     else
-        echo "$fallback_lr_full"
+        echo "$default_lr_full"
     fi
 }
 
@@ -490,7 +476,7 @@ run_single_method() {
         training_type="Full"
     fi
 
-    local JOB_NAME="${task}-${exp_method}-${compression_name}-${model_short}-${training_type}-lr${exp_lr}-b${batch_size}-s${seed}"
+    local JOB_NAME="${task}-${model_short}-${exp_method}-${compression_name}-${training_type}-lr${exp_lr}-b${batch_size}-s${seed}"
 
     local exp_output_dir
     if [[ -z "$output_dir" ]]; then
@@ -543,7 +529,6 @@ run_single_method() {
 --per_device_train_batch_size=$batch_size \
 --learning_rate=$exp_lr \
 --filter_frac=$filter_frac \
---min_batch_size_for_selection=$min_batch_size_for_selection \
 --max_steps=$max_steps \
 --num_train_epochs=$epochs \
 --seed=$seed \
@@ -643,7 +628,6 @@ if [[ -n "$methods" ]]; then
     echo "  Epochs: $epochs"
     echo "  Max steps: $max_steps (use -1 for epoch-based training)"
     echo "  Filter fraction: $filter_frac"
-    echo "  Min batch for selection: $min_batch_size_for_selection"
     echo "  Validation: self-reference (training buffer)"
     echo ""
     echo "PPO Settings:"

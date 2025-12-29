@@ -10,52 +10,51 @@ import logging
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
+# import torch.nn.functional as F
+# import torch.nn as nn
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
-import torch.nn as nn
-from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
-from typing import Dict, Optional
+from typing import Dict
 from torch import Tensor
 
 from transformers import Trainer
-
-
-def compute_train_loss_from_merged(logits, labels, train_batch_size):
-    """
-    Compute loss for train samples only from merged batch forward.
-
-    This allows reporting the train-only loss without an extra forward pass
-    when using merged batches (train + val) for data selection.
-
-    Args:
-        logits: Model output logits [batch_size, seq_len, vocab_size]
-        labels: Labels tensor [batch_size, seq_len]
-        train_batch_size: Number of train samples (first N in batch)
-
-    Returns:
-        Loss computed only on the train portion of the batch
-    """
-    # Extract train portion
-    train_logits = logits[:train_batch_size]  # [train_bs, seq_len, vocab_size]
-    train_labels = labels[:train_batch_size]  # [train_bs, seq_len]
-
-    # Shift for causal LM (predict next token)
-    shift_logits = train_logits[..., :-1, :].contiguous()
-    shift_labels = train_labels[..., 1:].contiguous()
-
-    # Flatten
-    shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-    shift_labels = shift_labels.view(-1)
-
-    # Compute loss (mean over valid tokens only)
-    loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
-    return loss
 
 from gradstream.optimizer import MeSOAdamW
 from gradstream.hook import GradientHook
 from gradstream.selection import create_separate_batch_strategy, create_merged_batch_strategy
 
 logger = logging.getLogger(__name__)
+
+# deprecated
+# def compute_train_loss_from_merged(logits, labels, train_batch_size):
+#     """
+#     Compute loss for train samples only from merged batch forward.
+
+#     This allows reporting the train-only loss without an extra forward pass
+#     when using merged batches (train + val) for data selection.
+
+#     Args:
+#         logits: Model output logits [batch_size, seq_len, vocab_size]
+#         labels: Labels tensor [batch_size, seq_len]
+#         train_batch_size: Number of train samples (first N in batch)
+
+#     Returns:
+#         Loss computed only on the train portion of the batch
+#     """
+#     # Extract train portion
+#     train_logits = logits[:train_batch_size]  # [train_bs, seq_len, vocab_size]
+#     train_labels = labels[:train_batch_size]  # [train_bs, seq_len]
+
+#     # Shift for causal LM (predict next token)
+#     shift_logits = train_logits[..., :-1, :].contiguous()
+#     shift_labels = train_labels[..., 1:].contiguous()
+
+#     # Flatten
+#     shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+#     shift_labels = shift_labels.view(-1)
+
+#     # Compute loss (mean over valid tokens only)
+#     loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+#     return loss
 
 
 class StreamingTrainer(Trainer):
@@ -196,32 +195,6 @@ class StreamingTrainer(Trainer):
             logger.info(f"  Mode: Baseline (full gradients, no selection)")
 
         logger.info("="*60)
-
-        # Set up profiler if enabled
-        self.profiler = None
-        self.profile_step_count = 0
-        if getattr(self.args, 'profile', False):
-            profile_dir = os.path.join(self.args.output_dir, 'profile')
-            os.makedirs(profile_dir, exist_ok=True)
-            profile_steps = getattr(self.args, 'profile_steps', 10)
-
-            self.profiler = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                schedule=schedule(
-                    wait=1,      # Skip first step (warmup)
-                    warmup=1,    # Warmup step
-                    active=profile_steps,  # Profile these steps
-                    repeat=1     # Only one cycle
-                ),
-                on_trace_ready=tensorboard_trace_handler(profile_dir),
-                record_shapes=True,
-                profile_memory=True,  # Disable for lower overhead
-                with_stack=True,      # Disable for lower overhead (stacks are expensive)
-                with_flops=True,      # Disable for lower overhead
-            )
-            self.profiler.start()
-            logger.info(f"Profiler enabled: will profile {profile_steps} steps, output to {profile_dir}")
-            logger.info("  View with: tensorboard --logdir=" + profile_dir)
 
     def _get_unwrapped_optimizer(self):
         """
@@ -447,33 +420,11 @@ class StreamingTrainer(Trainer):
                 # Cleanup val buffer
                 self.grad_hook.clear_val_buffer()
 
-            # Step profiler if enabled
-            if self.profiler is not None:
-                self.profiler.step()
-                self.profile_step_count += 1
-                profile_steps = getattr(self.args, 'profile_steps', 10)
-                if self.profile_step_count == profile_steps + 2:  # wait + warmup + active
-                    self.profiler.stop()
-                    logger.info(f"Profiler stopped after {profile_steps} steps. Check output_dir/profile/")
-                    self.profiler = None
-
             return loss
 
         # === BASELINE MODE (no data selection) ===
         else:
-            loss = self._training_step_baseline(model, inputs)
-
-            # Step profiler if enabled
-            if self.profiler is not None:
-                self.profiler.step()
-                self.profile_step_count += 1
-                profile_steps = getattr(self.args, 'profile_steps', 10)
-                if self.profile_step_count == profile_steps + 2:  # wait + warmup + active
-                    self.profiler.stop()
-                    logger.info(f"Profiler stopped after {profile_steps} steps. Check output_dir/profile/")
-                    self.profiler = None
-
-            return loss
+            return self._training_step_baseline(model, inputs)
 
     def _compute_loss_for_selection(self, model, batch):
         """Compute loss for selection (handles multi-GPU and grad accumulation)."""
@@ -688,11 +639,5 @@ class StreamingTrainer(Trainer):
 
     def on_train_end(self):
         """Called at the end of training to save final results."""
-        # Stop profiler if still running
-        if self.profiler is not None:
-            self.profiler.stop()
-            logger.info("Profiler stopped at end of training. Check output_dir/profile/")
-            self.profiler = None
-
         self._save_evaluation_results()
         logger.info(f"Training completed. Final results saved to {self.args.output_dir}/evaluation_results.json")

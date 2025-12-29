@@ -533,6 +533,29 @@ class SeparateBatchGREATSStrategy(SeparateBatchStrategy):
 
         self._cleanup()
 
+        # Handle empty selection: skip pass 2 and return zero loss
+        if n_selected == 0:
+            # Re-enable hooks for next step
+            self.grad_hook.enable_hooks()
+
+            # Return zero loss and stats indicating batch was skipped
+            # Include placeholder loss stats for consistent logging
+            import torch
+            zero_loss = torch.tensor(0.0, device=next(model.parameters()).device)
+            stats = {
+                "loss/total": 0.0,
+                "loss/policy": 0.0,
+                "loss/value": 0.0,
+                "policy/approx_kl": 0.0,
+                "policy/clipfrac": 0.0,
+                "policy/ratio_mean": 1.0,
+                "values/mean": 0.0,
+                "selection/n_selected": 0,
+                "selection/n_total": batch_size,
+                "selection/frac": 0.0,
+            }
+            return zero_loss, stats
+
         # === PASS 2: Gradient Computation on Selected ===
         self.grad_hook.disable_hooks()
         model.zero_grad()

@@ -129,13 +129,20 @@ class SelectionState(ABC):
         Compute token-based gradient scale factor for selected samples.
 
         Returns train_total_tokens / selected_tokens to maintain proper gradient magnitude.
+        Returns 1.0 if no samples are selected (empty selection case).
         """
         if self.tokens_per_sample is None:
             raise RuntimeError(
                 "Token counts not set. Call set_token_counts() before selection. "
                 "For SeparateBatch strategies, pass 'labels' in kwargs to execute_training_step()."
             )
+        # Handle empty selection to avoid division by zero
+        if selected_indices.numel() == 0:
+            return 1.0
         selected_tokens = self.tokens_per_sample[selected_indices].sum()
+        # Safety check in case all selected samples have zero tokens
+        if selected_tokens == 0:
+            return 1.0
         return self.train_total_tokens / selected_tokens
 
     @abstractmethod
@@ -226,19 +233,15 @@ class StreamingState(SelectionState):
         num_selected = selected_indices.shape[0]
 
         # Step 4: Aggregate selected gradients
-        if num_selected == 0:
-            reduced_grad = torch.zeros(
-                1, train_grads.shape[1],
-                device=train_grads.device,
-                dtype=train_grads.dtype
-            )
-        else:
-            selected_grads = train_grads[selected_indices]
-            reduced_grad = selected_grads.sum(dim=0, keepdim=True)
+        # Note: empty selection (num_selected=0) naturally produces zero gradients
+        # since train_grads[empty_indices].sum() = zeros
+        selected_grads = train_grads[selected_indices]
+        reduced_grad = selected_grads.sum(dim=0, keepdim=True)
 
-            # Step 5: Apply token-based gradient scaling
-            scale_factor = self._compute_scale_factor(selected_indices)
-            reduced_grad = reduced_grad * scale_factor
+        # Step 5: Apply token-based gradient scaling
+        # _compute_scale_factor handles empty selection internally (returns 1.0)
+        scale_factor = self._compute_scale_factor(selected_indices)
+        reduced_grad = reduced_grad * scale_factor
 
         self.num_selected = num_selected
         return reduced_grad, num_selected

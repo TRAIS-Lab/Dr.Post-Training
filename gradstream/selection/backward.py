@@ -177,7 +177,7 @@ class StreamingLinearBackward(Function):
             else:
                 grad_weight, grad_bias = StreamingLinearBackward._backward_full(
                     hook_manager, state, layer_idx,
-                    input, weight, bias, grad_output,
+                    input, bias, grad_output,
                     capture_val_mode, use_stored_val
                 )
 
@@ -242,7 +242,6 @@ class StreamingLinearBackward(Function):
         state: Optional["StreamingState"],
         layer_idx: int,
         input: Tensor,
-        weight: Tensor,
         bias: Optional[Tensor],
         grad_output: Tensor,
         capture_val_mode: bool,
@@ -294,12 +293,11 @@ class StreamingLinearBackward(Function):
 
         # Per-layer selection
         selected_indices = state._select_indices(scores, similarity)
-        num_selected = selected_indices.shape[0]
-        state.num_selected = num_selected
+        state.num_selected = selected_indices.shape[0]
 
-        if num_selected == 0:
-            return torch.zeros_like(weight), torch.zeros_like(bias) if bias is not None else None
-
+        # Compute gradients for selected samples
+        # Note: empty selection naturally produces zero gradients via einsum on empty tensors
+        # _compute_scale_factor handles empty selection internally (returns 1.0)
         scale_factor = _compute_scale_factor(state, selected_indices)
         grad_weight, grad_bias = compute_selected_gradients(
             train_grad_output, train_input, selected_indices, bias is not None, scale_factor

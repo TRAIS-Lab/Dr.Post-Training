@@ -1,32 +1,18 @@
 # RLHF Experiments
 
-This folder contains the training code for Reinforcement Learning from Human Feedback with **Gradient Streaming**.
+This folder contains the training and evaluation code and method configurations for Reinforcement Learning from Human Feedback.
 
-## Naming Convention
+## Experiment Summary
 
-Experiments follow the pattern: `{task}-{selection}-{compression}-{model}-{training_type}-lr{lr}-b{batch}-v{nval}-s{seed}`
+The following methods have been run and can be rerun with the commands below.
 
-| Component       | Options                     | Description                                   |
-| --------------- | --------------------------- | --------------------------------------------- |
-| `selection`     | `NA`, `Streaming`, `GREATS` | Data selection method                         |
-| `compression`   | `NA`, `LoGra`               | Gradient compression (implies MeSO optimizer) |
-| `training_type` | `Full`, `LoRA`              | Full fine-tuning or LoRA                      |
+| Task     | Model        | Batch | Val Size | Epochs | LoRA Rank |
+| -------- | ------------ | ----- | -------- | ------ | --------- |
+| Toxicity | gpt-neo-2.7B | 256   | 128      | 1      | 16        |
 
-> **Note:** GraSS compression is also available (`--compression GraSS`) but not used in default methods.
+### Experiment Configurations
 
-### Selection Methods
-- **NA**: No data selection (baseline PPO)
-- **Streaming**: Per-layer selection - each layer independently selects samples (single-pass)
-- **GREATS**: Global selection - accumulates scores across all layers (two-pass)
-
-### Compression Methods
-- **NA**: No compression - uses full gradients and standard AdamW optimizer
-- **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer
-- **GraSS**: Gradient Sparsification with Sketching (available but not used in default methods)
-
-## Experiment Configurations
-
-### Full Configuration Matrix (8 methods)
+We consider the following 8 methods for the toxicity task:
 
 | #   | Selection | Compression | Training | Description                               |
 | --- | --------- | ----------- | -------- | ----------------------------------------- |
@@ -39,36 +25,51 @@ Experiments follow the pattern: `{task}-{selection}-{compression}-{model}-{train
 | 4   | Streaming | LoGra       | Full     | Per-layer selection + MeSO                |
 | 5   | GREATS    | LoGra       | Full     | Global selection + MeSO                   |
 
-> [!Note]
-> Second-order interaction is enabled by default for all data selection methods (Streaming and GREATS).
+> Experiments follow the pattern: `{task}-{selection}-{compression}-{model}-{training_type}-lr{lr}-b{batch}-v{nval}-s{seed}`
 
-## Learning Rate Configuration
+1. Selection Modes
+   - **NA**: No data selection (baseline PPO)
+   - **Streaming**: Per-layer selection - each layer independently selects samples (single-pass)
+   - **GREATS**: Global selection - accumulates scores across all layers (two-pass)
+2. Compression Methods
+   - **NA**: No compression - uses full gradients and standard AdamW optimizer
+   - **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer
+   - **GraSS**: Gradient Sparsification with Sketching (available but not used in default methods)
+3. Training Types
+   - **Full**: Full fine-tuning of all model parameters
+   - **LoRA**: LoRA fine-tuning of low-rank adapters only
 
-The `RLHF/train/lr/` folder contains tools for finding optimal learning rates, where learning rates are managed via `RLHF/train/lr/config.json`.
+### LR Sweep Commands
 
-### Recommended Workflow
-
-1. **Run LR sweep** using either Grid Search or Binary Search:
+The `RLHF/train/lr/` folder contains tools for finding optimal learning rates, where learning rates are managed via `RLHF/train/lr/config.json`. Run LR sweep before full training to find optimal learning rates:
 
 ```bash
-# Grid Search (default) - tests multiple discrete LRs
-bash RLHF/train/lr/lr_sweep.sh --mode grid --methods all --task toxicity
-
-# Binary Search - efficient search using golden section method
-bash RLHF/train/lr/lr_sweep.sh --mode binary --methods all --task toxicity
+# Toxicity task
+bash RLHF/train/lr/lr_sweep.sh --mode binary --methods all --task toxicity \
+    --batch_size 256 --n_val 4 --sweep_max_steps 50 --seed 2
 ```
 
-2. **Run training** with optimal LRs (loaded automatically from config.json):
+You can also run grid search via `--mode grid`.
+
+### Training Commands
+
+All methods are launched using the unified `train.sh` script. Training commands (LRs loaded from lr_config.json):
 
 ```bash
+# Toxicity task - all methods
 bash RLHF/train/train.sh --methods all --task toxicity
+
+# Toxicity task - baseline only
+bash RLHF/train/train.sh --methods baseline --task toxicity
+
+# Toxicity task - streaming methods
+bash RLHF/train/train.sh --methods streaming --task toxicity
 ```
 
-## Running Experiments
+<details>
+  <summary>Detailed Training Script Configuration</summary>
 
-All methods are launched using the unified `train.sh` script.
-
-### Multi-Method Mode
+#### Run Multiple Experiments
 
 Run multiple methods with the `--methods` flag:
 
@@ -97,189 +98,67 @@ bash RLHF/train/train.sh --methods all --task toxicity --dry-run
 bash RLHF/train/train.sh --methods all --task toxicity --sbatch
 ```
 
-#### Available Categories
+Available Categories:
 
 | Category         | Experiments                                                |
 | ---------------- | ---------------------------------------------------------- |
-| `all`            | All 8 methods                                          |
+| `all`            | All 8 methods                                              |
 | `baseline`       | NA-NA-Full, NA-NA-LoRA                                     |
 | `streaming`      | Streaming-NA-Full, Streaming-NA-LoRA, Streaming-LoGra-Full |
 | `greats`         | GREATS-NA-Full, GREATS-NA-LoRA, GREATS-LoGra-Full          |
-| `full`           | All *-Full methods (5 total)                           |
-| `lora`           | All *-LoRA methods (3 total)                           |
+| `full`           | All *-Full methods (5 total)                               |
+| `lora`           | All *-LoRA methods (3 total)                               |
 | `compression`    | Streaming-LoGra-Full, GREATS-LoGra-Full                    |
-| `no-compression` | All methods without compression (6 total)              |
+| `no-compression` | All methods without compression (6 total)                  |
 
-### Single Experiment Mode
-
-Run a single method by specifying individual options:
-
-```bash
-# From project root
-bash RLHF/train/train.sh [options]
-
-# Or with SLURM
-sbatch RLHF/train/train.sh [options]
-```
-
-#### Examples
-
-```bash
-# NA-NA-Full: Baseline PPO full fine-tuning
-bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m
-
-# NA-NA-LoRA: Baseline PPO LoRA fine-tuning
-bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m --lora
-
-# Streaming-NA-Full: Per-layer selection with full gradients (second-order enabled)
-bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m \
-    --method Streaming --use_second_order
-
-# GREATS-NA-Full: Global selection with full gradients (second-order enabled)
-bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m \
-    --method GREATS --use_second_order
-
-# Streaming-LoGra-Full: Per-layer selection + MeSO (second-order enabled)
-bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m \
-    --method Streaming --compression LoGra --use_second_order
-
-# GREATS-LoGra-Full: Global selection + MeSO (second-order enabled)
-bash RLHF/train/train.sh --task toxicity --model EleutherAI/gpt-neo-125m \
-    --method GREATS --compression LoGra --use_second_order
-```
-
-### Parameters
+#### Parameters
 
 The unified training script accepts the following arguments:
 
-#### Task Arguments
-
-- `--task <task>` - Task: `toxicity`, `imdb` (default: `toxicity`)
-- `--model <model>` - Policy model (default: `EleutherAI/gpt-neo-2.7B`)
-- `--reward_model <model>` - Reward model (default: `facebook/roberta-hate-speech-dynabench-r4-target`)
-
-#### Data Selection Arguments
-
-- `--method <method>` - Data selection method:
-  - `NA` - No selection (baseline, default)
-  - `Streaming` - Per-layer selection (single-pass)
-  - `GREATS` - Global selection (two-pass)
-- `--use_second_order` - Enable greedy selection with second-order interactions (enabled by default for all selection methods)
-
-#### Compression Arguments
-
-- `--compression <method>` - Gradient compression method (implies MeSO optimizer):
-  - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
-  - `GraSS` - Gradient Sparsification with Sketching (available but not used in default methods)
-  - If not specified, uses full gradients and standard AdamW optimizer
-- `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
-
-#### Core Training Arguments
-
-- `--lr <lr>` - Learning rate override (if not specified, looked up from `lr_config.json`; fallback: `1e-5`)
-- `--lr_config <path>` - LR config file path (default: `RLHF/train/lr/config.json`)
-- `--batch_size <size>` - Batch size (default: `256`)
-- `--max_steps <steps>` - Maximum training steps (default: `-1`, meaning use epochs instead)
-- `--epochs <n>` - Number of training epochs (default: `1`, used when max_steps <= 0)
-- `--seed <seed>` - Random seed (default: `42`)
-
-#### Data Selection Arguments
-
-- `--n_val <n>` - Validation examples for data selection (default: `128`)
-- `--val_batch_size <size>` - Validation batch size for data selection (default: `32`)
-- `--filter_frac <frac>` - Fraction of negative-influence samples to drop (default: `1.0`)
-
-#### PPO Arguments
-
-- `--ppo_epochs <n>` - PPO epochs per batch (default: `4`)
-- `--forward_batch_size <n>` - Forward batch size for PPO updates (default: `256`)
-- `--init_kl_coef <coef>` - Initial KL penalty coefficient (default: `0.2`)
-- `--kl_penalty <mode>` - KL penalty mode: `kl`, `abs`, `mse`, `full` (default: `full`)
-- `--target_kl <kl>` - Target KL for adaptive control (default: `0.1`)
-- `--max_new_tokens <n>` - Maximum new tokens to generate (default: `30`)
-- `--min_new_tokens <n>` - Minimum new tokens to generate (default: `20`)
-
-#### LoRA Arguments
-
-- `--lora` - Enable LoRA fine-tuning (flag, omit for full fine-tuning)
-- `--lora_r <r>` - LoRA rank (default: `16`)
-- `--lora_alpha <alpha>` - LoRA alpha (default: `32`)
-- `--lora_target_modules <modules>` - Target modules for LoRA (default: `q_proj k_proj v_proj o_proj`)
-
-#### Model Arguments
-
-- `--flash_attention` - Enable Flash Attention 2 (default: enabled)
-- `--no_flash_attention` - Disable Flash Attention 2
-
-#### Toxicity Evaluation Arguments
-
-Training-time toxicity evaluation uses a **different classifier** than the reward model to prevent reward hacking and provide unbiased measurement.
-
-- `--enable_toxicity_eval` - Enable toxicity evaluation during training (default: `true`)
-- `--disable_toxicity_eval` - Disable toxicity evaluation
-- `--eval_interval <n>` - Evaluate every N steps; 0 = epoch end only (default: `1`)
-- `--eval_n_samples <n>` - Number of samples for full evaluation (default: `500`)
-- `--eval_batch_size <n>` - Batch size for generation during evaluation (default: `256`)
-- `--eval_on_step_generations` - Evaluate toxicity on each PPO step's generations (default: `true`)
-- `--no_eval_on_step_generations` - Disable per-step toxicity evaluation
-
-| Classifier Type | Model                                              | Usage                         |
-| --------------- | -------------------------------------------------- | ----------------------------- |
-| Reward Model    | `facebook/roberta-hate-speech-dynabench-r4-target` | Training signal (reward)      |
-| Evaluation      | `DaNLP/da-electra-hatespeech-detection`            | Unbiased toxicity measurement |
-
-#### Training Configuration
-
-- `--max_grad_norm` - Gradient clipping (default: `0.0` = disabled)
-- Learning rate: `1e-5` (fallback if not in config.json)
-
-> **Note:** Gradient clipping is disabled by default (`max_grad_norm=0.0`). With gradient clipping enabled (e.g., `max_grad_norm=1.0`), the effective updates become too small for PPO to learn properly.
-
-## Key Differences from SFT
-
-| Aspect           | SFT                             | RLHF (PPO)                                |
-| ---------------- | ------------------------------- | ----------------------------------------- |
-| Training Loss    | Cross-entropy                   | PPO objective (policy + value + KL)       |
-| Data             | Static dataset                  | Dynamic rollouts (generate responses)     |
-| Validation Loss  | NLL on target task              | Sequence-level reward-weighted likelihood |
-| Selection Target | Improve target task performance | Generate high-reward responses            |
-
-> **Note:** The validation gradient is computed using sequence-level attribution: `f^seq(θ) = -E[log π_θ(y|x) * Â(x,y)]`, which points toward higher-reward sequences.
-
-## Experiment Summary
-
-The following methods can be run with the commands below.
-
-| Task     | Model        | Batch | Val Size | Epochs | LoRA Rank |
-| -------- | ------------ | ----- | -------- | ------ | --------- |
-| Toxicity | gpt-neo-2.7B | 256   | 128      | 1      | 16        |
-
-> **Note:** Learning rates are managed via `RLHF/train/lr/config.json`. Run `lr_sweep.sh` to find optimal LRs before training.
-
-### LR Sweep Commands
-
-Run LR sweep before full training to find optimal learning rates:
-
-```bash
-# Toxicity task
-bash RLHF/train/lr/lr_sweep.sh --mode binary --methods all --task toxicity \
-    --batch_size 256 --n_val 4 --sweep_max_steps 50 --seed 2
-```
-
-### Training Commands
-
-Training commands (LRs loaded from lr_config.json):
-
-```bash
-# Toxicity task - all methods
-bash RLHF/train/train.sh --methods all --task toxicity
-
-# Toxicity task - baseline only
-bash RLHF/train/train.sh --methods baseline --task toxicity
-
-# Toxicity task - streaming methods
-bash RLHF/train/train.sh --methods streaming --task toxicity
-```
+1. Task Arguments
+   - `--task <task>` - Task: `toxicity`, `imdb` (default: `toxicity`)
+   - `--model <model>` - Policy model (default: `EleutherAI/gpt-neo-2.7B`)
+   - `--reward_model <model>` - Reward model (default: `facebook/roberta-hate-speech-dynabench-r4-target`)
+2. Data Selection Arguments
+   - `--method <method>` - Data selection method:
+     - `NA` - No selection (baseline, default)
+     - `Streaming` - Per-layer selection (single-pass)
+     - `GREATS` - Global selection (two-pass)
+   - `--use_second_order` - Enable greedy selection with second-order interactions (enabled by default for all selection methods)
+3. Compression Arguments
+   - `--compression <method>` - Gradient compression method (implies MeSO optimizer):
+     - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
+     - `GraSS` - Gradient Sparsification with Sketching (available but not used in default methods)
+     - If not specified, uses full gradients and standard AdamW optimizer
+   - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
+4. Core Training Arguments
+   - `--lr <lr>` - Learning rate override (if not specified, looked up from `lr_config.json`; fallback: `1e-5`)
+   - `--lr_config <path>` - LR config file path (default: `RLHF/train/lr/config.json`)
+   - `--batch_size <size>` - Batch size (default: `256`)
+   - `--max_steps <steps>` - Maximum training steps (default: `-1`, meaning use epochs instead)
+   - `--epochs <n>` - Number of training epochs (default: `1`, used when max_steps <= 0)
+   - `--seed <seed>` - Random seed (default: `42`)
+5. Data Selection Arguments
+   - `--n_val <n>` - Validation examples for data selection (default: `128`)
+   - `--val_batch_size <size>` - Validation batch size for data selection (default: `32`)
+   - `--filter_frac <frac>` - Fraction of negative-influence samples to drop (default: `1.0`)
+6. PPO Arguments
+   - `--ppo_epochs <n>` - PPO epochs per batch (default: `4`)
+   - `--forward_batch_size <n>` - Forward batch size for PPO updates (default: `256`)
+   - `--init_kl_coef <coef>` - Initial KL penalty coefficient (default: `0.2`)
+   - `--kl_penalty <mode>` - KL penalty mode: `kl`, `abs`, `mse`, `full` (default: `full`)
+   - `--target_kl <kl>` - Target KL for adaptive control (default: `0.1`)
+   - `--max_new_tokens <n>` - Maximum new tokens to generate (default: `30`)
+   - `--min_new_tokens <n>` - Minimum new tokens to generate (default: `20`)
+7. LoRA Arguments
+   - `--lora` - Enable LoRA fine-tuning (flag, omit for full fine-tuning)
+   - `--lora_r <r>` - LoRA rank (default: `16`)
+   - `--lora_alpha <alpha>` - LoRA alpha (default: `32`)
+   - `--lora_target_modules <modules>` - Target modules for LoRA (default: `q_proj k_proj v_proj o_proj`)
+8. Model Arguments
+   - `--flash_attention` - Enable Flash Attention 2 (default: enabled)
+   - `--no_flash_attention` - Disable Flash Attention 2
+</details>
 
 ### Evaluation Commands
 
@@ -293,9 +172,10 @@ bash RLHF/eval/eval.sh --task toxicity --batch_size 256 --seed 82
 python -m RLHF.eval.eval --model_path /path/to/model --n_samples 400
 ```
 
-## Evaluation
+<details>
+  <summary>Detailed Evaluation Configuration</summary>
 
-### Two-Classifier Approach
+#### Two-Classifier Approach
 
 To ensure genuine toxicity reduction (not reward hacking), we use **different classifiers** for training and evaluation:
 
@@ -303,24 +183,6 @@ To ensure genuine toxicity reduction (not reward hacking), we use **different cl
 | ---------- | -------------------------------------------------- | ---------- |
 | Training   | `facebook/roberta-hate-speech-dynabench-r4-target` | Direct     |
 | Evaluation | `DaNLP/da-electra-hatespeech-detection`            | `evaluate` |
-
-This follows the reference implementation approach where the evaluation classifier is independent from the reward model used during training.
-
-### Training-Time Evaluation
-
-During training, toxicity is evaluated automatically (enabled by default):
-- **Per-step evaluation**: Evaluates toxicity on each PPO step's generated responses (no extra generation cost)
-- **Full evaluation**: Runs at configurable intervals or at epoch end
-
-Training metrics include:
-- `eval/step_toxicity_prob` - Mean toxicity probability of step generations
-- `eval/step_toxicity_rate` - Fraction of toxic generations per step
-- `eval/toxicity_prob` - Mean toxicity from full evaluation
-- `eval/toxicity_rate` - Fraction of toxic generations from full evaluation
-
-### Post-Training Evaluation
-
-The evaluation script measures model toxicity on toxic prompt completions.
 
 #### Dataset
 
@@ -338,8 +200,6 @@ The evaluation script measures model toxicity on toxic prompt completions.
 | Toxicity Rate | Fraction of generations with toxicity > 0.5 |
 
 #### Classifier Selection
-
-The evaluation script supports both classifiers:
 
 ```bash
 # Use independent classifier (default, recommended)
@@ -370,3 +230,31 @@ bash RLHF/eval/eval.sh --sbatch
 # Dry run
 bash RLHF/eval/eval.sh --dry-run
 ```
+
+#### Toxicity Evaluation Arguments
+
+Training-time toxicity evaluation uses a **different classifier** than the reward model to prevent reward hacking and provide unbiased measurement.
+
+- `--enable_toxicity_eval` - Enable toxicity evaluation during training (default: `true`)
+- `--disable_toxicity_eval` - Disable toxicity evaluation
+- `--eval_interval <n>` - Evaluate every N steps; 0 = epoch end only (default: `1`)
+- `--eval_n_samples <n>` - Number of samples for full evaluation (default: `500`)
+- `--eval_batch_size <n>` - Batch size for generation during evaluation (default: `256`)
+- `--eval_on_step_generations` - Evaluate toxicity on each PPO step's generations (default: `true`)
+- `--no_eval_on_step_generations` - Disable per-step toxicity evaluation
+
+Training metrics include:
+- `eval/step_toxicity_prob` - Mean toxicity probability of step generations
+- `eval/step_toxicity_rate` - Fraction of toxic generations per step
+- `eval/toxicity_prob` - Mean toxicity from full evaluation
+- `eval/toxicity_rate` - Fraction of toxic generations from full evaluation
+</details>
+
+## Key Differences from SFT
+
+| Aspect           | SFT                             | RLHF (PPO)                                |
+| ---------------- | ------------------------------- | ----------------------------------------- |
+| Training Loss    | Cross-entropy                   | PPO objective (policy + value + KL)       |
+| Data             | Static dataset                  | Dynamic rollouts (generate responses)     |
+| Validation Loss  | NLL on target task              | Sequence-level reward-weighted likelihood |
+| Selection Target | Improve target task performance | Generate high-reward responses            |
