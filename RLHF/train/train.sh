@@ -37,25 +37,23 @@ task="toxicity"
 method="NA"  # NA, Streaming, or GREATS
 model="EleutherAI/gpt-neo-2.7B"
 reward_model="facebook/roberta-hate-speech-dynabench-r4-target"
-batch_size=512
+batch_size=256
 max_steps=-1  # -1 means no step limit (use epochs instead)
 epochs=1  # Number of training epochs (used when max_steps <= 0)
 seed=42
 
 # PPO settings
 ppo_epochs=4
-mini_batch_size=4
+mini_batch_size=1
 filter_frac=1.0
 init_kl_coef=0.04
-kl_penalty="full"  # Options: kl, abs, mse, full (use "kl" for token-level stability)
+kl_penalty="kl"  # Options: kl, abs, mse, full (use "kl" for token-level stability)
 adap_kl_ctrl=true
 target_kl=0.1
 max_new_tokens=30
 min_new_tokens=10
-# Selection settings
 use_second_order=false
 # Toxicity evaluation settings
-# Uses a DIFFERENT classifier than reward model for unbiased evaluation
 enable_toxicity_eval=true
 eval_interval=1  # 0 = end of epoch only, N > 0 = every N steps
 eval_n_samples=500

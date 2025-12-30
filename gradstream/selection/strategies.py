@@ -467,12 +467,6 @@ class SeparateBatchStreamingStrategy(SeparateBatchStrategy):
         loss, stats = compute_loss_fn()
         loss.backward()  # Per-layer selection happens in backward hooks
 
-        # Get selection stats before cleanup
-        if self.grad_hook.selection_state is not None:
-            n_selected = self.grad_hook.selection_state.num_selected
-            stats["selection/n_selected"] = n_selected
-            stats["selection/frac"] = n_selected / batch_size
-
         # Cleanup
         self._cleanup()
 
@@ -550,9 +544,6 @@ class SeparateBatchGREATSStrategy(SeparateBatchStrategy):
                 "policy/clipfrac": 0.0,
                 "policy/ratio_mean": 1.0,
                 "values/mean": 0.0,
-                "selection/n_selected": 0,
-                "selection/n_total": batch_size,
-                "selection/frac": 0.0,
             }
             return zero_loss, stats
 
@@ -567,11 +558,6 @@ class SeparateBatchGREATSStrategy(SeparateBatchStrategy):
 
         # Re-enable hooks for next step
         self.grad_hook.enable_hooks()
-
-        # Add selection stats
-        stats["selection/n_selected"] = n_selected
-        stats["selection/n_total"] = batch_size
-        stats["selection/frac"] = n_selected / batch_size
 
         return loss.detach(), stats
 

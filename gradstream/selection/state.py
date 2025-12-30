@@ -18,6 +18,7 @@ import torch
 
 from ..utils import greedy_selection, topk_selection, negative_filtering
 
+
 class SelectionState(ABC):
     """
     Abstract base class for selection state management during backward pass.
@@ -194,6 +195,38 @@ class StreamingState(SelectionState):
         # Track last selected indices for stats
         self._last_selected_indices: Optional[Tensor] = None
 
+        # Track selection stats across all layers
+        self._layer_selections: list = []  # (layer_idx, n_selected) tuples
+
+    def get_selection_stats(self) -> dict:
+        """Get aggregated selection statistics across all layers."""
+        if not self._layer_selections:
+            return {"n_layers": 0, "mean": 0, "min": 0, "max": 0}
+
+        selections = [n for _, n in self._layer_selections]
+
+        # Separate by layer type (even=lora_A, odd=lora_B)
+        lora_a_selections = [n for idx, n in self._layer_selections if idx % 2 == 0]
+        lora_b_selections = [n for idx, n in self._layer_selections if idx % 2 == 1]
+
+        stats = {
+            "n_layers": len(selections),
+            "mean": sum(selections) / len(selections),
+            "min": min(selections),
+            "max": max(selections),
+        }
+
+        if lora_a_selections:
+            stats["lora_a_mean"] = sum(lora_a_selections) / len(lora_a_selections)
+        if lora_b_selections:
+            stats["lora_b_mean"] = sum(lora_b_selections) / len(lora_b_selections)
+
+        return stats
+
+    def reset_layer_stats(self):
+        """Reset per-layer stats for a new mini-batch."""
+        self._layer_selections = []
+
     def process_layer_gradients(
         self,
         train_grads: Tensor,
@@ -215,6 +248,7 @@ class StreamingState(SelectionState):
         """
         # Step 1: Compute scores (gradient alignment)
         scores = train_grads @ val_grad
+
         if score_correction != 1.0:
             scores = scores * score_correction
 
@@ -231,6 +265,9 @@ class StreamingState(SelectionState):
         selected_indices = selected_indices.sort()[0]
         self._last_selected_indices = selected_indices
         num_selected = selected_indices.shape[0]
+
+        # Track selection for this layer
+        self._layer_selections.append((layer_idx, num_selected))
 
         # Step 4: Aggregate selected gradients
         # Note: empty selection (num_selected=0) naturally produces zero gradients

@@ -30,6 +30,7 @@ from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, set_seed, get_scheduler
 from trl import AutoModelForCausalLMWithValueHead
+from trl.models import create_reference_model
 
 # Suppress torch.compile warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
@@ -317,20 +318,16 @@ def main():
     if n_policy_trainable == 0:
         logger.warning("WARNING: No policy parameters are trainable! This will break PPO training.")
 
-    # Reference model handling:
+    # Reference model handling (matching reference implementation ppo_trainer.py:222-233):
     # - For PEFT (LoRA) models: No separate reference model needed
-    #   The trainer uses disable_adapter() on the policy model (matching reference implementation)
-    # - For non-PEFT models: Load a frozen copy for KL penalty
+    #   The trainer uses disable_adapter() on the policy model
+    # - For non-PEFT models: Use create_reference_model() with shared layers
+    #   This is more memory efficient than loading a separate frozen copy
     ref_model = None
     if not model_args.lora:
-        logger.info("Loading reference model (frozen) for non-PEFT training...")
-        ref_model = AutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            **model_kwargs,
-        ).to(device)
-        ref_model.eval()
-        for param in ref_model.parameters():
-            param.requires_grad = False
+        logger.info("Creating reference model with shared layers for non-PEFT training...")
+        ref_model = create_reference_model(model)
+        logger.info("Reference model created (shares layers with policy model)")
     else:
         logger.info("Using disable_adapter() for reference logprobs (PEFT model)")
 
@@ -492,15 +489,14 @@ def main():
         logger.info("Creating toxicity evaluator (DaNLP/da-electra-hatespeech-detection)...")
         evaluator = ToxicityEvaluator(
             device=device,
-            batch_size=32,
+            batch_size=64,
         )
         logger.info("Toxicity evaluator ready")
 
     # Create trainer
-    # Note: For PEFT models, ref_model=None and trainer uses disable_adapter()
     trainer = StreamingPPOTrainer(
         model=model,
-        ref_model=ref_model,  # None for PEFT, frozen model for non-PEFT
+        ref_model=ref_model,  # None for PEFT, shared-layer ref model for non-PEFT
         reward_model=reward_model,
         tokenizer=tokenizer,
         args=training_args,
