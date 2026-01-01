@@ -2,11 +2,12 @@
 Reward model utilities for RLHF experiments.
 
 This module provides utilities for loading and using reward models
-for PPO training. Currently supports toxicity classification.
+for PPO training. Currently supports:
+- Toxicity classification (facebook/roberta-hate-speech-dynabench-r4-target)
 """
 
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 def load_reward_model(
     model_name: str,
     device: str = "cuda",
+    task: str = "toxicity",
 ) -> Tuple[AutoTokenizer, nn.Module]:
     """
     Load a reward model for RLHF.
@@ -25,24 +27,12 @@ def load_reward_model(
     Args:
         model_name: Model name or path
         device: Device to load model on
+        task: Task type ('toxicity')
 
     Returns:
         Tuple of (tokenizer, model)
     """
-    if "hate" in model_name or "toxicity" in model_name:
-        return load_toxicity_model(model_name, device)
-    else:
-        # Generic reward model
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        model = AutoModelForSequenceClassification.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-        ).to(device)
-
-        return tokenizer, model
+    return load_toxicity_model(model_name, device)
 
 
 def load_toxicity_model(
@@ -130,6 +120,7 @@ class RewardModelWrapper(nn.Module):
         policy_tokenizer: AutoTokenizer,
         device: str = "cuda",
         max_length: int = 512,
+        task: str = "toxicity",
     ):
         """
         Initialize the wrapper.
@@ -140,6 +131,7 @@ class RewardModelWrapper(nn.Module):
             policy_tokenizer: Tokenizer for the policy model
             device: Device
             max_length: Maximum sequence length
+            task: Task type ('toxicity')
         """
         super().__init__()
         self.reward_model = reward_model
@@ -196,28 +188,22 @@ class RewardModelWrapper(nn.Module):
         """
         Compute rewards for query-response pairs.
 
-        IMPORTANT: For toxicity detection, we score ONLY the response text,
-        not the query+response. This matches the reference implementation
-        (rl_utils.py line 839):
+        For toxicity: Score ONLY the response text (not query+response).
+        This matches the reference implementation (rl_utils.py line 839):
             if 'hate' in rmname:
-                # only score the generations
                 rewards = process_reward(batch["response"], rmname, ...)
-
-        Scoring query+response would dilute the reward signal because the
-        query (prompt) may be toxic by design (we want the model to generate
-        less toxic continuations to toxic prompts).
+        Scoring query+response would dilute the signal because the query
+        may be toxic by design.
 
         Args:
-            queries: Query texts (unused for toxicity, kept for API compatibility)
+            queries: Query texts
             responses: Response texts
 
         Returns:
             Reward tensor [batch_size]
         """
-        # CRITICAL: Score ONLY the response, not query+response
-        # For toxicity, we want to reward the model for generating
-        # less toxic responses regardless of how toxic the prompt was
-        texts = responses  # NOT [q + r for q, r in zip(queries, responses)]
+        # For toxicity, score ONLY the response
+        texts = responses
 
         # Tokenize with reward tokenizer
         inputs = self.reward_tokenizer(
@@ -233,5 +219,7 @@ class RewardModelWrapper(nn.Module):
             outputs = self.reward_model(**inputs)
             logits = outputs.logits.float()
 
-        rewards = logits[:, 0]
+        # For toxicity models, output is binary classification
+        rewards = logits[:, 0]  # [batch_size] - nothate class
+
         return rewards

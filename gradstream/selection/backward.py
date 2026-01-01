@@ -269,6 +269,7 @@ class StreamingLinearBackward(Function):
             train_grad_output, train_input = grad_output, input
             val_grad_output, val_input, val_grad_total = _get_val_components(hook_manager, layer_idx)
             if val_grad_output is None and val_grad_total is None:
+                # Missing validation gradient - return None (will be zero gradient)
                 return None, None
             # Cached mode: gradients already correctly scaled, no correction needed
             score_correction = 1.0
@@ -294,6 +295,10 @@ class StreamingLinearBackward(Function):
         # Per-layer selection
         selected_indices = state._select_indices(scores, similarity)
         state.num_selected = selected_indices.shape[0]
+
+        # Track selection stats
+        if hasattr(state, '_layer_selections'):
+            state._layer_selections.append((layer_idx, state.num_selected))
 
         # Compute gradients for selected samples
         # Note: empty selection naturally produces zero gradients via einsum on empty tensors

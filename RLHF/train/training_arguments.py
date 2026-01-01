@@ -37,7 +37,7 @@ class TrainingArguments(TA):
         },
     )
     lr_scheduler_type: str = field(
-        default="linear",
+        default="constant",
         metadata={
             "help": (
                 "Learning rate scheduler type. Default 'constant' matches reference "
@@ -51,7 +51,7 @@ class TrainingArguments(TA):
     # ===================
     task: str = field(
         default="toxicity",
-        metadata={"help": "Task name: toxicity, imdb, etc."},
+        metadata={"help": "Task name: 'toxicity'"},
     )
 
     # ===================
@@ -69,13 +69,12 @@ class TrainingArguments(TA):
         },
     )
     filter_frac: float = field(
-        default=0.5,
+        default=1.0,
         metadata={
             "help": (
                 "Fraction of negative-influence samples to drop (0-1). "
                 "1.0 = drop all negative samples, 0.5 = drop bottom 50% of negative samples. "
-                "All positive-influence samples are always kept. "
-                "Note: 1.0 is too aggressive and often leaves only 1-2 samples per batch."
+                "All positive-influence samples are always kept."
             )
         },
     )
@@ -85,6 +84,37 @@ class TrainingArguments(TA):
             "help": (
                 "Use second-order selection (greedy with similarity matrix). "
                 "Slower but more accurate."
+            )
+        },
+    )
+    n_val: int = field(
+        default=8,
+        metadata={
+            "help": (
+                "Number of validation samples for data selection. "
+                "Uses a fixed validation set (separate from training) for computing "
+                "validation gradients. Set to 0 to use self-referencing validation "
+                "(training buffer as validation set)."
+            )
+        },
+    )
+    val_batch_size: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Batch size for validation gradient computation. "
+                "Controls how many validation samples are processed per gradient capture pass. "
+                "Smaller values use less memory but require more passes."
+            )
+        },
+    )
+    val_generation_interval: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Steps between regenerating validation completions. "
+                "0 = generate once at start and reuse throughout training. "
+                "N > 0 = regenerate every N steps (more compute but fresher validation)."
             )
         },
     )
@@ -125,12 +155,12 @@ class TrainingArguments(TA):
         metadata={"help": "Number of PPO epochs per batch (default: 4)"},
     )
     mini_batch_size: int = field(
-        default=1,
+        default=8,
         metadata={
             "help": (
-                "Mini-batch size for PPO updates (default: 1, matching reference). "
-                "With mini_batch_size=1 and ppo_epochs=4, each sample is updated 4 times "
-                "per rollout. Larger values reduce updates but may affect learning dynamics."
+                "Mini-batch size for PPO updates (default: 8). "
+                "Larger values reduce number of updates per rollout "
+                "but improve computational efficiency."
             )
         },
     )
@@ -149,15 +179,14 @@ class TrainingArguments(TA):
             )
         },
     )
-    kl_penalty: str = field(
-        default="kl",
+    kl_estimator: str = field(
+        default="k1",
         metadata={
             "help": (
-                "KL penalty mode: "
-                "'kl': model_logp - ref_logp (recommended for token-level stability), "
-                "'abs': abs(model_logp - ref_logp) (always positive, prevents reward bonus), "
-                "'mse': 0.5 * (model_logp - ref_logp)^2 (always positive), "
-                "'full': F.kl_div (broken for token-level logprobs, avoid)"
+                "KL divergence estimator (http://joschu.net/blog/kl-approx.html): "
+                "'k1': -log(r) = policy_logp - ref_logp (unbiased, higher variance, can be negative), "
+                "'k2': 0.5 * log(r)^2 (biased, low variance, for logging only), "
+                "'k3': (r - 1) - log(r) (unbiased, low variance, always positive)."
             )
         },
     )
@@ -170,11 +199,32 @@ class TrainingArguments(TA):
             )
         },
     )
+    target: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Target KL divergence for adaptive KL control (default: 1.0). "
+                "The AdaptiveKLController adjusts kl_coef to maintain KL near this value. "
+                "Higher values allow more policy divergence from reference."
+            )
+        },
+    )
     target_kl: float = field(
         default=0.1,
         metadata={
             "help": (
-                "Target KL divergence for adaptive KL control (default: 0.1). "
+                "KL threshold for early stopping (default: 0.1). "
+                "If policy KL exceeds 1.5 * target_kl, the optimization step is skipped. "
+                "This is separate from `target` which controls the adaptive KL coefficient."
+            )
+        },
+    )
+    early_stopping: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to enable early stopping based on KL divergence (default: False). "
+                "If True, optimization steps are skipped when policy KL exceeds 1.5 * target_kl."
             )
         },
     )
@@ -191,6 +241,16 @@ class TrainingArguments(TA):
     cliprange: float = field(
         default=0.2,
         metadata={"help": "PPO clipping range for policy (default: 0.2)"},
+    )
+    max_grad_norm: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum gradient norm for gradient clipping (default: None). "
+                "Set to None or 0 to disable gradient clipping. "
+                "Helps prevent training instability from gradient explosions."
+            )
+        },
     )
     cliprange_value: float = field(
         default=0.2,
@@ -217,16 +277,22 @@ class TrainingArguments(TA):
         metadata={"help": "Maximum new tokens to generate"},
     )
     min_new_tokens: int = field(
-        default=20,
-        metadata={"help": "Minimum new tokens to generate"},
+        default=0,
+        metadata={
+            "help": (
+                "Minimum new tokens to generate (ONLY used for evaluation, not training). "
+                "During training rollouts, min_length=-1 is used to avoid negative KL exploitation. "
+                "See: https://huggingface.co/docs/trl/main/en/how_to_train"
+            )
+        },
     )
     temperature: float = field(
         default=1.0,
         metadata={"help": "Sampling temperature"},
     )
-    top_k: int = field(
-        default=0,
-        metadata={"help": "Top-k sampling (0 to disable)"},
+    top_k: float = field(
+        default=0.0,
+        metadata={"help": "Top-k sampling (0.0 to disable)"},
     )
     top_p: float = field(
         default=1.0,
@@ -234,15 +300,14 @@ class TrainingArguments(TA):
     )
 
     # ===================
-    # Toxicity Evaluation (during training)
+    # Evaluation (during training)
     # ===================
-    enable_toxicity_eval: bool = field(
+    enable_eval: bool = field(
         default=True,
         metadata={
             "help": (
-                "Enable toxicity evaluation during training. "
-                "Uses a DIFFERENT classifier (DaNLP/da-electra-hatespeech-detection) "
-                "than the reward model to provide unbiased evaluation."
+                "Enable evaluation during training. "
+                "Uses DaNLP classifier (different from reward model)."
             )
         },
     )
@@ -250,7 +315,7 @@ class TrainingArguments(TA):
         default=1,
         metadata={
             "help": (
-                "Steps between toxicity evaluations. "
+                "Steps between evaluations. "
                 "0 = evaluate at the end of each epoch only. "
                 "N > 0 = evaluate every N steps."
             )
@@ -258,7 +323,7 @@ class TrainingArguments(TA):
     )
     eval_n_samples: int = field(
         default=500,
-        metadata={"help": "Number of samples for toxicity evaluation (default: 500)"},
+        metadata={"help": "Number of samples for evaluation (default: 500)"},
     )
     eval_batch_size: int = field(
         default=256,
@@ -268,13 +333,32 @@ class TrainingArguments(TA):
         default=True,
         metadata={
             "help": (
-                "Evaluate toxicity on the generations produced during each PPO step. "
-                "This provides per-step toxicity metrics without extra generation cost."
+                "Evaluate on the generations produced during each PPO step. "
+                "This provides per-step metrics without extra generation cost."
+            )
+        },
+    )
+
+    # ===================
+    # Debugging
+    # ===================
+    debug_n_samples: int = field(
+        default=3,
+        metadata={
+            "help": (
+                "Number of samples to print for debugging rollouts (default: 3). "
+                "Set to 0 to disable debug printing. "
+                "Prints prompt, response, and reward for first N samples in each batch."
             )
         },
     )
 
     def __post_init__(self):
+        # Validate task
+        valid_tasks = ["toxicity"]
+        if self.task not in valid_tasks:
+            raise ValueError(f"task must be one of {valid_tasks}, got {self.task}")
+
         # Validate method
         valid_methods = ["NA", "Streaming", "GREATS"]
         if self.method not in valid_methods:
@@ -284,10 +368,10 @@ class TrainingArguments(TA):
         if not 0 <= self.filter_frac <= 1:
             raise ValueError(f"filter_frac must be in [0, 1], got {self.filter_frac}")
 
-        # Validate kl_penalty (matching reference: ppo_config.py:217)
-        valid_kl_penalties = ["kl", "abs", "mse", "full"]
-        if self.kl_penalty not in valid_kl_penalties:
-            raise ValueError(f"kl_penalty must be one of {valid_kl_penalties}, got {self.kl_penalty}")
+        # Validate kl_estimator (matching TRL experimental PPO)
+        valid_kl_estimators = ["k1", "k2", "k3"]
+        if self.kl_estimator not in valid_kl_estimators:
+            raise ValueError(f"kl_estimator must be one of {valid_kl_estimators}, got {self.kl_estimator}")
 
         super().__post_init__()
 
@@ -300,3 +384,8 @@ class TrainingArguments(TA):
     def has_selection(self) -> bool:
         """Whether data selection is enabled."""
         return self.method != "NA"
+
+    @property
+    def use_fixed_validation(self) -> bool:
+        """Whether to use a fixed validation set (vs self-referencing validation)."""
+        return self.n_val > 0

@@ -22,7 +22,7 @@ cd $HOME/Project/Gradient-Streaming
 # Set PYTHONPATH to include project root for imports
 export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
 
-# Base training arguments
+# Base training arguments (static, never change)
 export base_training_args="--do_train=True \
 --do_eval=True \
 --max_seq_length=512 \
@@ -39,21 +39,15 @@ export base_training_args="--do_train=True \
 --tf32=False \
 --fp16=False \
 --overwrite_output_dir=True \
---report_to=none \
---seed=0 \
---percentage=0.5 \
---selection_frac=0.5"
+--report_to=none"
 
 # Default values
-data_selection="NA"  # NA, Streaming (per-layer), or GREATS (global)
+model="meta-llama/Llama-3.2-1B"
 optim="adamw_torch"  # Standard HF optimizer (adamw_torch, adamw_hf, etc.)
 data_dir="SFT/data"
 percentage=0.05
-n_val=8
 n_eval=500
-model="meta-llama/Llama-3.2-1B"
 batch_size=8
-val_batch_size="1"  # Defaults to batch_size if not specified
 seed=42
 
 gradient_accumulation_steps=1
@@ -63,11 +57,14 @@ subject="sociology"
 compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer.
 use_second_order=false  # If true, use greedy selection with second-order interactions
 selection_frac="0.5"  # Fraction of samples to select (for Streaming/GREATS)
-val_strategy="merged_batch"  # Validation strategy: separate_batch_factorized, separate_batch, merged_batch
 use_lora=false
 use_flash_attention=true
-enable_profile=false
-profile_steps=10
+
+# data selection
+data_selection="NA"  # NA, Streaming, or GREATS
+n_val=8  # Number of validation samples for data selection
+val_batch_size="1"  # Defaults to batch_size if not specified
+val_strategy="merged_batch"  # Validation strategy: separate_batch_factorized, separate_batch, merged_batch
 
 # LR configuration
 lr_config_file="SFT/train/lr/config.json"
@@ -82,8 +79,10 @@ dry_run=false
 use_sbatch=false
 
 
-# Method definitions
-# Format: "NAME:data_selection:compression:use_lora"
+# ========================================
+# Experiment Definitions
+# ========================================
+# Format: "data_selection:compression:use_lora"
 # Note: use_second_order is controlled by the --use_second_order flag, not per-method
 declare -A METHOD_DEFS=(
     ["NA-NA-Full"]="NA::false"
@@ -240,14 +239,6 @@ while [[ $# -gt 0 ]]; do
             use_sbatch=true
             shift
             ;;
-        --profile)
-            enable_profile=true
-            shift
-            ;;
-        --profile_steps)
-            profile_steps="$2"
-            shift 2
-            ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
@@ -306,10 +297,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --update_compressor_freq <steps>       Projector refresh interval (default: 200)"
             echo "  --flash_attention                      Enable Flash Attention 2 (default: enabled)"
             echo "  --data_dir <dir>                       Data directory (default: SFT/data)"
-            echo ""
-            echo "Profiling:"
-            echo "  --profile                              Enable PyTorch profiler (profiles first N steps)"
-            echo "  --profile_steps <n>                    Number of steps to profile (default: 10)"
             echo ""
             echo "Naming convention: {selection}-{compression}-{training_type}"
             echo "  Examples: Streaming-NA-Full, GREATS-LoGra-Full, NA-NA-LoRA"
@@ -574,11 +561,6 @@ run_single_method() {
 
     if [[ "$exp_data_selection" != "NA" ]] && [ "$exp_use_second_order" = true ]; then
         training_args="$training_args --use_second_order True"
-    fi
-
-    # Add profiling arguments
-    if [ "$enable_profile" = true ]; then
-        training_args="$training_args --profile True --profile_steps $profile_steps"
     fi
 
     training_args="$training_args 2>&1 | tee $output_dir/train.log"
@@ -886,11 +868,6 @@ fi
 # Add use_second_order for data selection
 if [[ "$data_selection" != "NA" ]] && [ "$use_second_order" = true ]; then
     training_args="$training_args --use_second_order True"
-fi
-
-# Add profiling arguments
-if [ "$enable_profile" = true ]; then
-    training_args="$training_args --profile True --profile_steps $profile_steps"
 fi
 
 training_args="$training_args 2>&1 | tee $output_dir/train.log"

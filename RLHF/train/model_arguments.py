@@ -23,7 +23,12 @@ class ModelArguments:
     )
     reward_model_name: Optional[str] = field(
         default="facebook/roberta-hate-speech-dynabench-r4-target",
-        metadata={"help": "Reward model name or path."},
+        metadata={
+            "help": (
+                "Reward model name or path. "
+                "Default: 'facebook/roberta-hate-speech-dynabench-r4-target'."
+            )
+        },
     )
     tokenizer_name: Optional[str] = field(
         default=None,
@@ -59,8 +64,8 @@ class ModelArguments:
         metadata={"help": "LoRA dropout"},
     )
     lora_target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"],
-        metadata={"help": "Target modules for LoRA"},
+        default_factory=list,  # Empty = PEFT auto-detects correct modules for each model
+        metadata={"help": "Target modules for LoRA (empty = auto-detect, use out_proj for GPT-Neo, o_proj for LLaMA)"},
     )
 
     # Flash attention

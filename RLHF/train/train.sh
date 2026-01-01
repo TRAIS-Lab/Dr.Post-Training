@@ -22,21 +22,18 @@ cd $HOME/Project/Gradient-Streaming
 # Set PYTHONPATH to include project root for imports
 export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
 
-# Base training arguments (shared across all methods, matching SFT)
-# Note: warmup_ratio=0 for PPO (pretrained policy doesn't need warmup, and LR=0 breaks first batch)
-# Note: max_grad_norm removed to match reference (reference doesn't use gradient clipping)
+# Base training arguments (static, never change)
 export base_training_args="--bf16=True \
---lr_scheduler_type=linear \
---warmup_ratio=0.03 \
+--lr_scheduler_type=constant \
+--warmup_ratio=0 \
 --weight_decay=0.0 \
 --logging_steps=1 \
 --report_to=none"
 
 # Default values
-task="toxicity"
-method="NA"  # NA, Streaming, or GREATS
 model="EleutherAI/gpt-neo-2.7B"
-reward_model="facebook/roberta-hate-speech-dynabench-r4-target"
+task="toxicity"
+reward_model=""  # Will be set based on task if not specified
 batch_size=256
 max_steps=-1  # -1 means no step limit (use epochs instead)
 epochs=1  # Number of training epochs (used when max_steps <= 0)
@@ -44,21 +41,30 @@ seed=42
 
 # PPO settings
 ppo_epochs=4
-mini_batch_size=1
+mini_batch_size=8
 filter_frac=1.0
-init_kl_coef=0.04
-kl_penalty="kl"  # Options: kl, abs, mse, full (use "kl" for token-level stability)
+init_kl_coef=0.1  # Author suggests 0.2 (reference uses 0.04)
+kl_estimator="k1"  # Options: k1, k2, k3 (k3 recommended - unbiased, low variance, always positive)
 adap_kl_ctrl=true
-target_kl=0.1
-max_new_tokens=30
-min_new_tokens=10
+target=1.0  # Target KL for AdaptiveKLController (author suggests 1, reference uses 6)
+target_kl=0.1  # Early stopping threshold: skip step if KL > 1.5 * target_kl
+early_stopping=false  # Enable early stopping based on target_kl
+max_new_tokens=""  # Will be set based on task if not specified
+min_new_tokens=0
 use_second_order=false
-# Toxicity evaluation settings
-enable_toxicity_eval=true
+
+# data selection
+data_selection="NA"  # NA, Streaming, or GREATS
+n_val=1024  # Number of validation samples for data selection (0 = self-referencing)
+val_batch_size=64  # Batch size for validation gradient computation
+val_generation_interval=0  # Steps between regenerating val completions (0 = once at start)
+
+# Evaluation settings
+enable_eval=true
 eval_interval=1  # 0 = end of epoch only, N > 0 = every N steps
 eval_n_samples=500
 eval_batch_size=256
-eval_on_step_generations=true  # Evaluate toxicity on each step's generations
+eval_on_step_generations=true  # Evaluate on each step's generations
 use_flash_attention=true
 
 # LR configuration
@@ -72,15 +78,12 @@ default_lr_lora="5e-6"
 use_lora=false
 lora_r=16
 lora_alpha=32
-lora_target_modules="q_proj k_proj v_proj o_proj"
+lora_target_modules=""  # Empty = PEFT auto-detects (out_proj for GPT-Neo, o_proj for LLaMA)
 
 
 # Compression settings
 compression=""  # LoGra or GraSS
 update_compressor_freq=200
-
-# Output
-output_dir=""
 
 # Multi-method mode
 methods=""
@@ -88,21 +91,22 @@ dry_run=false
 use_sbatch=false
 
 # ========================================
-# Experiment Definitions (8 methods, matching SFT)
+# Experiment Definitions
 # ========================================
-# Format: "method:compression:use_lora:use_second_order"
+# Format: "data_selection:compression:use_lora"
+# Note: use_second_order is controlled by the --use_second_order flag, not per-method
 declare -A METHOD_DEFS=(
-    ["NA-NA-Full"]="NA::false:false"
-    ["NA-NA-LoRA"]="NA::true:false"
-    ["Streaming-NA-Full"]="Streaming::false:true"
-    ["Streaming-NA-LoRA"]="Streaming::true:true"
-    ["GREATS-NA-Full"]="GREATS::false:true"
-    ["GREATS-NA-LoRA"]="GREATS::true:true"
-    ["Streaming-LoGra-Full"]="Streaming:LoGra:false:true"
-    ["GREATS-LoGra-Full"]="GREATS:LoGra:false:true"
+    ["NA-NA-Full"]="NA::false"
+    ["NA-NA-LoRA"]="NA::true"
+    ["Streaming-NA-Full"]="Streaming::false"
+    ["Streaming-NA-LoRA"]="Streaming::true"
+    ["GREATS-NA-Full"]="GREATS::false"
+    ["GREATS-NA-LoRA"]="GREATS::true"
+    ["Streaming-LoGra-Full"]="Streaming:LoGra:false"
+    ["GREATS-LoGra-Full"]="GREATS:LoGra:false"
 )
 
-# Category mappings (matching SFT)
+# Category mappings
 declare -A CATEGORY_METHODS=(
     ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
     ["baseline"]="NA-NA-Full,NA-NA-LoRA"
@@ -121,8 +125,8 @@ while [[ $# -gt 0 ]]; do
             task="$2"
             shift 2
             ;;
-        --method)
-            method="$2"
+        --data_selection)
+            data_selection="$2"
             shift 2
             ;;
         --model)
@@ -201,13 +205,25 @@ while [[ $# -gt 0 ]]; do
             mini_batch_size="$2"
             shift 2
             ;;
-        --kl_coef)
-            kl_coef="$2"
+        --kl_coef|--init_kl_coef)
+            init_kl_coef="$2"
             shift 2
             ;;
-        --kl_penalty)
-            kl_penalty="$2"
+        --kl_estimator)
+            kl_estimator="$2"
             shift 2
+            ;;
+        --target)
+            target="$2"
+            shift 2
+            ;;
+        --target_kl)
+            target_kl="$2"
+            shift 2
+            ;;
+        --early_stopping)
+            early_stopping=true
+            shift 1
             ;;
         --max_new_tokens)
             max_new_tokens="$2"
@@ -217,12 +233,24 @@ while [[ $# -gt 0 ]]; do
             use_second_order=true
             shift 1
             ;;
-        --enable_toxicity_eval)
-            enable_toxicity_eval=true
+        --n_val)
+            n_val="$2"
+            shift 2
+            ;;
+        --val_batch_size)
+            val_batch_size="$2"
+            shift 2
+            ;;
+        --val_generation_interval)
+            val_generation_interval="$2"
+            shift 2
+            ;;
+        --enable_eval)
+            enable_eval=true
             shift 1
             ;;
-        --disable_toxicity_eval|--no_toxicity_eval)
-            enable_toxicity_eval=false
+        --disable_eval|--no_eval)
+            enable_eval=false
             shift 1
             ;;
         --eval_interval)
@@ -245,10 +273,6 @@ while [[ $# -gt 0 ]]; do
             eval_on_step_generations=false
             shift 1
             ;;
-        --output_dir)
-            output_dir="$2"
-            shift 2
-            ;;
         --methods)
             methods="$2"
             shift 2
@@ -266,27 +290,27 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Run single or multiple RLHF training methods."
             echo ""
-            echo "Multi-Experiment Mode:"
+            echo "Multi-Method Mode:"
             echo "  --methods <list>       Run multiple methods (see below)"
             echo "  --dry-run                  Print commands without executing"
             echo "  --sbatch                   Use sbatch instead of bash"
             echo ""
-            echo "  Experiment names:"
+            echo "  Method names:"
             echo "    NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, Streaming-NA-LoRA,"
             echo "    GREATS-NA-Full, GREATS-NA-LoRA, Streaming-LoGra-Full, GREATS-LoGra-Full"
             echo ""
             echo "  Categories: all, baseline, streaming, greats, Full, LoRA, compression, no-compression"
             echo ""
-            echo "Single Experiment Options:"
-            echo "  --task <task>              Task: toxicity, imdb (default: toxicity)"
-            echo "  --method <method>          Selection: NA, Streaming, GREATS (default: NA)"
+            echo "Single Method Options:"
+            echo "  --task <task>              Task: toxicity (default: toxicity)"
+            echo "  --data_selection <method>  Data selection: NA, Streaming, GREATS (default: NA)"
             echo "  --model <model>            Policy model"
-            echo "  --reward_model <model>     Reward model"
+            echo "  --reward_model <model>     Reward model (auto-selected if not specified)"
             echo ""
             echo "  --lora                     Enable LoRA fine-tuning (default: full fine-tuning)"
             echo "  --lora_r <r>               LoRA rank (default: 16)"
             echo "  --lora_alpha <alpha>       LoRA alpha (default: 32)"
-            echo "  --lora_target_modules <m>  Target modules (default: q_proj k_proj v_proj o_proj)"
+            echo "  --lora_target_modules <m>  Target modules (default: auto-detect)"
             echo ""
             echo "  --flash_attention          Enable Flash Attention 2 (default: enabled)"
             echo "  --no_flash_attention       Disable Flash Attention 2"
@@ -304,29 +328,37 @@ while [[ $# -gt 0 ]]; do
             echo "  --seed <seed>              Random seed (default: 42)"
             echo ""
             echo "PPO Options:"
-            echo "  --ppo_epochs <n>           PPO epochs per batch (default: 4)"
-            echo "  --mini_batch_size <n>      Mini-batch size for PPO updates (default: 8)"
+            echo "  --ppo_epochs <n>           PPO epochs per batch (default: 1)"
+            echo "  --mini_batch_size <n>      Mini-batch size for PPO updates (default: 1)"
             echo "  --kl_coef <coef>           Initial KL penalty coefficient (default: 0.2)"
-            echo "  --kl_penalty <mode>        KL penalty mode: kl, abs, mse, full (default: full)"
+            echo "  --kl_estimator <mode>      KL estimator: k1, k2, k3 (default: k3)"
+            echo "  --target <val>             Target KL for AdaptiveKLController (default: 1.0)"
+            echo "  --target_kl <val>          Early stopping threshold (default: 0.1)"
+            echo "  --early_stopping           Enable early stopping when KL > 1.5 * target_kl"
             echo "  --max_new_tokens <n>       Maximum new tokens to generate (default: 30)"
             echo ""
-            echo "Note: Uses self-referencing validation (training buffer as validation set)"
+            echo "Note: 'target' controls adaptive KL coefficient adjustment."
+            echo "      'target_kl' controls early stopping (skip step if KL too high)."
             echo ""
-            echo "Toxicity Evaluation Options:"
-            echo "  --enable_toxicity_eval     Enable toxicity evaluation (default: true)"
-            echo "  --disable_toxicity_eval    Disable toxicity evaluation"
+            echo "Validation Options (for data selection):"
+            echo "  --n_val <n>                Number of validation samples (default: 8, 0=self-ref)"
+            echo "  --val_batch_size <n>       Batch size for validation gradients (default: 1)"
+            echo "  --val_generation_interval <n>  Steps between regenerating val completions (default: 0=once)"
+            echo ""
+            echo "Evaluation Options:"
+            echo "  --enable_eval              Enable evaluation during training (default: true)"
+            echo "  --disable_eval             Disable evaluation"
             echo "  --eval_interval <n>        Evaluate every N steps (0=epoch end only, default: 1)"
             echo "  --eval_n_samples <n>       Samples for full evaluation (default: 500)"
             echo "  --eval_batch_size <n>      Batch size for generation (default: 256)"
-            echo "  --eval_on_step_generations Evaluate toxicity on each step's generations (default: true)"
-            echo "  --no_eval_on_step_generations Disable per-step toxicity evaluation"
+            echo "  --eval_on_step_generations Evaluate on each step's generations (default: true)"
+            echo "  --no_eval_on_step_generations Disable per-step evaluation"
             echo ""
-            echo "  Note: Evaluation uses a DIFFERENT classifier (DaNLP/da-electra-hatespeech-detection)"
-            echo "        than the reward model to provide unbiased toxicity measurement."
+            echo "  Toxicity: Uses DaNLP classifier (independent of reward model)"
             echo ""
             echo "Learning Rate Resolution:"
             echo "  1. If --lr is specified, use that value"
-            echo "  2. Otherwise, look up from lr/config.json based on task + method"
+            echo "  2. Otherwise, look up from lr/config.json based on task + data_selection"
             echo "  3. If not found, use fallback (1e-5)"
             echo ""
             echo "  Run lr/lr_sweep.sh first to populate config.json with optimal LRs."
@@ -424,7 +456,7 @@ except:
 # Function to run a single method
 # ========================================
 run_single_method() {
-    local exp_method="$1"
+    local exp_data_selection="$1"
     local exp_compression="$2"
     local exp_use_lora="$3"
     local exp_use_second_order="$4"
@@ -474,17 +506,25 @@ run_single_method() {
         training_type="Full"
     fi
 
-    local JOB_NAME="${task}-${model_short}-${exp_method}-${compression_name}-${training_type}-lr${exp_lr}-b${batch_size}-s${seed}"
-
-    local exp_output_dir
-    if [[ -z "$output_dir" ]]; then
-        exp_output_dir="/scratch/pbb/Project/Gradient-Streaming/RLHF/${JOB_NAME}"
-    else
-        exp_output_dir="$output_dir"
+    # Build method string (include second-order indicator if enabled)
+    local method_str="${exp_data_selection}-${compression_name}"
+    if [[ "$exp_use_second_order" == "true" ]]; then
+        method_str="${method_str}-2nd"
     fi
 
-    if [[ ! -d $exp_output_dir ]]; then
-        mkdir -p $exp_output_dir
+    # Build validation string
+    local val_str="v${n_val}"
+    if [[ "$n_val" -gt 0 ]]; then
+        val_str="${val_str}b${val_batch_size}"
+    fi
+
+    # Job name format: task-model-method-training_type-lr-b-v-ppo-kl-s
+    # Includes: validation settings, PPO epochs, KL coefficient
+    local JOB_NAME="${task}-${model_short}-${method_str}-${training_type}-lr${exp_lr}-b${batch_size}-${val_str}-pe${ppo_epochs}-kl${init_kl_coef}-s${seed}"
+
+    local output_dir=/scratch/pbb/Project/Gradient-Streaming/RLHF/${JOB_NAME}
+    if [[ ! -d $output_dir ]]; then
+        mkdir -p $output_dir
     fi
 
     # Indicate LR source
@@ -505,15 +545,28 @@ run_single_method() {
     echo "=============================================="
     echo "Job name: $JOB_NAME"
     echo "Task: $task"
-    echo "Method: $exp_method"
+    echo "Selection: $method_str"
     echo "Model: $model"
-    echo "Compression: $compression_name"
     echo "Training type: $training_type"
-    if [[ "$exp_method" != "NA" ]]; then
-        echo "Second-order: $([ "$exp_use_second_order" = "true" ] && echo "yes" || echo "no")"
+    echo ""
+    echo "Training:"
+    echo "  Learning rate: $exp_lr $lr_source"
+    echo "  Batch size: $batch_size"
+    echo "  PPO epochs: $ppo_epochs"
+    echo "  Mini-batch size: $mini_batch_size"
+    echo "  KL coefficient: $init_kl_coef"
+    echo ""
+    echo "Validation (for data selection):"
+    if [[ "$n_val" -gt 0 ]]; then
+        echo "  Mode: fixed (n_val=$n_val, batch_size=$val_batch_size)"
+    else
+        echo "  Mode: self-reference"
     fi
-    echo "Learning rate: $exp_lr $lr_source"
-    echo "Output: $exp_output_dir"
+    if [[ "$exp_data_selection" != "NA" ]]; then
+        echo "  Second-order: $([ "$exp_use_second_order" = "true" ] && echo "yes" || echo "no")"
+    fi
+    echo ""
+    echo "Output: $output_dir"
     echo "=============================================="
 
     # ========================================
@@ -521,7 +574,7 @@ run_single_method() {
     # ========================================
     local training_args="$exp_training_args \
 --task=$task \
---method=$exp_method \
+--method=$exp_data_selection \
 --model_name_or_path=$model \
 --reward_model_name=$reward_model \
 --per_device_train_batch_size=$batch_size \
@@ -533,16 +586,22 @@ run_single_method() {
 --ppo_epochs=$ppo_epochs \
 --mini_batch_size=$mini_batch_size \
 --init_kl_coef=$init_kl_coef \
---kl_penalty=$kl_penalty \
+--kl_estimator=$kl_estimator \
 --adap_kl_ctrl=$adap_kl_ctrl \
+--target=$target \
 --target_kl=$target_kl \
+--early_stopping=$early_stopping \
 --max_new_tokens=$max_new_tokens \
 --min_new_tokens=$min_new_tokens \
---output_dir=$exp_output_dir"
+--output_dir=$output_dir"
 
     # Add LoRA settings
     if [[ "$exp_use_lora" == "true" ]]; then
-        training_args="$training_args --lora=True --lora_r=$lora_r --lora_alpha=$lora_alpha --lora_target_modules $lora_target_modules"
+        training_args="$training_args --lora=True --lora_r=$lora_r --lora_alpha=$lora_alpha"
+        # Only add target_modules if explicitly specified (empty = PEFT auto-detects)
+        if [[ -n "$lora_target_modules" ]]; then
+            training_args="$training_args --lora_target_modules $lora_target_modules"
+        fi
     else
         training_args="$training_args --lora=False"
     fi
@@ -570,9 +629,14 @@ run_single_method() {
         training_args="$training_args --use_second_order=True"
     fi
 
-    # Add toxicity evaluation settings
-    if [[ "$enable_toxicity_eval" == "true" ]]; then
-        training_args="$training_args --enable_toxicity_eval=True"
+    # Add validation settings (for data selection)
+    training_args="$training_args --n_val=$n_val"
+    training_args="$training_args --val_batch_size=$val_batch_size"
+    training_args="$training_args --val_generation_interval=$val_generation_interval"
+
+    # Add evaluation settings
+    if [[ "$enable_eval" == "true" ]]; then
+        training_args="$training_args --enable_eval=True"
         training_args="$training_args --eval_interval=$eval_interval"
         training_args="$training_args --eval_n_samples=$eval_n_samples"
         training_args="$training_args --eval_batch_size=$eval_batch_size"
@@ -582,11 +646,11 @@ run_single_method() {
             training_args="$training_args --eval_on_step_generations=False"
         fi
     else
-        training_args="$training_args --enable_toxicity_eval=False"
+        training_args="$training_args --enable_eval=False"
     fi
 
     # Add log file
-    training_args="$training_args 2>&1 | tee $exp_output_dir/train.log"
+    training_args="$training_args 2>&1 | tee $output_dir/train.log"
 
     local cmd="python RLHF/train/train.py $training_args"
 
@@ -603,6 +667,27 @@ run_single_method() {
 }
 
 # ========================================
+# Set task-specific defaults
+# ========================================
+# Set reward model based on task if not specified
+if [[ -z "$reward_model" ]]; then
+    case "$task" in
+        toxicity)
+            reward_model="facebook/roberta-hate-speech-dynabench-r4-target"
+            ;;
+        *)
+            echo "ERROR: Unknown task: $task. Valid: toxicity"
+            exit 1
+            ;;
+    esac
+fi
+
+# Set max_new_tokens based on task if not specified
+if [[ -z "$max_new_tokens" ]]; then
+    max_new_tokens=30
+fi
+
+# ========================================
 # Main execution logic
 # ========================================
 config_key="${task}"
@@ -615,7 +700,7 @@ if [[ -n "$methods" ]]; then
 
     echo ""
     echo "========================================================"
-    echo "  RLHF Multi-Experiment Mode"
+    echo "  RLHF Multi-Method Mode"
     echo "========================================================"
     echo "Task: $task"
     echo "Model: $model"
@@ -626,18 +711,29 @@ if [[ -n "$methods" ]]; then
     echo "  Epochs: $epochs"
     echo "  Max steps: $max_steps (use -1 for epoch-based training)"
     echo "  Filter fraction: $filter_frac"
-    echo "  Validation: self-reference (training buffer)"
+    echo ""
+    echo "Validation (for data selection):"
+    if [[ "$n_val" -gt 0 ]]; then
+        echo "  Mode: fixed validation set"
+        echo "  n_val: $n_val"
+        echo "  val_batch_size: $val_batch_size"
+        echo "  val_generation_interval: $val_generation_interval"
+    else
+        echo "  Mode: self-reference (training buffer)"
+    fi
     echo ""
     echo "PPO Settings:"
     echo "  PPO epochs: $ppo_epochs"
     echo "  Mini-batch size: $mini_batch_size"
     echo "  Init KL coefficient: $init_kl_coef"
     echo "  Adaptive KL control: $adap_kl_ctrl"
-    echo "  Target KL: $target_kl"
+    echo "  Target (adaptive KL): $target"
+    echo "  Target KL (early stop): $target_kl"
+    echo "  Early stopping: $early_stopping"
     echo ""
-    echo "Toxicity Evaluation:"
-    echo "  Enabled: $enable_toxicity_eval"
-    if [[ "$enable_toxicity_eval" == "true" ]]; then
+    echo "Evaluation:"
+    echo "  Enabled: $enable_eval"
+    if [[ "$enable_eval" == "true" ]]; then
         echo "  Eval interval: $eval_interval (0=epoch end only)"
         echo "  Eval samples: $eval_n_samples"
         echo "  Eval batch size: $eval_batch_size"
@@ -645,7 +741,7 @@ if [[ -n "$methods" ]]; then
     fi
     echo ""
     echo "LR Config: $lr_config_file"
-    echo "Experiments to run: $resolved_methods"
+    echo "Methods to run: $resolved_methods"
     echo "========================================================"
 
     method_count=$(echo "$resolved_methods" | tr ',' '\n' | wc -l)
@@ -660,15 +756,16 @@ if [[ -n "$methods" ]]; then
         echo "========================================================"
 
         IFS=':' read -ra exp_parts <<< "${METHOD_DEFS[$exp_name]}"
-        exp_method="${exp_parts[0]}"
+        exp_data_selection="${exp_parts[0]}"
         exp_compression="${exp_parts[1]}"
         exp_use_lora="${exp_parts[2]}"
-        exp_use_second_order="${exp_parts[3]}"
+        # use_second_order is controlled globally via --use_second_order flag
+        exp_use_second_order="$use_second_order"
 
         # Look up learning rate
         exp_lr=$(lookup_lr "$config_key" "$exp_name" "$exp_use_lora")
 
-        run_single_method "$exp_method" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$exp_lr" "$exp_name"
+        run_single_method "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$exp_lr" "$exp_name"
     done
 
     echo ""
@@ -682,9 +779,9 @@ else
     # Single method mode
     # ========================================
 
-    # Validate method
-    if [[ ! "$method" =~ ^(NA|Streaming|GREATS)$ ]]; then
-        echo "Error: method must be NA, Streaming, or GREATS"
+    # Validate data_selection
+    if [[ ! "$data_selection" =~ ^(NA|Streaming|GREATS)$ ]]; then
+        echo "Error: data_selection must be NA, Streaming, or GREATS"
         exit 1
     fi
 
@@ -716,14 +813,14 @@ else
     fi
 
     if [[ "$use_lora" == "true" ]]; then
-        exp_name="${method}-${local_compression:-NA}-LoRA"
+        exp_name="${data_selection}-${local_compression:-NA}-LoRA"
     else
-        exp_name="${method}-${local_compression:-NA}-Full"
+        exp_name="${data_selection}-${local_compression:-NA}-Full"
     fi
 
     # Look up learning rate
     lr=$(lookup_lr "$config_key" "$exp_name" "$use_lora")
 
     # Run single method
-    run_single_method "$method" "$local_compression" "$use_lora" "$use_second_order" "$lr" ""
+    run_single_method "$data_selection" "$local_compression" "$use_lora" "$use_second_order" "$lr" ""
 fi

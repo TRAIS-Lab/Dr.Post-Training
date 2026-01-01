@@ -231,8 +231,21 @@ class MergedBatchGREATSStrategy(MergedBatchStrategy):
         selected_indices = state.get_final_selection()
         # Sort indices for sequential memory access (better cache locality)
         selected_indices = selected_indices.sort()[0]
+        n_selected = len(selected_indices)
 
         self._cleanup()
+
+        # Handle empty selection: skip pass 2 and return zero loss
+        if n_selected == 0:
+            # Re-enable hooks for next step
+            if not self.has_compression:
+                self.grad_hook.enable_hooks()
+            else:
+                self.grad_hook.clear_token_counts()
+
+            import torch
+            zero_loss = torch.tensor(0.0, device=next(model.parameters()).device)
+            return zero_loss
 
         # === PASS 2: Gradient Computation on Selected ===
         if batch_train is None:
@@ -467,6 +480,15 @@ class SeparateBatchStreamingStrategy(SeparateBatchStrategy):
         loss, stats = compute_loss_fn()
         loss.backward()  # Per-layer selection happens in backward hooks
 
+        # Add selection stats from streaming state
+        sel_state = self.grad_hook.selection_state
+        if hasattr(sel_state, '_layer_selections') and sel_state._layer_selections:
+            n_selected_list = [n for _, n in sel_state._layer_selections]
+            stats["selection/mean_selected"] = sum(n_selected_list) / len(n_selected_list)
+            stats["selection/min_selected"] = min(n_selected_list)
+            # Use min for n_selected check - if any layer had 0, flag it
+            stats["selection/n_selected"] = min(n_selected_list)
+
         # Cleanup
         self._cleanup()
 
@@ -544,6 +566,7 @@ class SeparateBatchGREATSStrategy(SeparateBatchStrategy):
                 "policy/clipfrac": 0.0,
                 "policy/ratio_mean": 1.0,
                 "values/mean": 0.0,
+                "selection/n_selected": 0,
             }
             return zero_loss, stats
 
@@ -558,6 +581,9 @@ class SeparateBatchGREATSStrategy(SeparateBatchStrategy):
 
         # Re-enable hooks for next step
         self.grad_hook.enable_hooks()
+
+        # Add selection stats
+        stats["selection/n_selected"] = n_selected
 
         return loss.detach(), stats
 

@@ -198,6 +198,10 @@ class StreamingState(SelectionState):
         # Track selection stats across all layers
         self._layer_selections: list = []  # (layer_idx, n_selected) tuples
 
+        # Track score statistics for debugging instability
+        self._score_stats: list = []  # List of per-layer score stats
+        self._scale_factors: list = []  # List of scale factors applied
+
     def get_selection_stats(self) -> dict:
         """Get aggregated selection statistics across all layers."""
         if not self._layer_selections:
@@ -226,6 +230,45 @@ class StreamingState(SelectionState):
     def reset_layer_stats(self):
         """Reset per-layer stats for a new mini-batch."""
         self._layer_selections = []
+        self._score_stats = []
+        self._scale_factors = []
+
+    def get_score_stats(self) -> dict:
+        """
+        Get aggregated score statistics for debugging.
+
+        Returns statistics about gradient alignment scores which can help
+        diagnose training instability:
+        - score_mean: Average alignment score (should be positive for good selection)
+        - score_std: Score variance (high variance = unstable selection)
+        - score_pos_frac: Fraction of positive scores (low = most samples hurt validation)
+        - scale_factor_mean: Average gradient scaling applied
+        - scale_factor_max: Maximum scaling (very high = potential instability)
+        """
+        if not self._score_stats:
+            return {}
+
+        # Aggregate across layers
+        all_means = [s["mean"] for s in self._score_stats]
+        all_stds = [s["std"] for s in self._score_stats]
+        all_pos_fracs = [s["pos_frac"] for s in self._score_stats]
+        all_mins = [s["min"] for s in self._score_stats]
+        all_maxs = [s["max"] for s in self._score_stats]
+
+        stats = {
+            "score_mean": sum(all_means) / len(all_means),
+            "score_std": sum(all_stds) / len(all_stds),
+            "score_pos_frac": sum(all_pos_fracs) / len(all_pos_fracs),
+            "score_min": min(all_mins),
+            "score_max": max(all_maxs),
+        }
+
+        if self._scale_factors:
+            stats["scale_factor_mean"] = sum(self._scale_factors) / len(self._scale_factors)
+            stats["scale_factor_max"] = max(self._scale_factors)
+            stats["scale_factor_min"] = min(self._scale_factors)
+
+        return stats
 
     def process_layer_gradients(
         self,
@@ -251,6 +294,16 @@ class StreamingState(SelectionState):
 
         if score_correction != 1.0:
             scores = scores * score_correction
+
+        # Track score statistics for debugging (before lr scaling)
+        with torch.no_grad():
+            self._score_stats.append({
+                "mean": scores.mean().item(),
+                "std": scores.std().item() if scores.numel() > 1 else 0.0,
+                "min": scores.min().item(),
+                "max": scores.max().item(),
+                "pos_frac": (scores > 0).float().mean().item(),
+            })
 
         # Step 2: Compute similarity if second-order
         similarity = None
@@ -279,6 +332,9 @@ class StreamingState(SelectionState):
         # _compute_scale_factor handles empty selection internally (returns 1.0)
         scale_factor = self._compute_scale_factor(selected_indices)
         reduced_grad = reduced_grad * scale_factor
+
+        # Track scale factor for debugging
+        self._scale_factors.append(scale_factor)
 
         self.num_selected = num_selected
         return reduced_grad, num_selected
@@ -402,6 +458,7 @@ class GREATSState(SelectionState):
             selected_indices = topk_selection(scores, self.num_selected)
 
         self.num_selected = len(selected_indices)
+
         return selected_indices
 
     def reset_accumulators(self) -> None:

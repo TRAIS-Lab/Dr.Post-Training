@@ -1,14 +1,12 @@
 """
-Toxicity evaluation utilities for RLHF training.
+Evaluation utilities for RLHF training.
 
-This module provides toxicity evaluation that can be used during training
-to monitor progress. Following the reference implementation, we use a
-DIFFERENT toxicity classifier for evaluation than the reward model to
-ensure the model genuinely reduces toxicity rather than gaming the specific
-reward model.
+This module provides evaluation tools that can be used during training
+to monitor progress. Following the reference implementation, we use
+DIFFERENT evaluation metrics than the reward model to ensure the model
+genuinely improves rather than gaming the specific reward model.
 
-Evaluation classifier: DaNLP/da-electra-hatespeech-detection (via evaluate library)
-Reward model: facebook/roberta-hate-speech-dynabench-r4-target
+Toxicity: Uses DaNLP/da-electra-hatespeech-detection (different from reward model)
 
 Reference: archive/LDA-ORL-main/rlhf-toxicity/scripts/evaluate-toxicity.py
 """
@@ -193,6 +191,7 @@ class ToxicityEvaluator:
         prompts: Optional[List[str]] = None,
         n_samples: int = 100,
         max_new_tokens: int = 30,
+        min_new_tokens: int = 0,
         generation_batch_size: int = 16,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -201,12 +200,17 @@ class ToxicityEvaluator:
         """
         Evaluate model toxicity on prompts.
 
+        Note: min_new_tokens is safe to use here (unlike training rollouts) because
+        evaluation doesn't involve KL divergence computation. Using min_new_tokens
+        ensures consistent output lengths for fair comparison across methods.
+
         Args:
             model: The policy model to evaluate
             tokenizer: Tokenizer for the model
             prompts: List of prompts (if None, loads from wiki_toxic dataset)
             n_samples: Number of samples to evaluate
             max_new_tokens: Maximum tokens to generate
+            min_new_tokens: Minimum tokens to generate (safe for evaluation, not for training)
             generation_batch_size: Batch size for generation
             temperature: Generation temperature
             top_p: Top-p sampling parameter
@@ -251,6 +255,7 @@ class ToxicityEvaluator:
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens if min_new_tokens > 0 else None,
                     do_sample=True,
                     top_p=top_p,
                     temperature=temperature,
@@ -354,15 +359,17 @@ class ToxicityEvaluator:
 
 
 def create_evaluator(
+    task: str = "toxicity",
     device: str = "cuda",
     batch_size: int = 32,
-) -> ToxicityEvaluator:
+):
     """
-    Create a toxicity evaluator.
+    Create an evaluator for the specified task.
 
     Args:
+        task: Task name ('toxicity')
         device: Device to run evaluation on
-        batch_size: Batch size for toxicity scoring
+        batch_size: Batch size for scoring
 
     Returns:
         ToxicityEvaluator instance

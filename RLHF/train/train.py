@@ -35,12 +35,12 @@ from trl.models import create_reference_model
 # Suppress torch.compile warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
 
-from RLHF.data.get_prompts import get_prompt_dataset, collator
+from RLHF.data.get_prompts import get_prompt_dataset, get_validation_prompt_dataset, collator
 from RLHF.train.model_arguments import ModelArguments, add_padding_to_tokenizer
 from RLHF.train.training_arguments import TrainingArguments
 from RLHF.train.trainer import StreamingPPOTrainer
 from RLHF.train.rewards import load_reward_model, RewardModelWrapper
-from RLHF.train.evaluation import ToxicityEvaluator
+from RLHF.train.evaluation import create_evaluator
 
 from gradstream import GradientHook, setup_model_compressors, create_sample_inputs, MeSOAdamW
 
@@ -255,8 +255,19 @@ def main():
         seed=training_args.seed,
     )
     logger.info(f"  Train dataset: {len(train_dataset)} samples")
-    # Note: Self-referencing validation is used (Snapshot/IIF style)
-    # No separate validation dataset needed - training buffer is used as validation set
+
+    # Load validation dataset for data selection (if n_val > 0)
+    val_dataset = None
+    if training_args.use_fixed_validation:
+        val_dataset = get_validation_prompt_dataset(
+            task=training_args.task,
+            tokenizer=tokenizer,
+            n_val=training_args.n_val,
+            seed=training_args.seed,
+        )
+        logger.info(f"  Validation dataset: {len(val_dataset)} samples (fixed set for data selection)")
+    else:
+        logger.info("  Validation: self-referencing (training buffer as validation set)")
 
     # Load policy model with value head for PPO
     logger.info("Loading policy model with value head...")
@@ -336,6 +347,7 @@ def main():
     reward_tokenizer, reward_model_raw = load_reward_model(
         model_args.reward_model_name,
         device=device,
+        task=training_args.task,
     )
 
     # Wrap reward model to handle vocabulary mismatch
@@ -344,6 +356,7 @@ def main():
         reward_tokenizer=reward_tokenizer,
         policy_tokenizer=tokenizer,
         device=device,
+        task=training_args.task,
     )
 
     # Find trainable layers
@@ -482,16 +495,17 @@ def main():
         f"warmup_steps={num_warmup_steps}, total_steps={num_training_steps}"
     )
 
-    # Create toxicity evaluator (uses different classifier than reward model)
+    # Create evaluator (uses different metrics than reward model)
     # This provides unbiased evaluation during training
     evaluator = None
-    if training_args.enable_toxicity_eval:
-        logger.info("Creating toxicity evaluator (DaNLP/da-electra-hatespeech-detection)...")
-        evaluator = ToxicityEvaluator(
+    if training_args.enable_eval:
+        logger.info(f"Creating evaluator for task: {training_args.task}...")
+        evaluator = create_evaluator(
+            task=training_args.task,
             device=device,
             batch_size=64,
         )
-        logger.info("Toxicity evaluator ready")
+        logger.info("Evaluator ready")
 
     # Create trainer
     trainer = StreamingPPOTrainer(
@@ -504,6 +518,7 @@ def main():
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         evaluator=evaluator,
+        val_dataset=val_dataset,  # Fixed validation dataset (None if using self-referencing)
     )
 
     # Calculate training steps
@@ -515,17 +530,19 @@ def main():
 
     # Initial evaluation before training (step 0)
     initial_eval_results = None
-    if training_args.enable_toxicity_eval and evaluator is not None:
+    if training_args.enable_eval and evaluator is not None:
         logger.info("*** Running initial evaluation before training ***")
         initial_eval_results = evaluator.evaluate(
             model=model,
             tokenizer=tokenizer,
             n_samples=training_args.eval_n_samples,
             max_new_tokens=training_args.max_new_tokens,
+            min_new_tokens=training_args.min_new_tokens,  # Safe for eval (no KL computation)
             generation_batch_size=training_args.eval_batch_size,
             temperature=training_args.temperature,
             top_p=training_args.top_p,
         )
+        # Log toxicity metrics
         logger.info(
             f"[Initial Eval] toxicity: {initial_eval_results['mean_toxicity_prob']:.4f} "
             f"(rate={initial_eval_results['toxicity_rate']:.1%})"

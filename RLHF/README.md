@@ -116,15 +116,15 @@ Available Categories:
 The unified training script accepts the following arguments:
 
 1. Task Arguments
-   - `--task <task>` - Task: `toxicity`, `imdb` (default: `toxicity`)
+   - `--task <task>` - Task: `toxicity` (default: `toxicity`)
    - `--model <model>` - Policy model (default: `EleutherAI/gpt-neo-2.7B`)
    - `--reward_model <model>` - Reward model (default: `facebook/roberta-hate-speech-dynabench-r4-target`)
 2. Data Selection Arguments
-   - `--method <method>` - Data selection method:
+   - `--data_selection <method>` - Data selection method:
      - `NA` - No selection (baseline, default)
      - `Streaming` - Per-layer selection (single-pass)
      - `GREATS` - Global selection (two-pass)
-   - `--use_second_order` - Enable greedy selection with second-order interactions (enabled by default for all selection methods)
+   - `--use_second_order` - Enable greedy selection with second-order interactions (default: disabled)
 3. Compression Arguments
    - `--compression <method>` - Gradient compression method (implies MeSO optimizer):
      - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
@@ -138,24 +138,22 @@ The unified training script accepts the following arguments:
    - `--max_steps <steps>` - Maximum training steps (default: `-1`, meaning use epochs instead)
    - `--epochs <n>` - Number of training epochs (default: `1`, used when max_steps <= 0)
    - `--seed <seed>` - Random seed (default: `42`)
-5. Data Selection Arguments
-   - `--n_val <n>` - Validation examples for data selection (default: `128`)
-   - `--val_batch_size <size>` - Validation batch size for data selection (default: `32`)
    - `--filter_frac <frac>` - Fraction of negative-influence samples to drop (default: `1.0`)
-6. PPO Arguments
+5. PPO Arguments
    - `--ppo_epochs <n>` - PPO epochs per batch (default: `4`)
-   - `--forward_batch_size <n>` - Forward batch size for PPO updates (default: `256`)
-   - `--init_kl_coef <coef>` - Initial KL penalty coefficient (default: `0.2`)
-   - `--kl_penalty <mode>` - KL penalty mode: `kl`, `abs`, `mse`, `full` (default: `full`)
-   - `--target_kl <kl>` - Target KL for adaptive control (default: `0.1`)
+   - `--mini_batch_size <n>` - Mini-batch size for PPO updates (default: `8`)
+   - `--init_kl_coef <coef>` - Initial KL penalty coefficient (default: `0.04`)
+   - `--kl_estimator <mode>` - KL estimator: `k1`, `k2`, `k3` (default: `k1`)
+   - `--target <val>` - Target KL for adaptive KL controller (default: `1.0`)
+   - `--target_kl <kl>` - Early stopping threshold (default: `0.1`)
    - `--max_new_tokens <n>` - Maximum new tokens to generate (default: `30`)
-   - `--min_new_tokens <n>` - Minimum new tokens to generate (default: `20`)
-7. LoRA Arguments
+   - `--min_new_tokens <n>` - Minimum new tokens for evaluation only (default: `0`, not used in training)
+6. LoRA Arguments
    - `--lora` - Enable LoRA fine-tuning (flag, omit for full fine-tuning)
    - `--lora_r <r>` - LoRA rank (default: `16`)
    - `--lora_alpha <alpha>` - LoRA alpha (default: `32`)
-   - `--lora_target_modules <modules>` - Target modules for LoRA (default: `q_proj k_proj v_proj o_proj`)
-8. Model Arguments
+   - `--lora_target_modules <modules>` - Target modules for LoRA (default: auto-detect)
+7. Model Arguments
    - `--flash_attention` - Enable Flash Attention 2 (default: enabled)
    - `--no_flash_attention` - Disable Flash Attention 2
 </details>
@@ -231,12 +229,12 @@ bash RLHF/eval/eval.sh --sbatch
 bash RLHF/eval/eval.sh --dry-run
 ```
 
-#### Toxicity Evaluation Arguments
+#### Evaluation Arguments
 
 Training-time toxicity evaluation uses a **different classifier** than the reward model to prevent reward hacking and provide unbiased measurement.
 
-- `--enable_toxicity_eval` - Enable toxicity evaluation during training (default: `true`)
-- `--disable_toxicity_eval` - Disable toxicity evaluation
+- `--enable_eval` - Enable toxicity evaluation during training (default: `true`)
+- `--disable_eval` - Disable toxicity evaluation
 - `--eval_interval <n>` - Evaluate every N steps; 0 = epoch end only (default: `1`)
 - `--eval_n_samples <n>` - Number of samples for full evaluation (default: `500`)
 - `--eval_batch_size <n>` - Batch size for generation during evaluation (default: `256`)
@@ -244,10 +242,8 @@ Training-time toxicity evaluation uses a **different classifier** than the rewar
 - `--no_eval_on_step_generations` - Disable per-step toxicity evaluation
 
 Training metrics include:
-- `eval/step_toxicity_prob` - Mean toxicity probability of step generations
-- `eval/step_toxicity_rate` - Fraction of toxic generations per step
-- `eval/toxicity_prob` - Mean toxicity from full evaluation
-- `eval/toxicity_rate` - Fraction of toxic generations from full evaluation
+- `eval/toxicity_prob` - Mean toxicity probability of step generations
+- `eval/toxicity_rate` - Fraction of toxic generations per step
 </details>
 
 ## Key Differences from SFT

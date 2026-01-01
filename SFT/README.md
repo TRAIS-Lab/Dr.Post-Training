@@ -183,7 +183,7 @@ The unified training script accepts the following arguments:
      - `NA` - No selection (baseline, default)
      - `Streaming` - Per-layer selection (single-pass)
      - `GREATS` - Global selection (two-pass)
-   - `--use_second_order` - Enable greedy selection with second-order interactions (enabled by default for all selection methods)
+   - `--use_second_order` - Enable greedy selection with second-order interactions (default: disabled)
 3. Compression Arguments
    - `--compression <method>` - Gradient compression method (implies MeSO optimizer):
      - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
