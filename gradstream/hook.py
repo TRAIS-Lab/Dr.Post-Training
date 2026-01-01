@@ -40,7 +40,6 @@ class GradientHook:
         model: nn.Module,
         layer_names: List[str],
         device: str = 'cpu',
-        register_hooks: bool = True
     ) -> None:
         """
         Initialize the hook manager.
@@ -49,7 +48,6 @@ class GradientHook:
             model: The model to hook
             layer_names: Names of layers to hook (only Linear layers supported)
             device: Device for synchronization
-            register_hooks: Whether to register hooks immediately
         """
         self.model: nn.Module = model
         self.layer_names: List[str] = layer_names
@@ -100,9 +98,8 @@ class GradientHook:
         # Set during end_val_capture() to enable proper score scaling
         self.val_total_tokens: Optional[int] = None
 
-        # Register hooks if requested
-        if register_hooks:
-            self._register_hooks()
+        # Register hooks
+        self._register_hooks()
 
         logger.info(f"Initialized GradientHook with {len(layer_names)} layers")
 

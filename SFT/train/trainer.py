@@ -1,5 +1,5 @@
 """
-Streaming trainer with unified data selection and model update.
+Streaming SFT trainer with unified data selection and model update.
 """
 
 import json
@@ -10,8 +10,6 @@ import logging
 from pathlib import Path
 
 import torch
-# import torch.nn.functional as F
-# import torch.nn as nn
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from typing import Dict
 from torch import Tensor
@@ -24,59 +22,10 @@ from gradstream.selection import create_separate_batch_strategy, create_merged_b
 
 logger = logging.getLogger(__name__)
 
-# deprecated
-# def compute_train_loss_from_merged(logits, labels, train_batch_size):
-#     """
-#     Compute loss for train samples only from merged batch forward.
-
-#     This allows reporting the train-only loss without an extra forward pass
-#     when using merged batches (train + val) for data selection.
-
-#     Args:
-#         logits: Model output logits [batch_size, seq_len, vocab_size]
-#         labels: Labels tensor [batch_size, seq_len]
-#         train_batch_size: Number of train samples (first N in batch)
-
-#     Returns:
-#         Loss computed only on the train portion of the batch
-#     """
-#     # Extract train portion
-#     train_logits = logits[:train_batch_size]  # [train_bs, seq_len, vocab_size]
-#     train_labels = labels[:train_batch_size]  # [train_bs, seq_len]
-
-#     # Shift for causal LM (predict next token)
-#     shift_logits = train_logits[..., :-1, :].contiguous()
-#     shift_labels = train_labels[..., 1:].contiguous()
-
-#     # Flatten
-#     shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-#     shift_labels = shift_labels.view(-1)
-
-#     # Compute loss (mean over valid tokens only)
-#     loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
-#     return loss
-
 
 class StreamingTrainer(Trainer):
     """
-    Trainer supporting gradient-based data selection with optional compression.
-
-    Supports 6 training modes:
-
-    Data Selection Modes (method in ['Streaming', 'GREATS']):
-        - Streaming: Single-pass, per-layer selection during backward.
-          Validation gradients guide sample selection at each layer independently.
-        - GREATS: Two-pass, global selection across all layers.
-          First pass computes selection scores, second pass computes gradients
-          on the globally selected samples.
-
-    Compression Options (MeSO optimizer):
-        - With compression: Uses MeSOAdamW for compressed gradient storage.
-        - Without compression: Uses standard AdamW with full gradients.
-
-    Baseline Modes (method == 'NA'):
-        - MeSO only: Compressed gradients without data selection.
-        - Baseline: Standard training with full gradients.
+    SFT Trainer supporting gradient-based data selection with optional compression.
     """
 
     def __init__(self, grad_hook: GradientHook, val_dataset, *args, **kwargs):

@@ -25,7 +25,7 @@ We consider the following 8 methods for the toxicity task:
 | 4   | Streaming | LoGra       | Full     | Per-layer selection + MeSO                |
 | 5   | GREATS    | LoGra       | Full     | Global selection + MeSO                   |
 
-> Experiments follow the pattern: `{task}-{selection}-{compression}-{model}-{training_type}-lr{lr}-b{batch}-v{nval}-s{seed}`
+> Experiments follow the pattern: `{task}-{model}-{method_str}-{training_type}-lr{lr}-b{batch}-v{nval}b{val_batch}-pe{ppo_epochs}-mb{mini_batch}-kl{kl_coef}-s{seed}`
 
 1. Selection Modes
    - **NA**: No data selection (baseline PPO)
@@ -233,13 +233,9 @@ bash RLHF/eval/eval.sh --dry-run
 
 Training-time toxicity evaluation uses a **different classifier** than the reward model to prevent reward hacking and provide unbiased measurement.
 
-- `--enable_eval` - Enable toxicity evaluation during training (default: `true`)
-- `--disable_eval` - Disable toxicity evaluation
 - `--eval_interval <n>` - Evaluate every N steps; 0 = epoch end only (default: `1`)
-- `--eval_n_samples <n>` - Number of samples for full evaluation (default: `500`)
+- `--n_eval <n>` - Number of samples for full evaluation (default: `500`)
 - `--eval_batch_size <n>` - Batch size for generation during evaluation (default: `256`)
-- `--eval_on_step_generations` - Evaluate toxicity on each PPO step's generations (default: `true`)
-- `--no_eval_on_step_generations` - Disable per-step toxicity evaluation
 
 Training metrics include:
 - `eval/toxicity_prob` - Mean toxicity probability of step generations

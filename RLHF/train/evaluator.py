@@ -1,10 +1,11 @@
 """
-Evaluation utilities for RLHF training.
+In-training evaluator for RLHF.
 
-This module provides evaluation tools that can be used during training
-to monitor progress. Following the reference implementation, we use
-DIFFERENT evaluation metrics than the reward model to ensure the model
-genuinely improves rather than gaming the specific reward model.
+This module provides evaluation tools that are called DURING training to monitor
+progress. For post-training evaluation, use eval/eval.py instead.
+
+Key design decision: We use a DIFFERENT classifier than the reward model to ensure
+the model genuinely improves rather than gaming the specific reward model.
 
 Toxicity: Uses DaNLP/da-electra-hatespeech-detection (different from reward model)
 

@@ -1,11 +1,11 @@
-from dataclasses import asdict, dataclass, field, fields
+"""
+Training arguments for SFT experiments.
+"""
+
+from dataclasses import dataclass, field
 
 from transformers import TrainingArguments as TA
-from transformers.utils import logging
 
-logger = logging.get_logger(__name__)
-log_levels = logging.get_log_levels_dict().copy()
-trainer_log_levels = dict(**log_levels, passive=-1)
 
 fsdp_config = {
     "mpt7b_finetune": {

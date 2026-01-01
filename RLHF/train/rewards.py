@@ -31,7 +31,14 @@ def load_reward_model(
 
     Returns:
         Tuple of (tokenizer, model)
+
+    Raises:
+        ValueError: If task is not supported
     """
+    if task != "toxicity":
+        raise ValueError(
+            f"Unsupported task: '{task}'. Currently only 'toxicity' is supported."
+        )
     return load_toxicity_model(model_name, device)
 
 
@@ -134,11 +141,16 @@ class RewardModelWrapper(nn.Module):
             task: Task type ('toxicity')
         """
         super().__init__()
+        if task != "toxicity":
+            raise ValueError(
+                f"Unsupported task: '{task}'. Currently only 'toxicity' is supported."
+            )
         self.reward_model = reward_model
         self.reward_tokenizer = reward_tokenizer
         self.policy_tokenizer = policy_tokenizer
         self.device = device
         self.max_length = max_length
+        self.task = task
 
     def forward(
         self,

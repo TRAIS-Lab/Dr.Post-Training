@@ -28,21 +28,21 @@ export base_training_args="--bf16=True \
 --warmup_ratio=0 \
 --weight_decay=0.0 \
 --logging_steps=1 \
---report_to=none"
+--report_to=none \
+--enable_eval=True \
+--eval_on_step_generations=True"
 
 # Default values
 model="EleutherAI/gpt-neo-2.7B"
-task="toxicity"
 reward_model=""  # Will be set based on task if not specified
-batch_size=256
-max_steps=-1  # -1 means no step limit (use epochs instead)
-epochs=1  # Number of training epochs (used when max_steps <= 0)
+task="toxicity"
 seed=42
 
-# PPO settings
+# Training settings
+epochs=1  # Number of training epochs (used when max_steps <= 0)
+batch_size=256
 ppo_epochs=4
 mini_batch_size=8
-filter_frac=1.0
 init_kl_coef=0.1  # Author suggests 0.2 (reference uses 0.04)
 kl_estimator="k1"  # Options: k1, k2, k3 (k3 recommended - unbiased, low variance, always positive)
 adap_kl_ctrl=true
@@ -51,21 +51,16 @@ target_kl=0.1  # Early stopping threshold: skip step if KL > 1.5 * target_kl
 early_stopping=false  # Enable early stopping based on target_kl
 max_new_tokens=""  # Will be set based on task if not specified
 min_new_tokens=0
-use_second_order=false
+max_steps=-1  # -1 means no step limit (use epochs instead)
+use_flash_attention=true
 
 # data selection
 data_selection="NA"  # NA, Streaming, or GREATS
+filter_frac=1.0  # Fraction of negative samples to drop (1.0 = no filtering)
+use_second_order=false # If true, use greedy selection with second-order interactions
 n_val=1024  # Number of validation samples for data selection (0 = self-referencing)
 val_batch_size=64  # Batch size for validation gradient computation
-val_generation_interval=0  # Steps between regenerating val completions (0 = once at start)
-
-# Evaluation settings
-enable_eval=true
-eval_interval=1  # 0 = end of epoch only, N > 0 = every N steps
-eval_n_samples=500
-eval_batch_size=256
-eval_on_step_generations=true  # Evaluate on each step's generations
-use_flash_attention=true
+val_generation_interval=1  # Steps between regenerating val completions (0 = once at start)
 
 # LR configuration
 lr_config_file="RLHF/train/lr/config.json"
@@ -74,19 +69,23 @@ lr_override=""  # Set when --lr is explicitly passed
 default_lr_full="1e-5"
 default_lr_lora="5e-6"
 
+# Evaluation settings
+eval_interval=1  # 0 = end of epoch only, N > 0 = every N steps
+n_eval=500
+eval_batch_size=256
+
 # LoRA settings
 use_lora=false
 lora_r=16
 lora_alpha=32
 lora_target_modules=""  # Empty = PEFT auto-detects (out_proj for GPT-Neo, o_proj for LLaMA)
 
-
 # Compression settings
-compression=""  # LoGra or GraSS
+compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer and compressed gradient for data selection.
 update_compressor_freq=200
 
 # Multi-method mode
-methods=""
+methods="" # Comma-separated list of methods or categories
 dry_run=false
 use_sbatch=false
 
@@ -245,33 +244,17 @@ while [[ $# -gt 0 ]]; do
             val_generation_interval="$2"
             shift 2
             ;;
-        --enable_eval)
-            enable_eval=true
-            shift 1
-            ;;
-        --disable_eval|--no_eval)
-            enable_eval=false
-            shift 1
-            ;;
         --eval_interval)
             eval_interval="$2"
             shift 2
             ;;
-        --eval_n_samples)
-            eval_n_samples="$2"
+        --n_eval)
+            n_eval="$2"
             shift 2
             ;;
         --eval_batch_size)
             eval_batch_size="$2"
             shift 2
-            ;;
-        --eval_on_step_generations)
-            eval_on_step_generations=true
-            shift 1
-            ;;
-        --no_eval_on_step_generations)
-            eval_on_step_generations=false
-            shift 1
             ;;
         --methods)
             methods="$2"
@@ -346,13 +329,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --val_generation_interval <n>  Steps between regenerating val completions (default: 0=once)"
             echo ""
             echo "Evaluation Options:"
-            echo "  --enable_eval              Enable evaluation during training (default: true)"
-            echo "  --disable_eval             Disable evaluation"
             echo "  --eval_interval <n>        Evaluate every N steps (0=epoch end only, default: 1)"
-            echo "  --eval_n_samples <n>       Samples for full evaluation (default: 500)"
+            echo "  --n_eval <n>               Samples for full evaluation (default: 500)"
             echo "  --eval_batch_size <n>      Batch size for generation (default: 256)"
-            echo "  --eval_on_step_generations Evaluate on each step's generations (default: true)"
-            echo "  --no_eval_on_step_generations Disable per-step evaluation"
             echo ""
             echo "  Toxicity: Uses DaNLP classifier (independent of reward model)"
             echo ""
@@ -371,6 +350,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Extract model name from path for use in output directories
+# e.g., "EleutherAI/gpt-neo-2.7B" -> "gpt-neo-2.7B"
+model_name=$(basename "$model")
 
 # ========================================
 # Resolve method names from categories
@@ -464,20 +447,32 @@ run_single_method() {
     local exp_name="$6"
 
     # Start with base training args
-    local exp_training_args="$base_training_args"
+    local exp_base_training_args="$base_training_args"
 
     # ========================================
     # Compression Configuration
     # ========================================
-    local exp_sparsification=""
-    local exp_projection=""
+    local sparsification=""
+    local projection=""
     if [[ -n "$exp_compression" ]]; then
         case "$exp_compression" in
             LoGra)
-                exp_projection="Gaussian-256"
+                # LoGra: Gaussian random projection
+                if [[ "$exp_use_lora" == "true" ]]; then
+                    sparsification="normal-128*128"
+                else
+                    sparsification="normal-512*512"
+                fi
                 ;;
             GraSS)
-                exp_sparsification="Rademacher-64*64"
+                # GraSS: Random mask sparsification + SJLT projection
+                if [[ "$exp_use_lora" == "true" ]]; then
+                    sparsification="random_mask-256*256"
+                    projection="sjlt-16384"
+                else
+                    sparsification="random_mask-1024*1024"
+                    projection="sjlt-262144"
+                fi
                 ;;
             *)
                 echo "ERROR: Invalid compression method: $exp_compression"
@@ -486,28 +481,18 @@ run_single_method() {
         esac
     fi
 
-    # Derive compression name for job
-    local compression_name="NA"
-    if [[ -n "$exp_sparsification" ]]; then
-        compression_name="GraSS"
-    elif [[ -n "$exp_projection" ]]; then
-        compression_name="LoGra"
-    fi
-
     # ========================================
     # Build Job Name
     # ========================================
-    local model_short=$(echo "$model" | sed 's/.*\///' | tr '[:upper:]' '[:lower:]')
-
-    local training_type
+    local job_type
     if [[ "$exp_use_lora" == "true" ]]; then
-        training_type="LoRA"
+        job_type="LoRA"
     else
-        training_type="Full"
+        job_type="Full"
     fi
 
     # Build method string (include second-order indicator if enabled)
-    local method_str="${exp_data_selection}-${compression_name}"
+    local method_str="${exp_data_selection}-${exp_compression:-NA}"
     if [[ "$exp_use_second_order" == "true" ]]; then
         method_str="${method_str}-2nd"
     fi
@@ -518,9 +503,9 @@ run_single_method() {
         val_str="${val_str}b${val_batch_size}"
     fi
 
-    # Job name format: task-model-method-training_type-lr-b-v-ppo-kl-s
-    # Includes: validation settings, PPO epochs, KL coefficient
-    local JOB_NAME="${task}-${model_short}-${method_str}-${training_type}-lr${exp_lr}-b${batch_size}-${val_str}-pe${ppo_epochs}-kl${init_kl_coef}-s${seed}"
+    # Job name format: task-model-method-job_type-lr-b-v-ppo-mb-kl-s
+    # Includes: validation settings, PPO epochs, mini-batch size, KL coefficient
+    local JOB_NAME="${task}-${model_name}-${method_str}-${job_type}-lr${exp_lr}-b${batch_size}-${val_str}-pe${ppo_epochs}-mb${mini_batch_size}-kl${init_kl_coef}-s${seed}"
 
     local output_dir=/scratch/pbb/Project/Gradient-Streaming/RLHF/${JOB_NAME}
     if [[ ! -d $output_dir ]]; then
@@ -547,7 +532,7 @@ run_single_method() {
     echo "Task: $task"
     echo "Selection: $method_str"
     echo "Model: $model"
-    echo "Training type: $training_type"
+    echo "Training type: $job_type"
     echo ""
     echo "Training:"
     echo "  Learning rate: $exp_lr $lr_source"
@@ -572,7 +557,7 @@ run_single_method() {
     # ========================================
     # Build training arguments
     # ========================================
-    local training_args="$exp_training_args \
+    local training_args="$exp_base_training_args \
 --task=$task \
 --method=$exp_data_selection \
 --model_name_or_path=$model \
@@ -634,20 +619,10 @@ run_single_method() {
     training_args="$training_args --val_batch_size=$val_batch_size"
     training_args="$training_args --val_generation_interval=$val_generation_interval"
 
-    # Add evaluation settings
-    if [[ "$enable_eval" == "true" ]]; then
-        training_args="$training_args --enable_eval=True"
-        training_args="$training_args --eval_interval=$eval_interval"
-        training_args="$training_args --eval_n_samples=$eval_n_samples"
-        training_args="$training_args --eval_batch_size=$eval_batch_size"
-        if [[ "$eval_on_step_generations" == "true" ]]; then
-            training_args="$training_args --eval_on_step_generations=True"
-        else
-            training_args="$training_args --eval_on_step_generations=False"
-        fi
-    else
-        training_args="$training_args --enable_eval=False"
-    fi
+    # Add evaluation settings (enable_eval and eval_on_step_generations are in base_training_args)
+    training_args="$training_args --eval_interval=$eval_interval"
+    training_args="$training_args --n_eval=$n_eval"
+    training_args="$training_args --eval_batch_size=$eval_batch_size"
 
     # Add log file
     training_args="$training_args 2>&1 | tee $output_dir/train.log"
@@ -732,13 +707,9 @@ if [[ -n "$methods" ]]; then
     echo "  Early stopping: $early_stopping"
     echo ""
     echo "Evaluation:"
-    echo "  Enabled: $enable_eval"
-    if [[ "$enable_eval" == "true" ]]; then
-        echo "  Eval interval: $eval_interval (0=epoch end only)"
-        echo "  Eval samples: $eval_n_samples"
-        echo "  Eval batch size: $eval_batch_size"
-        echo "  Eval on step generations: $eval_on_step_generations"
-    fi
+    echo "  Eval interval: $eval_interval (0=epoch end only)"
+    echo "  Eval samples: $n_eval"
+    echo "  Eval batch size: $eval_batch_size"
     echo ""
     echo "LR Config: $lr_config_file"
     echo "Methods to run: $resolved_methods"
@@ -788,15 +759,28 @@ else
     # ========================================
     # Compression Configuration
     # ========================================
+    # Default: LoGra (Gaussian projection). GraSS (random mask + SJLT) also available.
     sparsification=""
     projection=""
     if [[ -n "$compression" ]]; then
         case "$compression" in
             LoGra)
-                projection="Gaussian-256"
+                # LoGra: Gaussian random projection
+                if [ "$use_lora" = true ]; then
+                    sparsification="normal-128*128"
+                else
+                    sparsification="normal-512*512"
+                fi
                 ;;
             GraSS)
-                sparsification="Rademacher-64*64"
+                # GraSS: Random mask sparsification + SJLT projection
+                if [ "$use_lora" = true ]; then
+                    sparsification="random_mask-256*256"
+                    projection="sjlt-16384"
+                else
+                    sparsification="random_mask-1024*1024"
+                    projection="sjlt-262144"
+                fi
                 ;;
             *)
                 echo "ERROR: Invalid compression method: $compression"

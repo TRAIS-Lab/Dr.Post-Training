@@ -1,8 +1,10 @@
+"""
+Model arguments for SFT experiments.
+"""
+
 import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
-
-from transformers import GPT2Tokenizer, GPTNeoXTokenizerFast, LlamaTokenizer
 
 logger = logging.getLogger(__name__)
 

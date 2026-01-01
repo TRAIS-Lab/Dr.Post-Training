@@ -2,22 +2,6 @@
 # coding=utf-8
 """
 Training script for RLHF with gradient streaming.
-
-This script implements PPO training with optional layer-wise data selection,
-following the same design patterns as SFT/train/train.py.
-
-Usage:
-    # Baseline (no selection)
-    python RLHF/train/train.py --method NA --output_dir outputs/baseline
-
-    # Streaming (per-layer filtering)
-    python RLHF/train/train.py --method Streaming --filter_frac 1.0
-
-    # GREATS (global filtering)
-    python RLHF/train/train.py --method GREATS --filter_frac 0.5
-
-    # With compression (implies MeSO optimizer)
-    python RLHF/train/train.py --method Streaming --sparsification Rademacher-64*64
 """
 
 import logging
@@ -26,9 +10,9 @@ import sys
 import warnings
 
 import torch
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, set_seed, get_scheduler
+from transformers import AutoTokenizer, HfArgumentParser, set_seed, get_scheduler
 from trl import AutoModelForCausalLMWithValueHead
 from trl.models import create_reference_model
 
@@ -40,7 +24,7 @@ from RLHF.train.model_arguments import ModelArguments, add_padding_to_tokenizer
 from RLHF.train.training_arguments import TrainingArguments
 from RLHF.train.trainer import StreamingPPOTrainer
 from RLHF.train.rewards import load_reward_model, RewardModelWrapper
-from RLHF.train.evaluation import create_evaluator
+from RLHF.train.evaluator import create_evaluator
 
 from gradstream import GradientHook, setup_model_compressors, create_sample_inputs, MeSOAdamW
 
@@ -363,82 +347,87 @@ def main():
     layer_names = find_trainable_layers(model, lora_only=model_args.lora)
     logger.info(f"Found {len(layer_names)} trainable layers")
 
-    # Setup gradient hooks if selection is enabled
+    # Create gradient hook only when needed (selection or compression enabled)
     grad_hook = None
     if training_args.has_selection or training_args.has_compression:
-        logger.info("Setting up gradient hooks...")
-
         grad_hook = GradientHook(
             model=model,
             layer_names=layer_names,
             device=device,
-            register_hooks=True,
+        )
+        logger.info(f"Gradient Hook created (selection={training_args.has_selection}, compression={training_args.has_compression})")
+    else:
+        logger.info(f"Training method: {training_args.method} - No gradient hooks needed")
+
+    # Optional: Set up gradient compression
+    if training_args.has_compression:
+        logger.info("=== Gradient Compression Setup ===")
+
+        # Parse sparsification
+        if training_args.sparsification is not None:
+            method, dim = training_args.sparsification.split("-")
+            assert "*" in dim, "Sparsification dimension must be factorized (e.g., '64*64')"
+            dim_parts = dim.split("*")
+            sparsification_dim = int(dim_parts[0])
+
+            sparsifier_kwargs = {
+                "proj_dim": sparsification_dim,
+                "proj_max_batch_size": training_args.per_device_train_batch_size,
+                "proj_seed": training_args.seed,
+                "device": device,
+                "proj_type": method,
+            }
+            logger.info(f"  Sparsification: {method} -> {sparsification_dim}*{sparsification_dim} dimension")
+        else:
+            sparsifier_kwargs = {
+                "proj_dim": -1,
+                "proj_type": "identity",
+                "device": device,
+            }
+            logger.info("  Sparsification: Disabled")
+
+        # Parse projection
+        if training_args.projection is not None:
+            method, dim = training_args.projection.split("-")
+            proj_dim = int(dim)
+
+            projector_kwargs = {
+                "proj_dim": proj_dim,
+                "proj_max_batch_size": training_args.per_device_train_batch_size,
+                "proj_seed": training_args.seed,
+                "device": device,
+                "proj_type": method,
+            }
+            logger.info(f"  Projection: {method} -> {proj_dim} dimension")
+        else:
+            projector_kwargs = {
+                "proj_dim": -1,
+                "proj_type": "identity",
+                "device": device,
+            }
+            logger.info("  Projection: Disabled")
+
+        # Create sample inputs for compressor initialization
+        sample_inputs = create_sample_inputs(
+            tokenizer=tokenizer,
+            max_seq_length=training_args.max_new_tokens + 20,
+            device=device,
         )
 
-        # Setup compression if enabled
-        if training_args.has_compression:
-            logger.info("Setting up gradient compression...")
+        # Setup compressors
+        compressors = setup_model_compressors(
+            model=model,
+            layer_names=layer_names,
+            sparsifier_kwargs=sparsifier_kwargs,
+            projector_kwargs=projector_kwargs,
+            sample_inputs=sample_inputs,
+            device=device,
+            update_freq=training_args.update_compressor_freq,
+        )
 
-            # Parse sparsification
-            if training_args.sparsification is not None:
-                method, dim = training_args.sparsification.split("-")
-                assert "*" in dim, "Sparsification dimension must be factorized (e.g., '64*64')"
-                dim_parts = dim.split("*")
-                sparsification_dim = int(dim_parts[0])
-
-                sparsifier_kwargs = {
-                    "proj_dim": sparsification_dim,
-                    "proj_max_batch_size": training_args.per_device_train_batch_size,
-                    "proj_seed": training_args.seed,
-                    "device": device,
-                    "proj_type": method,
-                }
-            else:
-                sparsifier_kwargs = {
-                    "proj_dim": -1,
-                    "proj_type": "identity",
-                    "device": device,
-                }
-
-            # Parse projection
-            if training_args.projection is not None:
-                method, dim = training_args.projection.split("-")
-                proj_dim = int(dim)
-
-                projector_kwargs = {
-                    "proj_dim": proj_dim,
-                    "proj_max_batch_size": training_args.per_device_train_batch_size,
-                    "proj_seed": training_args.seed,
-                    "device": device,
-                    "proj_type": method,
-                }
-            else:
-                projector_kwargs = {
-                    "proj_dim": -1,
-                    "proj_type": "identity",
-                    "device": device,
-                }
-
-            # Create sample inputs for compressor initialization
-            sample_inputs = create_sample_inputs(
-                tokenizer=tokenizer,
-                max_seq_length=training_args.max_new_tokens + 20,
-                device=device,
-            )
-
-            # Setup compressors
-            compressors = setup_model_compressors(
-                model=model,
-                layer_names=layer_names,
-                sparsifier_kwargs=sparsifier_kwargs,
-                projector_kwargs=projector_kwargs,
-                sample_inputs=sample_inputs,
-                device=device,
-                update_freq=training_args.update_compressor_freq,
-            )
-
-            grad_hook.set_compressors(compressors)
-            logger.info(f"Compression setup complete: {len(compressors)} layers")
+        grad_hook.set_compressors(compressors)
+        logger.info(f"  Set {len(compressors)} unified compressors (refreshed every {training_args.update_compressor_freq} steps)")
+        logger.info("Gradient compression setup completed!")
 
     # Create optimizer - only pass trainable parameters
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -535,7 +524,7 @@ def main():
         initial_eval_results = evaluator.evaluate(
             model=model,
             tokenizer=tokenizer,
-            n_samples=training_args.eval_n_samples,
+            n_samples=training_args.n_eval,
             max_new_tokens=training_args.max_new_tokens,
             min_new_tokens=training_args.min_new_tokens,  # Safe for eval (no KL computation)
             generation_batch_size=training_args.eval_batch_size,
@@ -549,8 +538,8 @@ def main():
         )
 
     # Train
-    logger.info("Starting training...")
-    history = trainer.train(
+    logger.info("*** Starting training ***")
+    train_result = trainer.train(
         train_dataloader=train_dataloader,
         num_epochs=int(num_epochs),
         max_steps=max_steps,
@@ -563,23 +552,23 @@ def main():
 
     # Add initial evaluation results to history
     if initial_eval_results is not None:
-        history["initial_eval_toxicity_prob"] = initial_eval_results["mean_toxicity_prob"]
-        history["initial_eval_toxicity_rate"] = initial_eval_results["toxicity_rate"]
+        train_result["initial_eval_toxicity_prob"] = initial_eval_results["mean_toxicity_prob"]
+        train_result["initial_eval_toxicity_rate"] = initial_eval_results["toxicity_rate"]
 
     # Save training history with evaluation results
     import json
     history_file = os.path.join(training_args.output_dir, "training_history.json")
     with open(history_file, "w") as f:
-        json.dump(history, f, indent=2)
+        json.dump(train_result, f, indent=2)
     logger.info(f"Training history saved to {history_file}")
 
-    # Clean up hooks
+    # Clean up hooks (only if grad_hook was created)
     if grad_hook is not None and grad_hook.hooks_registered:
         grad_hook.remove_hooks()
         logger.info("Removed gradient hooks")
 
     logger.info("Training complete!")
-    return history
+    return train_result
 
 
 if __name__ == "__main__":

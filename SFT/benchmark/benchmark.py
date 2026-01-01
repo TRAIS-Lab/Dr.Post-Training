@@ -1290,7 +1290,6 @@ def _setup_compression(model, config: BenchmarkConfig, use_meso_optimizer: bool 
         model=model,
         layer_names=layer_names,
         device=str(config.device),
-        register_hooks=True
     )
     grad_hook.set_compressors(compressors)
 
@@ -1487,7 +1486,6 @@ def _setup_logra_compression(model, config: BenchmarkConfig, use_meso_optimizer:
         model=model,
         layer_names=layer_names,
         device=str(config.device),
-        register_hooks=True
     )
     grad_hook.set_compressors(compressors)
 
@@ -1656,7 +1654,6 @@ def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_meso_optimizer: bool
         model=model,
         layer_names=layer_names,
         device=str(config.device),
-        register_hooks=True
     )
     grad_hook.set_compressors(compressors)
 

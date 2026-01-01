@@ -321,7 +321,7 @@ class TrainingArguments(TA):
             )
         },
     )
-    eval_n_samples: int = field(
+    n_eval: int = field(
         default=500,
         metadata={"help": "Number of samples for evaluation (default: 500)"},
     )

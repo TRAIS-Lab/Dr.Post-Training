@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 """
-Training script with gradient streaming (unified data selection and model update).
+Training script for SFT with gradient streaming.
 """
 
 import logging
@@ -203,26 +203,26 @@ def main():
     else:
         logger.warning("WARNING: No trainable layers found! Check model and lora_only setting.")
 
-    # Determine if hooks should be registered based on training method
-    # Register hooks for:
-    # 1. Streaming method (gradient streaming with data selection)
+    # Determine if gradient hooks are needed based on training method
+    # Hooks are needed for:
+    # 1. Selection method is not NA (Streaming or GREATS)
     # 2. Compression enabled (implies MeSO optimizer)
     has_compression = (training_args.sparsification is not None or training_args.projection is not None)
-    should_register_hooks = (
+    needs_grad_hook = (
         training_args.method in ('Streaming', 'GREATS') or has_compression
     )
-    logger.info(f"Training method: {training_args.method} - Hooks will be {'registered' if should_register_hooks else 'NOT registered'}")
-    if has_compression:
-        logger.info("  Compression enabled - will use MeSO optimizer")
 
-    # Create gradient hook
-    grad_hook = GradientHook(
-        model=model,
-        layer_names=layer_names,
-        device=str(training_args.device),
-        register_hooks=should_register_hooks
-    )
-    logger.info("Gradient Hook created successfully.")
+    # Create gradient hook only when needed
+    grad_hook = None
+    if needs_grad_hook:
+        grad_hook = GradientHook(
+            model=model,
+            layer_names=layer_names,
+            device=str(training_args.device),
+        )
+        logger.info(f"Gradient Hook created (method={training_args.method}, compression={has_compression})")
+    else:
+        logger.info(f"Training method: {training_args.method} - No gradient hooks needed")
 
     # Optional: Set up gradient compression
     if training_args.sparsification is not None or training_args.projection is not None:
@@ -351,7 +351,7 @@ def main():
     trainer.evaluate()
 
     # Train
-    logger.info("*** Starting training with gradient streaming ***")
+    logger.info("*** Starting training ***")
     train_result = trainer.train()
 
     # Final evaluation after training
@@ -364,12 +364,10 @@ def main():
     # Save model
     trainer.save_model()
 
-    # Clean up hooks (only if they were registered)
-    if grad_hook.hooks_registered:
+    # Clean up hooks (only if grad_hook was created)
+    if grad_hook is not None and grad_hook.hooks_registered:
         grad_hook.remove_hooks()
-        logger.info("Removed all hooks after training")
-    else:
-        logger.info("No hooks to remove (hooks were not registered)")
+        logger.info("Removed gradient hooks")
 
     # Clean up distributed process group
     if dist.is_initialized():

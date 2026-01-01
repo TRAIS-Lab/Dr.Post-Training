@@ -43,25 +43,23 @@ export base_training_args="--do_train=True \
 
 # Default values
 model="meta-llama/Llama-3.2-1B"
-optim="adamw_torch"  # Standard HF optimizer (adamw_torch, adamw_hf, etc.)
 data_dir="SFT/data"
+train_dataset=""  # Training dataset (if empty, uses task-based default)
 percentage=0.05
-n_eval=500
-batch_size=8
+task="mmlu"
+subject="sociology"
 seed=42
 
+# Training settings
+optim="adamw_torch"  # Standard HF optimizer (adamw_torch, adamw_hf, etc.)
+batch_size=8
 gradient_accumulation_steps=1
-task="mmlu"
-train_dataset=""  # Training dataset (if empty, uses task-based default)
-subject="sociology"
-compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer.
-use_second_order=false  # If true, use greedy selection with second-order interactions
-selection_frac="0.5"  # Fraction of samples to select (for Streaming/GREATS)
-use_lora=false
 use_flash_attention=true
 
 # data selection
 data_selection="NA"  # NA, Streaming, or GREATS
+selection_frac="0.5"  # Fraction of samples to select
+use_second_order=false  # If true, use greedy selection with second-order interactions
 n_val=8  # Number of validation samples for data selection
 val_batch_size="1"  # Defaults to batch_size if not specified
 val_strategy="merged_batch"  # Validation strategy: separate_batch_factorized, separate_batch, merged_batch
@@ -73,11 +71,24 @@ lr_override=""  # Set when --lr is explicitly passed
 default_lr_full="5e-05"
 default_lr_lora="2e-04"
 
+# Evaluation settings
+n_eval=500
+
+# LoRA settings
+use_lora=false
+lora_r=32
+lora_alpha=1
+lora_dropout=0.1
+lora_target_modules=""  # Empty = PEFT auto-detects (out_proj for GPT-Neo, o_proj for LLaMA)
+
+# Compression settings
+compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer and compressed gradient for data selection.
+update_compressor_freq=200
+
 # Multi-method mode
 methods=""  # Comma-separated list of methods or categories
 dry_run=false
 use_sbatch=false
-
 
 # ========================================
 # Experiment Definitions
@@ -106,13 +117,6 @@ declare -A CATEGORY_METHODS=(
     ["compression"]="Streaming-LoGra-Full,GREATS-LoGra-Full"
     ["no-compression"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
 )
-
-# LoRA-specific defaults (only used if --lora is passed)
-lora_alpha=1
-lora_r=32
-lora_dropout=0.1
-
-update_compressor_freq=200
 
 # Parse named arguments
 while [[ $# -gt 0 ]]; do
@@ -217,6 +221,10 @@ while [[ $# -gt 0 ]]; do
             lora_dropout="$2"
             shift 2
             ;;
+        --lora_target_modules)
+            lora_target_modules="$2"
+            shift 2
+            ;;
         --data_dir)
             data_dir="$2"
             shift 2
@@ -270,7 +278,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --lora_alpha <alpha>                   LoRA alpha (default: 1)"
             echo "  --lora_r <r>                           LoRA rank (default: 32)"
             echo "  --lora_dropout <dropout>               LoRA dropout (default: 0.1)"
-            echo "  --lora_target_modules <modules>        Target modules (default: q_proj k_proj v_proj o_proj)"
+            echo "  --lora_target_modules <modules>        Target modules (default: auto-detect)"
             echo ""
             echo "Shared Options (apply to all methods):"
             echo "  --model <model>                        HuggingFace model path (default: meta-llama/Llama-3.2-1B)"
@@ -544,7 +552,11 @@ run_single_method() {
     fi
 
     if [ "$exp_use_lora" = true ]; then
-        training_args="$training_args --lora True --lora_alpha $lora_alpha --lora_r $lora_r --lora_dropout $lora_dropout --lora_target_modules q_proj k_proj v_proj o_proj"
+        training_args="$training_args --lora True --lora_alpha $lora_alpha --lora_r $lora_r --lora_dropout $lora_dropout"
+        # Only add target_modules if explicitly specified (empty = PEFT auto-detects)
+        if [[ -n "$lora_target_modules" ]]; then
+            training_args="$training_args --lora_target_modules $lora_target_modules"
+        fi
     else
         training_args="$training_args --lora False"
     fi
@@ -603,8 +615,8 @@ if [[ -n "$methods" ]]; then
     echo "Training Settings:"
     echo "  Batch size: $batch_size"
     echo "  Val batch size: ${val_batch_size:-same as batch_size}"
-    echo "  Learning rate (Full): $lr"
-    echo "  Learning rate (LoRA): $lr_lora"
+    echo "  Default LR (Full): $default_lr_full"
+    echo "  Default LR (LoRA): $default_lr_lora"
     echo "  N_val: $n_val"
     echo ""
     echo "Methods to run: $resolved_methods"
@@ -849,7 +861,11 @@ fi
 
 # Add LoRA arguments if using LoRA
 if [ "$use_lora" = true ]; then
-    training_args="$training_args --lora True --lora_alpha $lora_alpha --lora_r $lora_r --lora_dropout $lora_dropout --lora_target_modules q_proj k_proj v_proj o_proj"
+    training_args="$training_args --lora True --lora_alpha $lora_alpha --lora_r $lora_r --lora_dropout $lora_dropout"
+    # Only add target_modules if explicitly specified (empty = PEFT auto-detects)
+    if [[ -n "$lora_target_modules" ]]; then
+        training_args="$training_args --lora_target_modules $lora_target_modules"
+    fi
 else
     training_args="$training_args --lora False"
 fi

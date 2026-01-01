@@ -1,10 +1,5 @@
 """
-Streaming PPO Trainer for RLHF experiments.
-
-Methods:
-- NA: Standard PPO (no selection)
-- Streaming: Per-layer selection during backward (single-pass for training)
-- GREATS: Global selection with validation gradients (two-pass for training)
+Streaming PPO trainer with unified data selection and model update.
 """
 
 import logging
@@ -17,6 +12,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
 
+from gradstream.hook import GradientHook
 from gradstream.selection import create_separate_batch_strategy
 
 logger = logging.getLogger(__name__)
@@ -30,8 +26,6 @@ def first_true_indices(bools: torch.Tensor, dtype=torch.long) -> torch.Tensor:
     """
     Find the position of the first True in each row.
     Returns the length of the row if no True is found.
-
-    Matches TRL's implementation.
     """
     row_len = bools.size(-1)
     zero_or_index = row_len * (~bools).type(dtype) + torch.arange(row_len, dtype=dtype, device=bools.device)
@@ -44,8 +38,6 @@ def truncate_response(stop_token_id: int, pad_token_id: int, responses: torch.Te
 
     This is critical for proper KL computation - positions after the stop token
     should be masked out consistently.
-
-    Matches TRL 0.26.1 implementation.
 
     Args:
         stop_token_id: Token ID where truncation occurs
@@ -70,8 +62,6 @@ class AdaptiveKLController:
     Adjusts the KL penalty coefficient based on observed KL divergence.
     When current KL > target, increases coefficient to penalize divergence more.
     When current KL < target, decreases coefficient to allow more exploration.
-
-    The clipping range [-0.2, 0.2] matches TRL's implementation for stable updates.
     """
 
     def __init__(self, init_kl_coef: float, target: float, horizon: float):
@@ -81,7 +71,7 @@ class AdaptiveKLController:
 
     def update(self, current: float, n_steps: int):
         # Proportional error: positive if current > target, negative if current < target
-        # Clipping to [-0.2, 0.2] ensures gradual updates (matches TRL reference)
+        # Clipping to [-0.2, 0.2] ensures gradual updates
         proportional_error = np.clip(current / self.target - 1, -0.2, 0.2)
         mult = 1 + proportional_error * n_steps / self.horizon
         self.value *= mult
@@ -107,8 +97,6 @@ def compute_gae(
 ) -> Tuple[Tensor, Tensor]:
     """
     Compute Generalized Advantage Estimation with optional whitening.
-
-    Matches TRL's compute_advantages + masked_whiten implementation.
 
     Args:
         rewards: Per-token rewards (with KL penalty already applied) [batch, seq_len]
@@ -143,8 +131,7 @@ def compute_gae(
 
     returns = advantages + values
 
-    # Whiten advantages (matching TRL's masked_whiten with Bessel correction)
-    # Reference: trl/core.py masked_whiten() - does NOT multiply by mask at end
+    # Whiten advantages
     if whiten:
         mask_sum = mask.sum()
         adv_mean = (advantages * mask).sum() / mask_sum.clamp(min=1)
@@ -164,12 +151,7 @@ def compute_gae(
 
 class StreamingPPOTrainer:
     """
-    PPO Trainer with gradient streaming for data selection.
-
-    This trainer implements PPO with support for three training methods:
-    - NA: Standard PPO (no selection)
-    - Streaming: Per-layer selection during backward (uses stored val gradients)
-    - GREATS: Global selection with validation gradients (two-pass)
+    PPO Trainer supporting gradient-based data selection with optional compression.
     """
 
     def __init__(
@@ -179,7 +161,7 @@ class StreamingPPOTrainer:
         reward_model: nn.Module,
         tokenizer,
         args,
-        grad_hook=None,
+        grad_hook: GradientHook,
         optimizer: Optional[torch.optim.Optimizer] = None,
         lr_scheduler=None,
         evaluator=None,
@@ -246,7 +228,7 @@ class StreamingPPOTrainer:
         self.ppo_epochs = args.ppo_epochs
         self.mini_batch_size = args.mini_batch_size
 
-        # KL Controller (matching reference implementation)
+        # KL Controller
         # Note: `target` is for AdaptiveKLController, `target_kl` is for early stopping
         self.adap_kl_ctrl = args.adap_kl_ctrl
         if self.adap_kl_ctrl:
@@ -276,65 +258,7 @@ class StreamingPPOTrainer:
             selection_mode="filtering",
         )
 
-        # Logging
-        self._log_config()
-
-    def _compute_gradient_norms(self) -> Dict[str, float]:
-        """
-        Compute gradient norms for policy (LoRA) and v_head layers.
-
-        This helps verify that gradient normalization is working correctly.
-        For Streaming/GREATS, policy gradients should match NA baseline if
-        normalization is correct.
-
-        Supports both compressed gradients (stored in _compressed_grad on weight params)
-        and standard gradients (param.grad).
-
-        Returns:
-            Dictionary with policy_grad_norm, vhead_grad_norm, and per-layer norms
-        """
-        policy_grad_norm_sq = 0.0
-        vhead_grad_norm_sq = 0.0
-        lora_a_grad_norm_sq = 0.0
-        lora_b_grad_norm_sq = 0.0
-
-        for name, param in self.model.named_parameters():
-            # Check for compressed gradient first (stored on weight parameters only)
-            # _compressed_grad contains both weight and bias gradients combined
-            compressed_grad = getattr(param, '_compressed_grad', None)
-
-            if compressed_grad is not None:
-                # Use compressed gradient norm (represents layer's gradient in compressed space)
-                grad_norm_sq = compressed_grad.norm().item() ** 2
-                # Only weight params have _compressed_grad, so categorize based on weight name
-                if "lora" in name.lower():
-                    policy_grad_norm_sq += grad_norm_sq
-                    if "lora_A" in name or "lora_a" in name:
-                        lora_a_grad_norm_sq += grad_norm_sq
-                    elif "lora_B" in name or "lora_b" in name:
-                        lora_b_grad_norm_sq += grad_norm_sq
-
-            elif param.grad is not None:
-                # Use standard gradient (for non-compressed layers like v_head)
-                grad_norm_sq = param.grad.norm().item() ** 2
-                if "v_head" in name:
-                    vhead_grad_norm_sq += grad_norm_sq
-                elif "lora" in name.lower():
-                    policy_grad_norm_sq += grad_norm_sq
-                    if "lora_A" in name or "lora_a" in name:
-                        lora_a_grad_norm_sq += grad_norm_sq
-                    elif "lora_B" in name or "lora_b" in name:
-                        lora_b_grad_norm_sq += grad_norm_sq
-
-        return {
-            "grad_norm/policy": policy_grad_norm_sq ** 0.5,
-            "grad_norm/vhead": vhead_grad_norm_sq ** 0.5,
-            "grad_norm/lora_a": lora_a_grad_norm_sq ** 0.5,
-            "grad_norm/lora_b": lora_b_grad_norm_sq ** 0.5,
-        }
-
-    def _log_config(self):
-        """Log trainer configuration."""
+        # Log configuration
         logger.info("=" * 60)
         logger.info("StreamingPPOTrainer Configuration")
         logger.info(f"  Method: {self.method}")
@@ -362,6 +286,247 @@ class StreamingPPOTrainer:
         else:
             logger.info(f"  Reference model: {'shared layers' if self.ref_model is not None else 'None'}")
         logger.info("=" * 60)
+
+    # =========================================================================
+    # Helper Methods
+    # =========================================================================
+
+    def _extract_model_outputs(
+        self, outputs, need_values: bool = True
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """
+        Extract logits and values from model outputs.
+
+        Handles both tuple format (AutoModelForCausalLMWithValueHead) and
+        object format (standard HuggingFace models).
+
+        Args:
+            outputs: Model outputs (tuple or object with .logits attribute)
+            need_values: Whether to extract values (default True)
+
+        Returns:
+            Tuple of (logits, values) where values may be None
+        """
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+            values = outputs[2] if need_values and len(outputs) >= 3 else None
+        else:
+            logits = outputs.logits
+            values = None
+
+        if values is not None and values.dim() == 3:
+            values = values.squeeze(-1)
+
+        return logits, values
+
+    def _compute_token_logprobs(
+        self,
+        logits: Tensor,
+        token_ids: Tensor,
+        temperature: float = 1.0,
+    ) -> Tensor:
+        """
+        Compute log probabilities for given tokens.
+
+        Args:
+            logits: Logits tensor [batch, seq_len, vocab_size]
+            token_ids: Token IDs to gather [batch, seq_len]
+            temperature: Temperature for scaling logits (default 1.0)
+
+        Returns:
+            Log probabilities [batch, seq_len]
+        """
+        if temperature != 1.0:
+            logits = logits / (temperature + 1e-7)
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        return torch.gather(
+            log_probs, dim=-1, index=token_ids.unsqueeze(-1)
+        ).squeeze(-1)
+
+    def _get_response_slice_indices(
+        self, query_len: int, response_len: int
+    ) -> Tuple[int, int]:
+        """
+        Get start and end indices for extracting response logits/values.
+
+        For next-token prediction, logit at position i predicts token at i+1.
+        So for response tokens at [query_len, query_len+response_len), we need
+        logits at [query_len-1, query_len+response_len-1).
+
+        Args:
+            query_len: Length of query sequence
+            response_len: Length of response sequence
+
+        Returns:
+            Tuple of (start_idx, end_idx)
+        """
+        start_idx = query_len - 1
+        end_idx = start_idx + response_len
+        return start_idx, end_idx
+
+    def _pad_and_stack(
+        self,
+        tensors: List[Tensor],
+        masks: List[Tensor],
+        pad_value: int,
+        pad_left: bool = False,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Pad tensors to same length and stack.
+
+        Args:
+            tensors: List of tensors to pad and stack
+            masks: List of corresponding masks
+            pad_value: Value to use for padding tensors
+            pad_left: If True, pad on left side; otherwise pad on right
+
+        Returns:
+            Tuple of (stacked_tensors, stacked_masks)
+        """
+        max_len = max(t.shape[1] for t in tensors)
+        padded_tensors = []
+        padded_masks = []
+
+        for t, m in zip(tensors, masks):
+            pad_len = max_len - t.shape[1]
+            if pad_len > 0:
+                if pad_left:
+                    t = F.pad(t, (pad_len, 0), value=pad_value)
+                    m = F.pad(m, (pad_len, 0), value=0)
+                else:
+                    t = F.pad(t, (0, pad_len), value=pad_value)
+                    m = F.pad(m, (0, pad_len), value=0)
+            padded_tensors.append(t)
+            padded_masks.append(m)
+
+        return torch.cat(padded_tensors, dim=0), torch.cat(padded_masks, dim=0)
+
+    def _compute_ppo_stats(
+        self,
+        ratio: Tensor,
+        values: Tensor,
+        old_values: Tensor,
+        new_logprobs: Tensor,
+        old_logprobs: Tensor,
+        response_mask: Tensor,
+    ) -> Dict[str, float]:
+        """
+        Compute common PPO statistics for logging.
+
+        Args:
+            ratio: Policy ratio (new_prob / old_prob) [batch, seq_len]
+            values: Current value estimates [batch, seq_len]
+            old_values: Old value estimates [batch, seq_len]
+            new_logprobs: New log probabilities [batch, seq_len]
+            old_logprobs: Old log probabilities [batch, seq_len]
+            response_mask: Valid token mask [batch, seq_len]
+
+        Returns:
+            Dictionary of statistics
+        """
+        # Policy clip fraction
+        pg_clipfrac = ((ratio - 1).abs() > self.cliprange).float().mean().item()
+
+        # Value clip fraction
+        vf_clipfrac = ((values - old_values).abs() > self.cliprange_value).float().mean().item()
+
+        # Second-order KL approximation (always >= 0)
+        approx_kl = (0.5 * (new_logprobs - old_logprobs) ** 2 * response_mask).sum()
+        approx_kl = approx_kl / response_mask.sum()
+
+        # First-order KL approximation (can be negative)
+        policykl = ((old_logprobs - new_logprobs) * response_mask).sum()
+        policykl = policykl / response_mask.sum()
+
+        # Ratio statistics
+        mask_sum = response_mask.sum().clamp(min=1)
+        avg_ratio = (ratio * response_mask).sum() / mask_sum
+        ratio_var = ((ratio - avg_ratio) ** 2 * response_mask).sum() / mask_sum
+
+        # Entropy
+        entropy = (-new_logprobs * response_mask).sum() / mask_sum
+
+        return {
+            "policy/approxkl": approx_kl.item(),
+            "policy/policykl": policykl.item(),
+            "policy/clipfrac": pg_clipfrac,
+            "policy/entropy": entropy.item(),
+            "policy/ratio": avg_ratio.item(),
+            "val/clipfrac": vf_clipfrac,
+            "val/ratio_var": ratio_var.item(),
+            "val/mean": values.mean().item(),
+        }
+
+    def _capture_validation_gradients_core(
+        self,
+        full_ids: Tensor,
+        full_mask: Tensor,
+        response_ids: Tensor,
+        response_mask: Tensor,
+        seq_advantages: Tensor,
+        query_len: int,
+        batch_size: int,
+    ) -> float:
+        """
+        Core logic for capturing validation gradients.
+
+        This is the shared implementation used by both buffer-based and
+        fixed validation gradient capture methods.
+
+        Args:
+            full_ids: Full sequence (query + response) [batch, seq_len]
+            full_mask: Full attention mask [batch, seq_len]
+            response_ids: Response token IDs [batch, response_len]
+            response_mask: Response attention mask [batch, response_len]
+            seq_advantages: Per-sequence advantages [batch]
+            query_len: Length of query portion
+            batch_size: Mini-batch size for processing
+
+        Returns:
+            Total validation loss value
+        """
+        full_batch_size = full_ids.shape[0]
+        total_val_loss = 0.0
+
+        for i in range(0, full_batch_size, batch_size):
+            end_idx = min(i + batch_size, full_batch_size)
+
+            # Extract mini-batch
+            mb_full_ids = full_ids[i:end_idx]
+            mb_full_mask = full_mask[i:end_idx]
+            mb_response_ids = response_ids[i:end_idx]
+            mb_response_mask = response_mask[i:end_idx]
+            mb_seq_advantages = seq_advantages[i:end_idx]
+
+            # Forward pass (log π_θ(y|x))
+            outputs = self.model(
+                input_ids=mb_full_ids,
+                attention_mask=mb_full_mask,
+            )
+
+            logits, _ = self._extract_model_outputs(outputs, need_values=False)
+
+            # Log probs for response tokens
+            logits = logits[:, query_len - 1:-1, :]
+            token_log_probs = self._compute_token_logprobs(logits, mb_response_ids)
+
+            # Sequence log probability (sum over response tokens)
+            seq_log_probs = (token_log_probs * mb_response_mask.float()).sum(dim=1)
+
+            # Compute validation loss: -E[log π_θ(y|x) * A(x,y)]
+            per_seq_loss = -(mb_seq_advantages * seq_log_probs)
+            mb_val_loss = per_seq_loss.sum() / full_batch_size
+
+            # Backward - hooks accumulate gradients into val_grad_buffer
+            mb_val_loss.backward()
+
+            total_val_loss += mb_val_loss.item()
+
+        return total_val_loss
+
+    # =========================================================================
+    # Core Training Methods
+    # =========================================================================
 
     @torch.no_grad()
     def _compute_initial_stats(
@@ -401,6 +566,7 @@ class StreamingPPOTrainer:
         """
         batch_size = query_ids.shape[0]
         query_len = query_ids.shape[1]
+        response_len = response_ids.shape[1]
 
         # Concatenate query and response
         input_ids = torch.cat([query_ids, response_ids], dim=1)
@@ -414,31 +580,18 @@ class StreamingPPOTrainer:
             use_cache=False,
         )
 
-        # Handle model output format
-        if isinstance(outputs, tuple):
-            logits = outputs[0]
-            values_full = outputs[2]
-        else:
-            logits = outputs.logits
+        # Extract model outputs
+        logits, values_full = self._extract_model_outputs(outputs)
+        if values_full is None:
             values_full = torch.zeros(batch_size, input_ids.shape[1], device=self.device)
 
         # Extract values and logits for response tokens
-        response_len = response_ids.shape[1]
-        start_idx = query_len - 1
-        end_idx = start_idx + response_len
-
-        if values_full.dim() == 3:
-            values_full = values_full.squeeze(-1)
+        start_idx, end_idx = self._get_response_slice_indices(query_len, response_len)
         values = values_full[:, start_idx:end_idx]
 
         # Compute new log probs
         logits_for_probs = logits[:, start_idx:end_idx, :]
-        log_probs = F.log_softmax(logits_for_probs.float(), dim=-1)
-        new_logprobs = torch.gather(
-            log_probs,
-            dim=-1,
-            index=response_ids.unsqueeze(-1),
-        ).squeeze(-1)
+        new_logprobs = self._compute_token_logprobs(logits_for_probs, response_ids)
 
         # PPO policy loss computation (without backward)
         logprob_diff = new_logprobs - old_logprobs
@@ -541,7 +694,6 @@ class StreamingPPOTrainer:
         Compute KL divergence estimate using configured estimator.
 
         Based on John Schulman's blog: http://joschu.net/blog/kl-approx.html
-        Matches TRL experimental PPO implementation.
 
         Let r = π_ref(x) / π(x), so log(r) = ref_logprob - logprob
 
@@ -627,7 +779,7 @@ class StreamingPPOTrainer:
                 response_ids,
             )
 
-        # Compute sequence lengths using first_true_indices (matches TRL)
+        # Compute sequence lengths using first_true_indices
         # sequence_length is the position of first pad token minus 1
         sequence_lengths = first_true_indices(response_ids == self.tokenizer.pad_token_id) - 1
         # Clamp to valid range (at least 0, at most response_len - 1)
@@ -674,26 +826,13 @@ class StreamingPPOTrainer:
             attention_mask=attention_mask,
         )
 
-        # Handle model output format
-        # AutoModelForCausalLMWithValueHead returns tuple: (logits, loss, values)
-        # Regular model returns object with .logits attribute
-        if isinstance(outputs, tuple):
-            logits = outputs[0]
-        else:
-            logits = outputs.logits
+        logits, _ = self._extract_model_outputs(outputs, need_values=False)
 
         # Shift logits for next-token prediction
         logits = logits[:, response_start - 1:-1, :]
         labels = input_ids[:, response_start:]
 
-        log_probs = F.log_softmax(logits.float(), dim=-1)
-        selected_log_probs = torch.gather(
-            log_probs,
-            dim=-1,
-            index=labels.unsqueeze(-1),
-        ).squeeze(-1)
-
-        return selected_log_probs
+        return self._compute_token_logprobs(logits, labels)
 
     def compute_ref_log_probs(
         self,
@@ -706,8 +845,6 @@ class StreamingPPOTrainer:
 
         For PEFT models: uses disable_adapter() on the policy model
         For non-PEFT models: uses the separate frozen reference model
-
-        This matches the reference implementation (ppo_trainer.py lines 780-798).
 
         Args:
             input_ids: Full sequence [batch, seq_len]
@@ -767,13 +904,9 @@ class StreamingPPOTrainer:
             attention_mask=attention_mask,
         )
 
-        # AutoModelForCausalLMWithValueHead returns tuple: (logits, loss, values)
-        if isinstance(outputs, tuple) and len(outputs) >= 3:
-            values_full = outputs[2]  # [batch, seq_len] or [batch, seq_len, 1]
-            # Extract values for response tokens only
-            if values_full.dim() == 3:
-                values_full = values_full.squeeze(-1)
-            # Fix: Values should start from position before first response token
+        _, values_full = self._extract_model_outputs(outputs)
+
+        if values_full is not None:
             # V(s_t) = value at state BEFORE taking action t
             # For response tokens, V(s_0) is at position response_start - 1
             values = values_full[:, response_start - 1:-1]
@@ -794,9 +927,6 @@ class StreamingPPOTrainer:
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute logprobs, logits, and values in batches for efficiency.
-
-        This matches the reference implementation (ppo_trainer.py batched_forward_pass)
-        which uses mini-batch processing for forward passes to maximize GPU utilization.
 
         Args:
             query_ids: Query token IDs [batch, query_len]
@@ -844,23 +974,11 @@ class StreamingPPOTrainer:
                 use_cache=False,
             )
 
-            # Handle output format
-            if isinstance(outputs, tuple):
-                logits = outputs[0]
-                values_full = outputs[2] if len(outputs) >= 3 else None
-            else:
-                logits = outputs.logits
-                values_full = None
+            logits, values_full = self._extract_model_outputs(outputs)
 
             # Extract logits for response tokens
-            # Use explicit response_len to ensure correct slicing regardless of model output shape
-            # Indexing: logit at position i predicts token at position i+1, so for response
-            # tokens at [query_len, query_len+response_len), we need logits at [query_len-1, query_len+response_len-1)
-            # TODO: For models like LLaMA that prepend BOS tokens, verify tokenizer.encode()
-            # uses add_special_tokens=False consistently, or adjust indices accordingly.
             response_len = batch_response_ids.shape[1]
-            start_idx = query_len - 1
-            end_idx = start_idx + response_len
+            start_idx, end_idx = self._get_response_slice_indices(query_len, response_len)
             logits_for_probs = logits[:, start_idx:end_idx, :]
 
             # Debug assertion to catch shape mismatches early
@@ -873,20 +991,13 @@ class StreamingPPOTrainer:
                 )
 
             # Compute log probs
-            log_probs = F.log_softmax(logits_for_probs.float(), dim=-1)
-            batch_logprobs = torch.gather(
-                log_probs,
-                dim=-1,
-                index=batch_response_ids.unsqueeze(-1),
-            ).squeeze(-1)
+            batch_logprobs = self._compute_token_logprobs(logits_for_probs, batch_response_ids)
 
             all_logprobs.append(batch_logprobs)
             all_logits.append(logits_for_probs)
 
             # Extract values
             if values_full is not None:
-                if values_full.dim() == 3:
-                    values_full = values_full.squeeze(-1)
                 batch_values = values_full[:, start_idx:end_idx]
             else:
                 batch_values = torch.zeros_like(batch_logprobs)
@@ -980,17 +1091,11 @@ class StreamingPPOTrainer:
                     use_cache=False,
                 )
 
-                # Handle output format
-                if isinstance(outputs, tuple):
-                    logits = outputs[0]
-                else:
-                    logits = outputs.logits
+                logits, _ = self._extract_model_outputs(outputs, need_values=False)
 
                 # Extract logits for response tokens
-                # Use explicit response_len to ensure correct slicing
                 response_len = batch_response_ids.shape[1]
-                start_idx = query_len - 1
-                end_idx = start_idx + response_len
+                start_idx, end_idx = self._get_response_slice_indices(query_len, response_len)
                 logits_for_probs = logits[:, start_idx:end_idx, :]
 
                 # Debug assertion to catch shape mismatches early
@@ -1002,18 +1107,11 @@ class StreamingPPOTrainer:
                         f"response_len={response_len}"
                     )
 
-                # TRL 0.26.1: Apply temperature scaling to logits before computing log_softmax
-                # Reference: ppo_trainer.py line 528
+                # Compute log probs with temperature scaling (TRL 0.26.1)
                 temperature = getattr(self.args, 'temperature', 1.0)
-                logits_for_probs = logits_for_probs / (temperature + 1e-7)
-
-                # Compute log probs
-                log_probs = F.log_softmax(logits_for_probs.float(), dim=-1)
-                batch_ref_logprobs = torch.gather(
-                    log_probs,
-                    dim=-1,
-                    index=batch_response_ids.unsqueeze(-1),
-                ).squeeze(-1)
+                batch_ref_logprobs = self._compute_token_logprobs(
+                    logits_for_probs, batch_response_ids, temperature=temperature
+                )
 
                 all_ref_logprobs.append(batch_ref_logprobs)
 
@@ -1050,7 +1148,7 @@ class StreamingPPOTrainer:
         Returns:
             Validation loss value
         """
-        # Reuse training rollout data (matching reference implementation)
+        # Reuse training rollout data
         response_ids = rollout_data["response_ids"]
         response_mask = rollout_data["response_mask"]
         advantages = rollout_data["advantages"]
@@ -1068,68 +1166,19 @@ class StreamingPPOTrainer:
             last_token_indices.long()
         ]
 
-        # Capture validation gradients
         # Start validation capture mode
         self.grad_hook.start_val_capture(use_factorized=False)
         self.grad_hook.enable_hooks()
-
-        # Set model to train mode for gradient computation
         self.model.train()
 
-        full_batch_size = query_ids.shape[0]
-        batch_size = self.mini_batch_size
-        total_val_loss = 0.0
+        # Use core helper for gradient capture
+        total_val_loss = self._capture_validation_gradients_core(
+            full_ids, full_mask, response_ids, response_mask,
+            seq_advantages, query_len, self.mini_batch_size,
+        )
 
-        # Process in mini-batches to avoid OOM
-        for i in range(0, full_batch_size, batch_size):
-            end_idx = min(i + batch_size, full_batch_size)
-
-            # Extract mini-batch
-            mb_full_ids = full_ids[i:end_idx]
-            mb_full_mask = full_mask[i:end_idx]
-            mb_response_ids = response_ids[i:end_idx]
-            mb_response_mask = response_mask[i:end_idx]
-            mb_seq_advantages = seq_advantages[i:end_idx]
-
-            # Forward pass on mini-batch (log π_θ(y|x))
-            outputs = self.model(
-                input_ids=mb_full_ids,
-                attention_mask=mb_full_mask,
-            )
-
-            # Handle model output format
-            if isinstance(outputs, tuple):
-                logits = outputs[0]
-            else:
-                logits = outputs.logits
-
-            # Log probs for response tokens
-            logits = logits[:, query_len - 1:-1, :]
-            log_probs = F.log_softmax(logits.float(), dim=-1)
-            token_log_probs = torch.gather(
-                log_probs,
-                dim=-1,
-                index=mb_response_ids.unsqueeze(-1),
-            ).squeeze(-1)
-
-            # Sequence log probability (sum over response tokens)
-            seq_log_probs = (token_log_probs * mb_response_mask.float()).sum(dim=1)
-
-            # Compute validation loss: -E[log π_θ(y|x) * Â_{-1}(x,y)]
-            # Following reference LDA-ORL: per_seq_loss = -seq_logprob * seq_score, then .mean()
-            # For mini-batch gradient accumulation: .sum() / full_batch_size is equivalent
-            per_seq_loss = -(mb_seq_advantages * seq_log_probs)
-            mb_val_loss = per_seq_loss.sum() / full_batch_size
-
-            # Backward - hooks accumulate gradients into val_grad_buffer
-            mb_val_loss.backward()
-
-            total_val_loss += mb_val_loss.item()
-
-        # Clear optimizer gradients (we only wanted to capture compressed grads)
+        # Cleanup
         self.optimizer.zero_grad()
-
-        # End capture mode
         self.grad_hook.end_val_capture()
 
         return total_val_loss
@@ -1183,20 +1232,12 @@ class StreamingPPOTrainer:
             all_query_ids.append(query_ids)
             all_query_masks.append(query_mask)
 
-        # Pad to same length and stack
-        max_query_len = max(q.shape[1] for q in all_query_ids)
-        padded_query_ids = []
-        padded_query_masks = []
-        for q, m in zip(all_query_ids, all_query_masks):
-            pad_len = max_query_len - q.shape[1]
-            if pad_len > 0:
-                q = F.pad(q, (pad_len, 0), value=self.tokenizer.pad_token_id)
-                m = F.pad(m, (pad_len, 0), value=0)
-            padded_query_ids.append(q)
-            padded_query_masks.append(m)
-
-        query_ids = torch.cat(padded_query_ids, dim=0)
-        query_mask = torch.cat(padded_query_masks, dim=0)
+        # Pad to same length and stack (left-padding for queries)
+        query_ids, query_mask = self._pad_and_stack(
+            all_query_ids, all_query_masks,
+            pad_value=self.tokenizer.pad_token_id,
+            pad_left=True,
+        )
 
         # Generate responses in batches
         val_batch_size = getattr(self.args, 'val_batch_size', 1)
@@ -1219,20 +1260,12 @@ class StreamingPPOTrainer:
             all_response_masks.append(response_mask)
             all_response_texts.extend(response_texts)
 
-        # Pad responses to same length and stack
-        max_response_len = max(r.shape[1] for r in all_response_ids)
-        padded_response_ids = []
-        padded_response_masks = []
-        for r, m in zip(all_response_ids, all_response_masks):
-            pad_len = max_response_len - r.shape[1]
-            if pad_len > 0:
-                r = F.pad(r, (0, pad_len), value=self.tokenizer.pad_token_id)
-                m = F.pad(m, (0, pad_len), value=0)
-            padded_response_ids.append(r)
-            padded_response_masks.append(m)
-
-        response_ids = torch.cat(padded_response_ids, dim=0)
-        response_mask = torch.cat(padded_response_masks, dim=0)
+        # Pad responses to same length and stack (right-padding for responses)
+        response_ids, response_mask = self._pad_and_stack(
+            all_response_ids, all_response_masks,
+            pad_value=self.tokenizer.pad_token_id,
+            pad_left=False,
+        )
 
         # Compute rewards
         query_texts = self.tokenizer.batch_decode(query_ids, skip_special_tokens=True)
@@ -1304,65 +1337,20 @@ class StreamingPPOTrainer:
         full_mask = torch.cat([query_mask, response_mask], dim=1)
         query_len = query_ids.shape[1]
 
-        # Capture validation gradients
+        # Start validation capture mode
         self.grad_hook.start_val_capture(use_factorized=False)
         self.grad_hook.enable_hooks()
-
-        # Set model to train mode for gradient computation
         self.model.train()
 
-        full_batch_size = query_ids.shape[0]
+        # Use core helper for gradient capture
         val_batch_size = getattr(self.args, 'val_batch_size', 1)
-        total_val_loss = 0.0
+        total_val_loss = self._capture_validation_gradients_core(
+            full_ids, full_mask, response_ids, response_mask,
+            advantages, query_len, val_batch_size,
+        )
 
-        # Process in mini-batches
-        for i in range(0, full_batch_size, val_batch_size):
-            end_idx = min(i + val_batch_size, full_batch_size)
-
-            # Extract mini-batch
-            mb_full_ids = full_ids[i:end_idx]
-            mb_full_mask = full_mask[i:end_idx]
-            mb_response_ids = response_ids[i:end_idx]
-            mb_response_mask = response_mask[i:end_idx]
-            mb_advantages = advantages[i:end_idx]
-
-            # Forward pass (log π_θ(y|x))
-            outputs = self.model(
-                input_ids=mb_full_ids,
-                attention_mask=mb_full_mask,
-            )
-
-            # Handle model output format
-            if isinstance(outputs, tuple):
-                logits = outputs[0]
-            else:
-                logits = outputs.logits
-
-            # Log probs for response tokens
-            logits = logits[:, query_len - 1:-1, :]
-            log_probs = F.log_softmax(logits.float(), dim=-1)
-            token_log_probs = torch.gather(
-                log_probs,
-                dim=-1,
-                index=mb_response_ids.unsqueeze(-1),
-            ).squeeze(-1)
-
-            # Sequence log probability (sum over response tokens)
-            seq_log_probs = (token_log_probs * mb_response_mask.float()).sum(dim=1)
-
-            # Compute validation loss: -E[log π_θ(y|x) * A(x,y)]
-            per_seq_loss = -(mb_advantages * seq_log_probs)
-            mb_val_loss = per_seq_loss.sum() / full_batch_size
-
-            # Backward - hooks accumulate gradients into val_grad_buffer
-            mb_val_loss.backward()
-
-            total_val_loss += mb_val_loss.item()
-
-        # Clear optimizer gradients (we only wanted to capture gradients)
+        # Cleanup
         self.optimizer.zero_grad()
-
-        # End capture mode
         self.grad_hook.end_val_capture()
 
         return total_val_loss
@@ -1403,6 +1391,7 @@ class StreamingPPOTrainer:
         """
         batch_size = query_ids.shape[0]
         query_len = query_ids.shape[1]
+        response_len = response_ids.shape[1]
 
         # Concatenate query and response
         input_ids = torch.cat([query_ids, response_ids], dim=1)
@@ -1413,7 +1402,6 @@ class StreamingPPOTrainer:
         input_ids_masked = torch.masked_fill(input_ids, ~attention_mask.bool(), 0)
 
         # Forward pass - model returns (logits, loss, values) for AutoModelForCausalLMWithValueHead
-        # use_cache=False to prevent KV cache issues
         outputs = self.model(
             input_ids=input_ids_masked,
             attention_mask=attention_mask,
@@ -1421,26 +1409,13 @@ class StreamingPPOTrainer:
             use_cache=False,
         )
 
-        # Handle model output format
-        # AutoModelForCausalLMWithValueHead returns tuple: (logits, loss, values)
-        if isinstance(outputs, tuple):
-            logits = outputs[0]
-            values_full = outputs[2]  # [batch, seq_len]
-        else:
-            # Fallback for standard model (shouldn't happen with value head)
-            logits = outputs.logits
+        # Extract model outputs
+        logits, values_full = self._extract_model_outputs(outputs)
+        if values_full is None:
             values_full = torch.zeros(batch_size, input_ids.shape[1], device=self.device)
 
         # Extract values and logits for response tokens only
-        # Use explicit response_len for robust slicing
-        # TODO: For LLaMA-style models with BOS tokens, verify index consistency (see batched_forward_pass)
-        response_len = response_ids.shape[1]
-        start_idx = query_len - 1
-        end_idx = start_idx + response_len
-
-        # V(s_t) = value at state BEFORE taking action t
-        if values_full.dim() == 3:
-            values_full = values_full.squeeze(-1)
+        start_idx, end_idx = self._get_response_slice_indices(query_len, response_len)
         values = values_full[:, start_idx:end_idx]
 
         # New log probs
@@ -1454,17 +1429,11 @@ class StreamingPPOTrainer:
                 f"logits.shape={logits.shape}, query_len={query_len}"
             )
 
-        # TRL 0.26.1: Apply temperature scaling to logits before computing log_softmax
-        # Reference: ppo_trainer.py line 637
+        # Compute new log probs with temperature scaling (TRL 0.26.1)
         temperature = getattr(self.args, 'temperature', 1.0)
-        logits_for_probs = logits_for_probs / (temperature + 1e-7)
-
-        log_probs = F.log_softmax(logits_for_probs.float(), dim=-1)
-        new_logprobs = torch.gather(
-            log_probs,
-            dim=-1,
-            index=response_ids.unsqueeze(-1),
-        ).squeeze(-1)
+        new_logprobs = self._compute_token_logprobs(
+            logits_for_probs, response_ids, temperature=temperature
+        )
 
         # TRL 0.26.1 approach: Apply INVALID_LOGPROB to masked positions
         padding_mask = (response_mask == 0)
@@ -1507,55 +1476,23 @@ class StreamingPPOTrainer:
         # Total loss (no KL term - it's in the rewards/advantages already)
         total_loss = pg_loss + self.vf_coef * vf_loss
 
-        # Stats for logging (TRL 0.26.1 naming conventions)
+        # Compute common PPO stats
         with torch.no_grad():
-            # Policy clip fraction
-            pg_clipfrac = ((ratio - 1).abs() > self.cliprange).float().mean().item()
-
-            # Value clip fraction (TRL: val/clipfrac_avg)
-            vf_clipfrac = ((values - old_values).abs() > self.cliprange_value).float().mean().item()
-
-            # Second-order KL approximation (always >= 0)
-            approx_kl = (0.5 * (new_logprobs - old_logprobs) ** 2 * response_mask).sum()
-            approx_kl = approx_kl / response_mask.sum()
-
-            # First-order KL approximation (can be negative) - matches TRL's policykl
-            policykl = ((old_logprobs - new_logprobs) * response_mask).sum()
-            policykl = policykl / response_mask.sum()
-
-            # Ratio statistics
-            avg_ratio = (ratio * response_mask).sum() / response_mask.sum().clamp(min=1)
-            avg_ratio = avg_ratio.item()
-            ratio_var = ((ratio - avg_ratio) ** 2 * response_mask).sum() / response_mask.sum().clamp(min=1)
-            ratio_var = ratio_var.item()
-
-            # Entropy (TRL: policy/entropy_avg)
-            # entropy = logsumexp(logits) - sum(prob * logits)
-            # Simplified: entropy = -sum(prob * log_prob) ≈ -new_logprobs for selected tokens
-            entropy = (-new_logprobs * response_mask).sum() / response_mask.sum().clamp(min=1)
-            entropy = entropy.item()
+            stats = self._compute_ppo_stats(
+                ratio, values, old_values, new_logprobs, old_logprobs, response_mask
+            )
 
         # Skip batch if ratio exceeds threshold (prevents divergence)
         ratio_threshold = getattr(self.args, 'ratio_threshold', 10.0)
-        if avg_ratio > ratio_threshold:
+        if stats["policy/ratio"] > ratio_threshold:
             total_loss = total_loss * 0.0
             pg_loss = pg_loss * 0.0
             vf_loss = vf_loss * 0.0
 
-        # Stats following TRL 0.26.1 naming conventions
-        stats = {
-            "loss/policy": pg_loss.item(),
-            "loss/value": vf_loss.item(),
-            "loss/total": total_loss.item(),
-            "policy/approxkl": approx_kl.item(),
-            "policy/policykl": policykl.item(),
-            "policy/clipfrac": pg_clipfrac,
-            "policy/entropy": entropy,
-            "policy/ratio": avg_ratio,
-            "val/clipfrac": vf_clipfrac,
-            "val/ratio_var": ratio_var,
-            "val/mean": values.mean().item(),
-        }
+        # Add loss stats
+        stats["loss/policy"] = pg_loss.item()
+        stats["loss/value"] = vf_loss.item()
+        stats["loss/total"] = total_loss.item()
 
         return total_loss, stats
 
@@ -1664,18 +1601,12 @@ class StreamingPPOTrainer:
                     if n_selected is not None:
                         stats["selection/n_selected"] = n_selected
 
-        # Compute gradient norms (before clipping, for logging)
-        grad_norms = self._compute_gradient_norms()
-        stats.update(grad_norms)
-
         # Gradient clipping
         if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
-            total_norm = torch.nn.utils.clip_grad_norm_(
+            torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 self.args.max_grad_norm,
             )
-            stats["grad_norm/total_before_clip"] = stats.get("grad_norm/policy", 0) + stats.get("grad_norm/vhead", 0)
-            stats["grad_norm/total_after_clip"] = total_norm.item() if isinstance(total_norm, torch.Tensor) else total_norm
 
         # Add learning rate to stats
         stats["lr"] = lr
@@ -1838,7 +1769,7 @@ class StreamingPPOTrainer:
                 break
 
             perm = torch.randperm(batch_size, device=query_ids.device)
-            epoch_ratios = []  # DEBUG: track ratios in this epoch
+            epoch_ratios = []
 
             for mb_start in range(0, batch_size, self.mini_batch_size):
                 mb_end = min(mb_start + self.mini_batch_size, batch_size)
@@ -1858,8 +1789,6 @@ class StreamingPPOTrainer:
                 epoch_ratios.append(mb_stats.get("policy/ratio_mean", 1.0))
 
                 # Check for early stopping based on policy KL
-                # Use policykl (first-order approximation) to match TRL's implementation
-                # Reference: ppo_trainer.py line 745 uses train_stats["policy/policykl"]
                 policy_kl = mb_stats.get("policy/policykl", 0.0)
                 if self._early_stop(policy_kl):
                     early_stopped = True
@@ -2188,14 +2117,14 @@ class StreamingPPOTrainer:
         if self.grad_hook is not None:
             self.grad_hook.disable_hooks()
 
-        eval_n_samples = getattr(self.args, 'eval_n_samples', 100)
+        n_eval = getattr(self.args, 'n_eval', 100)
         eval_batch_size = getattr(self.args, 'eval_batch_size', 16)
 
         # Run evaluation
         eval_results = self.evaluator.evaluate(
             model=self.model,
             tokenizer=self.tokenizer,
-            n_samples=eval_n_samples,
+            n_samples=n_eval,
             max_new_tokens=self.args.max_new_tokens,
             min_new_tokens=self.args.min_new_tokens,  # Safe for eval (no KL computation)
             generation_batch_size=eval_batch_size,

@@ -1,7 +1,5 @@
 """
 Model arguments for RLHF experiments.
-
-Following SFT conventions for consistency.
 """
 
 import logging

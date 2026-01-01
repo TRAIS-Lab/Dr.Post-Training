@@ -1,17 +1,20 @@
 #!/usr/bin/env python
 """
-Toxicity evaluation script for RLHF experiments.
+Post-training evaluation script for RLHF experiments.
+
+This script evaluates trained models AFTER training is complete.
+For in-training evaluation, see train/evaluator.py instead.
 
 Evaluates trained models on toxic prompt completion task using:
 - Dataset: OxAISH-AL-LLM/wiki_toxic (toxic prompts only)
 - Metrics: Mean toxicity, toxicity rate, max toxicity
 
 Two evaluation classifiers are supported:
-1. "reward" (default): facebook/roberta-hate-speech-dynabench-r4-target
+1. "reward": facebook/roberta-hate-speech-dynabench-r4-target
    - Same as the reward model used during training
    - Useful for checking reward model alignment
 
-2. "independent": DaNLP/da-electra-hatespeech-detection (via evaluate library)
+2. "independent" (default): DaNLP/da-electra-hatespeech-detection (via evaluate library)
    - Different from reward model (recommended for unbiased evaluation)
    - Matches reference implementation from rlhf-toxicity
 
