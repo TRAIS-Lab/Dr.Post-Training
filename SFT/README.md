@@ -78,18 +78,6 @@ We consider the following 8 methods for each of the training datasets above:
 
 > Experiments follow the pattern: `{train}_{task}-{model}-{selection}-{compression}-{training_type}-p{pct}-lr{lr}-b{batch}-v{nval}-s{seed}`
 
-1. Selection Modes
-   - **NA**: No data selection (baseline)
-   - **Streaming**: Per-layer selection - each layer independently selects samples (single-pass)
-   - **GREATS**: Global selection - accumulates scores across all layers (two-pass)
-2. Compression Methods
-   - **NA**: No compression - uses full gradients and standard AdamW optimizer
-   - **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer
-   - **GraSS**: Gradient Sparsification with Sketching (available but not used in default methods)
-3. Training Types
-   - **Full**: Full fine-tuning of all model parameters
-   - **LoRA**: LoRA fine-tuning of low-rank adapters only
-
 ### LR Sweep Commands
 
 The `SFT/train/lr/` folder contains tools for finding optimal learning rates, where learning rates are managed via `SFT/train/lr/config.json`. Run LR sweep before full training to find optimal learning rates:
@@ -209,8 +197,6 @@ The unified training script accepts the following arguments:
    - `--lora_r <r>` - LoRA rank (default: `32`)
    - `--lora_dropout <dropout>` - LoRA dropout (default: `0.1`)
    - `--lora_target_modules <modules>` - Target modules for LoRA (default: `q_proj k_proj v_proj o_proj`)
-7. Model Arguments
-   - `--flash_attention` - Enable Flash Attention 2 (default: enabled)
 </details>
 
 ### Evaluation Commands

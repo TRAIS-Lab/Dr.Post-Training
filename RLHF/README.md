@@ -8,7 +8,7 @@ The following methods have been run and can be rerun with the commands below.
 
 | Task     | Model        | Batch | Val Size | Epochs | LoRA Rank |
 | -------- | ------------ | ----- | -------- | ------ | --------- |
-| Toxicity | gpt-neo-2.7B | 256   | 128      | 1      | 16        |
+| Toxicity | gpt-neo-2.7B | 256   | 1024     | 1      | 16        |
 
 ### Experiment Configurations
 
@@ -26,18 +26,6 @@ We consider the following 8 methods for the toxicity task:
 | 5   | GREATS    | LoGra       | Full     | Global selection + MeSO                   |
 
 > Experiments follow the pattern: `{task}-{model}-{method_str}-{training_type}-lr{lr}-b{batch}-v{nval}b{val_batch}-pe{ppo_epochs}-mb{mini_batch}-kl{kl_coef}-s{seed}`
-
-1. Selection Modes
-   - **NA**: No data selection (baseline PPO)
-   - **Streaming**: Per-layer selection - each layer independently selects samples (single-pass)
-   - **GREATS**: Global selection - accumulates scores across all layers (two-pass)
-2. Compression Methods
-   - **NA**: No compression - uses full gradients and standard AdamW optimizer
-   - **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer
-   - **GraSS**: Gradient Sparsification with Sketching (available but not used in default methods)
-3. Training Types
-   - **Full**: Full fine-tuning of all model parameters
-   - **LoRA**: LoRA fine-tuning of low-rank adapters only
 
 ### LR Sweep Commands
 
@@ -142,7 +130,7 @@ The unified training script accepts the following arguments:
 5. PPO Arguments
    - `--ppo_epochs <n>` - PPO epochs per batch (default: `4`)
    - `--mini_batch_size <n>` - Mini-batch size for PPO updates (default: `8`)
-   - `--init_kl_coef <coef>` - Initial KL penalty coefficient (default: `0.04`)
+   - `--init_kl_coef <coef>` - Initial KL penalty coefficient (default: `0.1`)
    - `--kl_estimator <mode>` - KL estimator: `k1`, `k2`, `k3` (default: `k1`)
    - `--target <val>` - Target KL for adaptive KL controller (default: `1.0`)
    - `--target_kl <kl>` - Early stopping threshold (default: `0.1`)
@@ -153,9 +141,6 @@ The unified training script accepts the following arguments:
    - `--lora_r <r>` - LoRA rank (default: `16`)
    - `--lora_alpha <alpha>` - LoRA alpha (default: `32`)
    - `--lora_target_modules <modules>` - Target modules for LoRA (default: auto-detect)
-7. Model Arguments
-   - `--flash_attention` - Enable Flash Attention 2 (default: enabled)
-   - `--no_flash_attention` - Disable Flash Attention 2
 </details>
 
 ### Evaluation Commands

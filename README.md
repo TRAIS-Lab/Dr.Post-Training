@@ -34,5 +34,19 @@ pip3 install -r requirements.txt
 | **SFT**    | Supervised Fine-Tuning with gradient streaming data selection      | [SFT/README.md](SFT/README.md)   |
 | **RLHF**   | Reinforcement Learning from Human Feedback with gradient streaming | [RLHF/README.md](RLHF/README.md) |
 
+Generally speaking, we support the following:
+
+1. Selection Modes
+   - **NA**: No data selection (baseline PPO)
+   - **Streaming**: Per-layer selection - each layer independently selects samples (single-pass)
+   - **GREATS**: Global selection - accumulates scores across all layers (two-pass)
+2. Compression Methods
+   - **NA**: No compression - uses full gradients and standard AdamW optimizer
+   - **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer
+   - **GraSS**: Gradient Sparsification with Sketching (available but not used in default methods)
+3. Training Types
+   - **Full**: Full fine-tuning of all model parameters
+   - **LoRA**: LoRA fine-tuning of low-rank adapters only
+
 >[!Note]
 >This library is implemented in plain PyTorch without advanced distributed training frameworks (e.g., DeepSpeed, FairScale, or Hugging Face Accelerator) to maximize clarity and ease of understanding. For large-scale training, integrating with such frameworks may be necessary.

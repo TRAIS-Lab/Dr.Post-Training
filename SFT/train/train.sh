@@ -303,7 +303,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --seed <seed>                          Random seed (default: 42)"
             echo ""
             echo "  --update_compressor_freq <steps>       Projector refresh interval (default: 200)"
-            echo "  --flash_attention                      Enable Flash Attention 2 (default: enabled)"
             echo "  --data_dir <dir>                       Data directory (default: SFT/data)"
             echo ""
             echo "Naming convention: {selection}-{compression}-{training_type}"
