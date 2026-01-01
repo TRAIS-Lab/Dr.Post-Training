@@ -43,11 +43,11 @@ epochs=1  # Number of training epochs (used when max_steps <= 0)
 batch_size=256
 ppo_epochs=4
 mini_batch_size=8
-init_kl_coef=0.1  # Author suggests 0.2 (reference uses 0.04)
+init_kl_coef=0.1  # kl penalty coefficient initial value
 kl_estimator="k1"  # Options: k1, k2, k3 (k3 recommended - unbiased, low variance, always positive)
 adap_kl_ctrl=true
-target=1.0  # Target KL for AdaptiveKLController (author suggests 1, reference uses 6)
-target_kl=0.1  # Early stopping threshold: skip step if KL > 1.5 * target_kl
+target=1.0  # Target KL for AdaptiveKLController
+target_kl=0.1  # Early stopping threshold in PPO epochs: skip step if KL > 1.5 * target_kl
 early_stopping=false  # Enable early stopping based on target_kl
 max_new_tokens=""  # Will be set based on task if not specified
 min_new_tokens=0

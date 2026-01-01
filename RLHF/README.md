@@ -226,12 +226,3 @@ Training metrics include:
 - `eval/toxicity_prob` - Mean toxicity probability of step generations
 - `eval/toxicity_rate` - Fraction of toxic generations per step
 </details>
-
-## Key Differences from SFT
-
-| Aspect           | SFT                             | RLHF (PPO)                                |
-| ---------------- | ------------------------------- | ----------------------------------------- |
-| Training Loss    | Cross-entropy                   | PPO objective (policy + value + KL)       |
-| Data             | Static dataset                  | Dynamic rollouts (generate responses)     |
-| Validation Loss  | NLL on target task              | Sequence-level reward-weighted likelihood |
-| Selection Target | Improve target task performance | Generate high-reward responses            |
