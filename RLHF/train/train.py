@@ -81,7 +81,6 @@ def _patch_gpt_neo_flash_attention():
             # For 2D masks, pass as-is (Flash Attention handles them correctly)
 
             # Handle dtype casting for PEFT
-            import torch
             device_type = query.device.type if query.device.type != "mps" else "cpu"
             if query.dtype == torch.float32:
                 if torch.is_autocast_enabled():

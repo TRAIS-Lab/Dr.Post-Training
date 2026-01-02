@@ -24,8 +24,8 @@ export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
 
 # Base training arguments (static, never change)
 export base_training_args="--bf16=True \
---lr_scheduler_type=constant \
---warmup_ratio=0 \
+--lr_scheduler_type=linear \
+--warmup_ratio=0.03 \
 --weight_decay=0.0 \
 --logging_steps=1 \
 --report_to=none \
@@ -48,7 +48,7 @@ kl_estimator="k1"  # Options: k1, k2, k3 (k3 recommended - unbiased, low varianc
 adap_kl_ctrl=true
 target=1.0  # Target KL for AdaptiveKLController
 target_kl=0.1  # Early stopping threshold in PPO epochs: skip step if KL > 1.5 * target_kl
-early_stopping=false  # Enable early stopping based on target_kl
+early_stopping=true  # Enable early stopping based on target_kl
 max_new_tokens=""  # Will be set based on task if not specified
 min_new_tokens=0
 max_steps=-1  # -1 means no step limit (use epochs instead)
