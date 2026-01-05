@@ -274,7 +274,6 @@ def main():
     # AutoModelForCausalLMWithValueHead adds a v_head for value estimation
     # NOTE: Set summary_dropout_prob=0.0 to disable value head dropout
     # This ensures consistent behavior between train/eval modes for forward passes
-    # Reference: ppo_trainer.py uses eval() mode for old_logprobs computation
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         model_args.model_name_or_path,
         peft_config=peft_config,
@@ -428,14 +427,32 @@ def main():
         logger.info(f"  Set {len(compressors)} unified compressors (refreshed every {training_args.update_compressor_freq} steps)")
         logger.info("Gradient compression setup completed!")
 
-    # Create optimizer - only pass trainable parameters
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    logger.info(f"Optimizer will optimize {len(trainable_params)} parameter groups")
+    # Create optimizer - separate parameter groups for policy and value head
+    # This allows using different learning rates for each
+    policy_params = []
+    vhead_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if "v_head" in name:
+                vhead_params.append(param)
+            else:
+                policy_params.append(param)
+
+    # Determine value head learning rate
+    vhead_lr = training_args.learning_rate_vhead if training_args.learning_rate_vhead is not None else training_args.learning_rate
+
+    # Create parameter groups
+    param_groups = [
+        {"params": policy_params, "lr": training_args.learning_rate},
+        {"params": vhead_params, "lr": vhead_lr},
+    ]
+    logger.info(f"Optimizer: {len(policy_params)} policy params (lr={training_args.learning_rate}), "
+                f"{len(vhead_params)} v_head params (lr={vhead_lr})")
 
     if training_args.has_compression:
         # Use MeSO optimizer with gradient hook for compressed gradient access
         optimizer = MeSOAdamW(
-            trainable_params,
+            param_groups,
             grad_hook=grad_hook,
             lr=training_args.learning_rate,
             weight_decay=training_args.weight_decay,
@@ -445,7 +462,7 @@ def main():
     else:
         # Standard AdamW
         optimizer = torch.optim.AdamW(
-            trainable_params,
+            param_groups,
             lr=training_args.learning_rate,
             weight_decay=training_args.weight_decay,
         )

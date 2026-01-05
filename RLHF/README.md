@@ -27,21 +27,9 @@ We consider the following 8 methods for the toxicity task:
 
 > Experiments follow the pattern: `{task}-{model}-{method_str}-{training_type}-lr{lr}-b{batch}-v{nval}b{val_batch}-pe{ppo_epochs}-mb{mini_batch}-kl{kl_coef}-s{seed}`
 
-### LR Sweep Commands
-
-The `RLHF/train/lr/` folder contains tools for finding optimal learning rates, where learning rates are managed via `RLHF/train/lr/config.json`. Run LR sweep before full training to find optimal learning rates:
-
-```bash
-# Toxicity task
-bash RLHF/train/lr/lr_sweep.sh --mode binary --methods all --task toxicity \
-    --batch_size 256 --n_val 4 --sweep_max_steps 50 --seed 2
-```
-
-You can also run grid search via `--mode grid`.
-
 ### Training Commands
 
-All methods are launched using the unified `train.sh` script. Training commands (LRs loaded from lr_config.json):
+All methods are launched using the unified `train.sh` script. Hyperparameters (LR, init_kl_coef) are loaded from `RLHF/train/config.json`:
 
 ```bash
 # Toxicity task - all methods
@@ -120,8 +108,9 @@ The unified training script accepts the following arguments:
      - If not specified, uses full gradients and standard AdamW optimizer
    - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
 4. Core Training Arguments
-   - `--lr <lr>` - Learning rate override (if not specified, looked up from `lr_config.json`; fallback: `1e-5`)
-   - `--lr_config <path>` - LR config file path (default: `RLHF/train/lr/config.json`)
+   - `--lr <lr>` - Learning rate override (if not specified, looked up from `config.json`; fallback: `1e-5`)
+   - `--lr_vhead <lr>` - Value head learning rate override (if not specified, looked up from `config.json`; fallback: `5e-4`)
+   - `--config <path>` - Config file path (default: `RLHF/train/config.json`)
    - `--batch_size <size>` - Batch size (default: `256`)
    - `--max_steps <steps>` - Maximum training steps (default: `-1`, meaning use epochs instead)
    - `--epochs <n>` - Number of training epochs (default: `1`, used when max_steps <= 0)
@@ -129,11 +118,11 @@ The unified training script accepts the following arguments:
    - `--filter_frac <frac>` - Fraction of negative-influence samples to drop (default: `1.0`)
 5. PPO Arguments
    - `--ppo_epochs <n>` - PPO epochs per batch (default: `4`)
-   - `--mini_batch_size <n>` - Mini-batch size for PPO updates (default: `8`)
-   - `--init_kl_coef <coef>` - Initial KL penalty coefficient (default: `0.1`)
+   - `--mini_batch_size <n>` - Mini-batch size for PPO updates (default: `4`)
+   - `--init_kl_coef <coef>` - Initial KL penalty coefficient (default: `0.02`)
    - `--kl_estimator <mode>` - KL estimator: `k1`, `k2`, `k3` (default: `k1`)
-   - `--target <val>` - Target KL for adaptive KL controller (default: `1.0`)
-   - `--target_kl <kl>` - Early stopping threshold (default: `0.1`)
+   - `--target <val>` - Target KL for adaptive KL controller (default: `50.0`)
+   - `--target_kl <kl>` - Early stopping threshold (default: `0.2`)
    - `--max_new_tokens <n>` - Maximum new tokens to generate (default: `30`)
    - `--min_new_tokens <n>` - Minimum new tokens for evaluation only (default: `0`, not used in training)
 6. LoRA Arguments

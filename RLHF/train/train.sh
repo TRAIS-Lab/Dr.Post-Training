@@ -42,14 +42,13 @@ seed=42
 epochs=1  # Number of training epochs (used when max_steps <= 0)
 batch_size=256
 ppo_epochs=4
-mini_batch_size=8
-init_kl_coef=0.1  # kl penalty coefficient initial value
+mini_batch_size=4
 kl_estimator="k1"  # Options: k1, k2, k3 (k3 recommended - unbiased, low variance, always positive)
 adap_kl_ctrl=true
-target=1.0  # Target KL for AdaptiveKLController
-target_kl=0.1  # Early stopping threshold in PPO epochs: skip step if KL > 1.5 * target_kl
+target=50.0  # Target KL for AdaptiveKLController
+target_kl=0.2  # Early stopping threshold in PPO epochs: skip step if KL > 1.5 * target_kl
 early_stopping=true  # Enable early stopping based on target_kl
-max_new_tokens=""  # Will be set based on task if not specified
+max_new_tokens="30"  # Will be set based on task if not specified
 min_new_tokens=0
 max_steps=-1  # -1 means no step limit (use epochs instead)
 use_flash_attention=true
@@ -59,15 +58,19 @@ data_selection="NA"  # NA, Streaming, or GREATS
 filter_frac=1.0  # Fraction of negative samples to drop (1.0 = no filtering)
 use_second_order=false # If true, use greedy selection with second-order interactions
 n_val=1024  # Number of validation samples for data selection (0 = self-referencing)
-val_batch_size=64  # Batch size for validation gradient computation
+val_batch_size=256  # Batch size for validation gradient computation
 val_generation_interval=1  # Steps between regenerating val completions (0 = once at start)
 
-# LR configuration
-lr_config_file="RLHF/train/lr/config.json"
+# Config file (contains lr, lr_vhead, init_kl_coef per method)
+config_file="RLHF/train/config.json"
 lr_override=""  # Set when --lr is explicitly passed
-# Default LRs (used when lr_config.json has no entry for the method)
+lr_vhead_override=""  # Set when --lr_vhead is explicitly passed
+init_kl_coef_override=""  # Set when --init_kl_coef is explicitly passed
+# Default values (used when config.json has no entry for the method)
 default_lr_full="1e-5"
-default_lr_lora="5e-6"
+default_lr_lora="1e-5"
+default_lr_vhead="5e-4"
+default_init_kl_coef="0.02"
 
 # Evaluation settings
 eval_interval=1  # 0 = end of epoch only, N > 0 = every N steps
@@ -144,8 +147,8 @@ while [[ $# -gt 0 ]]; do
             lr_override="$2"
             shift 2
             ;;
-        --lr_config)
-            lr_config_file="$2"
+        --config)
+            config_file="$2"
             shift 2
             ;;
         --filter_frac)
@@ -205,7 +208,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --kl_coef|--init_kl_coef)
-            init_kl_coef="$2"
+            init_kl_coef_override="$2"
+            shift 2
+            ;;
+        --lr_vhead)
+            lr_vhead_override="$2"
             shift 2
             ;;
         --kl_estimator)
@@ -301,7 +308,8 @@ while [[ $# -gt 0 ]]; do
             echo "Shared Options:"
             echo "  --batch_size <size>        Training batch size (default: 256)"
             echo "  --lr <lr>                  Learning rate override (ignores config file)"
-            echo "  --lr_config <path>         LR config file (default: RLHF/train/lr/config.json)"
+            echo "  --lr_vhead <lr>            Value head learning rate override (default: 1e-4)"
+            echo "  --config <path>            Config file (default: RLHF/train/config.json)"
             echo "  --filter_frac <frac>       Fraction of negative samples to drop (default: 1.0)"
             echo "  --max_steps <steps>        Maximum training steps (default: -1, meaning no limit)"
             echo "  --epochs <n>               Number of training epochs (default: 1, used when max_steps <= 0)"
@@ -334,10 +342,8 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Learning Rate Resolution:"
             echo "  1. If --lr is specified, use that value"
-            echo "  2. Otherwise, look up from lr/config.json based on task + data_selection"
+            echo "  2. Otherwise, look up from config.json based on task + method"
             echo "  3. If not found, use fallback (1e-5)"
-            echo ""
-            echo "  Run lr/lr_sweep.sh first to populate config.json with optimal LRs."
             exit 0
             ;;
         *)
@@ -401,13 +407,13 @@ lookup_lr() {
     fi
 
     # Try to look up from config file
-    if [[ -f "$lr_config_file" ]]; then
+    if [[ -f "$config_file" ]]; then
         local looked_up_lr
         looked_up_lr=$(python3 -c "
 import json
 import sys
 try:
-    with open('$lr_config_file', 'r') as f:
+    with open('$config_file', 'r') as f:
         config = json.load(f)
     lr_val = config.get('$config_key', {}).get('$exp_name', {}).get('lr')
     if lr_val is not None:
@@ -433,6 +439,88 @@ except:
 }
 
 # ========================================
+# Look up lr_vhead from config file
+# ========================================
+lookup_lr_vhead() {
+    local config_key="$1"
+    local exp_name="$2"
+
+    # If lr_vhead_override is set, use it
+    if [[ -n "$lr_vhead_override" ]]; then
+        echo "$lr_vhead_override"
+        return
+    fi
+
+    # Try to look up from config file
+    if [[ -f "$config_file" ]]; then
+        local looked_up_lr_vhead
+        looked_up_lr_vhead=$(python3 -c "
+import json
+import sys
+try:
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
+    lr_val = config.get('$config_key', {}).get('$exp_name', {}).get('lr_vhead')
+    if lr_val is not None:
+        print(f'{lr_val:.0e}' if lr_val < 0.001 else f'{lr_val}')
+    else:
+        sys.exit(1)
+except:
+    sys.exit(1)
+" 2>/dev/null)
+
+        if [[ $? -eq 0 ]] && [[ -n "$looked_up_lr_vhead" ]]; then
+            echo "$looked_up_lr_vhead"
+            return
+        fi
+    fi
+
+    # Fallback to default
+    echo "$default_lr_vhead"
+}
+
+# ========================================
+# Look up init_kl_coef from config file
+# ========================================
+lookup_init_kl_coef() {
+    local config_key="$1"
+    local exp_name="$2"
+
+    # If init_kl_coef_override is set, use it
+    if [[ -n "$init_kl_coef_override" ]]; then
+        echo "$init_kl_coef_override"
+        return
+    fi
+
+    # Try to look up from config file
+    if [[ -f "$config_file" ]]; then
+        local looked_up_kl_coef
+        looked_up_kl_coef=$(python3 -c "
+import json
+import sys
+try:
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
+    kl_val = config.get('$config_key', {}).get('$exp_name', {}).get('init_kl_coef')
+    if kl_val is not None:
+        print(kl_val)
+    else:
+        sys.exit(1)
+except:
+    sys.exit(1)
+" 2>/dev/null)
+
+        if [[ $? -eq 0 ]] && [[ -n "$looked_up_kl_coef" ]]; then
+            echo "$looked_up_kl_coef"
+            return
+        fi
+    fi
+
+    # Fallback to default
+    echo "$default_init_kl_coef"
+}
+
+# ========================================
 # Function to run a single method
 # ========================================
 run_single_method() {
@@ -441,7 +529,9 @@ run_single_method() {
     local exp_use_lora="$3"
     local exp_use_second_order="$4"
     local exp_lr="$5"
-    local exp_name="$6"
+    local exp_lr_vhead="$6"
+    local exp_init_kl_coef="$7"
+    local exp_name="$8"
 
     # Start with base training args
     local exp_base_training_args="$base_training_args"
@@ -502,21 +592,39 @@ run_single_method() {
 
     # Job name format: task-model-method-job_type-lr-b-v-ppo-mb-kl-s
     # Includes: validation settings, PPO epochs, mini-batch size, KL coefficient
-    local JOB_NAME="${task}-${model_name}-${method_str}-${job_type}-lr${exp_lr}-b${batch_size}-${val_str}-pe${ppo_epochs}-mb${mini_batch_size}-kl${init_kl_coef}-s${seed}"
+    local JOB_NAME="${task}-${model_name}-${method_str}-${job_type}-lr${exp_lr}-b${batch_size}-${val_str}-pe${ppo_epochs}-mb${mini_batch_size}-kl${exp_init_kl_coef}-s${seed}"
 
     local output_dir=/scratch/pbb/Project/Gradient-Streaming/RLHF/${JOB_NAME}
     if [[ ! -d $output_dir ]]; then
         mkdir -p $output_dir
     fi
 
-    # Indicate LR source
+    # Indicate config source
     local lr_source
     if [[ -n "$lr_override" ]]; then
         lr_source="(--lr override)"
-    elif [[ -f "$lr_config_file" ]]; then
+    elif [[ -f "$config_file" ]]; then
         lr_source="(from config)"
     else
         lr_source="(fallback)"
+    fi
+
+    local lr_vhead_source
+    if [[ -n "$lr_vhead_override" ]]; then
+        lr_vhead_source="(--lr_vhead override)"
+    elif [[ -f "$config_file" ]]; then
+        lr_vhead_source="(from config)"
+    else
+        lr_vhead_source="(fallback)"
+    fi
+
+    local kl_source
+    if [[ -n "$init_kl_coef_override" ]]; then
+        kl_source="(--kl_coef override)"
+    elif [[ -f "$config_file" ]]; then
+        kl_source="(from config)"
+    else
+        kl_source="(fallback)"
     fi
 
     echo ""
@@ -533,10 +641,11 @@ run_single_method() {
     echo ""
     echo "Training:"
     echo "  Learning rate: $exp_lr $lr_source"
+    echo "  Learning rate (v_head): $exp_lr_vhead $lr_vhead_source"
     echo "  Batch size: $batch_size"
     echo "  PPO epochs: $ppo_epochs"
     echo "  Mini-batch size: $mini_batch_size"
-    echo "  KL coefficient: $init_kl_coef"
+    echo "  KL coefficient: $exp_init_kl_coef $kl_source"
     echo ""
     echo "Validation (for data selection):"
     if [[ "$n_val" -gt 0 ]]; then
@@ -561,13 +670,14 @@ run_single_method() {
 --reward_model_name=$reward_model \
 --per_device_train_batch_size=$batch_size \
 --learning_rate=$exp_lr \
+--learning_rate_vhead=$exp_lr_vhead \
 --filter_frac=$filter_frac \
 --max_steps=$max_steps \
 --num_train_epochs=$epochs \
 --seed=$seed \
 --ppo_epochs=$ppo_epochs \
 --mini_batch_size=$mini_batch_size \
---init_kl_coef=$init_kl_coef \
+--init_kl_coef=$exp_init_kl_coef \
 --kl_estimator=$kl_estimator \
 --adap_kl_ctrl=$adap_kl_ctrl \
 --target=$target \
@@ -697,7 +807,7 @@ if [[ -n "$methods" ]]; then
     echo "PPO Settings:"
     echo "  PPO epochs: $ppo_epochs"
     echo "  Mini-batch size: $mini_batch_size"
-    echo "  Init KL coefficient: $init_kl_coef"
+    echo "  Init KL coefficient: (per-method from config)"
     echo "  Adaptive KL control: $adap_kl_ctrl"
     echo "  Target (adaptive KL): $target"
     echo "  Target KL (early stop): $target_kl"
@@ -708,7 +818,7 @@ if [[ -n "$methods" ]]; then
     echo "  Eval samples: $n_eval"
     echo "  Eval batch size: $eval_batch_size"
     echo ""
-    echo "LR Config: $lr_config_file"
+    echo "Config: $config_file"
     echo "Methods to run: $resolved_methods"
     echo "========================================================"
 
@@ -730,10 +840,12 @@ if [[ -n "$methods" ]]; then
         # use_second_order is controlled globally via --use_second_order flag
         exp_use_second_order="$use_second_order"
 
-        # Look up learning rate
+        # Look up learning rate, lr_vhead, and init_kl_coef
         exp_lr=$(lookup_lr "$config_key" "$exp_name" "$exp_use_lora")
+        exp_lr_vhead=$(lookup_lr_vhead "$config_key" "$exp_name")
+        exp_init_kl_coef=$(lookup_init_kl_coef "$config_key" "$exp_name")
 
-        run_single_method "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$exp_lr" "$exp_name"
+        run_single_method "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$exp_lr" "$exp_lr_vhead" "$exp_init_kl_coef" "$exp_name"
     done
 
     echo ""
@@ -799,9 +911,11 @@ else
         exp_name="${data_selection}-${local_compression:-NA}-Full"
     fi
 
-    # Look up learning rate
+    # Look up learning rate, lr_vhead, and init_kl_coef
     lr=$(lookup_lr "$config_key" "$exp_name" "$use_lora")
+    lr_vhead=$(lookup_lr_vhead "$config_key" "$exp_name")
+    init_kl_coef=$(lookup_init_kl_coef "$config_key" "$exp_name")
 
     # Run single method
-    run_single_method "$data_selection" "$local_compression" "$use_lora" "$use_second_order" "$lr" ""
+    run_single_method "$data_selection" "$local_compression" "$use_lora" "$use_second_order" "$lr" "$lr_vhead" "$init_kl_coef" ""
 fi

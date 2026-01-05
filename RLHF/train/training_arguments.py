@@ -36,6 +36,16 @@ class TrainingArguments(TA):
             )
         },
     )
+    learning_rate_vhead: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Learning rate for the value head (default: None, uses same as learning_rate). "
+                "The value head is randomly initialized while the main model is pretrained, "
+                "so it may benefit from a different (often higher) learning rate."
+            )
+        },
+    )
     lr_scheduler_type: str = field(
         default="constant",
         metadata={

@@ -194,9 +194,10 @@ class StreamingPPOTrainer:
         self.evaluator = evaluator
         self.val_dataset = val_dataset
 
-        # Cached validation rollout data (generated once and reused)
-        self._val_rollout_cache: Optional[Dict[str, Any]] = None
-        self._val_rollout_step: int = -1  # Step when cache was generated
+        # Validation dataloader iterator for batch-by-batch sampling (like SFT)
+        self._val_dataloader_iter = None
+        if val_dataset is not None:
+            self._val_dataloader_iter = iter(self._get_val_dataloader())
 
         # Device
         self.device = next(model.parameters()).device
@@ -267,9 +268,7 @@ class StreamingPPOTrainer:
             if getattr(self.args, 'use_fixed_validation', False) and self.val_dataset is not None:
                 n_val = len(self.val_dataset)
                 val_batch_size = getattr(self.args, 'val_batch_size', 1)
-                val_gen_interval = getattr(self.args, 'val_generation_interval', 0)
-                logger.info(f"  Validation: fixed dataset (n_val={n_val}, batch_size={val_batch_size})")
-                logger.info(f"  Val generation interval: {val_gen_interval} (0=once at start)")
+                logger.info(f"  Validation: fixed dataset (n_val={n_val}, batch_size={val_batch_size}/step)")
             else:
                 logger.info(f"  Validation: self-reference (training buffer)")
             logger.info(f"  Second-order selection: {self.use_second_order}")
@@ -290,6 +289,42 @@ class StreamingPPOTrainer:
     # =========================================================================
     # Helper Methods
     # =========================================================================
+
+    def _get_val_dataloader(self):
+        """
+        Create validation dataloader for batch-by-batch validation sampling.
+
+        Returns an infinite iterator over the validation dataset, shuffled.
+        Similar to SFT's get_val_dataloader but for prompt datasets.
+        """
+        from torch.utils.data import DataLoader
+        from RLHF.data.get_prompts import collator
+
+        val_batch_size = getattr(self.args, 'val_batch_size', 1)
+        return DataLoader(
+            self.val_dataset,
+            batch_size=val_batch_size,
+            shuffle=True,
+            collate_fn=collator,
+            drop_last=False,
+        )
+
+    def _get_next_val_batch(self) -> Dict[str, Any]:
+        """
+        Get the next validation batch from the iterator.
+
+        Automatically recreates the iterator when exhausted.
+
+        Returns:
+            Dictionary with 'input_ids' and 'query' keys
+        """
+        try:
+            batch = next(self._val_dataloader_iter)
+        except StopIteration:
+            # Recreate iterator when exhausted
+            self._val_dataloader_iter = iter(self._get_val_dataloader())
+            batch = next(self._val_dataloader_iter)
+        return batch
 
     def _extract_model_outputs(
         self, outputs, need_values: bool = True
@@ -1183,46 +1218,34 @@ class StreamingPPOTrainer:
 
         return total_val_loss
 
-    @torch.no_grad()
-    def _generate_validation_rollouts(self, global_step: int = 0) -> Dict[str, Any]:
+    def capture_validation_gradients_from_fixed_val(self) -> float:
         """
-        Generate rollouts for the fixed validation dataset.
+        Capture validation gradients using one batch from the fixed validation dataset.
 
-        This method generates responses for validation prompts and computes
-        rewards and advantages. The results are cached and reused across
-        training steps unless val_generation_interval triggers regeneration.
+        This method follows the SFT pattern: at each training step, sample ONE batch
+        from the validation set, generate rollouts for it, and capture gradients.
+        This is more efficient than processing the entire validation set each time.
 
-        Args:
-            global_step: Current training step (used to check if regeneration needed)
+        The validation loss formula:
+            L_val = -E[log π_θ(y|x) * A(x,y)]
+
+        Where:
+        - y: Responses generated from the sampled validation batch
+        - A(x,y): Normalized reward (advantage) for each sample in the batch
+        - log π_θ(y|x): Log probability under the current policy
 
         Returns:
-            Dictionary containing validation rollout data:
-                - query_ids: Query token IDs [n_val, query_len]
-                - query_mask: Query attention mask
-                - response_ids: Generated response IDs [n_val, response_len]
-                - response_mask: Response attention mask
-                - response_texts: Generated response texts
-                - raw_rewards: Rewards from reward model [n_val]
-                - advantages: Computed advantages (last-token style) [n_val]
+            Validation loss value
         """
-        # Check if we can reuse cached rollouts
-        val_gen_interval = getattr(self.args, 'val_generation_interval', 0)
-        if self._val_rollout_cache is not None:
-            if val_gen_interval == 0:
-                # Generate once and reuse forever
-                return self._val_rollout_cache
-            elif global_step - self._val_rollout_step < val_gen_interval:
-                # Within interval, reuse cache
-                return self._val_rollout_cache
+        # Get next validation batch (automatically cycles through dataset)
+        val_batch = self._get_next_val_batch()
 
-        logger.info(f"Generating validation rollouts for fixed validation set (step {global_step})...")
-
-        # Prepare all validation prompts
+        # Prepare query tensors from batch (similar to _prepare_batch)
+        query_ids_list = val_batch["input_ids"]
         all_query_ids = []
         all_query_masks = []
 
-        for sample in self.val_dataset:
-            query_ids = sample["input_ids"]
+        for query_ids in query_ids_list:
             if isinstance(query_ids, torch.Tensor):
                 query_ids = query_ids.unsqueeze(0) if query_ids.dim() == 1 else query_ids
             else:
@@ -1239,98 +1262,23 @@ class StreamingPPOTrainer:
             pad_left=True,
         )
 
-        # Generate responses in batches
-        val_batch_size = getattr(self.args, 'val_batch_size', 1)
-        n_val = query_ids.shape[0]
-
-        all_response_ids = []
-        all_response_masks = []
-        all_response_texts = []
-
+        # Generate rollouts for this batch
         self.model.eval()
-        for i in range(0, n_val, val_batch_size):
-            end_idx = min(i + val_batch_size, n_val)
-            batch_query_ids = query_ids[i:end_idx]
-            batch_query_mask = query_mask[i:end_idx]
-
-            response_ids, response_mask, response_texts = self.generate_rollouts(
-                batch_query_ids, batch_query_mask
-            )
-            all_response_ids.append(response_ids)
-            all_response_masks.append(response_mask)
-            all_response_texts.extend(response_texts)
-
-        # Pad responses to same length and stack (right-padding for responses)
-        response_ids, response_mask = self._pad_and_stack(
-            all_response_ids, all_response_masks,
-            pad_value=self.tokenizer.pad_token_id,
-            pad_left=False,
+        response_ids, response_mask, response_texts = self.generate_rollouts(
+            query_ids, query_mask
         )
 
-        # Compute rewards
+        # Compute rewards for this batch
         query_texts = self.tokenizer.batch_decode(query_ids, skip_special_tokens=True)
-        raw_rewards = self.reward_model.compute_rewards(query_texts, all_response_texts)
+        raw_rewards = self.reward_model.compute_rewards(query_texts, response_texts)
 
-        # Compute advantages (last-token style, similar to capture_validation_gradients_from_buffer)
-        # For fixed validation, we use simple reward-based advantages
-        # Normalize rewards to have mean 0, std 1
-        if len(raw_rewards) > 1:
+        # Compute advantages (normalized rewards)
+        batch_size = len(raw_rewards)
+        if batch_size > 1:
             advantages = (raw_rewards - raw_rewards.mean()) / (raw_rewards.std() + 1e-8)
         else:
-            advantages = raw_rewards - raw_rewards.mean()
-
-        # Cache the rollouts
-        self._val_rollout_cache = {
-            "query_ids": query_ids,
-            "query_mask": query_mask,
-            "response_ids": response_ids,
-            "response_mask": response_mask,
-            "response_texts": all_response_texts,
-            "raw_rewards": raw_rewards,
-            "advantages": advantages,
-        }
-        self._val_rollout_step = global_step
-
-        logger.info(
-            f"Generated {n_val} validation rollouts. "
-            f"Mean reward: {raw_rewards.mean():.3f}, Std: {raw_rewards.std():.3f}"
-        )
-
-        return self._val_rollout_cache
-
-    def capture_validation_gradients_from_fixed_val(
-        self,
-        global_step: int = 0,
-    ) -> float:
-        """
-        Capture validation gradients using a fixed validation dataset.
-
-        Unlike capture_validation_gradients_from_buffer which uses the same
-        training batch for validation, this method uses a separate fixed
-        validation set with pre-generated completions.
-
-        The validation loss formula:
-            L_val = -E[log π_θ(y|x) * A(x,y)]
-
-        Where:
-        - y: Responses generated from fixed validation prompts
-        - A(x,y): Normalized reward (advantage) for each validation sample
-        - log π_θ(y|x): Log probability under the current policy
-
-        Args:
-            global_step: Current training step (for rollout regeneration check)
-
-        Returns:
-            Validation loss value
-        """
-        # Generate or retrieve cached validation rollouts
-        val_rollout = self._generate_validation_rollouts(global_step)
-
-        query_ids = val_rollout["query_ids"]
-        query_mask = val_rollout["query_mask"]
-        response_ids = val_rollout["response_ids"]
-        response_mask = val_rollout["response_mask"]
-        advantages = val_rollout["advantages"]  # [n_val] - per-sequence advantages
+            # For single sample, use raw reward (centered around 0 if reward model is calibrated)
+            advantages = raw_rewards
 
         # Prepare full sequence tensors
         full_ids = torch.cat([query_ids, response_ids], dim=1)
@@ -1343,10 +1291,10 @@ class StreamingPPOTrainer:
         self.model.train()
 
         # Use core helper for gradient capture
-        val_batch_size = getattr(self.args, 'val_batch_size', 1)
+        mini_batch_size = getattr(self.args, 'mini_batch_size', batch_size)
         total_val_loss = self._capture_validation_gradients_core(
             full_ids, full_mask, response_ids, response_mask,
-            advantages, query_len, val_batch_size,
+            advantages, query_len, mini_batch_size,
         )
 
         # Cleanup
@@ -2020,8 +1968,8 @@ class StreamingPPOTrainer:
                 # Capture validation gradients for selection methods
                 if self.method != "NA":
                     if getattr(self.args, 'use_fixed_validation', False) and self.val_dataset is not None:
-                        # Use fixed validation dataset (separate from training data)
-                        self.capture_validation_gradients_from_fixed_val(global_step)
+                        # Use fixed validation dataset (one batch per step, like SFT)
+                        self.capture_validation_gradients_from_fixed_val()
                     else:
                         # Use self-referencing validation (same rollout data) per LDA-ORL implementation
                         self.capture_validation_gradients_from_buffer(query_ids, query_mask, rollout_data)
