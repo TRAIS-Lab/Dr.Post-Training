@@ -54,7 +54,7 @@ max_steps=-1  # -1 means no step limit (use epochs instead)
 use_flash_attention=true
 
 # data selection
-data_selection="NA"  # NA, Streaming, or GREATS
+data_selection="NA"  # NA, IIF, Streaming, or GREATS
 filter_frac=1.0  # Fraction of negative samples to drop (1.0 = no filtering)
 use_second_order=false # If true, use greedy selection with second-order interactions
 n_val=1024  # Number of validation samples for data selection (0 = self-referencing)
@@ -100,6 +100,8 @@ use_sbatch=false
 declare -A METHOD_DEFS=(
     ["NA-NA-Full"]="NA::false"
     ["NA-NA-LoRA"]="NA::true"
+    ["IIF-NA-Full"]="IIF::false"
+    ["IIF-NA-LoRA"]="IIF::true"
     ["Streaming-NA-Full"]="Streaming::false"
     ["Streaming-NA-LoRA"]="Streaming::true"
     ["GREATS-NA-Full"]="GREATS::false"
@@ -110,14 +112,15 @@ declare -A METHOD_DEFS=(
 
 # Category mappings
 declare -A CATEGORY_METHODS=(
-    ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["all"]="NA-NA-Full,NA-NA-LoRA,IIF-NA-Full,IIF-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
     ["baseline"]="NA-NA-Full,NA-NA-LoRA"
+    ["iif"]="IIF-NA-Full,IIF-NA-LoRA"
     ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
     ["greats"]="GREATS-NA-Full,GREATS-NA-LoRA,GREATS-LoGra-Full"
-    ["full"]="NA-NA-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
-    ["lora"]="NA-NA-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
+    ["full"]="NA-NA-Full,IIF-NA-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["lora"]="NA-NA-LoRA,IIF-NA-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
     ["compression"]="Streaming-LoGra-Full,GREATS-LoGra-Full"
-    ["no-compression"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
+    ["no-compression"]="NA-NA-Full,NA-NA-LoRA,IIF-NA-Full,IIF-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
 )
 
 # Parse named arguments
@@ -286,14 +289,15 @@ while [[ $# -gt 0 ]]; do
             echo "  --sbatch                   Use sbatch instead of bash"
             echo ""
             echo "  Method names:"
-            echo "    NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, Streaming-NA-LoRA,"
-            echo "    GREATS-NA-Full, GREATS-NA-LoRA, Streaming-LoGra-Full, GREATS-LoGra-Full"
+            echo "    NA-NA-Full, NA-NA-LoRA, IIF-NA-Full, IIF-NA-LoRA,"
+            echo "    Streaming-NA-Full, Streaming-NA-LoRA, GREATS-NA-Full, GREATS-NA-LoRA,"
+            echo "    Streaming-LoGra-Full, GREATS-LoGra-Full"
             echo ""
-            echo "  Categories: all, baseline, streaming, greats, Full, LoRA, compression, no-compression"
+            echo "  Categories: all, baseline, iif, streaming, greats, Full, LoRA, compression, no-compression"
             echo ""
             echo "Single Method Options:"
             echo "  --task <task>              Task: toxicity (default: toxicity)"
-            echo "  --data_selection <method>  Data selection: NA, Streaming, GREATS (default: NA)"
+            echo "  --data_selection <method>  Data selection: NA, IIF, Streaming, GREATS (default: NA)"
             echo "  --model <model>            Policy model"
             echo "  --reward_model <model>     Reward model (auto-selected if not specified)"
             echo ""
@@ -860,8 +864,8 @@ else
     # ========================================
 
     # Validate data_selection
-    if [[ ! "$data_selection" =~ ^(NA|Streaming|GREATS)$ ]]; then
-        echo "Error: data_selection must be NA, Streaming, or GREATS"
+    if [[ ! "$data_selection" =~ ^(NA|IIF|Streaming|GREATS)$ ]]; then
+        echo "Error: data_selection must be NA, IIF, Streaming, or GREATS"
         exit 1
     fi
 

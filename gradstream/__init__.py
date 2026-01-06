@@ -6,9 +6,6 @@ This module provides core components for on-the-fly gradient streaming during tr
 - Compressors (sparsifiers and projectors) for reducing gradient dimensionality
 - MeSO optimizer for memory-efficient subspace optimization
 - Selection module with clean separation of Streaming vs GREATS methods
-
-Note: Task-specific trainers (e.g., StreamingTrainer for SFT) are in their respective
-experiment directories (e.g., SFT/train/trainer.py).
 """
 
 from .hook import GradientHook
@@ -16,7 +13,7 @@ from .compressor import setup_model_compressors
 from .optimizer import MeSOAdamW
 from .utils import create_sample_inputs
 
-# Selection module exports
+# Selection module exports (gradient-based)
 from .selection import (
     SelectionState,
     StreamingState,

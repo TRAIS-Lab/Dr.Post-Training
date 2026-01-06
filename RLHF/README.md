@@ -12,18 +12,26 @@ The following methods have been run and can be rerun with the commands below.
 
 ### Experiment Configurations
 
-We consider the following 8 methods for the toxicity task:
+We consider the following 10 methods for the toxicity task:
 
-| #   | Selection | Compression | Training | Description                               |
-| --- | --------- | ----------- | -------- | ----------------------------------------- |
-| 1a  | NA        | NA          | Full     | Baseline PPO full fine-tuning             |
-| 1b  | NA        | NA          | LoRA     | Baseline PPO LoRA fine-tuning             |
-| 2a  | Streaming | NA          | Full     | Per-layer selection, full gradients       |
-| 2b  | Streaming | NA          | LoRA     | Per-layer selection, full gradients, LoRA |
-| 3a  | GREATS    | NA          | Full     | Global selection, full gradients          |
-| 3b  | GREATS    | NA          | LoRA     | Global selection, full gradients, LoRA    |
-| 4   | Streaming | LoGra       | Full     | Per-layer selection + MeSO                |
-| 5   | GREATS    | LoGra       | Full     | Global selection + MeSO                   |
+| #   | Selection | Compression | Training | Description                                      |
+| --- | --------- | ----------- | -------- | ------------------------------------------------ |
+| 1a  | NA        | NA          | Full     | Baseline PPO full fine-tuning                    |
+| 1b  | NA        | NA          | LoRA     | Baseline PPO LoRA fine-tuning                    |
+| 2a  | IIF       | NA          | Full     | Pre-filter rollout (original baseline)           |
+| 2b  | IIF       | NA          | LoRA     | Pre-filter rollout, LoRA                         |
+| 3a  | Streaming | NA          | Full     | Per-layer selection, full gradients              |
+| 3b  | Streaming | NA          | LoRA     | Per-layer selection, full gradients, LoRA        |
+| 4a  | GREATS    | NA          | Full     | Global selection, full gradients                 |
+| 4b  | GREATS    | NA          | LoRA     | Global selection, full gradients, LoRA           |
+| 5   | Streaming | LoGra       | Full     | Per-layer selection + MeSO                       |
+| 6   | GREATS    | LoGra       | Full     | Global selection + MeSO                          |
+
+**Selection Methods:**
+- **NA**: No data selection (baseline)
+- **IIF**: Influence Function-based Filtering - Pre-filter entire rollout *before* PPO epochs
+- **Streaming**: Per-layer, per-mini-batch selection during PPO training
+- **GREATS**: Global selection across all layers, per-mini-batch during PPO training
 
 > Experiments follow the pattern: `{task}-{model}-{method_str}-{training_type}-lr{lr}-b{batch}-v{nval}b{val_batch}-pe{ppo_epochs}-mb{mini_batch}-kl{kl_coef}-s{seed}`
 
@@ -76,16 +84,17 @@ bash RLHF/train/train.sh --methods all --task toxicity --sbatch
 
 Available Categories:
 
-| Category         | Experiments                                                |
-| ---------------- | ---------------------------------------------------------- |
-| `all`            | All 8 methods                                              |
-| `baseline`       | NA-NA-Full, NA-NA-LoRA                                     |
-| `streaming`      | Streaming-NA-Full, Streaming-NA-LoRA, Streaming-LoGra-Full |
-| `greats`         | GREATS-NA-Full, GREATS-NA-LoRA, GREATS-LoGra-Full          |
-| `full`           | All *-Full methods (5 total)                               |
-| `lora`           | All *-LoRA methods (3 total)                               |
-| `compression`    | Streaming-LoGra-Full, GREATS-LoGra-Full                    |
-| `no-compression` | All methods without compression (6 total)                  |
+| Category         | Experiments                                                          |
+| ---------------- | -------------------------------------------------------------------- |
+| `all`            | All 10 methods                                                       |
+| `baseline`       | NA-NA-Full, NA-NA-LoRA                                               |
+| `iif`            | IIF-NA-Full, IIF-NA-LoRA                                             |
+| `streaming`      | Streaming-NA-Full, Streaming-NA-LoRA, Streaming-LoGra-Full           |
+| `greats`         | GREATS-NA-Full, GREATS-NA-LoRA, GREATS-LoGra-Full                    |
+| `full`           | All *-Full methods (6 total)                                         |
+| `lora`           | All *-LoRA methods (4 total)                                         |
+| `compression`    | Streaming-LoGra-Full, GREATS-LoGra-Full                              |
+| `no-compression` | All methods without compression (8 total)                            |
 
 #### Parameters
 
@@ -98,8 +107,9 @@ The unified training script accepts the following arguments:
 2. Data Selection Arguments
    - `--data_selection <method>` - Data selection method:
      - `NA` - No selection (baseline, default)
-     - `Streaming` - Per-layer selection (single-pass)
-     - `GREATS` - Global selection (two-pass)
+     - `IIF` - Influence Function-based Filtering (pre-filter entire rollout before PPO epochs)
+     - `Streaming` - Per-layer selection (single-pass, during PPO mini-batches)
+     - `GREATS` - Global selection (two-pass, during PPO mini-batches)
    - `--use_second_order` - Enable greedy selection with second-order interactions (default: disabled)
 3. Compression Arguments
    - `--compression <method>` - Gradient compression method (implies MeSO optimizer):

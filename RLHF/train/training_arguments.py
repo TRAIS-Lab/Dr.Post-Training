@@ -73,6 +73,7 @@ class TrainingArguments(TA):
             "help": (
                 "Training method: "
                 "'NA' (baseline, no selection), "
+                "'IIF' (pre-filter entire rollout before PPO epochs), "
                 "'Streaming' (per-layer selection, single-pass), "
                 "'GREATS' (global selection, two-pass)"
             )
@@ -370,7 +371,7 @@ class TrainingArguments(TA):
             raise ValueError(f"task must be one of {valid_tasks}, got {self.task}")
 
         # Validate method
-        valid_methods = ["NA", "Streaming", "GREATS"]
+        valid_methods = ["NA", "IIF", "Streaming", "GREATS"]
         if self.method not in valid_methods:
             raise ValueError(f"method must be one of {valid_methods}, got {self.method}")
 

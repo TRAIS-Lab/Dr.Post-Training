@@ -251,8 +251,11 @@ class StreamingPPOTrainer:
 
         # Create selection strategy for clean separation of selection methods
         # RLHF uses filtering mode: keep positive + drop bottom frac of negative
+        # Note: For IIF, we use NA strategy since IIF does pre-filtering at rollout level,
+        # not per-step filtering during PPO epochs
+        effective_method = "NA" if self.method == "IIF" else self.method
         self.selection_strategy = create_separate_batch_strategy(
-            method=self.method,
+            method=effective_method,
             grad_hook=self.grad_hook,
             frac=self.filter_frac,
             use_second_order=self.use_second_order,
@@ -263,6 +266,8 @@ class StreamingPPOTrainer:
         logger.info("=" * 60)
         logger.info("StreamingPPOTrainer Configuration")
         logger.info(f"  Method: {self.method}")
+        if self.method == "IIF":
+            logger.info(f"  IIF: Pre-filter entire rollout before PPO epochs")
         if self.method != "NA":
             logger.info(f"  Filter fraction (negative samples to drop): {self.filter_frac}")
             if getattr(self.args, 'use_fixed_validation', False) and self.val_dataset is not None:
@@ -1303,6 +1308,154 @@ class StreamingPPOTrainer:
 
         return total_val_loss
 
+    def iif_pre_select(
+        self,
+        query_ids: Tensor,
+        query_mask: Tensor,
+        rollout_data: Dict[str, Any],
+    ) -> Tensor:
+        """
+        Pre-select samples using IIF (Influence Function-based Filtering).
+
+        IIF computes influence scores for ALL samples in the rollout against the
+        validation gradient, then filters out samples with negative influence
+        BEFORE starting PPO epochs.
+
+        This is different from GREATS/Streaming which filter during each mini-batch.
+
+        Key differences:
+        - IIF: Pre-filter entire rollout ONCE → train on filtered data for ALL PPO epochs
+        - GREATS: Filter EACH mini-batch during PPO epochs
+        - Streaming: Per-layer, per-mini-batch filtering
+
+        Implementation:
+        - Uses GREATS-style batched score computation (efficient)
+        - Processes mini-batches to accumulate scores for all samples
+        - Applies global selection after all scores are computed
+        - No model update during score computation
+
+        Args:
+            query_ids: Query token IDs [batch, query_len]
+            query_mask: Query attention mask
+            rollout_data: Dictionary from _generate_rollout_data()
+
+        Returns:
+            Tensor of selected sample indices
+        """
+        from gradstream.selection.state import GREATSState
+        from gradstream.utils import negative_filtering
+
+        response_ids = rollout_data["response_ids"]
+        response_mask = rollout_data["response_mask"]
+        advantages = rollout_data["advantages"]
+
+        batch_size = query_ids.shape[0]
+        query_len = query_ids.shape[1]
+        response_len = response_ids.shape[1]
+
+        # Prepare full sequence tensors
+        full_ids = torch.cat([query_ids, response_ids], dim=1)
+        full_mask = torch.cat([query_mask, response_mask], dim=1)
+
+        # Accumulator for scores across all mini-batches
+        all_scores = torch.zeros(batch_size, device=self.device, dtype=torch.float32)
+
+        # Save original state
+        original_state = self.grad_hook.selection_state
+
+        # Enable hooks for GREATS-style score computation
+        self.grad_hook.enable_hooks()
+        self.model.train()
+
+        # Process mini-batches to compute scores
+        mini_batch_size = self.mini_batch_size
+        num_layers = len(self.grad_hook.layer_names)
+        lr = self.optimizer.param_groups[0]["lr"]
+
+        for mb_start in range(0, batch_size, mini_batch_size):
+            mb_end = min(mb_start + mini_batch_size, batch_size)
+            mb_size = mb_end - mb_start
+
+            # Create a GREATSState sized for this mini-batch
+            mb_state = GREATSState(
+                train_batch_size=mb_size,
+                num_layers=num_layers,
+                frac=self.filter_frac,  # Not used for selection here, just for state init
+                lr=lr,
+                device=str(self.device),
+                dtype=torch.float32,
+                use_second_order=False,  # Keep simple for IIF
+                selection_mode="filtering",
+            )
+
+            # Set token counts for this mini-batch
+            mb_tokens = response_mask[mb_start:mb_end].sum(dim=1)
+            mb_total_tokens = mb_tokens.sum().item()
+            mb_state.set_token_counts(mb_tokens, int(mb_total_tokens), int(mb_total_tokens))
+
+            # Mark to use pre-captured validation gradients from buffer
+            mb_state._use_stored_val = True
+
+            # Set as current state for hooks
+            self.grad_hook.selection_state = mb_state
+
+            # Zero gradients
+            self.optimizer.zero_grad()
+
+            # Forward pass on mini-batch
+            mb_full_ids = full_ids[mb_start:mb_end]
+            mb_full_mask = full_mask[mb_start:mb_end]
+            position_ids = mb_full_mask.cumsum(1) - mb_full_mask.long()
+            input_ids_masked = torch.masked_fill(mb_full_ids, ~mb_full_mask.bool(), 0)
+
+            outputs = self.model(
+                input_ids=input_ids_masked,
+                attention_mask=mb_full_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+
+            # Extract logits and compute loss
+            logits, _ = self._extract_model_outputs(outputs)
+            start_idx, end_idx = self._get_response_slice_indices(query_len, response_len)
+            logits_for_probs = logits[:, start_idx:end_idx, :]
+
+            temperature = getattr(self.args, 'temperature', 1.0)
+            new_logprobs = self._compute_token_logprobs(
+                logits_for_probs, response_ids[mb_start:mb_end], temperature=temperature
+            )
+
+            # Compute mini-batch loss (advantage-weighted, like validation)
+            mb_advantages = advantages[mb_start:mb_end]
+            mb_response_mask = response_mask[mb_start:mb_end]
+
+            masked_term = mb_advantages * new_logprobs * mb_response_mask.float()
+            per_sample_loss = -masked_term.sum(dim=1) / mb_response_mask.sum(dim=1).clamp(min=1)
+            mb_loss = per_sample_loss.sum()  # Sum for per-sample gradient semantics
+
+            # Backward pass - this triggers GREATS score accumulation via hooks
+            mb_loss.backward()
+
+            # Collect accumulated scores for this mini-batch
+            # The scores are accumulated in mb_state.grad_dot_scores
+            all_scores[mb_start:mb_end] = mb_state.grad_dot_scores.clone()
+
+        # Apply filtering globally: keep positive + drop bottom filter_frac of negative
+        scores_scaled = all_scores * lr
+        selected_indices = negative_filtering(scores_scaled, self.filter_frac)
+
+        # Log selection stats
+        n_selected = len(selected_indices)
+        n_positive = (all_scores >= 0).sum().item()
+        logger.info(f"IIF pre-selection: {n_selected}/{batch_size} samples selected "
+                    f"({100*n_selected/batch_size:.1f}%), {n_positive} positive scores")
+
+        # Restore original state and clean up
+        self.grad_hook.selection_state = original_state
+        self.optimizer.zero_grad()
+
+        return selected_indices
+
     def compute_ppo_loss(
         self,
         query_ids: Tensor,
@@ -1973,6 +2126,37 @@ class StreamingPPOTrainer:
                     else:
                         # Use self-referencing validation (same rollout data) per LDA-ORL implementation
                         self.capture_validation_gradients_from_buffer(query_ids, query_mask, rollout_data)
+
+                # IIF: Pre-filter rollouts BEFORE PPO epochs (different from GREATS/Streaming)
+                # IIF filters the entire rollout once, then runs standard PPO on filtered data
+                if self.method == "IIF":
+                    original_batch_size = query_ids.shape[0]
+                    selected_indices = self.iif_pre_select(query_ids, query_mask, rollout_data)
+
+                    # Filter query tensors
+                    query_ids = query_ids[selected_indices]
+                    query_mask = query_mask[selected_indices]
+                    response_mask = response_mask[selected_indices]
+
+                    # Filter rollout data
+                    rollout_data = {
+                        "response_ids": rollout_data["response_ids"][selected_indices],
+                        "response_mask": rollout_data["response_mask"][selected_indices],
+                        "old_logprobs": rollout_data["old_logprobs"][selected_indices],
+                        "old_values": rollout_data["old_values"][selected_indices],
+                        "advantages": rollout_data["advantages"][selected_indices],
+                        "returns": rollout_data["returns"][selected_indices],
+                        "raw_rewards": rollout_data["raw_rewards"][selected_indices],
+                        "kl_penalty": rollout_data["kl_penalty"][selected_indices],
+                        "response_texts": [rollout_data["response_texts"][i] for i in selected_indices.tolist()],
+                    }
+
+                    # Track IIF selection stats
+                    if "iif/n_selected" not in history:
+                        history["iif/n_selected"] = []
+                        history["iif/selection_rate"] = []
+                    history["iif/n_selected"].append(len(selected_indices))
+                    history["iif/selection_rate"].append(len(selected_indices) / original_batch_size)
 
                 # Run PPO training epochs
                 ppo_stats = self._run_ppo_epochs(query_ids, query_mask, rollout_data)
