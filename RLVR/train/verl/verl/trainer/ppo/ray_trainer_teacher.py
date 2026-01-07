@@ -698,7 +698,12 @@ class RayPPOTrainer(object):
 
         effective_total_steps = self.total_training_steps - self.global_steps
         trained_epochs = self.global_steps // self.config.data.mu
-        
+
+        # Check if training is already complete
+        if trained_epochs >= self.config.trainer.total_epochs:
+            print(f"Training already complete (trained_epochs={trained_epochs} >= total_epochs={self.config.trainer.total_epochs})")
+            return
+
         # we start from step 1
         self.global_steps += 1
         
@@ -709,6 +714,11 @@ class RayPPOTrainer(object):
         
         while retry_count <= max_retries:
             try:
+                # Initialize epoch_raw and epoch_metrics before the loop
+                # in case training is already complete and the loop doesn't execute
+                epoch_raw = {}
+                epoch_metrics = {}
+
                 with tqdm(total=effective_total_steps, desc="Training Progress") as pbar:
 
                     for epoch in range(trained_epochs, self.config.trainer.total_epochs):
@@ -921,6 +931,11 @@ class RayPPOTrainer(object):
 
                                     old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                                     batch = batch.union(old_log_prob)
+
+                                    # compute behavior log prob for temperature-based method
+                                    if self.config.actor_rollout_ref.actor.get('use_temp_log_prob', False):
+                                        temp_log_prob = self.actor_rollout_wg.compute_temp_log_prob(batch)
+                                        batch = batch.union(temp_log_prob)
 
                                     if self.use_reference_policy:
                                         # compute reference log_prob

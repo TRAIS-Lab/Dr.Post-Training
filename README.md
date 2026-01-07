@@ -2,13 +2,12 @@
 
 This repository implements **Gradient Streaming** for fine-grained data selection for modern model training.
 
-## Installation
+## Environment Setup
 
-```bash
-pip install -r requirements.txt
-```
+> [!IMPORTANT]
+> **SFT/RLHF** and **RLVR** require **different conda environments** due to incompatible dependencies (e.g., `transformers` version conflicts). Choose the appropriate setup below.
 
-### Recommended Environment Setup
+### For SFT and RLHF
 
 ```bash
 conda create -n GradStream python=3.10
@@ -17,29 +16,51 @@ conda activate GradStream
 conda install -c "nvidia/label/cuda-12.4.0" cudatoolkit
 pip3 install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
-pip3 install packaging ninja
-
+pip3 install packaging ninja psutil
 pip3 install sjlt --no-build-isolation
 pip install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
 
 pip3 install -r requirements.txt
 ```
 
-> Before installing `flash-attn`, you might need to install `psutil` first.
+### For RLVR
+
+RLVR uses [VERL](https://github.com/volcengine/verl) (Ray-based distributed RL) with vLLM for fast generation. This requires a separate environment.
+
+```bash
+conda create -n GradStream-RLVR python=3.10
+conda activate GradStream-RLVR
+
+conda install -c "nvidia/label/cuda-12.1.0" cudatoolkit
+pip3 install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+
+# Install VERL and dependencies
+cd RLVR/train/verl
+pip install -e .
+pip install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
+
+pip install -r requirements.txt
+```
+
+> See [RLVR/README.md](RLVR/README.md) for detailed setup and usage instructions.
 
 ## Experiments
 
-| Experiment | Description                                                        | Documentation                    |
-| ---------- | ------------------------------------------------------------------ | -------------------------------- |
-| **SFT**    | Supervised Fine-Tuning with gradient streaming data selection      | [SFT/README.md](SFT/README.md)   |
-| **RLHF**   | Reinforcement Learning from Human Feedback with gradient streaming | [RLHF/README.md](RLHF/README.md) |
+| Experiment | Environment       | Description                                                        | Documentation                    |
+| ---------- | ----------------- | ------------------------------------------------------------------ | -------------------------------- |
+| **SFT**    | `GradStream`      | Supervised Fine-Tuning with gradient streaming data selection      | [SFT/README.md](SFT/README.md)   |
+| **RLHF**   | `GradStream`      | Reinforcement Learning from Human Feedback with gradient streaming | [RLHF/README.md](RLHF/README.md) |
+| **RLVR**   | `GradStream-RLVR` | Reinforcement Learning with Verifiable Rewards (VERL + vLLM)       | [RLVR/README.md](RLVR/README.md) |
+
+## Methods
 
 Generally speaking, we support the following:
 
 1. Selection Modes
-   - **NA**: No data selection (baseline PPO)
-   - **Streaming**: Per-layer selection - each layer independently selects samples (single-pass)
-   - **GREATS**: Global selection - accumulates scores across all layers (two-pass)
+   - **NA**: No data selection
+   - **Baseline**: Data selection in the existing literature
+   - **GREATS**: Global online selection
+   - **Streaming**: Per-layer selection
 2. Compression Methods
    - **NA**: No compression - uses full gradients and standard AdamW optimizer
    - **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer

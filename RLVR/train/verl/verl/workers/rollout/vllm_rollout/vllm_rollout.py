@@ -273,9 +273,10 @@ class vLLMRollout(BaseRollout):
 
                 # Clean up and restart engine
                 torch.cuda.empty_cache()
-                if hasattr(self.inference_engine, 'free_cache_engine'):
-                    self.inference_engine.free_cache_engine()
-                del self.inference_engine
+                if hasattr(self, 'inference_engine'):
+                    if hasattr(self.inference_engine, 'free_cache_engine'):
+                        self.inference_engine.free_cache_engine()
+                    del self.inference_engine
 
                 # Reinitialize engine with same parameters
                 self.inference_engine = LLM(

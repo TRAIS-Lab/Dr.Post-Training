@@ -30,22 +30,22 @@ MODEL_PATHS=(
 )
 
 DATASET_PATHS=(
-    "data/deepscaler.parquet"
+    "../data/deepscaler.parquet"
 )
 
 # ============================================================================
 # Training Hyperparameters
 # ============================================================================
-NUM_EPOCHS=30
+NUM_EPOCHS=2            # Small number for testing
 LEARNING_RATE=1e-6
 USE_TEMP_LOG_PROB=True
 
-MU=2                    # Steps per epoch
+MU=1                    # Steps per epoch (1 for quick test)
 BETA=0                  # KL loss coefficient
 ENTROPY_COEFF=0
 
-NUM_GENERATIONS=8
-WORLD_SIZE=8
+NUM_GENERATIONS=2       # Fewer generations for testing
+WORLD_SIZE=1            # Single GPU for testing
 
 # ============================================================================
 # Selection Method Configuration
@@ -92,11 +92,15 @@ for DATASET_PATH in "${DATASET_PATHS[@]}"; do
         echo "MAX_COMPLETION_LENGTH=$MAX_COMPLETION_LENGTH"
         PPO_MAX_TOKEN_LEN_PER_GPU=$((8 * 1024 + MAX_COMPLETION_LENGTH))
 
-        # Set batch size based on model size
+        # Set batch size based on model size and GPU count
         if [[ "$MODEL_PATH" == *7B* ]]; then
             EFFECTIVE_BATCH_SIZE=$((WORLD_SIZE * 32))
         else
-            EFFECTIVE_BATCH_SIZE=$((WORLD_SIZE * 64))
+            EFFECTIVE_BATCH_SIZE=$((WORLD_SIZE * 16))  # Smaller for single GPU testing
+        fi
+        # Minimum batch size for testing
+        if [[ $EFFECTIVE_BATCH_SIZE -lt 16 ]]; then
+            EFFECTIVE_BATCH_SIZE=16
         fi
 
         # Build experiment name based on selection type
@@ -141,9 +145,12 @@ for DATASET_PATH in "${DATASET_PATHS[@]}"; do
             )
         elif [[ "$SELECTION_TYPE" == "random" ]]; then
             # Random mode: rlvr_enabled=False, random_selection=True
+            # Note: alpha and tau are still needed for the selection mechanism
             SELECTION_ARGS=(
                 "+data.random_selection=True"
                 "+data.rlvr_enabled=False"
+                "+data.alpha=$ALPHA"
+                "+data.tau=$TAU"
             )
         else
             # RLVR mode (GREATS or Streaming): rlvr_enabled=True
@@ -165,7 +172,7 @@ for DATASET_PATH in "${DATASET_PATHS[@]}"; do
             data.train_files=$DATASET_PATH \
             data.val_files=$DATASET_PATH \
             data.train_batch_size=$EFFECTIVE_BATCH_SIZE \
-            data.val_batch_size=512 \
+            data.val_batch_size=$EFFECTIVE_BATCH_SIZE \
             data.max_prompt_length=1024 \
             data.max_response_length=$MAX_COMPLETION_LENGTH \
             +data.mu=$MU \
@@ -174,7 +181,8 @@ for DATASET_PATH in "${DATASET_PATHS[@]}"; do
             actor_rollout_ref.model.path=$MODEL_PATH \
             actor_rollout_ref.actor.optim.lr=$LEARNING_RATE \
             actor_rollout_ref.model.use_remove_padding=True \
-            actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+            actor_rollout_ref.actor.ppo_mini_batch_size=$EFFECTIVE_BATCH_SIZE \
+            actor_rollout_ref.actor.ppo_micro_batch_size=$EFFECTIVE_BATCH_SIZE \
             actor_rollout_ref.actor.use_dynamic_bsz=True \
             actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$PPO_MAX_TOKEN_LEN_PER_GPU \
             actor_rollout_ref.actor.use_kl_loss=True \
@@ -190,11 +198,11 @@ for DATASET_PATH in "${DATASET_PATHS[@]}"; do
             actor_rollout_ref.rollout.name=vllm \
             actor_rollout_ref.rollout.temperature=0.6 \
             actor_rollout_ref.rollout.val_temperature=0.6 \
-            actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+            actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
             actor_rollout_ref.rollout.n=$NUM_GENERATIONS \
-            actor_rollout_ref.rollout.n_val=8 \
+            actor_rollout_ref.rollout.n_val=$NUM_GENERATIONS \
             trainer.critic_warmup=0 \
-            trainer.logger=['console','wandb'] \
+            trainer.logger=['console'] \
             trainer.project_name="rl" \
             trainer.experiment_name=$WANDB_NAME \
             +trainer.val_before_train=False \

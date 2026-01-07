@@ -363,6 +363,11 @@ class RayRLVRTrainer(RayPPOTrainer):
         retry_count = 0
         retry_delay = self.config.trainer.get('retry_delay', 60)
 
+        # Initialize epoch_raw outside the loop to handle edge cases
+        # (e.g., when resuming past the training loop)
+        epoch_raw = {}
+        epoch_metrics = {}
+
         while retry_count <= max_retries:
             try:
                 with tqdm(total=effective_total_steps, desc="Training Progress") as pbar:
@@ -669,6 +674,11 @@ class RayRLVRTrainer(RayPPOTrainer):
                                         critic_output = self.critic_wg.update_critic(batch)
                                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                                         metrics.update(critic_output_metrics)
+
+                                    # Compute temp_log_prob if enabled
+                                    if self.config.actor_rollout_ref.actor.get('use_temp_log_prob', False):
+                                        temp_log_prob = self.actor_rollout_wg.compute_temp_log_prob(batch)
+                                        batch = batch.union(temp_log_prob)
 
                                     # Update actor (after warmup)
                                     if self.config.trainer.critic_warmup <= self.global_steps:

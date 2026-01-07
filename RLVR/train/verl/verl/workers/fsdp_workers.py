@@ -590,7 +590,9 @@ class ActorRolloutRefWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        self.ref_policy.actor_module._handle.reshard(True)
+        # Only call reshard if actually using a sharded strategy (not applicable for single-GPU)
+        if self.ref_policy.actor_module._handle.uses_sharded_strategy:
+            self.ref_policy.actor_module._handle.reshard(True)
 
         torch.cuda.empty_cache()
         return output
@@ -1375,7 +1377,9 @@ class RewardModelWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        self.reward_module._handle.reshard(True)
+        # Only call reshard if actually using a sharded strategy (not applicable for single-GPU)
+        if self.reward_module._handle.uses_sharded_strategy:
+            self.reward_module._handle.reshard(True)
 
         output = output.to('cpu')
         torch.cuda.empty_cache()

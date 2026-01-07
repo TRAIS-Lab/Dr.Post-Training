@@ -37,7 +37,13 @@ import torch
 from verl.utils.reward_score import gsm8k, math
 from verl.trainer.ppo.teacher_utils import TeacherModelWorker
 
-from deepscaler.rewards.math_reward import deepscaler_reward_fn
+# Optional deepscaler import - falls back to math.compute_score if not available
+try:
+    from deepscaler.rewards.math_reward import deepscaler_reward_fn
+    HAS_DEEPSCALER = True
+except ImportError:
+    HAS_DEEPSCALER = False
+    deepscaler_reward_fn = None
 
 
 def _select_rm_score_fn(data_source):
@@ -46,7 +52,12 @@ def _select_rm_score_fn(data_source):
     elif data_source == 'lighteval/MATH':
         return math.compute_score
     else:
-        return deepscaler_reward_fn
+        # Use deepscaler if available, otherwise fall back to math.compute_score
+        if HAS_DEEPSCALER:
+            return deepscaler_reward_fn
+        else:
+            print(f"Warning: deepscaler not installed, using math.compute_score for {data_source}")
+            return math.compute_score
 
 
 class RewardManager():
@@ -148,7 +159,8 @@ def main_task(config):
     else:
         raise NotImplementedError
 
-    from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
+    # Import from ray_trainer_teacher to match RayPPOTrainer's Role enum
+    from verl.trainer.ppo.ray_trainer_teacher import ResourcePoolManager, Role
 
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
