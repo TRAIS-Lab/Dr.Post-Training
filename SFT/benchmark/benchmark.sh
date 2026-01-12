@@ -19,7 +19,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 # Python interpreter (override with PYTHON env var if needed)
-PYTHON="${PYTHON:-$HOME/miniconda3/envs/IF/bin/python}"
+PYTHON="${PYTHON:-$HOME/miniforge3/envs/GradStream/bin/python}"
 
 # Default values
 methods=""
