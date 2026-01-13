@@ -53,6 +53,8 @@ class Config:
     device: str
     use_flash_attention: bool
     selection_frac: float
+    score_proj_dim: int
+    score_proj_seed: int
 
     def torch_dtype(self) -> torch.dtype:
         mapping = {
@@ -81,6 +83,10 @@ def parse_args() -> Config:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no-flash-attention", action="store_true")
     parser.add_argument("--selection-frac", type=float, default=0.5)
+    parser.add_argument("--score-proj-dim", type=int, default=0,
+                        help="Apply dummy SJLT-style projection to score computation (0 disables).")
+    parser.add_argument("--score-proj-seed", type=int, default=1234,
+                        help="Seed for dummy SJLT projection.")
 
     args = parser.parse_args()
     val_seq_length = args.val_seq_length if args.val_seq_length is not None else args.seq_length
@@ -99,6 +105,8 @@ def parse_args() -> Config:
         device=args.device,
         use_flash_attention=not args.no_flash_attention,
         selection_frac=args.selection_frac,
+        score_proj_dim=args.score_proj_dim,
+        score_proj_seed=args.score_proj_seed,
     )
 
 
@@ -170,6 +178,102 @@ def compute_scores_and_similarity(
         return scores
 
     raise ValueError("Missing validation gradients for scoring")
+
+
+def _make_sjlt_projection(
+    input_dim: int,
+    proj_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    proj_idx = torch.randint(0, input_dim, (proj_dim,), device=device, generator=gen)
+    signs = torch.randint(0, 2, (proj_dim,), device=device, generator=gen, dtype=torch.int8)
+    proj_sign = (signs * 2 - 1).to(dtype=dtype)
+    return proj_idx, proj_sign
+
+
+def _get_or_create_proj(
+    hook: "MinimalGradientHook",
+    layer_idx: int,
+    input_dim: int,
+    output_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if hook.proj_in_idx[layer_idx] is None:
+        in_idx, in_sign = _make_sjlt_projection(
+            input_dim=input_dim,
+            proj_dim=hook.score_proj_dim,
+            device=next(hook.model.parameters()).device,
+            dtype=next(hook.model.parameters()).dtype,
+            seed=hook.score_proj_seed + layer_idx,
+        )
+        hook.proj_in_idx[layer_idx] = in_idx
+        hook.proj_in_sign[layer_idx] = in_sign
+    if hook.proj_out_idx[layer_idx] is None:
+        out_idx, out_sign = _make_sjlt_projection(
+            input_dim=output_dim,
+            proj_dim=hook.score_proj_dim,
+            device=next(hook.model.parameters()).device,
+            dtype=next(hook.model.parameters()).dtype,
+            seed=hook.score_proj_seed + 10007 + layer_idx,
+        )
+        hook.proj_out_idx[layer_idx] = out_idx
+        hook.proj_out_sign[layer_idx] = out_sign
+    return (
+        hook.proj_in_idx[layer_idx],
+        hook.proj_in_sign[layer_idx],
+        hook.proj_out_idx[layer_idx],
+        hook.proj_out_sign[layer_idx],
+    )
+
+
+def _apply_sjlt_to_input(
+    input: torch.Tensor,
+    proj_idx: torch.Tensor,
+    proj_sign: torch.Tensor,
+) -> torch.Tensor:
+    if input.dim() == 3:
+        proj = input[..., proj_idx]
+        return proj * proj_sign
+    proj = input[:, proj_idx]
+    return proj * proj_sign
+
+
+def _apply_sjlt_to_weight(
+    weight: torch.Tensor,
+    proj_idx: torch.Tensor,
+    proj_sign: torch.Tensor,
+) -> torch.Tensor:
+    proj = weight[:, proj_idx]
+    return proj * proj_sign
+
+
+def _apply_sjlt_to_output(
+    grad_output: torch.Tensor,
+    proj_idx: torch.Tensor,
+    proj_sign: torch.Tensor,
+) -> torch.Tensor:
+    if grad_output.dim() == 3:
+        proj = grad_output[..., proj_idx]
+        return proj * proj_sign
+    proj = grad_output[:, proj_idx]
+    return proj * proj_sign
+
+
+def _apply_sjlt_to_weight_both(
+    weight: torch.Tensor,
+    out_idx: torch.Tensor,
+    out_sign: torch.Tensor,
+    in_idx: torch.Tensor,
+    in_sign: torch.Tensor,
+) -> torch.Tensor:
+    proj = weight[out_idx, :]
+    proj = proj * out_sign[:, None]
+    proj = proj[:, in_idx]
+    proj = proj * in_sign[None, :]
+    return proj
 
 
 def compute_selected_gradients(
@@ -260,7 +364,7 @@ class MinimalStreamingState:
 
 
 class MinimalGradientHook:
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, score_proj_dim: int, score_proj_seed: int):
         self.model = model
         self.layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
         self.layer_name_to_idx = {name: idx for idx, name in enumerate(self.layer_names)}
@@ -271,6 +375,13 @@ class MinimalGradientHook:
         self.val_grad_output_buffer = [None] * len(self.layer_names)
         self.val_input_buffer = [None] * len(self.layer_names)
         self.val_grad_buffer = [None] * len(self.layer_names)
+        self.val_proj_applied = [False] * len(self.layer_names)
+        self.proj_in_idx = [None] * len(self.layer_names)
+        self.proj_in_sign = [None] * len(self.layer_names)
+        self.proj_out_idx = [None] * len(self.layer_names)
+        self.proj_out_sign = [None] * len(self.layer_names)
+        self.score_proj_dim = score_proj_dim
+        self.score_proj_seed = score_proj_seed
         self._register_hooks()
 
     def _register_hooks(self) -> None:
@@ -291,6 +402,7 @@ class MinimalGradientHook:
         self.val_grad_output_buffer = [None] * len(self.layer_names)
         self.val_input_buffer = [None] * len(self.layer_names)
         self.val_grad_buffer = [None] * len(self.layer_names)
+        self.val_proj_applied = [False] * len(self.layer_names)
 
     def end_val_capture(self) -> None:
         self.capture_val_mode = False
@@ -299,6 +411,7 @@ class MinimalGradientHook:
         self.val_grad_output_buffer = [None] * len(self.layer_names)
         self.val_input_buffer = [None] * len(self.layer_names)
         self.val_grad_buffer = [None] * len(self.layer_names)
+        self.val_proj_applied = [False] * len(self.layer_names)
         self.capture_val_mode = False
 
     def setup_streaming(self, train_batch_size: int, frac: float, lr: float) -> None:
@@ -337,10 +450,34 @@ class MinimalLinearBackward(Function):
         if hook.capture_val_mode:
             _nvtx_push(f"layer_{layer_idx}/val_capture")
             if hook.use_factorized_val:
-                hook.val_grad_output_buffer[layer_idx] = grad_output.detach()
-                hook.val_input_buffer[layer_idx] = input.detach()
+                val_input = input.detach()
+                val_grad_output = grad_output.detach()
+                proj_dim = hook.score_proj_dim
+                if proj_dim and proj_dim < val_input.shape[-1]:
+                    _nvtx_push(f"layer_{layer_idx}/val_proj")
+                    in_idx, in_sign, out_idx, out_sign = _get_or_create_proj(
+                        hook, layer_idx, val_input.shape[-1], val_grad_output.shape[-1]
+                    )
+                    val_input = _apply_sjlt_to_input(val_input, in_idx, in_sign)
+                    val_grad_output = _apply_sjlt_to_output(val_grad_output, out_idx, out_sign)
+                    hook.val_proj_applied[layer_idx] = True
+                    _nvtx_pop()
+                hook.val_grad_output_buffer[layer_idx] = val_grad_output
+                hook.val_input_buffer[layer_idx] = val_input
             else:
-                total = compute_total_gradient(grad_output, input)
+                val_input = input.detach()
+                val_grad_output = grad_output.detach()
+                proj_dim = hook.score_proj_dim
+                if proj_dim and proj_dim < val_input.shape[-1]:
+                    _nvtx_push(f"layer_{layer_idx}/val_proj")
+                    in_idx, in_sign, out_idx, out_sign = _get_or_create_proj(
+                        hook, layer_idx, val_input.shape[-1], val_grad_output.shape[-1]
+                    )
+                    val_input = _apply_sjlt_to_input(val_input, in_idx, in_sign)
+                    val_grad_output = _apply_sjlt_to_output(val_grad_output, out_idx, out_sign)
+                    hook.val_proj_applied[layer_idx] = True
+                    _nvtx_pop()
+                total = compute_total_gradient(val_grad_output, val_input)
                 if hook.val_grad_buffer[layer_idx] is None:
                     hook.val_grad_buffer[layer_idx] = total
                 else:
@@ -378,18 +515,48 @@ class MinimalLinearBackward(Function):
                 train_input, val_input = split_train_val_batch(
                     input, state.train_batch_size
                 )
+                proj_dim = hook.score_proj_dim
+                if proj_dim and proj_dim < train_input.shape[-1]:
+                    _nvtx_push(f"layer_{layer_idx}/val_proj")
+                    in_idx, in_sign, out_idx, out_sign = _get_or_create_proj(
+                        hook, layer_idx, train_input.shape[-1], val_grad_output.shape[-1]
+                    )
+                    val_input = _apply_sjlt_to_input(val_input, in_idx, in_sign)
+                    val_grad_output = _apply_sjlt_to_output(val_grad_output, out_idx, out_sign)
+                    hook.val_proj_applied[layer_idx] = True
+                    _nvtx_pop()
                 val_grad_total = compute_total_gradient(val_grad_output, val_input)
                 val_grad_output = None
                 val_input = None
         _nvtx_pop()
 
         _nvtx_push(f"layer_{layer_idx}/score_compute")
+        score_train_input = train_input
+        score_train_grad_output = train_grad_output
+        score_val_input = val_input
+        score_val_grad_total = val_grad_total
+        proj_dim = hook.score_proj_dim
+        if proj_dim and proj_dim < train_input.shape[-1]:
+            _nvtx_push(f"layer_{layer_idx}/score_proj")
+            in_idx, in_sign, out_idx, out_sign = _get_or_create_proj(
+                hook, layer_idx, train_input.shape[-1], train_grad_output.shape[-1]
+            )
+            score_train_input = _apply_sjlt_to_input(train_input, in_idx, in_sign)
+            score_train_grad_output = _apply_sjlt_to_output(train_grad_output, out_idx, out_sign)
+            if score_val_input is not None and not hook.val_proj_applied[layer_idx]:
+                score_val_input = _apply_sjlt_to_input(score_val_input, in_idx, in_sign)
+            if score_val_grad_total is not None and not hook.val_proj_applied[layer_idx]:
+                score_val_grad_total = _apply_sjlt_to_weight_both(
+                    score_val_grad_total, out_idx, out_sign, in_idx, in_sign
+                )
+            _nvtx_pop()
+
         scores = compute_scores_and_similarity(
-            train_grad_output,
-            train_input,
+            score_train_grad_output,
+            score_train_input,
             val_grad_output,
-            val_input,
-            val_grad_total,
+            score_val_input,
+            score_val_grad_total,
         )
         _nvtx_pop()
         _nvtx_push(f"layer_{layer_idx}/select_reduce")
@@ -556,7 +723,7 @@ def main() -> None:
 
     grad_hook = None
     if cfg.method == "Streaming_NA_Full":
-        grad_hook = MinimalGradientHook(model)
+        grad_hook = MinimalGradientHook(model, cfg.score_proj_dim, cfg.score_proj_seed)
 
     timings = []
     val_timings = []
