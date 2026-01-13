@@ -133,19 +133,41 @@ def compute_scores_and_similarity(
 ) -> torch.Tensor:
     if val_grad_output is not None and val_input is not None:
         if train_grad_output.dim() == 3:
+            _nvtx_push("score/val_total_einsum")
             val_grad_total = torch.einsum("vso,vsi->oi", val_grad_output, val_input)
+            _nvtx_pop()
+            _nvtx_push("score/train_matmul")
             temp = train_input @ val_grad_total.T
-            return (train_grad_output * temp).sum(dim=(1, 2))
+            _nvtx_pop()
+            _nvtx_push("score/mul_reduce")
+            scores = (train_grad_output * temp).sum(dim=(1, 2))
+            _nvtx_pop()
+            return scores
         val_grad_total = torch.einsum("vo,vi->oi", val_grad_output, val_input)
+        _nvtx_push("score/train_matmul")
         temp = train_input @ val_grad_total.T
-        return (train_grad_output * temp).sum(dim=1)
+        _nvtx_pop()
+        _nvtx_push("score/mul_reduce")
+        scores = (train_grad_output * temp).sum(dim=1)
+        _nvtx_pop()
+        return scores
 
     if val_grad_total is not None:
         if train_grad_output.dim() == 3:
+            _nvtx_push("score/train_matmul")
             temp = train_input @ val_grad_total.T
-            return (train_grad_output * temp).sum(dim=(1, 2))
+            _nvtx_pop()
+            _nvtx_push("score/mul_reduce")
+            scores = (train_grad_output * temp).sum(dim=(1, 2))
+            _nvtx_pop()
+            return scores
+        _nvtx_push("score/train_matmul")
         temp = train_input @ val_grad_total.T
-        return (train_grad_output * temp).sum(dim=1)
+        _nvtx_pop()
+        _nvtx_push("score/mul_reduce")
+        scores = (train_grad_output * temp).sum(dim=1)
+        _nvtx_pop()
+        return scores
 
     raise ValueError("Missing validation gradients for scoring")
 
