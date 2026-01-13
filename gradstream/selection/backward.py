@@ -31,6 +31,16 @@ from .utils import (
 )
 
 
+def _nvtx_push(msg: str) -> None:
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(msg)
+
+
+def _nvtx_pop() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_pop()
+
+
 # =============================================================================
 # Helper functions for backward passes
 # =============================================================================
@@ -158,7 +168,9 @@ class StreamingLinearBackward(Function):
         if input.dtype != grad_output.dtype:
             input = input.to(grad_output.dtype)
 
+        _nvtx_push(f"layer_{layer_idx}/grad_input")
         grad_input = grad_output @ weight.to(grad_output.dtype)
+        _nvtx_pop()
 
         compressor = hook_manager.compressors[layer_idx]
         state: Optional[StreamingState] = hook_manager.selection_state
@@ -200,12 +212,14 @@ class StreamingLinearBackward(Function):
         compressed_grad = compressor.forward((grad_output, input_aug))
 
         if capture_val_mode:
+            _nvtx_push(f"layer_{layer_idx}/val_capture")
             # Val capture: accumulate total compressed gradient (sum, not mean)
             total_grad = compressed_grad.sum(dim=0)
             if hook_manager.val_grad_buffer[layer_idx] is None:
                 hook_manager.val_grad_buffer[layer_idx] = total_grad
             else:
                 hook_manager.val_grad_buffer[layer_idx] += total_grad
+            _nvtx_pop()
             return None, None
 
         if state is None:
@@ -230,9 +244,13 @@ class StreamingLinearBackward(Function):
             return None, None
 
         # Per-layer selection and reduction (with score correction for joint batch)
+        _nvtx_push(f"layer_{layer_idx}/score_compute")
+        _nvtx_push(f"layer_{layer_idx}/select_reduce")
         reduced_grad, _ = state.process_layer_gradients(
             train_grads, val_grad, layer_idx, score_correction
         )
+        _nvtx_pop()
+        _nvtx_pop()
         hook_manager._store_compressed_grad(layer_idx, reduced_grad)
         return None, None
 
@@ -249,6 +267,7 @@ class StreamingLinearBackward(Function):
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
         """Handle full gradient path."""
         if capture_val_mode:
+            _nvtx_push(f"layer_{layer_idx}/val_capture")
             # Val capture: store gradients for later use
             if hook_manager.use_factorized_val:
                 hook_manager.val_grad_output_buffer[layer_idx] = grad_output.detach()
@@ -259,6 +278,7 @@ class StreamingLinearBackward(Function):
                     hook_manager.val_grad_buffer[layer_idx] = val_grad_total
                 else:
                     hook_manager.val_grad_buffer[layer_idx] += val_grad_total
+            _nvtx_pop()
             return None, None
 
         if state is None:
@@ -281,10 +301,12 @@ class StreamingLinearBackward(Function):
             # Joint batch needs correction: T_total²/(T_train × T_val)
             score_correction = state.score_correction
 
+        _nvtx_push(f"layer_{layer_idx}/score_compute")
         scores, similarity = compute_scores_and_similarity(
             train_grad_output, train_input, val_grad_output, val_input, val_grad_total,
             state.use_second_order
         )
+        _nvtx_pop()
 
         # Apply correction for joint batch mode
         if score_correction != 1.0:
@@ -304,9 +326,11 @@ class StreamingLinearBackward(Function):
         # Note: empty selection naturally produces zero gradients via einsum on empty tensors
         # _compute_scale_factor handles empty selection internally (returns 1.0)
         scale_factor = _compute_scale_factor(state, selected_indices)
+        _nvtx_push(f"layer_{layer_idx}/select_reduce")
         grad_weight, grad_bias = compute_selected_gradients(
             train_grad_output, train_input, selected_indices, bias is not None, scale_factor
         )
+        _nvtx_pop()
 
         return grad_weight, grad_bias
 

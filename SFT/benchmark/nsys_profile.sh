@@ -6,7 +6,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-OUT="${OUT:-${SCRIPT_DIR}/nsys_report_stream_na}"
+OUT="${OUT:-${SCRIPT_DIR}/nsys_report_stream_logra}"
 PYTHON="${PYTHON:-python}"
 METHOD="${METHOD:-Streaming_LoGra_Full}"
 VAL_STRATEGY="${VAL_STRATEGY:-merged}"

@@ -69,6 +69,7 @@ class SelectionState(ABC):
         # Token-based scaling (set via set_token_counts)
         self.tokens_per_sample: Optional[Tensor] = None
         self.train_total_tokens: int = 0
+        self.train_total_tokens_tensor: Optional[Tensor] = None
 
         # Precomputed score correction for joint batch mode (1.0 = no correction)
         self.score_correction: float = 1.0
@@ -90,6 +91,11 @@ class SelectionState(ABC):
         # Store for gradient scaling: train_total_tokens / selected_tokens
         self.tokens_per_sample = tokens_per_sample
         self.train_total_tokens = total_train_tokens
+        self.train_total_tokens_tensor = torch.tensor(
+            float(total_train_tokens),
+            device=tokens_per_sample.device,
+            dtype=torch.float32,
+        )
 
         # Precompute score correction for joint batch mode
         val_tokens = batch_total_tokens - total_train_tokens
@@ -125,26 +131,25 @@ class SelectionState(ABC):
         else:
             return topk_selection(scores_scaled, self.num_selected)
 
-    def _compute_scale_factor(self, selected_indices: Tensor) -> float:
+    def _compute_scale_factor(self, selected_indices: Tensor) -> Tensor:
         """
         Compute token-based gradient scale factor for selected samples.
 
         Returns train_total_tokens / selected_tokens to maintain proper gradient magnitude.
         Returns 1.0 if no samples are selected (empty selection case).
         """
-        if self.tokens_per_sample is None:
+        # NOTE(liuxs): return tensor instead of float to avoid D2H memcpy
+        if self.tokens_per_sample is None or self.train_total_tokens_tensor is None:
             raise RuntimeError(
                 "Token counts not set. Call set_token_counts() before selection. "
                 "For SeparateBatch strategies, pass 'labels' in kwargs to execute_training_step()."
             )
         # Handle empty selection to avoid division by zero
         if selected_indices.numel() == 0:
-            return 1.0
+            return torch.tensor(1.0, device=selected_indices.device, dtype=torch.float32)
         selected_tokens = self.tokens_per_sample[selected_indices].sum()
-        # Safety check in case all selected samples have zero tokens
-        if selected_tokens == 0:
-            return 1.0
-        return self.train_total_tokens / selected_tokens
+        scale = self.train_total_tokens_tensor / selected_tokens
+        return torch.where(selected_tokens > 0, scale, torch.ones_like(scale))
 
     @abstractmethod
     def process_layer_gradients(
@@ -290,34 +295,43 @@ class StreamingState(SelectionState):
             (reduced_grad, num_selected) tuple
         """
         # Step 1: Compute scores (gradient alignment)
+        from .backward import _nvtx_push, _nvtx_pop
+        _nvtx_push(f"layer_{layer_idx}/score_dot")
         scores = train_grads @ val_grad
+        _nvtx_pop()
 
         if score_correction != 1.0:
+            _nvtx_push(f"layer_{layer_idx}/score_scale")
             scores = scores * score_correction
+            _nvtx_pop()
 
-        # Track score statistics for debugging (before lr scaling)
-        with torch.no_grad():
-            self._score_stats.append({
-                "mean": scores.mean().item(),
-                "std": scores.std().item() if scores.numel() > 1 else 0.0,
-                "min": scores.min().item(),
-                "max": scores.max().item(),
-                "pos_frac": (scores > 0).float().mean().item(),
-            })
+        # NOTE(liuxs): Score stats disabled to avoid per-layer D2H sync during profiling.
+        # with torch.no_grad():
+        #     self._score_stats.append({
+        #         "mean": scores.mean().item(),
+        #         "std": scores.std().item() if scores.numel() > 1 else 0.0,
+        #         "min": scores.min().item(),
+        #         "max": scores.max().item(),
+        #         "pos_frac": (scores > 0).float().mean().item(),
+        #     })
 
         # Step 2: Compute similarity if second-order
         similarity = None
         if self.use_second_order:
+            _nvtx_push(f"layer_{layer_idx}/score_similarity")
             similarity = train_grads @ train_grads.T
             if score_correction != 1.0:
                 similarity = similarity * (score_correction ** 2)
+            _nvtx_pop()
 
         # Step 3: Select indices
+        _nvtx_push(f"layer_{layer_idx}/select_indices")
         selected_indices = self._select_indices(scores, similarity)
-        # Sort indices for sequential memory access (better cache locality)
-        selected_indices = selected_indices.sort()[0]
+        # NOTE: Sorting disabled to avoid extra syncs in profiling.
+        # selected_indices = selected_indices.sort()[0]
         self._last_selected_indices = selected_indices
         num_selected = selected_indices.shape[0]
+        _nvtx_pop()
 
         # Track selection for this layer
         self._layer_selections.append((layer_idx, num_selected))
@@ -325,13 +339,17 @@ class StreamingState(SelectionState):
         # Step 4: Aggregate selected gradients
         # Note: empty selection (num_selected=0) naturally produces zero gradients
         # since train_grads[empty_indices].sum() = zeros
+        _nvtx_push(f"layer_{layer_idx}/reduce_grad")
         selected_grads = train_grads[selected_indices]
         reduced_grad = selected_grads.sum(dim=0, keepdim=True)
+        _nvtx_pop()
 
         # Step 5: Apply token-based gradient scaling
         # _compute_scale_factor handles empty selection internally (returns 1.0)
+        _nvtx_push(f"layer_{layer_idx}/scale_grad")
         scale_factor = self._compute_scale_factor(selected_indices)
         reduced_grad = reduced_grad * scale_factor
+        _nvtx_pop()
 
         # Track scale factor for debugging
         self._scale_factors.append(scale_factor)
