@@ -8,7 +8,7 @@ VAL_STRATEGY="${VAL_STRATEGY:-merged}"
 SEQ_LENGTH="${SEQ_LENGTH:-512}"
 VAL_SEQ_LENGTH="${VAL_SEQ_LENGTH:-256}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
-VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-2}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-1}"
 ITERATIONS="${ITERATIONS:-10}"
 WARMUP="${WARMUP:-5}"
 
@@ -42,5 +42,5 @@ nsys profile -o "${SCRIPT_DIR}/nsys_report_stream" \
   --val-batch-size "${VAL_BATCH_SIZE}" \
   --iterations "${ITERATIONS}" \
   --warmup "${WARMUP}" \
-  --score-proj-dim 64 \
+  --score-proj-dim 256 \
   "$@"
