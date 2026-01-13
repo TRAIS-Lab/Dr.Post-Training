@@ -44,6 +44,9 @@ dist
 *.nfs*
 *.txt
 *.pickle
+*.pkl
+*.safetensors
+*.parquet
 
 */log
 */data/train

@@ -194,10 +194,15 @@ class StreamingLinearBackward(Function):
         bias: Optional[Tensor],
         capture_val_mode: bool,
         use_stored_val: bool
-    ) -> Tuple[None, None]:
-        """Handle compressed gradient path."""
+    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+        """Handle compressed gradient path.
+
+        When use_meso_optimizer=True: compressed scores + compressed gradient updates
+        When use_meso_optimizer=False: compressed scores + full gradient updates
+        """
         input_aug = augment_input_for_bias(input, bias is not None)
         compressed_grad = compressor.forward((grad_output, input_aug))
+        use_meso = hook_manager.use_meso_optimizer
 
         if capture_val_mode:
             # Val capture: accumulate total compressed gradient (sum, not mean)
@@ -209,11 +214,12 @@ class StreamingLinearBackward(Function):
             return None, None
 
         if state is None:
-            # No selection: sum and store
-            hook_manager._store_compressed_grad(layer_idx, compressed_grad.sum(dim=0, keepdim=True))
+            # No selection: sum and store (only for MeSO optimizer)
+            if use_meso:
+                hook_manager._store_compressed_grad(layer_idx, compressed_grad.sum(dim=0, keepdim=True))
             return None, None
 
-        # Get train/val gradients
+        # Get train/val gradients for score computation
         if use_stored_val:
             train_grads = compressed_grad
             val_grad = hook_manager.val_grad_buffer[layer_idx]
@@ -226,15 +232,55 @@ class StreamingLinearBackward(Function):
             score_correction = state.score_correction
 
         if val_grad is None:
-            hook_manager._store_compressed_grad(layer_idx, compressed_grad.mean(dim=0, keepdim=True))
+            if use_meso:
+                hook_manager._store_compressed_grad(layer_idx, compressed_grad.mean(dim=0, keepdim=True))
             return None, None
 
-        # Per-layer selection and reduction (with score correction for joint batch)
-        reduced_grad, _ = state.process_layer_gradients(
-            train_grads, val_grad, layer_idx, score_correction
-        )
-        hook_manager._store_compressed_grad(layer_idx, reduced_grad)
-        return None, None
+        if use_meso:
+            # MeSO optimizer: compressed scores + compressed gradient updates
+            reduced_grad, _ = state.process_layer_gradients(
+                train_grads, val_grad, layer_idx, score_correction
+            )
+            hook_manager._store_compressed_grad(layer_idx, reduced_grad)
+            return None, None
+        else:
+            # Standard optimizer: compressed scores + full gradient updates
+            # Step 1: Compute scores from compressed gradients
+            scores = train_grads @ val_grad
+            if score_correction != 1.0:
+                scores = scores * score_correction
+
+            # Step 2: Compute similarity if second-order
+            similarity = None
+            if state.use_second_order:
+                similarity = train_grads @ train_grads.T
+                if score_correction != 1.0:
+                    similarity = similarity * (score_correction ** 2)
+
+            # Step 3: Select indices
+            selected_indices = state._select_indices(scores, similarity)
+            selected_indices = selected_indices.sort()[0]
+            state._last_selected_indices = selected_indices
+            state.num_selected = selected_indices.shape[0]
+
+            # Track selection for this layer
+            if hasattr(state, '_layer_selections'):
+                state._layer_selections.append((layer_idx, state.num_selected))
+
+            # Step 4: Compute full gradients for selected samples
+            # Get train portion of full gradients
+            if use_stored_val:
+                train_grad_output, train_input = grad_output, input
+            else:
+                train_grad_output, _ = split_train_val_batch(grad_output, state.train_batch_size)
+                train_input, _ = split_train_val_batch(input, state.train_batch_size)
+
+            scale_factor = _compute_scale_factor(state, selected_indices)
+            grad_weight, grad_bias = compute_selected_gradients(
+                train_grad_output, train_input, selected_indices, bias is not None, scale_factor
+            )
+
+            return grad_weight, grad_bias
 
     @staticmethod
     def _backward_full(

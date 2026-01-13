@@ -347,19 +347,33 @@ def main():
 
     # Create gradient hook only when needed (selection or compression enabled)
     grad_hook = None
+    # Determine if MeSO optimizer is used (explicit compression implies MeSO)
+    use_meso_optimizer = training_args.has_compression
     if training_args.has_selection or training_args.has_compression:
         grad_hook = GradientHook(
             model=model,
             layer_names=layer_names,
             device=device,
         )
-        logger.info(f"Gradient Hook created (selection={training_args.has_selection}, compression={training_args.has_compression})")
+        grad_hook.use_meso_optimizer = use_meso_optimizer
+        logger.info(f"Gradient Hook created (selection={training_args.has_selection}, compression={training_args.has_compression}, use_meso={use_meso_optimizer})")
     else:
         logger.info(f"Training method: {training_args.method} - No gradient hooks needed")
 
-    # Optional: Set up gradient compression
-    if training_args.has_compression:
+    # Set up gradient compression
+    # Two modes:
+    # 1. Explicit compression: MeSO optimizer, compressed updates
+    # 2. Auto score compression: Standard optimizer, compressed scores only
+    needs_compression_setup = training_args.has_compression or (
+        training_args.has_selection and training_args.score_compression_dim > 0
+    )
+
+    if needs_compression_setup:
         logger.info("=== Gradient Compression Setup ===")
+        if training_args.has_compression:
+            logger.info("  Mode: Explicit compression (MeSO optimizer, compressed updates)")
+        else:
+            logger.info("  Mode: Auto score compression (standard optimizer, compressed scores only)")
 
         # Parse sparsification
         if training_args.sparsification is not None:
@@ -376,6 +390,17 @@ def main():
                 "proj_type": method,
             }
             logger.info(f"  Sparsification: {method} -> {sparsification_dim}*{sparsification_dim} dimension")
+        elif training_args.has_selection and training_args.score_compression_dim > 0:
+            # Auto score compression: use LoGra (normal projection) with score_compression_dim
+            sparsification_dim = training_args.score_compression_dim
+            sparsifier_kwargs = {
+                "proj_dim": sparsification_dim,
+                "proj_max_batch_size": training_args.per_device_train_batch_size,
+                "proj_seed": training_args.seed,
+                "device": device,
+                "proj_type": "normal",  # LoGra uses normal (Gaussian) projection
+            }
+            logger.info(f"  Sparsification (auto): normal -> {sparsification_dim}*{sparsification_dim} dimension")
         else:
             sparsifier_kwargs = {
                 "proj_dim": -1,

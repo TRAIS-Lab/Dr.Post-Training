@@ -144,6 +144,16 @@ class TrainingArguments(TA):
             )
         },
     )
+    score_compression_dim: int = field(
+        default=64,
+        metadata={
+            "help": (
+                "Dimension for score-only compression (factorized, so actual dim is score_compression_dim^2). "
+                "Used when data selection is enabled but no explicit compression is specified. "
+                "Set to 0 to disable auto score compression. Default: 64 (i.e., 64*64)"
+            )
+        },
+    )
     use_second_order: bool = field(
         default=False,
         metadata={

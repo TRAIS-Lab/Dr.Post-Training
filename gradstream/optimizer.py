@@ -602,9 +602,15 @@ class MeSOAdamW(Optimizer):
         num_refreshed, old_compressors = self.grad_hook.refresh_compressors(next_step)
 
         if num_refreshed > 0:
-            logger.info(f"Refreshed {num_refreshed} compressors, now transforming optimizer states...")
-            # Transform optimizer states after refresh
-            self._transform_optimizer_states(old_compressors)
+            # Only transform optimizer states when using MeSO optimizer (compressed states)
+            # In hybrid mode (use_meso_optimizer=False), optimizer states are in full space
+            # and don't need transformation
+            if self.grad_hook.use_meso_optimizer:
+                logger.info(f"Refreshed {num_refreshed} compressors, now transforming optimizer states...")
+                # Transform optimizer states after refresh
+                self._transform_optimizer_states(old_compressors)
+            else:
+                logger.info(f"Refreshed {num_refreshed} compressors (hybrid mode: skipping state transformation)")
         else:
             logger.debug(f"No compressor refresh needed at step {next_step}")
 

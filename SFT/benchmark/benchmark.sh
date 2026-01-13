@@ -19,7 +19,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 # Python interpreter (override with PYTHON env var if needed)
-PYTHON="${PYTHON:-$HOME/miniconda3/envs/IF/bin/python}"
+PYTHON="${PYTHON:-$HOME/miniconda3/envs/GradStream/bin/python}"
 
 # Default values
 methods=""
@@ -36,18 +36,27 @@ declare -A METHOD_TO_INTERNAL=(
     ["GREATS-NA-LoRA"]="GREATS_NA_LoRA"
     ["Streaming-LoGra-Full"]="Streaming_LoGra_Full"
     ["GREATS-LoGra-Full"]="GREATS_LoGra_Full"
+    # ScoreComp: Hybrid mode (compressed scores + full gradient updates)
+    ["Streaming-ScoreComp-Full"]="Streaming_ScoreComp_Full"
+    ["GREATS-ScoreComp-Full"]="GREATS_ScoreComp_Full"
 )
 
 # Category mappings (matching train.sh)
 declare -A CATEGORY_METHODS=(
-    ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full,Streaming-ScoreComp-Full,GREATS-ScoreComp-Full"
     ["baseline"]="NA-NA-Full,NA-NA-LoRA"
-    ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
-    ["greats"]="GREATS-NA-Full,GREATS-NA-LoRA,GREATS-LoGra-Full"
-    ["full"]="NA-NA-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full,Streaming-ScoreComp-Full"
+    ["greats"]="GREATS-NA-Full,GREATS-NA-LoRA,GREATS-LoGra-Full,GREATS-ScoreComp-Full"
+    ["full"]="NA-NA-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full,Streaming-ScoreComp-Full,GREATS-ScoreComp-Full"
     ["lora"]="NA-NA-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
     ["compression"]="Streaming-LoGra-Full,GREATS-LoGra-Full"
     ["no-compression"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
+    # ScoreComp: Hybrid mode methods (compressed scores + full gradient updates)
+    ["scorecomp"]="Streaming-ScoreComp-Full,GREATS-ScoreComp-Full"
+    # Compare all three modes for streaming selection
+    ["streaming-compare"]="Streaming-NA-Full,Streaming-LoGra-Full,Streaming-ScoreComp-Full"
+    # Compare all three modes for GREATS selection
+    ["greats-compare"]="GREATS-NA-Full,GREATS-LoGra-Full,GREATS-ScoreComp-Full"
 )
 
 # Collect other arguments to pass to benchmark.py
@@ -81,13 +90,19 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "  Method names:"
             echo "    NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, Streaming-NA-LoRA,"
-            echo "    GREATS-NA-Full, GREATS-NA-LoRA, Streaming-LoGra-Full, GREATS-LoGra-Full"
+            echo "    GREATS-NA-Full, GREATS-NA-LoRA, Streaming-LoGra-Full, GREATS-LoGra-Full,"
+            echo "    Streaming-ScoreComp-Full, GREATS-ScoreComp-Full"
             echo ""
-            echo "  Categories: all, baseline, streaming, greats, full, lora, compression, no-compression"
+            echo "  Categories:"
+            echo "    all, baseline, streaming, greats, full, lora, compression, no-compression"
+            echo "    scorecomp          - Hybrid mode methods (compressed scores + full updates)"
+            echo "    streaming-compare  - Compare NA vs LoGra vs ScoreComp for Streaming"
+            echo "    greats-compare     - Compare NA vs LoGra vs ScoreComp for GREATS"
             echo ""
             echo "  Examples:"
-            echo "    --methods all                              Run all 8 methods"
+            echo "    --methods all                              Run all 10 methods"
             echo "    --methods baseline                         Run NA-NA-Full and NA-NA-LoRA"
+            echo "    --methods streaming-compare                Compare all three Streaming modes"
             echo "    --methods \"NA-NA-Full,Streaming-LoGra-Full\" Run specific methods"
             echo ""
             echo "Benchmark Options (passed to benchmark.py):"

@@ -102,6 +102,7 @@ class BenchmarkConfig:
     # Selection config
     use_second_order: bool = False  # If True, use greedy selection with O(k*n) complexity
     val_strategy: str = 'merged'  # 'separate' or 'merged' - how to handle validation gradients
+    score_compression_dim: int = 64  # Dimension for score-only compression (factorized, so 64*64)
 
     # Reproducibility
     seed: int = 42
@@ -138,6 +139,8 @@ class BenchmarkConfig:
             config.use_second_order = True
         if args.val_strategy is not None:
             config.val_strategy = args.val_strategy
+        if args.score_compression_dim is not None:
+            config.score_compression_dim = args.score_compression_dim
         if args.seed is not None:
             config.seed = args.seed
         return config
@@ -1576,6 +1579,153 @@ def setup_GREATS_LoGra_full_gc(config: BenchmarkConfig):
     return model, optimizer, tokenizer, grad_hook
 
 
+def _setup_score_compression(model, config: BenchmarkConfig):
+    """
+    Helper to set up score-only compression for hybrid mode.
+
+    Hybrid mode: Uses compressed gradients for fast score computation,
+    but standard optimizer with full gradients for model updates.
+
+    This is the new default behavior for Streaming/GREATS methods:
+    - Score computation: Uses LoGra (Gaussian projection) with small dimension (e.g., 64*64)
+    - Model updates: Uses standard AdamW optimizer with full gradients
+
+    Args:
+        model: The model to set up compression for
+        config: Benchmark configuration
+
+    Returns:
+        Tuple of (grad_hook, optimizer, tokenizer)
+    """
+    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    sample_inputs = {k: v.to(config.device) for k, v in
+                     tokenizer('test', return_tensors='pt', max_length=config.seq_length, truncation=True).items()
+                     if k != 'labels'}
+
+    # Score compression uses LoGra (Gaussian projection) with small dimension
+    # This is used only for computing selection scores, not for model updates
+    sparsifier_kwargs = {
+        "proj_dim": config.score_compression_dim,  # Factorized: e.g., 64*64
+        "proj_max_batch_size": 64,
+        "proj_seed": config.seed,
+        "device": str(config.device),
+        "proj_type": "normal",  # LoGra uses Gaussian (normal) projection
+    }
+
+    # No additional projection (identity)
+    projector_kwargs = {
+        "proj_dim": -1,
+        "proj_max_batch_size": 64,
+        "proj_seed": config.seed,
+        "device": str(config.device),
+        "proj_type": "identity",
+    }
+
+    compressors = setup_model_compressors(
+        model=model,
+        layer_names=layer_names,
+        sparsifier_kwargs=sparsifier_kwargs,
+        projector_kwargs=projector_kwargs,
+        sample_inputs=sample_inputs,
+        device=str(config.device),
+        update_freq=200
+    )
+
+    grad_hook = GradientHook(
+        model=model,
+        layer_names=layer_names,
+        device=str(config.device),
+    )
+    grad_hook.set_compressors(compressors)
+
+    # KEY: Set use_meso_optimizer=False for hybrid mode
+    # This tells the backward pass to compute compressed scores but return full gradients
+    grad_hook.use_meso_optimizer = False
+
+    # Use standard AdamW optimizer (not MeSO) for full gradient updates
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+
+    return grad_hook, optimizer, tokenizer
+
+
+def setup_Streaming_ScoreComp_Full(config: BenchmarkConfig):
+    """
+    Streaming-ScoreComp-Full: Per-layer selection with compressed scores + full gradient updates.
+
+    Hybrid mode where:
+    - Score computation uses compressed gradients (fast)
+    - Model updates use full gradients via standard AdamW (accurate)
+
+    This is the recommended mode for production use.
+    """
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_score_compression(model, config)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_Streaming_ScoreComp_Full_gc(config: BenchmarkConfig):
+    """Streaming-ScoreComp-Full with gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_score_compression(model, config)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_GREATS_ScoreComp_Full(config: BenchmarkConfig):
+    """
+    GREATS-ScoreComp-Full: Global selection with compressed scores + full gradient updates.
+
+    Hybrid mode where:
+    - Score computation uses compressed gradients (fast)
+    - Model updates use full gradients via standard AdamW (accurate)
+
+    This is the recommended mode for production use.
+    """
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_score_compression(model, config)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
+def setup_GREATS_ScoreComp_Full_gc(config: BenchmarkConfig):
+    """GREATS-ScoreComp-Full with gradient checkpointing."""
+    model_kwargs = {'dtype': config.get_torch_dtype(), 'device_map': config.device}
+    if config.use_flash_attention:
+        model_kwargs['attn_implementation'] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    model.gradient_checkpointing_enable()
+    model.train()
+
+    grad_hook, optimizer, tokenizer = _setup_score_compression(model, config)
+
+    return model, optimizer, tokenizer, grad_hook
+
+
 def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_meso_optimizer: bool = True, use_gc: bool = False):
     """
     Helper to set up LoRA model with gradient hook for data selection.
@@ -1768,6 +1918,10 @@ STREAMING_METHODS = {
     # Streaming-LoGra: Per-layer selection with MeSO (full fine-tuning only)
     'Streaming_LoGra_Full': (setup_Streaming_LoGra_full, 0.5, True),
     'Streaming_LoGra_Full_gc': (setup_Streaming_LoGra_full_gc, 0.5, True),
+    # Streaming-ScoreComp: Hybrid mode (compressed scores + full gradient updates)
+    # This is the recommended mode: fast score computation with accurate updates
+    'Streaming_ScoreComp_Full': (setup_Streaming_ScoreComp_Full, 0.5, True),
+    'Streaming_ScoreComp_Full_gc': (setup_Streaming_ScoreComp_Full_gc, 0.5, True),
 }
 
 # === GREATS Selection Methods (GREATS-*-*) ===
@@ -1784,6 +1938,10 @@ GREATS_METHODS = {
     # GREATS-LoGra: Global selection with MeSO (full fine-tuning only)
     'GREATS_LoGra_Full': (setup_GREATS_LoGra_full, 0.5, True),
     'GREATS_LoGra_Full_gc': (setup_GREATS_LoGra_full_gc, 0.5, True),
+    # GREATS-ScoreComp: Hybrid mode (compressed scores + full gradient updates)
+    # This is the recommended mode: fast score computation with accurate updates
+    'GREATS_ScoreComp_Full': (setup_GREATS_ScoreComp_Full, 0.5, True),
+    'GREATS_ScoreComp_Full_gc': (setup_GREATS_ScoreComp_Full_gc, 0.5, True),
 }
 
 # === External Baselines ===
@@ -1987,15 +2145,21 @@ def main():
         epilog="""
 Naming Convention: {selection}_{compression}_{training}
   selection:   NA (baseline), Streaming (per-layer), GREATS (global)
-  compression: NA (standard optimizer), LoGra (MeSO optimizer)
+  compression: NA (standard optimizer), LoGra (MeSO optimizer), ScoreComp (hybrid mode)
   training:    full, lora
 
-Note: GraSS compression is also available but LoGra is used in default experiments.
+Compression modes:
+  NA        - No compression, standard optimizer (slow scores, accurate updates)
+  LoGra     - Full compression with MeSO optimizer (fast scores, approximate updates)
+  ScoreComp - Hybrid mode: compressed scores + full gradient updates (fast scores, accurate updates)
+
+Note: ScoreComp is the recommended mode for production use.
 
 Examples:
-  NA_NA_Full           - Baseline full fine-tuning
-  Streaming_LoGra_Full - Per-layer selection with MeSO
-  GREATS_NA_Full       - Global selection with standard optimizer
+  NA_NA_Full              - Baseline full fine-tuning
+  Streaming_LoGra_Full    - Per-layer selection with MeSO (compressed updates)
+  Streaming_ScoreComp_Full- Per-layer selection with hybrid mode (recommended)
+  GREATS_ScoreComp_Full   - Global selection with hybrid mode (recommended)
         """
     )
 
@@ -2036,6 +2200,9 @@ Examples:
                         help='Use second-order interactions for selection (greedy, slower but more accurate)')
     parser.add_argument('--val-strategy', type=str, default=None, choices=['separate', 'merged'],
                         help=f'Validation gradient strategy (default: {defaults.val_strategy})')
+    parser.add_argument('--score-compression-dim', type=int, default=None,
+                        help=f'Dimension for score-only compression in hybrid mode (factorized, so 64 means 64*64). '
+                             f'Used by ScoreComp methods. (default: {defaults.score_compression_dim})')
 
     # Reproducibility (defaults from BenchmarkConfig)
     parser.add_argument('--seed', type=int, default=None,
@@ -2060,10 +2227,13 @@ Examples:
         print("\nAvailable methods:")
         print("Naming convention: {selection}_{compression}_{training}")
         print("  selection: NA (baseline), Streaming (per-layer), GREATS (global)")
-        print("  compression: NA (standard optimizer), LoGra (MeSO optimizer)")
+        print("  compression: NA (standard optimizer), LoGra (MeSO), ScoreComp (hybrid)")
         print("  training: full, lora")
         print("")
-        print("Note: GraSS compression is also available but LoGra is used in default experiments.")
+        print("Compression modes:")
+        print("  NA        - No compression, standard optimizer")
+        print("  LoGra     - Full compression with MeSO optimizer")
+        print("  ScoreComp - Hybrid mode: compressed scores + full gradient updates (recommended)")
         print("")
         print("=" * 80)
         print(f"{'Index':<6} {'Method Name':<30} {'Category':<25} {'Description'}")
@@ -2077,12 +2247,22 @@ Examples:
             idx += 1
         for name in STREAMING_METHODS:
             _, _, has_comp = STREAMING_METHODS[name]
-            desc = "Per-layer selection" + (" + MeSO" if has_comp else " + AdamW")
+            if 'ScoreComp' in name:
+                desc = "Per-layer selection (compressed scores + full updates)"
+            elif has_comp:
+                desc = "Per-layer selection + MeSO"
+            else:
+                desc = "Per-layer selection + AdamW"
             print(f"{idx:<6} {name:<30} {'Streaming':<25} {desc}")
             idx += 1
         for name in GREATS_METHODS:
             _, _, has_comp = GREATS_METHODS[name]
-            desc = "Global selection" + (" + MeSO" if has_comp else " + AdamW")
+            if 'ScoreComp' in name:
+                desc = "Global selection (compressed scores + full updates)"
+            elif has_comp:
+                desc = "Global selection + MeSO"
+            else:
+                desc = "Global selection + AdamW"
             print(f"{idx:<6} {name:<30} {'GREATS':<25} {desc}")
             idx += 1
         for name in EXTERNAL_BASELINES:
@@ -2107,6 +2287,7 @@ Examples:
     print(f"  Timed Iterations: {config.num_iterations}")
     print(f"  Use Second Order: {config.use_second_order}")
     print(f"  Val Strategy: {config.val_strategy}")
+    print(f"  Score Compression Dim: {config.score_compression_dim}")
     print(f"  Seed: {config.seed}")
     print(f"  Methods: {methods}")
     print()

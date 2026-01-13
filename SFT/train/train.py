@@ -207,10 +207,13 @@ def main():
     # Hooks are needed for:
     # 1. Selection method is not NA (Streaming or GREATS)
     # 2. Compression enabled (implies MeSO optimizer)
-    has_compression = (training_args.sparsification is not None or training_args.projection is not None)
-    needs_grad_hook = (
-        training_args.method in ('Streaming', 'GREATS') or has_compression
-    )
+    has_explicit_compression = (training_args.sparsification is not None or training_args.projection is not None)
+    needs_selection = training_args.method in ('Streaming', 'GREATS')
+    needs_grad_hook = needs_selection or has_explicit_compression
+
+    # Determine if MeSO optimizer is used (explicit compression implies MeSO)
+    # When only auto score compression is used (no explicit compression), we use standard optimizer
+    use_meso_optimizer = has_explicit_compression
 
     # Create gradient hook only when needed
     grad_hook = None
@@ -220,24 +223,48 @@ def main():
             layer_names=layer_names,
             device=str(training_args.device),
         )
-        logger.info(f"Gradient Hook created (method={training_args.method}, compression={has_compression})")
+        grad_hook.use_meso_optimizer = use_meso_optimizer
+        logger.info(f"Gradient Hook created (method={training_args.method}, explicit_compression={has_explicit_compression}, use_meso={use_meso_optimizer})")
     else:
         logger.info(f"Training method: {training_args.method} - No gradient hooks needed")
 
-    # Optional: Set up gradient compression
-    if training_args.sparsification is not None or training_args.projection is not None:
+    # Set up gradient compression
+    # Two modes:
+    # 1. Explicit compression (sparsification/projection specified): MeSO optimizer, compressed updates
+    # 2. Auto score compression (selection method enabled, no explicit compression): Standard optimizer, compressed scores only
+    needs_compression_setup = has_explicit_compression or (
+        needs_selection and training_args.score_compression_dim > 0
+    )
+
+    if needs_compression_setup:
         logger.info("=== Gradient Compression Setup ===")
+        if has_explicit_compression:
+            logger.info("  Mode: Explicit compression (MeSO optimizer, compressed updates)")
+        else:
+            logger.info("  Mode: Auto score compression (standard optimizer, compressed scores only)")
 
         # Parse sparsification argument
         if training_args.sparsification is None:
-            sparsifier_kwargs = {
-                "proj_dim": -1,
-                "proj_max_batch_size": 64,
-                "proj_seed": training_args.seed,
-                "device": str(training_args.device),
-                "proj_type": "identity",
-            }
-            logger.info("  Sparsification: Disabled")
+            if needs_selection and training_args.score_compression_dim > 0:
+                # Auto score compression: use LoGra (normal projection) with score_compression_dim
+                sparsification_dim = training_args.score_compression_dim
+                sparsifier_kwargs = {
+                    "proj_dim": sparsification_dim,
+                    "proj_max_batch_size": 64,
+                    "proj_seed": training_args.seed,
+                    "device": str(training_args.device),
+                    "proj_type": "normal",  # LoGra uses normal (Gaussian) projection
+                }
+                logger.info(f"  Sparsification (auto): normal -> {sparsification_dim}*{sparsification_dim} dimension")
+            else:
+                sparsifier_kwargs = {
+                    "proj_dim": -1,
+                    "proj_max_batch_size": 64,
+                    "proj_seed": training_args.seed,
+                    "device": str(training_args.device),
+                    "proj_type": "identity",
+                }
+                logger.info("  Sparsification: Disabled")
         else:
             sparsification_method, sparsification_dim = training_args.sparsification.split("-")
             assert "*" in sparsification_dim, "Sparsification dimension must be factorized (e.g., '64*64')."
@@ -307,7 +334,10 @@ def main():
 
         logger.info("Gradient compression setup completed!")
     else:
-        logger.info("Gradient compression disabled (sparsification and projection both None)")
+        if needs_selection:
+            logger.info("Gradient compression disabled (score_compression_dim=0)")
+        else:
+            logger.info("Gradient compression disabled (no selection method and no explicit compression)")
 
     # Prepare validation dataset (used for data selection in gradient streaming)
     val_dataset = get_dataset(

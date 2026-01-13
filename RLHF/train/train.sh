@@ -86,6 +86,7 @@ lora_target_modules=""  # Empty = PEFT auto-detects (out_proj for GPT-Neo, o_pro
 # Compression settings
 compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer and compressed gradient for data selection.
 update_compressor_freq=200
+score_compression_dim=64  # Auto score compression dimension (default: 64, i.e., 64*64). Set to 0 to disable.
 
 # Multi-method mode
 methods="" # Comma-separated list of methods or categories
@@ -202,6 +203,10 @@ while [[ $# -gt 0 ]]; do
             update_compressor_freq="$2"
             shift 2
             ;;
+        --score_compression_dim)
+            score_compression_dim="$2"
+            shift 2
+            ;;
         --ppo_epochs)
             ppo_epochs="$2"
             shift 2
@@ -307,6 +312,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --lora_target_modules <m>  Target modules (default: auto-detect)"
             echo ""
             echo "  --compression <method>     Compression: LoGra, GraSS (implies MeSO optimizer)"
+            echo "  --score_compression_dim <dim>  Score compression dimension (default: 64, set to 0 to disable)"
             echo "  --use_second_order         Enable second-order selection"
             echo ""
             echo "Shared Options:"
@@ -710,14 +716,19 @@ run_single_method() {
     fi
 
     # Add compression settings
-    if [[ -n "$exp_sparsification" ]]; then
-        training_args="$training_args --sparsification=$exp_sparsification"
+    if [[ -n "$sparsification" ]]; then
+        training_args="$training_args --sparsification=$sparsification"
     fi
-    if [[ -n "$exp_projection" ]]; then
-        training_args="$training_args --projection=$exp_projection"
+    if [[ -n "$projection" ]]; then
+        training_args="$training_args --projection=$projection"
     fi
-    if [[ -n "$exp_sparsification" || -n "$exp_projection" ]]; then
+    if [[ -n "$sparsification" || -n "$projection" ]]; then
         training_args="$training_args --update_compressor_freq=$update_compressor_freq"
+    fi
+
+    # Add score compression dimension for data selection methods without explicit compression
+    if [[ "$exp_data_selection" != "NA" ]] && [[ -z "$exp_compression" ]]; then
+        training_args="$training_args --score_compression_dim=$score_compression_dim"
     fi
 
     # Add second-order flag

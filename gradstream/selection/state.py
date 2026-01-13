@@ -125,12 +125,14 @@ class SelectionState(ABC):
         else:
             return topk_selection(scores_scaled, self.num_selected)
 
-    def _compute_scale_factor(self, selected_indices: Tensor) -> float:
+    def _compute_scale_factor(self, selected_indices: Tensor) -> Tensor:
         """
         Compute token-based gradient scale factor for selected samples.
 
         Returns train_total_tokens / selected_tokens to maintain proper gradient magnitude.
-        Returns 1.0 if no samples are selected (empty selection case).
+        Returns tensor(1.0) if no samples are selected (empty selection case).
+
+        Note: Returns a tensor to avoid device-to-host memory transfer.
         """
         if self.tokens_per_sample is None:
             raise RuntimeError(
@@ -139,12 +141,15 @@ class SelectionState(ABC):
             )
         # Handle empty selection to avoid division by zero
         if selected_indices.numel() == 0:
-            return 1.0
+            return torch.tensor(1.0, device=self.device, dtype=self.dtype)
         selected_tokens = self.tokens_per_sample[selected_indices].sum()
         # Safety check in case all selected samples have zero tokens
-        if selected_tokens == 0:
-            return 1.0
-        return self.train_total_tokens / selected_tokens
+        # Use torch.where to avoid D2H transfer from Python conditional
+        return torch.where(
+            selected_tokens == 0,
+            torch.tensor(1.0, device=self.device, dtype=self.dtype),
+            self.train_total_tokens / selected_tokens
+        )
 
     @abstractmethod
     def process_layer_gradients(
@@ -202,74 +207,6 @@ class StreamingState(SelectionState):
         self._score_stats: list = []  # List of per-layer score stats
         self._scale_factors: list = []  # List of scale factors applied
 
-    def get_selection_stats(self) -> dict:
-        """Get aggregated selection statistics across all layers."""
-        if not self._layer_selections:
-            return {"n_layers": 0, "mean": 0, "min": 0, "max": 0}
-
-        selections = [n for _, n in self._layer_selections]
-
-        # Separate by layer type (even=lora_A, odd=lora_B)
-        lora_a_selections = [n for idx, n in self._layer_selections if idx % 2 == 0]
-        lora_b_selections = [n for idx, n in self._layer_selections if idx % 2 == 1]
-
-        stats = {
-            "n_layers": len(selections),
-            "mean": sum(selections) / len(selections),
-            "min": min(selections),
-            "max": max(selections),
-        }
-
-        if lora_a_selections:
-            stats["lora_a_mean"] = sum(lora_a_selections) / len(lora_a_selections)
-        if lora_b_selections:
-            stats["lora_b_mean"] = sum(lora_b_selections) / len(lora_b_selections)
-
-        return stats
-
-    def reset_layer_stats(self):
-        """Reset per-layer stats for a new mini-batch."""
-        self._layer_selections = []
-        self._score_stats = []
-        self._scale_factors = []
-
-    def get_score_stats(self) -> dict:
-        """
-        Get aggregated score statistics for debugging.
-
-        Returns statistics about gradient alignment scores which can help
-        diagnose training instability:
-        - score_mean: Average alignment score (should be positive for good selection)
-        - score_std: Score variance (high variance = unstable selection)
-        - score_pos_frac: Fraction of positive scores (low = most samples hurt validation)
-        - scale_factor_mean: Average gradient scaling applied
-        - scale_factor_max: Maximum scaling (very high = potential instability)
-        """
-        if not self._score_stats:
-            return {}
-
-        # Aggregate across layers
-        all_means = [s["mean"] for s in self._score_stats]
-        all_stds = [s["std"] for s in self._score_stats]
-        all_pos_fracs = [s["pos_frac"] for s in self._score_stats]
-        all_mins = [s["min"] for s in self._score_stats]
-        all_maxs = [s["max"] for s in self._score_stats]
-
-        stats = {
-            "score_mean": sum(all_means) / len(all_means),
-            "score_std": sum(all_stds) / len(all_stds),
-            "score_pos_frac": sum(all_pos_fracs) / len(all_pos_fracs),
-            "score_min": min(all_mins),
-            "score_max": max(all_maxs),
-        }
-
-        if self._scale_factors:
-            stats["scale_factor_mean"] = sum(self._scale_factors) / len(self._scale_factors)
-            stats["scale_factor_max"] = max(self._scale_factors)
-            stats["scale_factor_min"] = min(self._scale_factors)
-
-        return stats
-
     def process_layer_gradients(
         self,
         train_grads: Tensor,
@@ -294,16 +231,6 @@ class StreamingState(SelectionState):
 
         if score_correction != 1.0:
             scores = scores * score_correction
-
-        # Track score statistics for debugging (before lr scaling)
-        with torch.no_grad():
-            self._score_stats.append({
-                "mean": scores.mean().item(),
-                "std": scores.std().item() if scores.numel() > 1 else 0.0,
-                "min": scores.min().item(),
-                "max": scores.max().item(),
-                "pos_frac": (scores > 0).float().mean().item(),
-            })
 
         # Step 2: Compute similarity if second-order
         similarity = None

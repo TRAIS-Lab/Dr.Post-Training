@@ -72,6 +72,11 @@ class GradientHook:
         self.hooks_registered: bool = False
         self.hooks_enabled: bool = True
 
+        # MeSO optimizer flag: determines gradient update path when compressor is set
+        # - True: compressed scores + compressed gradient updates (store via _store_compressed_grad)
+        # - False: compressed scores + full gradient updates (return grad_weight, grad_bias)
+        self.use_meso_optimizer: bool = False
+
         # Selection state (set by trainer before forward/backward)
         self.selection_state: Optional[SelectionState] = None
 
