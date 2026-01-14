@@ -371,6 +371,9 @@ class GradientHook:
         self.val_total_tokens = None
         self.capture_val_mode = False
 
+    # Alias for backward compatibility
+    clear_val_gradients = clear_val_buffer
+
     def setup_selection_with_stored_val(
         self,
         train_batch_size: int,

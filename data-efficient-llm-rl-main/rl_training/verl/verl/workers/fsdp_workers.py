@@ -355,9 +355,21 @@ class ActorRolloutRefWorker(Worker):
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
-            self.actor = DataParallelPPOActor(config=self.config.actor,
-                                              actor_module=self.actor_module_fsdp,
-                                              actor_optimizer=self.actor_optimizer)
+
+            # Check if online selection is enabled (GREATS or Streaming)
+            selection_method = self.config.actor.get('selection_method', 'NA')
+            if selection_method in ['GREATS', 'Streaming']:
+                from verl.workers.actor import DataParallelPPOActorWithSelection
+                logger.info(f"Using DataParallelPPOActorWithSelection with method={selection_method}")
+                self.actor = DataParallelPPOActorWithSelection(
+                    config=self.config.actor,
+                    actor_module=self.actor_module_fsdp,
+                    actor_optimizer=self.actor_optimizer,
+                )
+            else:
+                self.actor = DataParallelPPOActor(config=self.config.actor,
+                                                  actor_module=self.actor_module_fsdp,
+                                                  actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout()

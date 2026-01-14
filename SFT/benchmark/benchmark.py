@@ -92,8 +92,8 @@ class BenchmarkConfig:
     dataset: str = 'alpaca'
 
     # Benchmark
-    num_warmup: int = 50
-    num_iterations: int = 100
+    num_warmup: int = 10
+    num_iterations: int = 20
 
     # LoRA config
     lora_rank: int = 32
@@ -101,8 +101,10 @@ class BenchmarkConfig:
 
     # Selection config
     use_second_order: bool = False  # If True, use greedy selection with O(k*n) complexity
-    val_strategy: str = 'merged'  # 'separate' or 'merged' - how to handle validation gradients
+    val_strategy: str = 'separate'  # 'separate' or 'merged' - how to handle validation gradients
     score_compression_dim: int = 64  # Dimension for score-only compression (factorized, so 64*64)
+    val_dataset: str = 'samsum'  # Validation dataset for selection. Options: 'samsum', 'gsm8k', 'bbh', etc. If None, uses same as training dataset
+    data_dir: str = 'data'  # Data directory for validation datasets (used when val_dataset is set)
 
     # Reproducibility
     seed: int = 42
@@ -143,6 +145,10 @@ class BenchmarkConfig:
             config.score_compression_dim = args.score_compression_dim
         if args.seed is not None:
             config.seed = args.seed
+        if hasattr(args, 'val_dataset') and args.val_dataset is not None:
+            config.val_dataset = args.val_dataset
+        if hasattr(args, 'data_dir') and args.data_dir is not None:
+            config.data_dir = args.data_dir
         return config
 
 
@@ -388,6 +394,116 @@ class RealDataset(Dataset):
                     elif role == 'system':
                         messages.append({"role": "system", "content": content})
                 return messages if messages else None
+
+            else:
+                return None
+        except Exception:
+            return None
+
+    def __len__(self):
+        return len(self.encoded_examples)
+
+    def __getitem__(self, idx):
+        return self.encoded_examples[idx % len(self.encoded_examples)]
+
+
+class ValidationDataset(Dataset):
+    """
+    Dataset that loads validation data directly from HuggingFace for selection methods.
+    This avoids the need to prepare JSONL files for benchmark usage.
+    """
+
+    # Mapping of dataset names to HuggingFace dataset info
+    DATASET_INFO = {
+        'samsum': {
+            'path': 'knkarthick/samsum',
+            'split': 'validation',
+            'format': 'samsum',
+        },
+        'gsm8k': {
+            'path': 'openai/gsm8k',
+            'name': 'main',
+            'split': 'test',  # GSM8K uses test split for validation
+            'format': 'gsm8k',
+        },
+        'tydiqa': {
+            'path': 'tydiqa',
+            'name': 'secondary_task',
+            'split': 'validation',
+            'format': 'tydiqa',
+        },
+    }
+
+    def __init__(self, dataset_name: str, tokenizer, seq_length: int, size: int = 1000):
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+        self.size = size
+
+        if dataset_name not in self.DATASET_INFO:
+            raise ValueError(f"Unknown validation dataset: {dataset_name}. Available: {list(self.DATASET_INFO.keys())}")
+
+        info = self.DATASET_INFO[dataset_name]
+        print(f"Loading validation dataset: {info['path']} (split: {info['split']})...")
+
+        # Load dataset from HuggingFace
+        if 'name' in info:
+            raw_dataset = load_dataset(info['path'], info['name'], split=info['split'])
+        else:
+            raw_dataset = load_dataset(info['path'], split=info['split'])
+
+        # Convert to messages format and encode
+        self.encoded_examples = []
+        for i, example in enumerate(raw_dataset):
+            if len(self.encoded_examples) >= size:
+                break
+
+            messages = self._convert_to_messages(example, info['format'])
+            if messages is None:
+                continue
+
+            encoded = encode_with_messages_format(
+                {'messages': messages}, tokenizer, seq_length)
+            if encoded is not None:
+                self.encoded_examples.append(encoded)
+
+        print(f"Loaded {len(self.encoded_examples)} validation examples from {dataset_name}")
+
+    def _convert_to_messages(self, example, format_type):
+        """Convert different dataset formats to unified messages format."""
+        try:
+            if format_type == 'samsum':
+                # SamSUM format: dialogue, summary
+                dialogue = example.get('dialogue', '')
+                summary = example.get('summary', '')
+
+                return [
+                    {"role": "user", "content": f"Summarize the following dialogue:\n\n{dialogue}"},
+                    {"role": "assistant", "content": summary}
+                ]
+
+            elif format_type == 'gsm8k':
+                # GSM8K format: question, answer
+                question = example.get('question', '')
+                answer = example.get('answer', '')
+
+                return [
+                    {"role": "user", "content": f"Solve the following math problem step by step.\n\n{question}"},
+                    {"role": "assistant", "content": answer}
+                ]
+
+            elif format_type == 'tydiqa':
+                # TyDiQA format: context, question, answers
+                context = example.get('context', '')
+                question = example.get('question', '')
+                answers = example.get('answers', {})
+                answer_texts = answers.get('text', [])
+                answer = answer_texts[0] if answer_texts else ''
+
+                user_content = f"Answer the question based on the given context.\n\nContext: {context}\n\nQuestion: {question}"
+                return [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": answer}
+                ]
 
             else:
                 return None
@@ -661,7 +777,13 @@ class SelectionStepHelper:
 
     def _create_val_dataloader(self):
         """Create validation dataloader for selection."""
-        if self.config is not None and self.config.dataset != 'dummy':
+        # If val_dataset is specified, load directly from HuggingFace (e.g., samsum)
+        if self.config is not None and self.config.val_dataset is not None:
+            dataset = ValidationDataset(self.config.val_dataset, self.tokenizer, self.seq_length, size=1000)
+            collator = DataCollatorForSeq2Seq(tokenizer=self.tokenizer, padding="longest")
+            return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, collate_fn=collator)
+        # Otherwise, use same dataset as training
+        elif self.config is not None and self.config.dataset != 'dummy':
             dataset = RealDataset(self.config.dataset, self.tokenizer, self.seq_length, size=1000)
             collator = DataCollatorForSeq2Seq(tokenizer=self.tokenizer, padding="longest")
         else:
@@ -746,7 +868,8 @@ def make_step_streaming(selection_helper: SelectionStepHelper, selection_frac: f
             model=model,
             batch_size=train_batch_size,
             compute_loss_fn=compute_train_loss,
-            lr=lr
+            lr=lr,
+            labels=batch['labels']  # Pass labels for token count computation
         )
         optimizer.step()
 
@@ -835,7 +958,8 @@ def make_step_greats(selection_helper: SelectionStepHelper, selection_frac: floa
             batch_size=train_batch_size,
             compute_loss_fn=compute_train_loss,
             lr=lr,
-            filter_batch_fn=filter_batch_fn
+            filter_batch_fn=filter_batch_fn,
+            labels=batch['labels']  # Pass labels for token count computation
         )
         optimizer.step()
 
@@ -2188,6 +2312,9 @@ Examples:
     parser.add_argument('--dataset', type=str, default=None,
                         choices=['dummy', 'alpaca', 'gsm8k', 'dolly', 'openhermes'],
                         help=f'Dataset to use. "dummy" uses synthetic data, others load from HuggingFace (default: {defaults.dataset})')
+    parser.add_argument('--val-dataset', type=str, default=None,
+                        choices=['samsum', 'gsm8k', 'tydiqa'],
+                        help='Validation dataset for selection methods (loaded directly from HuggingFace). If not specified, uses same as training dataset.')
 
     # Benchmark config (defaults from BenchmarkConfig)
     parser.add_argument('--num-warmup', type=int, default=None,
