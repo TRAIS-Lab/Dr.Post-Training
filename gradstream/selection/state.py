@@ -69,6 +69,7 @@ class SelectionState(ABC):
         # Token-based scaling (set via set_token_counts)
         self.tokens_per_sample: Optional[Tensor] = None
         self.train_total_tokens: int = 0
+        self.train_total_tokens_tensor: Optional[Tensor] = None
 
         # Precomputed score correction for joint batch mode (1.0 = no correction)
         self.score_correction: float = 1.0
@@ -90,7 +91,11 @@ class SelectionState(ABC):
         # Store for gradient scaling: train_total_tokens / selected_tokens
         self.tokens_per_sample = tokens_per_sample
         self.train_total_tokens = total_train_tokens
-
+        self.train_total_tokens_tensor = torch.tensor(
+            float(total_train_tokens),
+            device=tokens_per_sample.device,
+            dtype=self.dtype,
+        )
         # Precompute score correction for joint batch mode
         val_tokens = batch_total_tokens - total_train_tokens
         if val_tokens > 0 and total_train_tokens > 0:
@@ -130,11 +135,10 @@ class SelectionState(ABC):
         Compute token-based gradient scale factor for selected samples.
 
         Returns train_total_tokens / selected_tokens to maintain proper gradient magnitude.
-        Returns tensor(1.0) if no samples are selected (empty selection case).
-
-        Note: Returns a tensor to avoid device-to-host memory transfer.
+        Returns 1.0 if no samples are selected (empty selection case).
         """
-        if self.tokens_per_sample is None:
+        # NOTE(liuxs): return tensor instead of float to avoid D2H memcpy
+        if self.tokens_per_sample is None or self.train_total_tokens_tensor is None:
             raise RuntimeError(
                 "Token counts not set. Call set_token_counts() before selection. "
                 "For SeparateBatch strategies, pass 'labels' in kwargs to execute_training_step()."
@@ -143,13 +147,8 @@ class SelectionState(ABC):
         if selected_indices.numel() == 0:
             return torch.tensor(1.0, device=self.device, dtype=self.dtype)
         selected_tokens = self.tokens_per_sample[selected_indices].sum()
-        # Safety check in case all selected samples have zero tokens
-        # Use torch.where to avoid D2H transfer from Python conditional
-        return torch.where(
-            selected_tokens == 0,
-            torch.tensor(1.0, device=self.device, dtype=self.dtype),
-            self.train_total_tokens / selected_tokens
-        )
+        scale = self.train_total_tokens_tensor / selected_tokens
+        return torch.where(selected_tokens == 0, torch.ones_like(scale), scale)
 
     @abstractmethod
     def process_layer_gradients(
