@@ -5,6 +5,11 @@ This module provides three distinct autograd Functions:
 - CompressedLinearBackward: Pure gradient compression (no selection)
 - StreamingLinearBackward: Per-layer selection, single-pass
 - GREATSLinearBackward: Score accumulation, two-pass
+
+Each function routes to specific handlers based on CompressionMode:
+- NONE: Full gradients for scoring and updates
+- SCORE_ONLY: Compressed scoring, full gradient updates
+- FULL: Compressed scoring and gradient updates (MeSO)
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Function
 
+from ..compression_mode import CompressionMode
 from .utils import (
     augment_input_for_bias,
     split_train_val_batch,
@@ -197,54 +203,59 @@ class StreamingLinearBackward(Function):
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
         """Handle compressed gradient path.
 
-        When use_meso_optimizer=True: compressed scores + compressed gradient updates
-        When use_meso_optimizer=False: compressed scores + full gradient updates
+        Routes based on CompressionMode:
+        - FULL (MeSO): compressed scores + compressed gradient updates
+        - SCORE_ONLY: compressed scores + full gradient updates
         """
-        input_aug = augment_input_for_bias(input, bias is not None)
+        has_bias = bias is not None
+        input_aug = augment_input_for_bias(input, has_bias)
         compressed_grad = compressor.forward((grad_output, input_aug))
-        use_meso = hook_manager.use_meso_optimizer
+        compression_mode = hook_manager.compression_mode
 
+        # === Validation Capture Mode ===
         if capture_val_mode:
-            # Val capture: accumulate total compressed gradient (sum, not mean)
+            # Store compressed gradient for validation
+            # Compression is already done, so store directly to the compressed buffer
             total_grad = compressed_grad.sum(dim=0)
-            if hook_manager.val_grad_buffer[layer_idx] is None:
-                hook_manager.val_grad_buffer[layer_idx] = total_grad
+            val_cache = hook_manager.val_cache
+            if val_cache._compressed[layer_idx] is None:
+                val_cache._compressed[layer_idx] = total_grad
             else:
-                hook_manager.val_grad_buffer[layer_idx] += total_grad
+                val_cache._compressed[layer_idx] = val_cache._compressed[layer_idx] + total_grad
             return None, None
 
+        # === No Selection State ===
         if state is None:
-            # No selection: sum and store (only for MeSO optimizer)
-            if use_meso:
+            if compression_mode == CompressionMode.FULL:
                 hook_manager._store_compressed_grad(layer_idx, compressed_grad.sum(dim=0, keepdim=True))
             return None, None
 
-        # Get train/val gradients for score computation
+        # === Get train/val gradients for score computation ===
         if use_stored_val:
             train_grads = compressed_grad
             val_grad = hook_manager.val_grad_buffer[layer_idx]
-            # Cached mode: gradients already correctly scaled
             score_correction = 1.0
         else:
             train_grads, val_grads = split_train_val_batch(compressed_grad, state.train_batch_size)
-            val_grad = val_grads.sum(dim=0)  # Sum, not mean, for token-weighted semantics
-            # Joint batch needs correction: T_total²/(T_train × T_val)
+            val_grad = val_grads.sum(dim=0)
             score_correction = state.score_correction
 
         if val_grad is None:
-            if use_meso:
+            if compression_mode == CompressionMode.FULL:
                 hook_manager._store_compressed_grad(layer_idx, compressed_grad.mean(dim=0, keepdim=True))
             return None, None
 
-        if use_meso:
-            # MeSO optimizer: compressed scores + compressed gradient updates
+        # === Route based on CompressionMode ===
+        if compression_mode == CompressionMode.FULL:
+            # FULL compression (MeSO): compressed scores + compressed gradient updates
             reduced_grad, _ = state.process_layer_gradients(
                 train_grads, val_grad, layer_idx, score_correction
             )
             hook_manager._store_compressed_grad(layer_idx, reduced_grad)
             return None, None
+
         else:
-            # Standard optimizer: compressed scores + full gradient updates
+            # SCORE_ONLY: compressed scores + full gradient updates
             # Step 1: Compute scores from compressed gradients
             scores = train_grads @ val_grad
             if score_correction != 1.0:
@@ -263,12 +274,10 @@ class StreamingLinearBackward(Function):
             state._last_selected_indices = selected_indices
             state.num_selected = selected_indices.shape[0]
 
-            # Track selection for this layer
             if hasattr(state, '_layer_selections'):
                 state._layer_selections.append((layer_idx, state.num_selected))
 
             # Step 4: Compute full gradients for selected samples
-            # Get train portion of full gradients
             if use_stored_val:
                 train_grad_output, train_input = grad_output, input
             else:
@@ -277,7 +286,7 @@ class StreamingLinearBackward(Function):
 
             scale_factor = _compute_scale_factor(state, selected_indices)
             grad_weight, grad_bias = compute_selected_gradients(
-                train_grad_output, train_input, selected_indices, bias is not None, scale_factor
+                train_grad_output, train_input, selected_indices, has_bias, scale_factor
             )
 
             return grad_weight, grad_bias
@@ -296,15 +305,13 @@ class StreamingLinearBackward(Function):
         """Handle full gradient path."""
         if capture_val_mode:
             # Val capture: store gradients for later use
-            if hook_manager.use_factorized_val:
-                hook_manager.val_grad_output_buffer[layer_idx] = grad_output.detach()
-                hook_manager.val_input_buffer[layer_idx] = input.detach()
-            else:
-                val_grad_total = compute_total_gradient(grad_output, input)
-                if hook_manager.val_grad_buffer[layer_idx] is None:
-                    hook_manager.val_grad_buffer[layer_idx] = val_grad_total
-                else:
-                    hook_manager.val_grad_buffer[layer_idx] += val_grad_total
+            # Note: Use val_cache.store_layer() to properly persist data
+            hook_manager.val_cache.store_layer(
+                layer_idx=layer_idx,
+                grad_output=grad_output.detach(),
+                input=input.detach(),
+                compressor=None
+            )
             return None, None
 
         if state is None:

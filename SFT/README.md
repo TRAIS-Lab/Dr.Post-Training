@@ -173,11 +173,19 @@ The unified training script accepts the following arguments:
      - `GREATS` - Global selection (two-pass)
    - `--use_second_order` - Enable greedy selection with second-order interactions (default: disabled)
 3. Compression Arguments
-   - `--compression <method>` - Gradient compression method (implies MeSO optimizer):
-     - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
-     - `GraSS` - Gradient Sparsification with Sketching (available but not used in default methods)
-     - If not specified, uses full gradients and standard AdamW optimizer
+   - `--compression <method>` - Gradient compression method:
+     - `LoGra` - Low-rank Gradient compression (Gaussian projection)
+     - `GraSS` - Gradient Sparsification with Sketching
+     - If not specified, uses full gradients for model updates
+   - `--score_compression_dim <dim>` - Auto score compression dimension (default: `32`, i.e., 32x32). Set to `0` to disable score compression.
    - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
+
+   **Compression Modes** (automatically determined):
+   | Mode | Condition | Scoring | Model Updates | Optimizer |
+   |------|-----------|---------|---------------|-----------|
+   | NONE | No compression args | Full gradients | Full gradients | AdamW |
+   | SCORE_ONLY | `--score_compression_dim > 0` (no explicit compression) | Compressed | Full gradients | AdamW |
+   | FULL | `--compression` specified | Compressed | Compressed | MeSO |
 4. Core Training Arguments
    - `--model <model>` - HuggingFace model path (default: `meta-llama/Llama-3.2-1B`)
    - `--lr <lr>` - Learning rate override (if not specified, looked up from `lr_config.json`; fallback: `5e-05` for full, `2e-04` for LoRA)

@@ -4,6 +4,11 @@ Hook manager with monkey-patching and custom autograd Functions.
 The hook supports two distinct selection methods via the selection module:
 - Streaming: Per-layer selection, single-pass (StreamingLinearBackward)
 - GREATS: Global selection, two-pass (GREATSLinearBackward)
+
+Compression modes (via CompressionMode enum):
+- NONE: No compression, full gradients everywhere
+- SCORE_ONLY: Compressed scoring, full gradient updates
+- FULL: Compressed scoring and gradient updates (MeSO optimizer)
 """
 
 from __future__ import annotations
@@ -19,6 +24,12 @@ import torch.nn.functional as F
 import functools
 import logging
 
+# Compression mode configuration
+from .compression_mode import CompressionMode
+
+# Validation gradient cache
+from .validation_cache import ValidationCache
+
 # Selection module
 from .selection.state import SelectionState, StreamingState, GREATSState
 from .selection.backward import (
@@ -33,6 +44,13 @@ logger = logging.getLogger(__name__)
 class GradientHook:
     """
     Hook manager for custom gradient computation.
+
+    This class manages:
+    1. Monkey-patching Linear layers for custom backward passes
+    2. Compression configuration (via CompressionMode)
+    3. Selection state management (Streaming/GREATS)
+    4. Validation gradient caching (for separate-batch strategies)
+    5. Token count tracking for proper gradient scaling
     """
 
     def __init__(
@@ -61,57 +79,117 @@ class GradientHook:
 
         # Centralized storage arrays
         self.forward_hooks: List[Optional[Any]] = [None] * len(layer_names)
-        # Note: Compressed gradients are now stored directly on weight parameters as
-        # weight._compressed_grad instead of in a separate list. See _store_compressed_grad()
-        # and _get_compressed_grad() for details.
 
-        # Unified compressors
+        # Unified compressors (one per layer)
         self.compressors: List[Optional[Compressor]] = [None] * len(layer_names)
+
+        # Compression mode configuration
+        # This replaces the old use_meso_optimizer flag with a clearer enum
+        self._compression_mode: CompressionMode = CompressionMode.NONE
 
         # Track hook registration status
         self.hooks_registered: bool = False
         self.hooks_enabled: bool = True
 
-        # MeSO optimizer flag: determines gradient update path when compressor is set
-        # - True: compressed scores + compressed gradient updates (store via _store_compressed_grad)
-        # - False: compressed scores + full gradient updates (return grad_weight, grad_bias)
-        self.use_meso_optimizer: bool = False
-
         # Selection state (set by trainer before forward/backward)
         self.selection_state: Optional[SelectionState] = None
 
-        # Validation gradient buffer for separate val/train passes
-        # Two storage modes:
-        # 1. Full gradient mode: store val_grad_total [O, I] per layer
-        # 2. Factorized mode: store val_grad_output [B, S, O] and val_input [B, S, I]
-        #    This enables using _compute_scores_factorized which never materializes [B, O, I]
-        self.val_grad_buffer: List[Optional[Tensor]] = [None] * len(layer_names)
-        self.val_grad_output_buffer: List[Optional[Tensor]] = [None] * len(layer_names)
-        self.val_input_buffer: List[Optional[Tensor]] = [None] * len(layer_names)
-        self.capture_val_mode: bool = False  # True when capturing validation gradients
-        self.use_factorized_val: bool = True  # If True, store factorized components instead of full grad
+        # Validation gradient cache (consolidated from three separate buffers)
+        self._val_cache: ValidationCache = ValidationCache(len(layer_names))
 
         # Token count tracking for proper gradient scaling
-        # The loss is averaged over valid tokens (where labels != -100), not samples.
-        # To properly scale gradients, we need to track:
-        # - total_tokens: total valid tokens in the batch
-        # - tokens_per_sample: valid tokens per sample [batch_size]
         self.total_tokens: Optional[int] = None
         self.tokens_per_sample: Optional[Tensor] = None
-
-        # Validation token count (for cached mode score scaling)
-        # Set during end_val_capture() to enable proper score scaling
-        self.val_total_tokens: Optional[int] = None
 
         # Register hooks
         self._register_hooks()
 
         logger.info(f"Initialized GradientHook with {len(layer_names)} layers")
 
+    # =========================================================================
+    # Compression Mode Configuration
+    # =========================================================================
+
+    @property
+    def compression_mode(self) -> CompressionMode:
+        """Get the current compression mode."""
+        return self._compression_mode
+
+    @compression_mode.setter
+    def compression_mode(self, mode: CompressionMode) -> None:
+        """
+        Set the compression mode.
+
+        Args:
+            mode: CompressionMode enum value
+
+        Raises:
+            ValueError: If FULL mode is set but no compressors are configured
+        """
+        if mode == CompressionMode.FULL:
+            if not any(c is not None for c in self.compressors):
+                raise ValueError(
+                    "Cannot set FULL compression mode without compressors. "
+                    "Call set_compressors() first."
+                )
+        self._compression_mode = mode
+        logger.debug(f"Set compression mode to {mode.value}")
+
+    @property
+    def use_meso_optimizer(self) -> bool:
+        """
+        Check if MeSO optimizer mode is enabled.
+
+        This is True when compression_mode is FULL, meaning compressed
+        gradients are used for model updates (not just scoring).
+
+        Maintained for backward compatibility.
+        """
+        return self._compression_mode == CompressionMode.FULL
+
+    @use_meso_optimizer.setter
+    def use_meso_optimizer(self, value: bool) -> None:
+        """
+        Set MeSO optimizer mode.
+
+        Maintained for backward compatibility. Prefer setting compression_mode directly.
+        """
+        if value:
+            self._compression_mode = CompressionMode.FULL
+        elif self._compression_mode == CompressionMode.FULL:
+            # Downgrade to SCORE_ONLY if compressors exist, else NONE
+            if any(c is not None for c in self.compressors):
+                self._compression_mode = CompressionMode.SCORE_ONLY
+            else:
+                self._compression_mode = CompressionMode.NONE
+
+    def configure_compression(
+        self,
+        has_compressor: bool,
+        use_meso_optimizer: bool = False
+    ) -> None:
+        """
+        Configure compression mode from flags.
+
+        This is a convenience method for configuring compression from
+        legacy flag-based configuration.
+
+        Args:
+            has_compressor: Whether compressors are configured
+            use_meso_optimizer: Whether to use compressed gradient updates
+        """
+        self._compression_mode = CompressionMode.from_config(
+            has_compressor=has_compressor,
+            use_meso_optimizer=use_meso_optimizer
+        )
+        logger.info(f"Configured compression mode: {self._compression_mode.value}")
+
+    # =========================================================================
+    # Hook Registration
+    # =========================================================================
+
     def _register_hooks(self):
-        """
-        Monkey-patch Linear layers to use our custom Function.
-        """
+        """Monkey-patch Linear layers to use our custom Function."""
         if self.hooks_registered:
             logger.warning("Hooks already registered, skipping")
             return
@@ -144,57 +222,61 @@ class GradientHook:
 
     def _custom_linear_forward(self, module: nn.Linear, idx: int, input: Tensor) -> Tensor:
         """
-        Replacement forward method that uses our custom streaming Function.
+        Replacement forward method that uses our custom autograd Function.
 
-        Routes to appropriate autograd function based on selection state type:
-        - GREATSState -> GREATSLinearBackward (score accumulation only)
-        - StreamingState -> StreamingLinearBackward (per-layer selection)
-        - capture_val_mode -> StreamingLinearBackward (captures val gradients)
-        - None -> original forward (no interception needed)
+        Routing logic:
+        1. If hooks disabled -> call original forward method
+        2. If GREATS state -> GREATSLinearBackward (score accumulation)
+        3. If Streaming state -> StreamingLinearBackward (per-layer selection)
+        4. If capture_val_mode -> StreamingLinearBackward (val gradient capture)
+        5. If compressor present -> CompressedLinearBackward (compression only)
+        6. Otherwise -> call original forward method
         """
         if not self.hooks_enabled:
-            return F.linear(input, module.weight, module.bias)
+            # Use original forward method to preserve any layer-specific behavior
+            # This is important for LoRA layers where we hook lora_A/lora_B Linear modules
+            return module._original_forward(input)
 
         # Route based on selection state type
         state = self.selection_state
 
         if isinstance(state, GREATSState):
-            # GREATS: score accumulation across layers
             return GREATSLinearBackward.apply(
                 input, module.weight, module.bias, self, idx
             )
         elif isinstance(state, StreamingState):
-            # Streaming: per-layer selection
             return StreamingLinearBackward.apply(
                 input, module.weight, module.bias, self, idx
             )
         elif self.capture_val_mode:
-            # Val capture mode: use StreamingLinearBackward to capture gradients
-            # (even without selection state, it handles capture_val_mode)
+            # Val capture mode: use StreamingLinearBackward
             return StreamingLinearBackward.apply(
                 input, module.weight, module.bias, self, idx
             )
         elif self.compressors[idx] is not None:
-            # Compression only (no data selection):
-            # Use dedicated CompressedLinearBackward for clean separation
+            # Compression only (no data selection)
             return CompressedLinearBackward.apply(
                 input, module.weight, module.bias, self, idx
             )
         else:
-            # No selection state and no compression: use standard PyTorch forward
-            return F.linear(input, module.weight, module.bias)
+            # No selection and no compression: use original forward
+            return module._original_forward(input)
 
     def set_compressors(self, compressors: List[Compressor]) -> None:
         """Set unified compressor objects for each layer."""
         self.compressors = compressors
 
     def enable_hooks(self) -> None:
-        """Enable hooks to compute compressed gradients."""
+        """Enable hooks to compute custom gradients."""
         self.hooks_enabled = True
 
     def disable_hooks(self) -> None:
         """Disable hooks to allow standard gradient computation."""
         self.hooks_enabled = False
+
+    # =========================================================================
+    # Selection State Management
+    # =========================================================================
 
     def setup_selection(
         self,
@@ -207,39 +289,26 @@ class GradientHook:
         selection_mode: str = "topk"
     ) -> None:
         """
-        Set up streaming state for on-the-fly gradient streaming.
-
-        This should be called by the trainer before each forward/backward pass
-        that requires gradient streaming with data selection.
+        Set up selection state for gradient streaming.
 
         Args:
             train_batch_size: Number of training samples
-            selection_method: Selection method (Streaming, Regular, GREATS)
-            frac: Fraction parameter. Meaning depends on selection_mode:
-                  - "topk": Fraction of samples to select (top frac by score)
-                  - "filtering": Fraction of negative-influence samples to DROP
+            selection_method: Selection method ("Streaming", "GREATS", or "Regular")
+            frac: Selection fraction (topk) or filter fraction (filtering)
             lr: Learning rate for score scaling
-            compute_scores_only: If True, only compute scores without aggregating gradients.
-                                Used for GREATS first pass (score accumulation).
-            use_second_order: If True, compute similarity matrix and use greedy selection
-                            with second-order interactions. If False (default), use simple
-                            top-k selection which is ~200x faster.
-            selection_mode: How to select samples based on scores:
-                           - "topk": Select top frac samples by score (SFT style)
-                           - "filtering": Keep all positive + drop bottom frac of negative (RLHF style)
+            compute_scores_only: If True, only compute scores (GREATS pass 1)
+            use_second_order: If True, use greedy selection with similarity matrix
+            selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
         """
-        # Regular mode: no selection, use baseline
         if selection_method == "Regular":
             self.selection_state = None
             logger.debug("Set up baseline mode (no selection)")
             return
 
-        # Infer dtype from model parameters
         dtype = next(self.model.parameters()).dtype
         num_layers = len(self.layer_names)
 
         if selection_method == "GREATS":
-            # GREATS: score accumulation across layers
             self.selection_state = GREATSState(
                 train_batch_size=train_batch_size,
                 num_layers=num_layers,
@@ -251,7 +320,6 @@ class GradientHook:
                 selection_mode=selection_mode
             )
         elif selection_method == "Streaming":
-            # Streaming: per-layer selection
             self.selection_state = StreamingState(
                 train_batch_size=train_batch_size,
                 num_layers=num_layers,
@@ -263,113 +331,176 @@ class GradientHook:
                 selection_mode=selection_mode
             )
         else:
-            raise ValueError(f"Unknown selection_method: {selection_method}. Use 'Streaming', 'GREATS', or 'Regular'.")
+            raise ValueError(
+                f"Unknown selection_method: {selection_method}. "
+                f"Use 'Streaming', 'GREATS', or 'Regular'."
+            )
 
-        logger.debug(f"Set up {selection_method} state: {train_batch_size} train, scores_only={compute_scores_only}, use_second_order={use_second_order}, selection_mode={selection_mode}, frac={frac}, dtype={dtype}")
+        logger.debug(
+            f"Set up {selection_method} state: {train_batch_size} train, "
+            f"scores_only={compute_scores_only}, use_second_order={use_second_order}, "
+            f"selection_mode={selection_mode}, frac={frac}"
+        )
 
     def clear_selection(self) -> None:
         """Clear selection state after forward/backward."""
         self.selection_state = None
 
+    # =========================================================================
+    # Token Count Tracking
+    # =========================================================================
+
     def set_token_counts(self, labels: Tensor, train_batch_size: Optional[int] = None) -> None:
         """
         Set token counts for proper gradient scaling.
 
-        The loss is averaged over valid tokens (where labels != -100), not samples.
-        This method computes and stores the token counts needed for proper scaling.
-
         Args:
             labels: Label tensor [batch_size, seq_length] with -100 for ignored positions
             train_batch_size: If provided, only count tokens for first train_batch_size samples
-                            (for SFT mode where batch is merged train+val)
         """
-        # Count valid tokens per sample
-        valid_mask = (labels != -100)  # [batch_size, seq_length]
-        tokens_per_sample = valid_mask.sum(dim=1)  # [batch_size]
+        valid_mask = (labels != -100)
+        tokens_per_sample = valid_mask.sum(dim=1)
 
-        # Total tokens in the batch (used for gradient scaling)
         self.total_tokens = tokens_per_sample.sum().item()
         self.tokens_per_sample = tokens_per_sample
 
-        # If train_batch_size is provided, set token counts for gradient scaling and score correction
         if train_batch_size is not None and self.selection_state is not None:
             train_tokens = tokens_per_sample[:train_batch_size]
             total_train_tokens = train_tokens.sum().item()
             self.selection_state.set_token_counts(train_tokens, total_train_tokens, self.total_tokens)
 
-        logger.debug(f"Set token counts: total={self.total_tokens}, per_sample={tokens_per_sample.tolist()}")
+        logger.debug(f"Set token counts: total={self.total_tokens}")
 
     def clear_token_counts(self) -> None:
         """Clear token counts after forward/backward."""
         self.total_tokens = None
         self.tokens_per_sample = None
 
-    # ========================================
-    # Methods for separate val/train passes
-    # ========================================
+    # =========================================================================
+    # Validation Gradient Management
+    # =========================================================================
+
+    @property
+    def val_cache(self) -> ValidationCache:
+        """Get the validation gradient cache."""
+        return self._val_cache
+
+    @property
+    def capture_val_mode(self) -> bool:
+        """Check if in validation gradient capture mode."""
+        return self._val_cache.capturing
+
+    @property
+    def use_factorized_val(self) -> bool:
+        """Check if using factorized validation gradient storage."""
+        return self._val_cache.is_factorized
+
+    @property
+    def val_total_tokens(self) -> Optional[int]:
+        """Get total tokens in validation batch."""
+        return self._val_cache.total_tokens
+
+    # Backward compatibility: expose buffers as properties
+    @property
+    def val_grad_buffer(self) -> List[Optional[Tensor]]:
+        """Get full validation gradient buffer (backward compatibility)."""
+        return self._val_cache._full
+
+    @val_grad_buffer.setter
+    def val_grad_buffer(self, value: List[Optional[Tensor]]) -> None:
+        """Set full validation gradient buffer (backward compatibility)."""
+        self._val_cache._full = value
+
+    @property
+    def val_grad_output_buffer(self) -> List[Optional[Tensor]]:
+        """Get factorized grad_output buffer (backward compatibility)."""
+        return [
+            data[0] if data is not None else None
+            for data in self._val_cache._factorized
+        ]
+
+    @val_grad_output_buffer.setter
+    def val_grad_output_buffer(self, value: List[Optional[Tensor]]) -> None:
+        """Set factorized grad_output buffer (backward compatibility)."""
+        for idx, val in enumerate(value):
+            if val is not None:
+                existing = self._val_cache._factorized[idx]
+                if existing is not None:
+                    self._val_cache._factorized[idx] = (val, existing[1])
+                else:
+                    self._val_cache._factorized[idx] = (val, None)
+            else:
+                if self._val_cache._factorized[idx] is not None:
+                    _, inp = self._val_cache._factorized[idx]
+                    if inp is not None:
+                        self._val_cache._factorized[idx] = (None, inp)
+                    else:
+                        self._val_cache._factorized[idx] = None
+
+    @property
+    def val_input_buffer(self) -> List[Optional[Tensor]]:
+        """Get factorized input buffer (backward compatibility)."""
+        return [
+            data[1] if data is not None else None
+            for data in self._val_cache._factorized
+        ]
+
+    @val_input_buffer.setter
+    def val_input_buffer(self, value: List[Optional[Tensor]]) -> None:
+        """Set factorized input buffer (backward compatibility)."""
+        for idx, val in enumerate(value):
+            if val is not None:
+                existing = self._val_cache._factorized[idx]
+                if existing is not None:
+                    self._val_cache._factorized[idx] = (existing[0], val)
+                else:
+                    self._val_cache._factorized[idx] = (None, val)
+            else:
+                if self._val_cache._factorized[idx] is not None:
+                    go, _ = self._val_cache._factorized[idx]
+                    if go is not None:
+                        self._val_cache._factorized[idx] = (go, None)
+                    else:
+                        self._val_cache._factorized[idx] = None
 
     def start_val_capture(self, use_factorized: bool = True) -> None:
         """
         Start capturing validation gradients.
 
         Args:
-            use_factorized: If True (default), store factorized components
-                           (val_grad_output [V, S, O] and val_input [V, S, I]).
+            use_factorized: If True, store (grad_output, input) components.
                            If False, store total gradient [O, I] per layer.
-
-        Mode selection guidelines:
-        - use_factorized=True (default): Better when validation batch is small.
-          Stores more per validation sample but enables efficient score computation
-          during training without materializing [B_train, O, I] per-sample gradients.
-        - use_factorized=False: Better when validation batch is large (e.g., when
-          using the full training batch as self-reference validation). Stores only
-          the total gradient [O, I] per layer, significantly reducing memory for
-          large validation batches.
         """
-        self.capture_val_mode = True
-        self.use_factorized_val = use_factorized
-        # Clear all buffers for fresh capture
-        self.val_grad_buffer = [None] * len(self.layer_names)
-        self.val_grad_output_buffer = [None] * len(self.layer_names)
-        self.val_input_buffer = [None] * len(self.layer_names)
-        logger.debug(f"Started validation gradient capture mode (factorized={use_factorized})")
+        mode = "factorized" if use_factorized else "full"
+
+        # Check if compression is enabled - use compressed storage
+        if self._compression_mode.uses_compression:
+            mode = "compressed"
+
+        self._val_cache.start_capture(mode=mode)
+        logger.debug(f"Started validation gradient capture mode (mode={mode})")
 
     def end_val_capture(self, val_total_tokens: Optional[int] = None) -> None:
         """
         End validation gradient capture mode.
 
-        After calling this, the validation gradients are stored and ready for
-        use in selection. In factorized mode, val_grad_output_buffer and
-        val_input_buffer contain the raw components. In legacy mode,
-        val_grad_buffer contains the total gradient [O, I] per layer.
-
         Args:
-            val_total_tokens: Total valid tokens in validation batch. If not provided,
-                uses self.total_tokens if set (from set_token_counts called during val).
-                This is used for score scaling in cached mode.
+            val_total_tokens: Total valid tokens in validation batch.
         """
-        self.capture_val_mode = False
+        if val_total_tokens is None:
+            val_total_tokens = self.total_tokens
 
-        # Store validation token count for score scaling
-        if val_total_tokens is not None:
-            self.val_total_tokens = val_total_tokens
-        elif self.total_tokens is not None:
-            self.val_total_tokens = self.total_tokens
+        self._val_cache.end_capture(total_tokens=val_total_tokens)
 
-        if self.use_factorized_val:
-            num_captured = sum(1 for g in self.val_grad_output_buffer if g is not None)
-            logger.debug(f"Ended validation gradient capture (factorized), captured {num_captured} layers, val_tokens={self.val_total_tokens}")
-        else:
-            num_captured = sum(1 for g in self.val_grad_buffer if g is not None)
-            logger.debug(f"Ended validation gradient capture (full), captured {num_captured} layers, val_tokens={self.val_total_tokens}")
+        num_captured = self._val_cache.get_num_captured()
+        logger.debug(
+            f"Ended validation gradient capture, captured {num_captured} layers, "
+            f"val_tokens={self._val_cache.total_tokens}"
+        )
 
     def clear_val_buffer(self) -> None:
         """Clear all validation gradient buffers."""
-        self.val_grad_buffer = [None] * len(self.layer_names)
-        self.val_grad_output_buffer = [None] * len(self.layer_names)
-        self.val_input_buffer = [None] * len(self.layer_names)
-        self.val_total_tokens = None
-        self.capture_val_mode = False
+        self._val_cache.clear()
 
     # Alias for backward compatibility
     clear_val_gradients = clear_val_buffer
@@ -387,38 +518,26 @@ class GradientHook:
         """
         Set up selection state using pre-captured validation gradients.
 
-        Uses stored validation gradients instead of expecting merged batches.
-        The backward pass will only process training samples and compute scores
-        against stored validation gradients.
-
         Args:
             train_batch_size: Number of training samples
-            selection_method: Selection method (Streaming, GREATS)
-            frac: Fraction parameter. Meaning depends on selection_mode:
-                  - "topk": Fraction of samples to select (top frac by score)
-                  - "filtering": Fraction of negative-influence samples to DROP
+            selection_method: Selection method ("Streaming" or "GREATS")
+            frac: Selection/filter fraction
             lr: Learning rate for score scaling
-            compute_scores_only: If True, only compute scores (for GREATS first pass)
-            use_second_order: If True, use greedy selection with second-order
-            selection_mode: How to select samples based on scores:
-                           - "topk": Select top frac samples by score
-                           - "filtering": Keep all positive + drop bottom frac of negative
+            compute_scores_only: If True, only compute scores (GREATS pass 1)
+            use_second_order: If True, use greedy selection
+            selection_mode: "topk" or "filtering"
         """
-        # Verify we have captured validation gradients (either factorized or full)
-        num_factorized = sum(1 for g in self.val_grad_output_buffer if g is not None)
-        num_full = sum(1 for g in self.val_grad_buffer if g is not None)
-        if num_factorized == 0 and num_full == 0:
+        num_captured = self._val_cache.get_num_captured()
+        if num_captured == 0:
             raise RuntimeError(
                 "No validation gradients captured. Call start_val_capture(), "
                 "run forward/backward on validation data, then end_val_capture() first."
             )
 
-        # Infer dtype from model parameters
         dtype = next(self.model.parameters()).dtype
         num_layers = len(self.layer_names)
 
         if selection_method == "GREATS":
-            # GREATS: score accumulation across layers
             self.selection_state = GREATSState(
                 train_batch_size=train_batch_size,
                 num_layers=num_layers,
@@ -430,7 +549,6 @@ class GradientHook:
                 selection_mode=selection_mode
             )
         elif selection_method == "Streaming":
-            # Streaming: per-layer selection
             self.selection_state = StreamingState(
                 train_batch_size=train_batch_size,
                 num_layers=num_layers,
@@ -442,16 +560,22 @@ class GradientHook:
                 selection_mode=selection_mode
             )
         else:
-            raise ValueError(f"Unknown selection_method: {selection_method}. Use 'Streaming' or 'GREATS'.")
+            raise ValueError(
+                f"Unknown selection_method: {selection_method}. "
+                f"Use 'Streaming' or 'GREATS'."
+            )
 
-        # Mark that we're using stored validation gradients (train_batch_size = actual batch size)
+        # Mark that we're using stored validation gradients
         self.selection_state._use_stored_val = True
-        num_captured = num_factorized if num_factorized > 0 else num_full
+
         logger.debug(
             f"Set up selection with stored val gradients: {train_batch_size} train samples, "
-            f"{num_captured} layers with val gradients (factorized={num_factorized > 0}), "
-            f"selection_mode={selection_mode}, frac={frac}"
+            f"{num_captured} layers with val gradients, selection_mode={selection_mode}, frac={frac}"
         )
+
+    # =========================================================================
+    # Compressed Gradient Storage (for MeSO optimizer)
+    # =========================================================================
 
     def _get_layer_name_from_idx(self, layer_idx: int) -> str:
         """Get layer name from layer index."""
@@ -463,35 +587,17 @@ class GradientHook:
         return self.layer_name_to_module[layer_name]
 
     def _store_compressed_grad(self, layer_idx: int, compressed_grad: Tensor) -> None:
-        """
-        Store compressed gradient on the weight parameter.
-
-        Stored on weight (not bias) because compressed grad is one tensor per layer.
-        Gradient norm should be computed in compressed space using _compressed_grad directly.
-        """
+        """Store compressed gradient on the weight parameter."""
         module = self._get_module_from_idx(layer_idx)
         module.weight._compressed_grad = compressed_grad
 
     def _get_compressed_grad(self, layer_idx: int) -> Optional[Tensor]:
-        """
-        Get compressed gradient from the weight parameter of the layer.
-
-        Args:
-            layer_idx: Index of the layer
-
-        Returns:
-            Compressed gradient tensor or None if not set
-        """
+        """Get compressed gradient from the weight parameter."""
         module = self._get_module_from_idx(layer_idx)
         return getattr(module.weight, '_compressed_grad', None)
 
     def _clear_compressed_grad(self, layer_idx: int) -> None:
-        """
-        Clear compressed gradient from the weight parameter of the layer.
-
-        Args:
-            layer_idx: Index of the layer
-        """
+        """Clear compressed gradient from the weight parameter."""
         module = self._get_module_from_idx(layer_idx)
         if hasattr(module.weight, '_compressed_grad'):
             module.weight._compressed_grad = None
@@ -502,13 +608,12 @@ class GradientHook:
             self._clear_compressed_grad(layer_idx)
 
     def get_compressed_grads(self) -> List[Optional[Tensor]]:
-        """
-        Get all captured compressed gradients.
-
-        Returns a list for backward compatibility, but the gradients are actually
-        stored on weight._compressed_grad attributes.
-        """
+        """Get all captured compressed gradients."""
         return [self._get_compressed_grad(idx) for idx in range(len(self.layer_names))]
+
+    # =========================================================================
+    # Compressor Management
+    # =========================================================================
 
     def refresh_compressors(self, step: int) -> Tuple[int, List[Optional[Any]]]:
         """

@@ -1,6 +1,7 @@
 import json
+import logging
 import os
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -8,8 +9,35 @@ from datasets import Dataset
 from torch.utils.data import DataLoader
 from transformers import DataCollatorForSeq2Seq, PreTrainedTokenizerBase
 
+logger = logging.getLogger(__name__)
+
 # llama-chat model's instruction format
 B_INST, E_INST = "[INST]", "[/INST]"
+
+# Default multiplier for max sequence length threshold (relative to avg train seq length)
+DEFAULT_SEQ_LENGTH_MULTIPLIER = 1.2
+
+
+def estimate_token_length(
+        tokenizer: PreTrainedTokenizerBase,
+        query: str,
+        completion: str,
+    ) -> int:
+    """
+    Estimate the token length of a query-completion pair without truncation.
+
+    Args:
+        tokenizer: The tokenizer to use.
+        query: The query/prompt string.
+        completion: The completion/answer string.
+
+    Returns:
+        The number of tokens in the full sequence.
+    """
+    full_prompt = query + completion
+    # Use encode without truncation to get the true length
+    tokens = tokenizer.encode(full_prompt, add_special_tokens=True)
+    return len(tokens)
 
 
 def tokenize(
@@ -109,6 +137,7 @@ def get_bbh_dataset(
         validation: bool = False,
         k: int = 5,
         subject: str = None,
+        max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
     """
@@ -123,15 +152,23 @@ def get_bbh_dataset(
         validation: If True, load validation split; otherwise load test split.
         k: Number of examples to load.
         subject: Optional BBH task name to filter by (e.g., "boolean_expressions").
+        max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
         Dataset: The BBH dataset containing input_ids, attention_mask, and labels.
     """
-    examples = load_unified_jsonl(data_dir, "bbh", validation, k, subject)
+    # Load more examples than needed if rejection sampling is enabled
+    load_k = k * 3 if max_seq_length_threshold is not None else k
+    examples = load_unified_jsonl(data_dir, "bbh", validation, load_k, subject)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+    rejected_count = 0
+    accepted_count = 0
 
     for i, example in enumerate(examples):
+        if accepted_count >= k:
+            break
+
         messages = example.get('messages', [])
         if len(messages) < 2:
             continue
@@ -150,14 +187,25 @@ def get_bbh_dataset(
 
         answer = assistant_content + tokenizer.eos_token
 
+        # Rejection sampling based on sequence length
+        if max_seq_length_threshold is not None:
+            token_length = estimate_token_length(tokenizer, prompt, answer)
+            if token_length > max_seq_length_threshold:
+                rejected_count += 1
+                continue
+
         full_input_ids, labels, attention_mask = tokenize(
             tokenizer, prompt, answer, max_length,
-            print_ex=True if i == 0 else False
+            print_ex=True if accepted_count == 0 else False
         )
 
         dataset["input_ids"].append(full_input_ids)
         dataset["labels"].append(labels)
         dataset["attention_mask"].append(attention_mask)
+        accepted_count += 1
+
+    if rejected_count > 0:
+        logger.info(f"BBH: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
 
     dataset = Dataset.from_dict(dataset)
     return dataset
@@ -171,6 +219,7 @@ def get_tydiqa_dataset(
         chat_format: str = "tulu",
         validation: bool = False,
         k: int = 5,
+        max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
     """
@@ -184,15 +233,23 @@ def get_tydiqa_dataset(
         chat_format: The chat format to use.
         validation: If True, load validation split; otherwise load test split.
         k: Number of examples to load.
+        max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
         Dataset: The TyDiQA dataset containing input_ids, attention_mask, and labels.
     """
-    examples = load_unified_jsonl(data_dir, "tydiqa", validation, k)
+    # Load more examples than needed if rejection sampling is enabled
+    load_k = k * 3 if max_seq_length_threshold is not None else k
+    examples = load_unified_jsonl(data_dir, "tydiqa", validation, load_k)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+    rejected_count = 0
+    accepted_count = 0
 
     for i, example in enumerate(examples):
+        if accepted_count >= k:
+            break
+
         messages = example.get('messages', [])
         if len(messages) < 2:
             continue
@@ -211,14 +268,25 @@ def get_tydiqa_dataset(
 
         answer = assistant_content + tokenizer.eos_token
 
+        # Rejection sampling based on sequence length
+        if max_seq_length_threshold is not None:
+            token_length = estimate_token_length(tokenizer, prompt, answer)
+            if token_length > max_seq_length_threshold:
+                rejected_count += 1
+                continue
+
         full_input_ids, labels, attention_mask = tokenize(
             tokenizer, prompt, answer, max_length,
-            print_ex=True if i == 0 else False
+            print_ex=True if accepted_count == 0 else False
         )
 
         dataset["input_ids"].append(full_input_ids)
         dataset["labels"].append(labels)
         dataset["attention_mask"].append(attention_mask)
+        accepted_count += 1
+
+    if rejected_count > 0:
+        logger.info(f"TyDiQA: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
 
     dataset = Dataset.from_dict(dataset)
     return dataset
@@ -230,6 +298,7 @@ def get_gsm8k_dataset(
         max_length: int,
         validation: bool = False,
         k: int = 5,
+        max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
     """
@@ -241,15 +310,23 @@ def get_gsm8k_dataset(
         max_length: The maximum length of the input sequence.
         validation: If True, load validation split; otherwise load test split.
         k: Number of examples to use.
+        max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
         Dataset: The GSM8K dataset containing input_ids, attention_mask, and labels.
     """
-    examples = load_unified_jsonl(data_dir, "gsm8k", validation, k)
+    # Load more examples than needed if rejection sampling is enabled
+    load_k = k * 3 if max_seq_length_threshold is not None else k
+    examples = load_unified_jsonl(data_dir, "gsm8k", validation, load_k)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+    rejected_count = 0
+    accepted_count = 0
 
     for i, example in enumerate(examples):
+        if accepted_count >= k:
+            break
+
         messages = example.get('messages', [])
         if len(messages) < 2:
             continue
@@ -260,14 +337,25 @@ def get_gsm8k_dataset(
         prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
         answer = assistant_content + tokenizer.eos_token
 
+        # Rejection sampling based on sequence length
+        if max_seq_length_threshold is not None:
+            token_length = estimate_token_length(tokenizer, prompt, answer)
+            if token_length > max_seq_length_threshold:
+                rejected_count += 1
+                continue
+
         full_input_ids, labels, attention_mask = tokenize(
             tokenizer, prompt, answer, max_length,
-            print_ex=True if i == 0 else False
+            print_ex=True if accepted_count == 0 else False
         )
 
         dataset["input_ids"].append(full_input_ids)
         dataset["labels"].append(labels)
         dataset["attention_mask"].append(attention_mask)
+        accepted_count += 1
+
+    if rejected_count > 0:
+        logger.info(f"GSM8K: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
 
     dataset = Dataset.from_dict(dataset)
     return dataset
@@ -279,6 +367,7 @@ def get_math500_dataset(
         max_length: int,
         validation: bool = False,
         k: int = 5,
+        max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
     """
@@ -290,15 +379,23 @@ def get_math500_dataset(
         max_length: The maximum length of the input sequence.
         validation: If True, load validation split; otherwise load test split.
         k: Number of examples to use.
+        max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
         Dataset: The MATH500 dataset containing input_ids, attention_mask, and labels.
     """
-    examples = load_unified_jsonl(data_dir, "math500", validation, k)
+    # Load more examples than needed if rejection sampling is enabled
+    load_k = k * 3 if max_seq_length_threshold is not None else k
+    examples = load_unified_jsonl(data_dir, "math500", validation, load_k)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+    rejected_count = 0
+    accepted_count = 0
 
     for i, example in enumerate(examples):
+        if accepted_count >= k:
+            break
+
         messages = example.get('messages', [])
         if len(messages) < 2:
             continue
@@ -309,14 +406,25 @@ def get_math500_dataset(
         prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
         answer = assistant_content + tokenizer.eos_token
 
+        # Rejection sampling based on sequence length
+        if max_seq_length_threshold is not None:
+            token_length = estimate_token_length(tokenizer, prompt, answer)
+            if token_length > max_seq_length_threshold:
+                rejected_count += 1
+                continue
+
         full_input_ids, labels, attention_mask = tokenize(
             tokenizer, prompt, answer, max_length,
-            print_ex=True if i == 0 else False
+            print_ex=True if accepted_count == 0 else False
         )
 
         dataset["input_ids"].append(full_input_ids)
         dataset["labels"].append(labels)
         dataset["attention_mask"].append(attention_mask)
+        accepted_count += 1
+
+    if rejected_count > 0:
+        logger.info(f"MATH500: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
 
     dataset = Dataset.from_dict(dataset)
     return dataset
@@ -328,6 +436,7 @@ def get_samsum_dataset(
         max_length: int,
         validation: bool = False,
         k: int = 5,
+        max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
     """
@@ -339,15 +448,23 @@ def get_samsum_dataset(
         max_length: The maximum length of the input sequence.
         validation: If True, load validation split; otherwise load test split.
         k: Number of examples to use.
+        max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
         Dataset: The SamSUM dataset containing input_ids, attention_mask, and labels.
     """
-    examples = load_unified_jsonl(data_dir, "samsum", validation, k)
+    # Load more examples than needed if rejection sampling is enabled
+    load_k = k * 3 if max_seq_length_threshold is not None else k
+    examples = load_unified_jsonl(data_dir, "samsum", validation, load_k)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+    rejected_count = 0
+    accepted_count = 0
 
     for i, example in enumerate(examples):
+        if accepted_count >= k:
+            break
+
         messages = example.get('messages', [])
         if len(messages) < 2:
             continue
@@ -358,14 +475,25 @@ def get_samsum_dataset(
         prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
         answer = assistant_content + tokenizer.eos_token
 
+        # Rejection sampling based on sequence length
+        if max_seq_length_threshold is not None:
+            token_length = estimate_token_length(tokenizer, prompt, answer)
+            if token_length > max_seq_length_threshold:
+                rejected_count += 1
+                continue
+
         full_input_ids, labels, attention_mask = tokenize(
             tokenizer, prompt, answer, max_length,
-            print_ex=True if i == 0 else False
+            print_ex=True if accepted_count == 0 else False
         )
 
         dataset["input_ids"].append(full_input_ids)
         dataset["labels"].append(labels)
         dataset["attention_mask"].append(attention_mask)
+        accepted_count += 1
+
+    if rejected_count > 0:
+        logger.info(f"SamSUM: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
 
     dataset = Dataset.from_dict(dataset)
     return dataset
@@ -384,6 +512,7 @@ def get_mmlu_dataset(
         validation: bool = False,
         k: int = 5,
         subject: str = None,
+        max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
     """
@@ -398,15 +527,23 @@ def get_mmlu_dataset(
         validation: If True, load validation split; otherwise load test split.
         k: Number of examples to load.
         subject: Optional MMLU subject to filter by (e.g., "sociology").
+        max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
         Dataset: The MMLU dataset containing input_ids, attention_mask, and labels.
     """
-    examples = load_unified_jsonl(data_dir, "mmlu", validation, k, subject)
+    # Load more examples than needed if rejection sampling is enabled
+    load_k = k * 3 if max_seq_length_threshold is not None else k
+    examples = load_unified_jsonl(data_dir, "mmlu", validation, load_k, subject)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+    rejected_count = 0
+    accepted_count = 0
 
     for i, example in enumerate(examples):
+        if accepted_count >= k:
+            break
+
         messages = example.get('messages', [])
         if len(messages) < 2:
             continue
@@ -425,14 +562,25 @@ def get_mmlu_dataset(
 
         answer = " " + assistant_content + tokenizer.eos_token
 
+        # Rejection sampling based on sequence length
+        if max_seq_length_threshold is not None:
+            token_length = estimate_token_length(tokenizer, prompt, answer)
+            if token_length > max_seq_length_threshold:
+                rejected_count += 1
+                continue
+
         full_input_ids, labels, attention_mask = tokenize(
             tokenizer, prompt, answer, max_length,
-            print_ex=True if i == 0 else False
+            print_ex=True if accepted_count == 0 else False
         )
 
         dataset["input_ids"].append(full_input_ids)
         dataset["labels"].append(labels)
         dataset["attention_mask"].append(attention_mask)
+        accepted_count += 1
+
+    if rejected_count > 0:
+        logger.info(f"MMLU: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
 
     dataset = Dataset.from_dict(dataset)
     return dataset
@@ -449,6 +597,14 @@ def get_dataset(task: str, **kwargs) -> Dataset:
     Args:
         task: The name of the task (bbh, tydiqa, mmlu, samsum, gsm8k, math500).
         **kwargs: Additional arguments passed to the task-specific function.
+            Common kwargs:
+            - data_dir: Base data directory
+            - tokenizer: Tokenizer for encoding
+            - max_length: Maximum sequence length
+            - validation: If True, load validation split; else test split
+            - k: Number of examples to load
+            - max_seq_length_threshold: If provided, reject samples longer than
+              this threshold (for rejection sampling based on train avg length)
 
     Returns:
         Dataset: The dataset for the task.

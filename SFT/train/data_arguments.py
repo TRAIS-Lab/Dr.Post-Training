@@ -44,8 +44,18 @@ class DataArguments:
     )
 
 
-def get_data_statistics(lm_datasets):
-    """ Get the data statistics of the dataset. """
+def get_data_statistics(lm_datasets, return_avg_length: bool = False):
+    """
+    Get the data statistics of the dataset.
+
+    Args:
+        lm_datasets: The dataset(s) to compute statistics for.
+        return_avg_length: If True, return the average sequence length.
+
+    Returns:
+        If return_avg_length is True, returns the average sequence length (float).
+        Otherwise, returns None.
+    """
     def get_length(examples):
         lengths = [len(ids) for ids in examples["input_ids"]]
 
@@ -58,6 +68,7 @@ def get_data_statistics(lm_datasets):
     if not isinstance(lm_datasets, dict):
         lm_datasets = {"train": lm_datasets}
 
+    avg_length = None
     for key in lm_datasets:
         dataset = lm_datasets[key]
         data_size = len(dataset)
@@ -70,3 +81,10 @@ def get_data_statistics(lm_datasets):
             f"[{key} set] examples: {data_size}; # avg tokens: {length}")
         print(
             f"[{key} set] examples: {data_size}; # avg completion tokens: {c_length}")
+
+        # Store avg length for the first (or only) dataset
+        if avg_length is None:
+            avg_length = length
+
+    if return_avg_length:
+        return avg_length

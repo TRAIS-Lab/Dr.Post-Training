@@ -112,11 +112,19 @@ The unified training script accepts the following arguments:
      - `GREATS` - Global selection (two-pass, during PPO mini-batches)
    - `--use_second_order` - Enable greedy selection with second-order interactions (default: disabled)
 3. Compression Arguments
-   - `--compression <method>` - Gradient compression method (implies MeSO optimizer):
-     - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
-     - `GraSS` - Gradient Sparsification with Sketching (available but not used in default methods)
-     - If not specified, uses full gradients and standard AdamW optimizer
+   - `--compression <method>` - Gradient compression method:
+     - `LoGra` - Low-rank Gradient compression (Gaussian projection)
+     - `GraSS` - Gradient Sparsification with Sketching
+     - If not specified, uses full gradients for model updates
+   - `--score_compression_dim <dim>` - Auto score compression dimension (default: `64`, i.e., 64x64). Set to `0` to disable score compression.
    - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
+
+   **Compression Modes** (automatically determined):
+   | Mode | Condition | Scoring | Model Updates | Optimizer |
+   |------|-----------|---------|---------------|-----------|
+   | NONE | No compression args | Full gradients | Full gradients | AdamW |
+   | SCORE_ONLY | `--score_compression_dim > 0` (no explicit compression) | Compressed | Full gradients | AdamW |
+   | FULL | `--compression` specified | Compressed | Compressed | MeSO |
 4. Core Training Arguments
    - `--lr <lr>` - Learning rate override (if not specified, looked up from `config.json`; fallback: `1e-5`)
    - `--lr_vhead <lr>` - Value head learning rate override (if not specified, looked up from `config.json`; fallback: `5e-4`)

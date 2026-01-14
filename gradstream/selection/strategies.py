@@ -24,6 +24,7 @@ gradients are obtained:
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
@@ -32,8 +33,11 @@ if TYPE_CHECKING:
     from ..hook import GradientHook
     from torch import Tensor
 
+import torch
 import torch.nn as nn
 from .state import StreamingState, GREATSState
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================

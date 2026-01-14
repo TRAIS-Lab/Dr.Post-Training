@@ -23,12 +23,13 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           DataCollatorForSeq2Seq, HfArgumentParser, set_seed)
 
 from SFT.data.get_train_dataset import get_training_dataset
-from SFT.data.get_val_dataset import get_dataset
+from SFT.data.get_val_dataset import get_dataset, DEFAULT_SEQ_LENGTH_MULTIPLIER
 
 from gradstream import (
     GradientHook,
     setup_model_compressors,
-    create_sample_inputs
+    create_sample_inputs,
+    CompressionMode,
 )
 from SFT.train.trainer import StreamingTrainer
 
@@ -141,7 +142,8 @@ def main():
         train_dataset_names=training_args.train_dataset_names
     )
 
-    get_data_statistics(train_dataset)
+    avg_train_seq_length = get_data_statistics(train_dataset, return_avg_length=True)
+    logger.info(f"Average training sequence length: {avg_train_seq_length:.1f}")
 
     # Load model - NO CUSTOM LAYER REPLACEMENT!
     # Auto-derive model dtype from training precision if not explicitly set
@@ -211,9 +213,17 @@ def main():
     needs_selection = training_args.method in ('Streaming', 'GREATS')
     needs_grad_hook = needs_selection or has_explicit_compression
 
-    # Determine if MeSO optimizer is used (explicit compression implies MeSO)
-    # When only auto score compression is used (no explicit compression), we use standard optimizer
-    use_meso_optimizer = has_explicit_compression
+    # Determine compression mode:
+    # - NONE: No compression (baseline or selection-only without score compression)
+    # - SCORE_ONLY: Compress for scoring only (auto score compression, standard optimizer)
+    # - FULL: Full compression (explicit compression, MeSO optimizer)
+    has_score_compression = needs_selection and training_args.score_compression_dim > 0
+    if has_explicit_compression:
+        compression_mode = CompressionMode.FULL
+    elif has_score_compression:
+        compression_mode = CompressionMode.SCORE_ONLY
+    else:
+        compression_mode = CompressionMode.NONE
 
     # Create gradient hook only when needed
     grad_hook = None
@@ -223,8 +233,7 @@ def main():
             layer_names=layer_names,
             device=str(training_args.device),
         )
-        grad_hook.use_meso_optimizer = use_meso_optimizer
-        logger.info(f"Gradient Hook created (method={training_args.method}, explicit_compression={has_explicit_compression}, use_meso={use_meso_optimizer})")
+        logger.info(f"Gradient Hook created (method={training_args.method}, compression_mode={compression_mode.value})")
     else:
         logger.info(f"Training method: {training_args.method} - No gradient hooks needed")
 
@@ -330,16 +339,27 @@ def main():
         )
 
         grad_hook.set_compressors(compressors)
+        grad_hook.compression_mode = compression_mode
         logger.info(f"  Set {len(compressors)} unified compressors (refreshed every {training_args.update_compressor_freq} steps)")
+        logger.info(f"  Compression mode: {compression_mode.value}")
 
         logger.info("Gradient compression setup completed!")
     else:
+        # No compression setup, but still configure compression mode on hook if it exists
+        if grad_hook is not None:
+            grad_hook.compression_mode = compression_mode
+            logger.info(f"Compression mode: {compression_mode.value} (no compressors)")
         if needs_selection:
             logger.info("Gradient compression disabled (score_compression_dim=0)")
         else:
             logger.info("Gradient compression disabled (no selection method and no explicit compression)")
 
     # Prepare validation dataset (used for data selection in gradient streaming)
+    # Use rejection sampling to filter out validation samples that are significantly
+    # longer than the average training sequence length
+    val_seq_length_threshold = int(avg_train_seq_length * DEFAULT_SEQ_LENGTH_MULTIPLIER)
+    logger.info(f"Validation sequence length threshold: {val_seq_length_threshold} ({DEFAULT_SEQ_LENGTH_MULTIPLIER}x avg train length)")
+
     val_dataset = get_dataset(
         task=training_args.analysis_dataset,
         data_dir=data_args.data_dir,
@@ -347,7 +367,8 @@ def main():
         max_length=data_args.max_seq_length,
         validation=True,
         k=training_args.n_val,
-        subject=training_args.subject
+        subject=training_args.subject,
+        max_seq_length_threshold=val_seq_length_threshold
     )
 
     # Prepare evaluation dataset (held-out test set for measuring generalization)

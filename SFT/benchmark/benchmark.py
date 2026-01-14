@@ -89,7 +89,7 @@ class BenchmarkConfig:
 
     # Dataset config
     # Options: 'dummy', 'alpaca', 'gsm8k', 'dolly', 'openhermes'
-    dataset: str = 'alpaca'
+    dataset: str = 'tulu3'
 
     # Benchmark
     num_warmup: int = 10
@@ -101,9 +101,9 @@ class BenchmarkConfig:
 
     # Selection config
     use_second_order: bool = False  # If True, use greedy selection with O(k*n) complexity
-    val_strategy: str = 'separate'  # 'separate' or 'merged' - how to handle validation gradients
+    val_strategy: str = 'merged'  # 'separate' or 'merged' - how to handle validation gradients
     score_compression_dim: int = 64  # Dimension for score-only compression (factorized, so 64*64)
-    val_dataset: str = 'samsum'  # Validation dataset for selection. Options: 'samsum', 'gsm8k', 'bbh', etc. If None, uses same as training dataset
+    val_dataset: str = 'tydiqa'  # Validation dataset for selection. Options: 'samsum', 'gsm8k', 'bbh', etc. If None, uses same as training dataset
     data_dir: str = 'data'  # Data directory for validation datasets (used when val_dataset is set)
 
     # Reproducibility
@@ -297,6 +297,36 @@ class RealDataset(Dataset):
             'split': 'train',
             'format': 'sharegpt',  # conversations format
         },
+        'samsum': {
+            'path': 'knkarthick/samsum',
+            'split': 'train',
+            'format': 'samsum',  # dialogue, summary format
+        },
+        'vicuna': {
+            'path': 'Aeala/ShareGPT_Vicuna_unfiltered',
+            'split': 'train',
+            'format': 'sharegpt',  # conversations format
+        },
+        'wizardlm': {
+            'path': 'WizardLMTeam/WizardLM_evol_instruct_V2_196k',
+            'split': 'train',
+            'format': 'sharegpt',  # conversations format
+        },
+        'tulu3': {
+            'path': 'allenai/tulu-3-sft-mixture',
+            'split': 'train',
+            'format': 'tulu',  # messages format
+        },
+        'oasst1': {
+            'path': 'OpenAssistant/oasst1',
+            'split': 'train',
+            'format': 'oasst',  # tree structure, prompter/assistant roles
+        },
+        'cot': {
+            'path': 'kaist-ai/CoT-Collection',
+            'split': 'train',
+            'format': 'cot',  # source, rationale format
+        },
     }
 
     def __init__(self, dataset_name: str, tokenizer, seq_length: int, size: int = 10000):
@@ -331,7 +361,11 @@ class RealDataset(Dataset):
             if encoded is not None:
                 self.encoded_examples.append(encoded)
 
-        print(f"Loaded {len(self.encoded_examples)} examples from {dataset_name}")
+        # Compute and print sequence length statistics
+        seq_lengths = [ex['input_ids'].shape[0] for ex in self.encoded_examples]
+        avg_len = sum(seq_lengths) / len(seq_lengths) if seq_lengths else 0
+        print(f"Loaded {len(self.encoded_examples)} examples from {dataset_name} "
+              f"(avg seq len: {avg_len:.1f}, min: {min(seq_lengths)}, max: {max(seq_lengths)})")
 
     def _convert_to_messages(self, example, format_type):
         """Convert different dataset formats to unified messages format."""
@@ -381,19 +415,64 @@ class RealDataset(Dataset):
                 ]
 
             elif format_type == 'sharegpt':
-                # ShareGPT/OpenHermes format: conversations list
+                # ShareGPT/OpenHermes/Vicuna/WizardLM format: conversations list
                 conversations = example.get('conversations', [])
                 messages = []
                 for conv in conversations:
-                    role = conv.get('from', '')
-                    content = conv.get('value', '')
-                    if role == 'human':
+                    role = conv.get('from', conv.get('role', ''))
+                    content = conv.get('value', conv.get('content', ''))
+                    if role in ('human', 'user'):
                         messages.append({"role": "user", "content": content})
-                    elif role == 'gpt':
+                    elif role in ('gpt', 'assistant'):
                         messages.append({"role": "assistant", "content": content})
                     elif role == 'system':
                         messages.append({"role": "system", "content": content})
-                return messages if messages else None
+                return messages if len(messages) >= 2 else None
+
+            elif format_type == 'samsum':
+                # SamSUM format: dialogue, summary
+                dialogue = example.get('dialogue', '')
+                summary = example.get('summary', '')
+                return [
+                    {"role": "user", "content": f"Summarize the following dialogue:\n\n{dialogue}"},
+                    {"role": "assistant", "content": summary}
+                ]
+
+            elif format_type == 'tulu':
+                # Tulu3 format: messages list with role/content
+                messages_raw = example.get('messages', [])
+                messages = []
+                for msg in messages_raw:
+                    role = msg.get('role', '')
+                    content = msg.get('content', '')
+                    if role == 'user':
+                        messages.append({"role": "user", "content": content})
+                    elif role == 'assistant':
+                        messages.append({"role": "assistant", "content": content})
+                    # Skip system messages
+                return messages if len(messages) >= 2 else None
+
+            elif format_type == 'oasst':
+                # OpenAssistant format: role is 'prompter' or 'assistant'
+                role = example.get('role', '')
+                text = example.get('text', '')
+                # OASST has tree structure; for simplicity, we skip standalone messages
+                # and only use examples that have clear user/assistant pairs
+                # This is a simplified approach - full OASST needs tree reconstruction
+                if role == 'prompter':
+                    return [{"role": "user", "content": text}]
+                elif role == 'assistant':
+                    return [{"role": "assistant", "content": text}]
+                return None
+
+            elif format_type == 'cot':
+                # Chain-of-Thought format: source, rationale
+                source = example.get('source', '')
+                rationale = example.get('rationale', '')
+                return [
+                    {"role": "user", "content": source},
+                    {"role": "assistant", "content": rationale}
+                ]
 
             else:
                 return None
@@ -432,6 +511,23 @@ class ValidationDataset(Dataset):
             'split': 'validation',
             'format': 'tydiqa',
         },
+        'mmlu': {
+            'path': 'cais/mmlu',
+            'name': 'sociology',  # Use one subject for benchmark (full MMLU has 57 subjects)
+            'split': 'validation',
+            'format': 'mmlu',
+        },
+        'bbh': {
+            'path': 'lukaemon/bbh',
+            'name': 'boolean_expressions',  # Use one task for benchmark (full BBH has 27 tasks)
+            'split': 'test',
+            'format': 'bbh',
+        },
+        'math500': {
+            'path': 'HuggingFaceH4/MATH-500',
+            'split': 'test',
+            'format': 'math500',
+        },
     }
 
     def __init__(self, dataset_name: str, tokenizer, seq_length: int, size: int = 1000):
@@ -466,7 +562,11 @@ class ValidationDataset(Dataset):
             if encoded is not None:
                 self.encoded_examples.append(encoded)
 
-        print(f"Loaded {len(self.encoded_examples)} validation examples from {dataset_name}")
+        # Compute and print sequence length statistics
+        seq_lengths = [ex['input_ids'].shape[0] for ex in self.encoded_examples]
+        avg_len = sum(seq_lengths) / len(seq_lengths) if seq_lengths else 0
+        print(f"Loaded {len(self.encoded_examples)} validation examples from {dataset_name} "
+              f"(avg seq len: {avg_len:.1f}, min: {min(seq_lengths)}, max: {max(seq_lengths)})")
 
     def _convert_to_messages(self, example, format_type):
         """Convert different dataset formats to unified messages format."""
@@ -503,6 +603,51 @@ class ValidationDataset(Dataset):
                 return [
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": answer}
+                ]
+
+            elif format_type == 'mmlu':
+                # MMLU format: question, choices, answer
+                question = example.get('question', '')
+                choices = example.get('choices', [])
+                answer_idx = example.get('answer', 0)
+                choices_letters = ["A", "B", "C", "D"]
+
+                # Format question with choices
+                prompt = f"The following is a multiple choice question. Answer with A, B, C, or D.\n\n{question}\n"
+                for i, choice in enumerate(choices):
+                    prompt += f"{choices_letters[i]}. {choice}\n"
+                prompt += "\nAnswer:"
+
+                # Convert answer index to letter
+                answer = choices_letters[answer_idx] if isinstance(answer_idx, int) else answer_idx
+
+                return [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": answer}
+                ]
+
+            elif format_type == 'bbh':
+                # BBH format: input, target
+                input_text = example.get('input', '')
+                target = example.get('target', '')
+
+                return [
+                    {"role": "user", "content": input_text},
+                    {"role": "assistant", "content": target}
+                ]
+
+            elif format_type == 'math500':
+                # MATH500 format: problem, solution
+                problem = example.get('problem', '')
+                solution = example.get('solution', '')
+                level = example.get('level', 'unknown')
+                prob_type = example.get('type', 'unknown')
+
+                user_content = f"Solve the following Level {level} {prob_type} problem:\n{problem}"
+
+                return [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": solution}
                 ]
 
             else:
@@ -1419,6 +1564,7 @@ def _setup_compression(model, config: BenchmarkConfig, use_meso_optimizer: bool 
         device=str(config.device),
     )
     grad_hook.set_compressors(compressors)
+    grad_hook.use_meso_optimizer = use_meso_optimizer
 
     if use_meso_optimizer:
         optimizer = MeSOAdamW(
@@ -1615,6 +1761,7 @@ def _setup_logra_compression(model, config: BenchmarkConfig, use_meso_optimizer:
         device=str(config.device),
     )
     grad_hook.set_compressors(compressors)
+    grad_hook.use_meso_optimizer = use_meso_optimizer
 
     if use_meso_optimizer:
         optimizer = MeSOAdamW(
@@ -2310,10 +2457,10 @@ Examples:
 
     # Dataset config (defaults from BenchmarkConfig)
     parser.add_argument('--dataset', type=str, default=None,
-                        choices=['dummy', 'alpaca', 'gsm8k', 'dolly', 'openhermes'],
+                        choices=['dummy', 'alpaca', 'gsm8k', 'dolly', 'openhermes', 'samsum', 'vicuna', 'wizardlm', 'tulu3', 'oasst1', 'cot'],
                         help=f'Dataset to use. "dummy" uses synthetic data, others load from HuggingFace (default: {defaults.dataset})')
     parser.add_argument('--val-dataset', type=str, default=None,
-                        choices=['samsum', 'gsm8k', 'tydiqa'],
+                        choices=['samsum', 'gsm8k', 'tydiqa', 'mmlu', 'bbh', 'math500'],
                         help='Validation dataset for selection methods (loaded directly from HuggingFace). If not specified, uses same as training dataset.')
 
     # Benchmark config (defaults from BenchmarkConfig)

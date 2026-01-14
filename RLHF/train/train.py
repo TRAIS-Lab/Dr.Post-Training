@@ -26,7 +26,7 @@ from RLHF.train.trainer import StreamingPPOTrainer
 from RLHF.train.rewards import load_reward_model, RewardModelWrapper
 from RLHF.train.evaluator import create_evaluator
 
-from gradstream import GradientHook, setup_model_compressors, create_sample_inputs, MeSOAdamW
+from gradstream import GradientHook, setup_model_compressors, create_sample_inputs, MeSOAdamW, CompressionMode
 
 logger = logging.getLogger(__name__)
 
@@ -347,16 +347,26 @@ def main():
 
     # Create gradient hook only when needed (selection or compression enabled)
     grad_hook = None
-    # Determine if MeSO optimizer is used (explicit compression implies MeSO)
-    use_meso_optimizer = training_args.has_compression
+
+    # Determine compression mode:
+    # - NONE: No compression (baseline or selection-only without score compression)
+    # - SCORE_ONLY: Compress for scoring only (auto score compression, standard optimizer)
+    # - FULL: Full compression (explicit compression, MeSO optimizer)
+    has_score_compression = training_args.has_selection and training_args.score_compression_dim > 0
+    if training_args.has_compression:
+        compression_mode = CompressionMode.FULL
+    elif has_score_compression:
+        compression_mode = CompressionMode.SCORE_ONLY
+    else:
+        compression_mode = CompressionMode.NONE
+
     if training_args.has_selection or training_args.has_compression:
         grad_hook = GradientHook(
             model=model,
             layer_names=layer_names,
             device=device,
         )
-        grad_hook.use_meso_optimizer = use_meso_optimizer
-        logger.info(f"Gradient Hook created (selection={training_args.has_selection}, compression={training_args.has_compression}, use_meso={use_meso_optimizer})")
+        logger.info(f"Gradient Hook created (selection={training_args.has_selection}, compression_mode={compression_mode.value})")
     else:
         logger.info(f"Training method: {training_args.method} - No gradient hooks needed")
 
@@ -449,8 +459,15 @@ def main():
         )
 
         grad_hook.set_compressors(compressors)
+        grad_hook.compression_mode = compression_mode
         logger.info(f"  Set {len(compressors)} unified compressors (refreshed every {training_args.update_compressor_freq} steps)")
+        logger.info(f"  Compression mode: {compression_mode.value}")
         logger.info("Gradient compression setup completed!")
+    else:
+        # No compression setup, but still configure compression mode on hook if it exists
+        if grad_hook is not None:
+            grad_hook.compression_mode = compression_mode
+            logger.info(f"Compression mode: {compression_mode.value} (no compressors)")
 
     # Create optimizer - separate parameter groups for policy and value head
     # This allows using different learning rates for each

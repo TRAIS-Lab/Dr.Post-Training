@@ -137,7 +137,6 @@ class SelectionState(ABC):
         Returns train_total_tokens / selected_tokens to maintain proper gradient magnitude.
         Returns 1.0 if no samples are selected (empty selection case).
         """
-        # NOTE(liuxs): return tensor instead of float to avoid D2H memcpy
         if self.tokens_per_sample is None or self.train_total_tokens_tensor is None:
             raise RuntimeError(
                 "Token counts not set. Call set_token_counts() before selection. "

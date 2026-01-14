@@ -6,12 +6,20 @@ This module provides core components for on-the-fly gradient streaming during tr
 - Compressors (sparsifiers and projectors) for reducing gradient dimensionality
 - MeSO optimizer for memory-efficient subspace optimization
 - Selection module with clean separation of Streaming vs GREATS methods
+- CompressionMode enum for clear compression configuration
+- ValidationCache for unified validation gradient management
 """
 
 from .hook import GradientHook
 from .compressor import setup_model_compressors
 from .optimizer import MeSOAdamW
 from .utils import create_sample_inputs
+
+# Compression mode configuration
+from .compression_mode import CompressionMode
+
+# Validation gradient cache
+from .validation_cache import ValidationCache, ValidationStorageMode
 
 # Selection module exports (gradient-based)
 from .selection import (
@@ -38,6 +46,11 @@ __all__ = [
     "MeSOAdamW",
     "setup_model_compressors",
     "create_sample_inputs",
+    # Compression configuration
+    "CompressionMode",
+    # Validation cache
+    "ValidationCache",
+    "ValidationStorageMode",
     # Selection state classes
     "SelectionState",
     "StreamingState",
