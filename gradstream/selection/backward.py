@@ -36,7 +36,7 @@ from .utils import (
 # =============================================================================
 
 def _get_val_components(
-    hook_manager: "GradientHook",
+    hook_manager: GradientHook,
     layer_idx: int
 ) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     """
@@ -57,7 +57,7 @@ def _get_val_components(
     return None, None, val_grad_total
 
 
-def _compute_scale_factor(state: "StreamingState", selected_indices: "Tensor") -> float:
+def _compute_scale_factor(state: StreamingState, selected_indices: Tensor) -> Tensor:
     """Compute token-based gradient scale factor for selected samples."""
     return state._compute_scale_factor(selected_indices)
 
