@@ -68,40 +68,42 @@ class SelectionState(ABC):
 
         # Token-based scaling (set via set_token_counts)
         self.tokens_per_sample: Optional[Tensor] = None
-        self.train_total_tokens: int = 0
         self.train_total_tokens_tensor: Optional[Tensor] = None
 
         # Precomputed score correction for joint batch mode (1.0 = no correction)
-        self.score_correction: float = 1.0
+        # Stored as Tensor to avoid D2H memory copies during backward
+        self.score_correction: Optional[Tensor] = None
 
     def set_token_counts(
         self,
         tokens_per_sample: Tensor,
-        total_train_tokens: int,
-        batch_total_tokens: int
+        total_train_tokens: Tensor,
+        batch_total_tokens: Tensor
     ) -> None:
         """
         Set token counts for gradient scaling and score correction.
 
         Args:
             tokens_per_sample: Token count per training sample [train_batch_size]
-            total_train_tokens: Sum of tokens in training samples
-            batch_total_tokens: Sum of tokens in entire batch (train + val for joint batch)
+            total_train_tokens: Sum of tokens in training samples (scalar Tensor)
+            batch_total_tokens: Sum of tokens in entire batch (train + val for joint batch, scalar Tensor)
         """
         # Store for gradient scaling: train_total_tokens / selected_tokens
         self.tokens_per_sample = tokens_per_sample
-        self.train_total_tokens = total_train_tokens
-        self.train_total_tokens_tensor = torch.tensor(
-            float(total_train_tokens),
-            device=tokens_per_sample.device,
-            dtype=self.dtype,
-        )
+        self.train_total_tokens_tensor = total_train_tokens.to(dtype=self.dtype)
+
         # Precompute score correction for joint batch mode
+        # All operations kept on device as Tensors to avoid D2H memcpy
         val_tokens = batch_total_tokens - total_train_tokens
-        if val_tokens > 0 and total_train_tokens > 0:
-            self.score_correction = float(batch_total_tokens ** 2) / float(total_train_tokens * val_tokens)
-        else:
-            self.score_correction = 1.0
+        # Use torch.where to handle the conditional without branching on CPU values
+        correction = (batch_total_tokens.to(self.dtype) ** 2) / (total_train_tokens.to(self.dtype) * val_tokens.to(self.dtype))
+        # Set to 1.0 if val_tokens <= 0 or total_train_tokens <= 0
+        valid_mask = (val_tokens > 0) & (total_train_tokens > 0)
+        self.score_correction = torch.where(
+            valid_mask,
+            correction,
+            torch.ones((), device=tokens_per_sample.device, dtype=self.dtype)
+        )
 
     def _select_indices(
         self,
@@ -155,7 +157,7 @@ class SelectionState(ABC):
         train_grads: Tensor,
         val_grad: Tensor,
         layer_idx: int,
-        score_correction: float = 1.0,
+        score_correction: Optional[Tensor] = None,
     ) -> Optional[Tuple[Tensor, int]]:
         """
         Process gradients for a single layer.
@@ -164,9 +166,9 @@ class SelectionState(ABC):
             train_grads: Per-sample gradients [train_batch_size, feature_dim]
             val_grad: Total validation gradient [feature_dim] (sum over val samples)
             layer_idx: Index of the current layer
-            score_correction: Correction factor for joint batch mode.
+            score_correction: Correction factor for joint batch mode (scalar Tensor).
                 For joint batch: T_total²/(T_train × T_val) to convert to standalone scaling.
-                For cached mode: 1.0 (no correction needed).
+                For cached mode: None (no correction needed).
 
         Returns:
             For Streaming: (reduced_grad, num_selected) tuple
@@ -210,7 +212,7 @@ class StreamingState(SelectionState):
         train_grads: Tensor,
         val_grad: Tensor,
         layer_idx: int,
-        score_correction: float = 1.0,
+        score_correction: Optional[Tensor] = None,
     ) -> Tuple[Tensor, int]:
         """
         Immediately select and aggregate at this layer.
@@ -219,7 +221,7 @@ class StreamingState(SelectionState):
             train_grads: Per-sample gradients [train_batch_size, feature_dim]
             val_grad: Total validation gradient [feature_dim]
             layer_idx: Index of the current layer
-            score_correction: Correction factor for joint batch mode
+            score_correction: Correction factor for joint batch mode (scalar Tensor or None)
 
         Returns:
             (reduced_grad, num_selected) tuple
@@ -227,14 +229,14 @@ class StreamingState(SelectionState):
         # Step 1: Compute scores (gradient alignment)
         scores = train_grads @ val_grad
 
-        if score_correction != 1.0:
+        if score_correction is not None:
             scores = scores * score_correction
 
         # Step 2: Compute similarity if second-order
         similarity = None
         if self.use_second_order:
             similarity = train_grads @ train_grads.T
-            if score_correction != 1.0:
+            if score_correction is not None:
                 similarity = similarity * (score_correction ** 2)
 
         # Step 3: Select indices
@@ -303,7 +305,7 @@ class GREATSState(SelectionState):
         train_grads: Tensor,
         val_grad: Tensor,
         layer_idx: int,
-        score_correction: float = 1.0,
+        score_correction: Optional[Tensor] = None,
     ) -> None:
         """
         Accumulate scores - no immediate selection.
@@ -312,7 +314,7 @@ class GREATSState(SelectionState):
             train_grads: Per-sample gradients [train_batch_size, feature_dim]
             val_grad: Total validation gradient [feature_dim]
             layer_idx: Index of the current layer
-            score_correction: Correction factor for joint batch mode
+            score_correction: Correction factor for joint batch mode (scalar Tensor or None)
 
         Returns:
             None (scores accumulated internally)
@@ -324,13 +326,15 @@ class GREATSState(SelectionState):
             val_grad = val_grad.to(self.dtype)
 
         # Accumulate first-order scores: train_grads @ val_grad
-        # Apply score_correction via the alpha parameter
-        torch.addmv(self.grad_dot_scores, train_grads, val_grad, alpha=score_correction, out=self.grad_dot_scores)
+        # Apply score_correction via the alpha parameter (convert to scalar for addmv)
+        alpha = score_correction.item() if score_correction is not None else 1.0
+        torch.addmv(self.grad_dot_scores, train_grads, val_grad, alpha=alpha, out=self.grad_dot_scores)
 
         # Accumulate similarity matrix if second-order
         if self.similarity_matrix is not None:
             # Scale similarity by score_correction² to be consistent with scores
-            torch.addmm(self.similarity_matrix, train_grads, train_grads.t(), alpha=score_correction**2, out=self.similarity_matrix)
+            alpha_sq = alpha ** 2
+            torch.addmm(self.similarity_matrix, train_grads, train_grads.t(), alpha=alpha_sq, out=self.similarity_matrix)
 
         return None
 
@@ -338,7 +342,7 @@ class GREATSState(SelectionState):
         self,
         scores: Tensor,
         similarity: Optional[Tensor],
-        score_correction: float = 1.0,
+        score_correction: Optional[Tensor] = None,
     ) -> None:
         """
         Accumulate pre-computed scores (for full gradient path).
@@ -349,10 +353,10 @@ class GREATSState(SelectionState):
         Args:
             scores: Pre-computed scores [train_batch_size]
             similarity: Pre-computed similarity matrix [train_batch_size, train_batch_size] or None
-            score_correction: Correction factor for joint batch mode
+            score_correction: Correction factor for joint batch mode (scalar Tensor or None)
         """
         # Apply score correction
-        if score_correction != 1.0:
+        if score_correction is not None:
             scores = scores * score_correction
             if similarity is not None:
                 similarity = similarity * (score_correction ** 2)

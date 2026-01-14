@@ -234,11 +234,11 @@ class StreamingLinearBackward(Function):
         if use_stored_val:
             train_grads = compressed_grad
             val_grad = hook_manager.val_grad_buffer[layer_idx]
-            score_correction = 1.0
+            score_correction = None  # Cached mode: no correction needed
         else:
             train_grads, val_grads = split_train_val_batch(compressed_grad, state.train_batch_size)
             val_grad = val_grads.sum(dim=0)
-            score_correction = state.score_correction
+            score_correction = state.score_correction  # Tensor
 
         if val_grad is None:
             if compression_mode == CompressionMode.FULL:
@@ -258,14 +258,14 @@ class StreamingLinearBackward(Function):
             # SCORE_ONLY: compressed scores + full gradient updates
             # Step 1: Compute scores from compressed gradients
             scores = train_grads @ val_grad
-            if score_correction != 1.0:
+            if score_correction is not None:
                 scores = scores * score_correction
 
             # Step 2: Compute similarity if second-order
             similarity = None
             if state.use_second_order:
                 similarity = train_grads @ train_grads.T
-                if score_correction != 1.0:
+                if score_correction is not None:
                     similarity = similarity * (score_correction ** 2)
 
             # Step 3: Select indices
@@ -325,14 +325,14 @@ class StreamingLinearBackward(Function):
                 # Missing validation gradient - return None (will be zero gradient)
                 return None, None
             # Cached mode: gradients already correctly scaled, no correction needed
-            score_correction = 1.0
+            score_correction = None
         else:
             # Joint batch mode: split merged batch
             train_grad_output, val_grad_output = split_train_val_batch(grad_output, state.train_batch_size)
             train_input, val_input = split_train_val_batch(input, state.train_batch_size)
             val_grad_total = None
             # Joint batch needs correction: T_total²/(T_train × T_val)
-            score_correction = state.score_correction
+            score_correction = state.score_correction  # Tensor
 
         scores, similarity = compute_scores_and_similarity(
             train_grad_output, train_input, val_grad_output, val_input, val_grad_total,
@@ -340,7 +340,7 @@ class StreamingLinearBackward(Function):
         )
 
         # Apply correction for joint batch mode
-        if score_correction != 1.0:
+        if score_correction is not None:
             scores = scores * score_correction
             if similarity is not None:
                 similarity = similarity * (score_correction ** 2)
@@ -447,12 +447,12 @@ class GREATSLinearBackward(Function):
             train_grads = compressed_grad
             val_grad = hook_manager.val_grad_buffer[layer_idx]
             # Cached mode: gradients already correctly scaled
-            score_correction = 1.0
+            score_correction = None
         else:
             train_grads, val_grads = split_train_val_batch(compressed_grad, state.train_batch_size)
             val_grad = val_grads.sum(dim=0)  # Sum, not mean, for token-weighted semantics
             # Joint batch needs correction: T_total²/(T_train × T_val)
-            score_correction = state.score_correction
+            score_correction = state.score_correction  # Tensor
 
         if val_grad is not None:
             state.process_layer_gradients(train_grads, val_grad, layer_idx, score_correction)
@@ -473,14 +473,14 @@ class GREATSLinearBackward(Function):
             if val_go is None and val_grad_total is None:
                 return
             # Cached mode: gradients already correctly scaled, no correction needed
-            score_correction = 1.0
+            score_correction = None
         else:
             # Joint batch mode: split merged batch
             train_grad_output, val_go = split_train_val_batch(grad_output, state.train_batch_size)
             train_input, val_inp = split_train_val_batch(input, state.train_batch_size)
             val_grad_total = None
             # Joint batch needs correction: T_total²/(T_train × T_val)
-            score_correction = state.score_correction
+            score_correction = state.score_correction  # Tensor
 
         scores, similarity = compute_scores_and_similarity(
             train_grad_output, train_input, val_go, val_inp, val_grad_total,

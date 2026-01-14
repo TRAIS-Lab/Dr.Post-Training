@@ -98,7 +98,8 @@ class GradientHook:
         self._val_cache: ValidationCache = ValidationCache(len(layer_names))
 
         # Token count tracking for proper gradient scaling
-        self.total_tokens: Optional[int] = None
+        # Kept as Tensors to avoid D2H memory copies during backward
+        self.total_tokens: Optional[Tensor] = None
         self.tokens_per_sample: Optional[Tensor] = None
 
         # Register hooks
@@ -361,12 +362,13 @@ class GradientHook:
         valid_mask = (labels != -100)
         tokens_per_sample = valid_mask.sum(dim=1)
 
-        self.total_tokens = tokens_per_sample.sum().item()
+        # Keep as Tensor to avoid D2H memory copy
+        self.total_tokens = tokens_per_sample.sum()
         self.tokens_per_sample = tokens_per_sample
 
         if train_batch_size is not None and self.selection_state is not None:
             train_tokens = tokens_per_sample[:train_batch_size]
-            total_train_tokens = train_tokens.sum().item()
+            total_train_tokens = train_tokens.sum()
             self.selection_state.set_token_counts(train_tokens, total_train_tokens, self.total_tokens)
 
         logger.debug(f"Set token counts: total={self.total_tokens}")
