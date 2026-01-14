@@ -5,9 +5,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --partition=gpuA100x4
-#SBATCH --account=bdzy-delta-gpu
-#SBATCH --time=24:00:00
+#SBATCH --partition=gpuA40x4
+#SBATCH --account=bfwm-delta-gpu
+#SBATCH --time=12:00:00
 #SBATCH --constraint="scratch"
 #SBATCH --output=/u/%u/Project/Gradient-Streaming/SFT/log/%x-%j.log
 
@@ -43,7 +43,7 @@ export base_training_args="--do_train=True \
 
 # Default values
 model="meta-llama/Llama-3.2-1B"
-data_dir="SFT/data"
+data_dir="/work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT/data"
 train_dataset=""  # Training dataset (if empty, uses task-based default)
 percentage=0.05
 task="mmlu"
@@ -89,7 +89,6 @@ score_compression_dim=32  # Auto score compression dimension (default: 32, i.e.,
 # Multi-method mode
 methods=""  # Comma-separated list of methods or categories
 dry_run=false
-use_sbatch=false
 
 # ========================================
 # Experiment Definitions
@@ -248,10 +247,6 @@ while [[ $# -gt 0 ]]; do
             dry_run=true
             shift
             ;;
-        --sbatch)
-            use_sbatch=true
-            shift
-            ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
@@ -260,7 +255,6 @@ while [[ $# -gt 0 ]]; do
             echo "Multi-Method Mode:"
             echo "  --methods <list>                       Run multiple methods (see below)"
             echo "  --dry-run                              Print commands without executing"
-            echo "  --sbatch                               Use sbatch instead of bash"
             echo ""
             echo "  Method names: NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, Streaming-NA-LoRA,"
             echo "                GREATS-NA-Full, GREATS-NA-LoRA, Streaming-LoGra-Full, GREATS-LoGra-Full"
@@ -477,7 +471,7 @@ run_single_method() {
         JOB_NAME="${train_str}_${task}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
     fi
 
-    local output_dir=/scratch/pbb/Project/Gradient-Streaming/SFT/${JOB_NAME}
+    local output_dir=/work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT/${JOB_NAME}
     if [[ ! -d $output_dir ]]; then
         mkdir -p $output_dir
     fi
@@ -524,7 +518,7 @@ run_single_method() {
     local ID=$RANDOM
     local PORT=$((29400 + RANDOM % 10000))
     local header="torchrun --nproc_per_node 1 --nnodes 1 \
---rdzv-id=$ID --rdzv_backend c10d --rdzv-endpoint=localhost:$PORT \
+--rdzv_id=$ID --rdzv_backend c10d --rdzv_endpoint=localhost:$PORT \
 -m SFT.train.train"
 
     # Build training arguments
@@ -590,13 +584,6 @@ run_single_method() {
     # Execute or print command
     if [ "$dry_run" = true ]; then
         echo "[DRY-RUN] Would execute: $header $training_args"
-    elif [ "$use_sbatch" = true ]; then
-        echo "Submitting with sbatch..."
-        # For sbatch, we need to write a temporary script or use sbatch --wrap
-        # For now, we'll use the current script with sbatch
-        echo "sbatch $0 (with current arguments)"
-        # Note: sbatch mode would need the script to be called without --sbatch
-        # This is a simplified version - in practice you might want separate handling
     else
         eval "$header" "$training_args"
     fi
@@ -772,7 +759,7 @@ else
     JOB_NAME="${train_str}_${task}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
 fi
 
-output_dir=/scratch/pbb/Project/Gradient-Streaming/SFT/${JOB_NAME}
+output_dir=/work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT/${JOB_NAME}
 if [[ ! -d $output_dir ]]; then
     mkdir -p $output_dir
 fi
@@ -835,7 +822,7 @@ ID=$RANDOM
 # Generate a unique port for this job to avoid conflicts with other jobs
 PORT=$((29400 + RANDOM % 10000))
 export header="torchrun --nproc_per_node 1 --nnodes 1 \
---rdzv-id=$ID --rdzv_backend c10d --rdzv-endpoint=localhost:$PORT \
+--rdzv_id=$ID --rdzv_backend c10d --rdzv_endpoint=localhost:$PORT \
 -m SFT.train.train"
 
 # Build training arguments

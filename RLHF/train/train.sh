@@ -5,9 +5,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --partition=gpuA100x4
-#SBATCH --account=bdzy-delta-gpu
-#SBATCH --time=24:00:00
+#SBATCH --partition=gpuA40x4
+#SBATCH --account=bfwm-delta-gpu
+#SBATCH --time=12:00:00
 #SBATCH --constraint="scratch"
 #SBATCH --output=/u/%u/Project/Gradient-Streaming/RLHF/log/%x-%j.log
 
@@ -91,7 +91,6 @@ score_compression_dim=64  # Auto score compression dimension (default: 64, i.e.,
 # Multi-method mode
 methods="" # Comma-separated list of methods or categories
 dry_run=false
-use_sbatch=false
 
 # ========================================
 # Experiment Definitions
@@ -279,10 +278,6 @@ while [[ $# -gt 0 ]]; do
             dry_run=true
             shift
             ;;
-        --sbatch)
-            use_sbatch=true
-            shift
-            ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
@@ -291,7 +286,6 @@ while [[ $# -gt 0 ]]; do
             echo "Multi-Method Mode:"
             echo "  --methods <list>       Run multiple methods (see below)"
             echo "  --dry-run                  Print commands without executing"
-            echo "  --sbatch                   Use sbatch instead of bash"
             echo ""
             echo "  Method names:"
             echo "    NA-NA-Full, NA-NA-LoRA, IIF-NA-Full, IIF-NA-LoRA,"
@@ -604,7 +598,7 @@ run_single_method() {
     # Includes: validation settings, PPO epochs, mini-batch size, KL coefficient
     local JOB_NAME="${task}-${model_name}-${method_str}-${job_type}-lr${exp_lr}-b${batch_size}-${val_str}-pe${ppo_epochs}-mb${mini_batch_size}-kl${exp_init_kl_coef}-s${seed}"
 
-    local output_dir=/scratch/pbb/Project/Gradient-Streaming/RLHF/${JOB_NAME}
+    local output_dir=/work/hdd/bfwm/phu1/Project/Gradient-Streaming/RLHF/${JOB_NAME}
     if [[ ! -d $output_dir ]]; then
         mkdir -p $output_dir
     fi

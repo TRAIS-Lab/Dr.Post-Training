@@ -1,15 +1,26 @@
 #!/bin/bash
-#
-# Evaluation script for RLHF experiments
-#
-# Evaluates toxicity of trained models using toxic prompts from wiki_toxic dataset.
-#
-# Usage:
-#   bash RLHF/eval/eval.sh                       # Evaluate all models
-#   bash RLHF/eval/eval.sh --task toxicity       # Filter by task
-#   bash RLHF/eval/eval.sh --batch_size 16       # Set batch size
-#   bash RLHF/eval/eval.sh --sbatch              # Submit to SLURM
-#
+
+#SBATCH --job-name=RLHF-Eval
+#SBATCH --mem=64g
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --partition=gpuA40x4
+#SBATCH --account=bfwm-delta-gpu
+#SBATCH --time=12:00:00
+#SBATCH --constraint="scratch"
+#SBATCH --output=/u/%u/Project/Gradient-Streaming/RLHF/log/%x-%j.log
+
+### GPU options ###
+#SBATCH --gpus-per-node=1
+#SBATCH --gpu-bind=none
+#SBATCH --mail-user=pbb@illinois.edu
+#SBATCH --mail-type="END"
+
+cd $HOME/Project/Gradient-Streaming
+
+# Set PYTHONPATH to include project root for imports
+export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
 
 set -e
 
@@ -21,7 +32,6 @@ BATCH_SIZE=16
 MAX_NEW_TOKENS=30
 SEED=42
 CLASSIFIER="independent"  # Use independent classifier by default for unbiased evaluation
-SBATCH=false
 DRY_RUN=false
 
 # Parse arguments
@@ -55,10 +65,6 @@ while [[ $# -gt 0 ]]; do
             CLASSIFIER="$2"
             shift 2
             ;;
-        --sbatch)
-            SBATCH=true
-            shift
-            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -76,7 +82,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --classifier TYPE      Toxicity classifier: independent (default) or reward"
             echo "                         'independent' uses DaNLP/da-electra-hatespeech-detection"
             echo "                         'reward' uses facebook/roberta-hate-speech-dynabench-r4-target"
-            echo "  --sbatch               Submit as SLURM job"
             echo "  --dry-run              Print command without executing"
             exit 0
             ;;
@@ -86,11 +91,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-# Get directories
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RLHF_DIR="$(dirname "$SCRIPT_DIR")"
-PROJECT_DIR="$(dirname "$RLHF_DIR")"
 
 echo ""
 echo "========================================================"
@@ -122,41 +122,8 @@ if [[ -n "$TASK" ]]; then
     CMD="$CMD --task $TASK"
 fi
 
-if [[ "$SBATCH" == true ]]; then
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="rlhf_eval_${TIMESTAMP}"
-    LOG_DIR="$MODELS_DIR/logs"
-    mkdir -p "$LOG_DIR"
-
-    SLURM_SCRIPT="$LOG_DIR/${JOB_NAME}.sbatch"
-    cat > "$SLURM_SCRIPT" << EOF
-#!/bin/bash
-#SBATCH --job-name=$JOB_NAME
-#SBATCH --output=$LOG_DIR/${JOB_NAME}_%j.out
-#SBATCH --error=$LOG_DIR/${JOB_NAME}_%j.err
-#SBATCH --time=12:00:00
-#SBATCH --gres=gpu:1
-#SBATCH --mem=64G
-#SBATCH --partition=gpuA100x4
-#SBATCH --account=bdzy-delta-gpu
-
-cd $PROJECT_DIR
-export PYTHONPATH="$PROJECT_DIR:\$PYTHONPATH"
-$CMD
-EOF
-
-    echo "SLURM script: $SLURM_SCRIPT"
-    if [[ "$DRY_RUN" == true ]]; then
-        echo "Dry run - would submit: sbatch $SLURM_SCRIPT"
-    else
-        sbatch "$SLURM_SCRIPT"
-    fi
+if [[ "$DRY_RUN" == true ]]; then
+    echo "Dry run: $CMD"
 else
-    cd "$PROJECT_DIR"
-    export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
-    if [[ "$DRY_RUN" == true ]]; then
-        echo "Dry run: $CMD"
-    else
-        eval "$CMD"
-    fi
+    eval "$CMD"
 fi

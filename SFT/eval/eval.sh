@@ -1,15 +1,26 @@
 #!/bin/bash
-#
-# Evaluation script for SFT experiments
-#
-# Task is auto-detected from model name (e.g., alpaca_samsum -> samsum)
-#
-# Usage:
-#   bash SFT/eval/eval.sh                       # Evaluate all models
-#   bash SFT/eval/eval.sh --train alpaca        # Only alpaca training set
-#   bash SFT/eval/eval.sh --batch_size 4        # Set batch size
-#   bash SFT/eval/eval.sh --sbatch              # Submit to SLURM
-#
+
+#SBATCH --job-name=SFT-Eval
+#SBATCH --mem=64g
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --partition=gpuA40x4
+#SBATCH --account=bfwm-delta-gpu
+#SBATCH --time=24:00:00
+#SBATCH --constraint="scratch"
+#SBATCH --output=/u/%u/Project/Gradient-Streaming/SFT/log/%x-%j.log
+
+### GPU options ###
+#SBATCH --gpus-per-node=1
+#SBATCH --gpu-bind=none
+#SBATCH --mail-user=pbb@illinois.edu
+#SBATCH --mail-type="END"
+
+cd $HOME/Project/Gradient-Streaming
+
+# Set PYTHONPATH to include project root for imports
+export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
 
 set -e
 
@@ -22,7 +33,6 @@ N_TEST=-1
 BATCH_SIZE=1
 MAX_NEW_TOKENS=128
 SEED=42
-SBATCH=false
 DRY_RUN=false
 
 # Parse arguments
@@ -60,10 +70,6 @@ while [[ $# -gt 0 ]]; do
             SEED="$2"
             shift 2
             ;;
-        --sbatch)
-            SBATCH=true
-            shift
-            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -80,7 +86,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --batch_size N       Batch size for generation (default: 1)"
             echo "  --max_new_tokens N   Max tokens to generate (default: 128)"
             echo "  --seed N             Random seed for reproducibility (default: 42)"
-            echo "  --sbatch             Submit as SLURM job"
             echo "  --dry-run            Print command without executing"
             exit 0
             ;;
@@ -94,7 +99,6 @@ done
 # Get directories
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SFT_DIR="$(dirname "$SCRIPT_DIR")"
-PROJECT_DIR="$(dirname "$SFT_DIR")"
 DATA_DIR="$SFT_DIR/data"
 
 echo ""
@@ -137,37 +141,8 @@ if [[ -n "$SUBJECT" ]]; then
     CMD="$CMD --subject $SUBJECT"
 fi
 
-if [[ "$SBATCH" == true ]]; then
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="eval_${TIMESTAMP}"
-    LOG_DIR="$MODELS_DIR/logs"
-    mkdir -p "$LOG_DIR"
-
-    SLURM_SCRIPT="$LOG_DIR/${JOB_NAME}.sbatch"
-    cat > "$SLURM_SCRIPT" << EOF
-#!/bin/bash
-#SBATCH --job-name=$JOB_NAME
-#SBATCH --output=$LOG_DIR/${JOB_NAME}_%j.out
-#SBATCH --error=$LOG_DIR/${JOB_NAME}_%j.err
-#SBATCH --time=24:00:00
-#SBATCH --gres=gpu:1
-#SBATCH --mem=64G
-
-cd $PROJECT_DIR
-$CMD
-EOF
-
-    echo "SLURM script: $SLURM_SCRIPT"
-    if [[ "$DRY_RUN" == true ]]; then
-        echo "Dry run - would submit: sbatch $SLURM_SCRIPT"
-    else
-        sbatch "$SLURM_SCRIPT"
-    fi
+if [[ "$DRY_RUN" == true ]]; then
+    echo "Dry run: $CMD"
 else
-    cd "$PROJECT_DIR"
-    if [[ "$DRY_RUN" == true ]]; then
-        echo "Dry run: $CMD"
-    else
-        eval "$CMD"
-    fi
+    eval "$CMD"
 fi
