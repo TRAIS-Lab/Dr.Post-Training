@@ -261,6 +261,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         # Extract tensors
         val_input_ids = val_batch['input_ids']
         val_attention_mask = val_batch['attention_mask']
+        val_position_ids = val_batch.get('position_ids', None)
         val_responses = val_batch['responses']
         val_advantages = val_batch['advantages']
 
@@ -278,6 +279,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             output = self.actor_module(
                 input_ids=val_input_ids,
                 attention_mask=val_attention_mask,
+                position_ids=val_position_ids,
                 use_cache=False,
             )
             logits = output.logits
@@ -344,6 +346,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         # Extract tensors
         input_ids = train_batch['input_ids']
         attention_mask = train_batch['attention_mask']
+        position_ids = train_batch.get('position_ids', None)
         responses = train_batch['responses']
         old_log_prob = train_batch['old_log_probs']
         advantages = train_batch['advantages']
@@ -358,6 +361,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             output = self.actor_module(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 use_cache=False,
             )
             logits = output.logits
@@ -446,10 +450,16 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         temperature = data.meta_info['temperature']
 
         # Select keys
-        select_keys = [
-            'responses', 'input_ids', 'attention_mask', 'position_ids',
-            'old_log_probs', 'advantages'
-        ]
+        if self.config.use_temp_log_prob:
+            select_keys = [
+                'responses', 'input_ids', 'attention_mask', 'position_ids',
+                'old_log_probs', 'advantages', 'temp_log_probs'
+            ]
+        else:
+            select_keys = [
+                'responses', 'input_ids', 'attention_mask', 'position_ids',
+                'old_log_probs', 'advantages'
+            ]
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
         batch = data.select(batch_keys=select_keys).batch
@@ -478,6 +488,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         val_batch = {
             'input_ids': batch['input_ids'][val_indices],
             'attention_mask': batch['attention_mask'][val_indices],
+            'position_ids': batch['position_ids'][val_indices],
             'responses': batch['responses'][val_indices],
             'advantages': batch['advantages'][val_indices],
         }
@@ -516,6 +527,10 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     resp_mask = attn_mask[:, -resp_length:]
                     old_log_prob = micro_batch['old_log_probs']
                     advs = micro_batch['advantages']
+                    if self.config.use_temp_log_prob:
+                        temp_log_prob = micro_batch['temp_log_probs']
+                    else:
+                        temp_log_prob = None
 
                     micro_batch_size = responses.size(0)
 
@@ -523,6 +538,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     train_batch_dict = {
                         'input_ids': micro_batch['input_ids'],
                         'attention_mask': attn_mask,
+                        'position_ids': micro_batch['position_ids'],
                         'responses': responses,
                         'old_log_probs': old_log_prob,
                         'advantages': advs,
@@ -541,6 +557,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                         sel_old_log_prob = old_log_prob[selected_indices]
                         sel_advantages = advs[selected_indices]
                         sel_response_mask = resp_mask[selected_indices]
+                        sel_temp_log_prob = temp_log_prob[selected_indices] if temp_log_prob is not None else None
 
                         # Forward on selected
                         entropy, log_prob = self._forward_micro_batch(
@@ -554,13 +571,23 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                         )
 
                         # Compute loss
-                        pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
-                            old_log_prob=sel_old_log_prob,
-                            log_prob=log_prob,
-                            advantages=sel_advantages,
-                            eos_mask=sel_response_mask,
-                            cliprange=self.config.clip_ratio,
-                        )
+                        if not self.config.use_temp_log_prob:
+                            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
+                                old_log_prob=sel_old_log_prob,
+                                log_prob=log_prob,
+                                advantages=sel_advantages,
+                                eos_mask=sel_response_mask,
+                                cliprange=self.config.clip_ratio,
+                            )
+                        else:
+                            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss_temp(
+                                old_log_prob=sel_old_log_prob,
+                                log_prob=log_prob,
+                                advantages=sel_advantages,
+                                eos_mask=sel_response_mask,
+                                cliprange=self.config.clip_ratio,
+                                temp_log_prob=sel_temp_log_prob,
+                            )
 
                         entropy_loss = verl_F.masked_mean(entropy, sel_response_mask)
                         policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
@@ -582,19 +609,33 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
                     elif self.selection_method == 'Streaming':
                         # Streaming: Setup selection, forward/backward does selection per-layer
-                        self._setup_streaming(micro_batch_size, responses)
+                        # Create labels with -100 for prompt positions (only response is valid)
+                        # The response_mask already indicates valid response tokens
+                        labels_for_streaming = torch.full_like(attn_mask, -100)
+                        labels_for_streaming[:, -resp_length:] = responses * resp_mask.long() + (-100) * (~resp_mask.bool()).long()
+                        self._setup_streaming(micro_batch_size, labels_for_streaming)
 
                         entropy, log_prob = self._forward_micro_batch(
                             micro_batch, temperature=temperature
                         )
 
-                        pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advs,
-                            eos_mask=resp_mask,
-                            cliprange=self.config.clip_ratio,
-                        )
+                        if not self.config.use_temp_log_prob:
+                            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advs,
+                                eos_mask=resp_mask,
+                                cliprange=self.config.clip_ratio,
+                            )
+                        else:
+                            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss_temp(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advs,
+                                eos_mask=resp_mask,
+                                cliprange=self.config.clip_ratio,
+                                temp_log_prob=temp_log_prob,
+                            )
 
                         entropy_loss = verl_F.masked_mean(entropy, resp_mask)
                         policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
@@ -623,13 +664,23 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                             micro_batch, temperature=temperature
                         )
 
-                        pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advs,
-                            eos_mask=resp_mask,
-                            cliprange=self.config.clip_ratio,
-                        )
+                        if not self.config.use_temp_log_prob:
+                            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advs,
+                                eos_mask=resp_mask,
+                                cliprange=self.config.clip_ratio,
+                            )
+                        else:
+                            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss_temp(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advs,
+                                eos_mask=resp_mask,
+                                cliprange=self.config.clip_ratio,
+                                temp_log_prob=temp_log_prob,
+                            )
 
                         entropy_loss = verl_F.masked_mean(entropy, resp_mask)
                         policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
@@ -664,7 +715,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         # Clear validation gradients
         if self._is_selection_enabled():
-            self.grad_hook.clear_val_gradients()
+            self.grad_hook.clear_val_buffer()
 
         # Add selection stats to metrics
         for key, val in self.selection_stats.items():

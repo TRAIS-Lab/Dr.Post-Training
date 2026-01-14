@@ -56,6 +56,7 @@ def set_seed(seed: int):
 
 from gradstream.hook import GradientHook
 from gradstream.compressor import setup_model_compressors
+from gradstream.compression_mode import CompressionMode
 from gradstream.optimizer import MeSOAdamW
 from gradstream.selection.strategies import (
     SeparateBatchStreamingStrategy, SeparateBatchGREATSStrategy,
@@ -1509,14 +1510,15 @@ def setup_lora_sgd_momentum_gc(config: BenchmarkConfig):
     return model, optimizer, tokenizer
 
 
-def _setup_compression(model, config: BenchmarkConfig, use_meso_optimizer: bool = True):
+def _setup_compression(model, config: BenchmarkConfig, use_full_compression: bool = True):
     """
     Helper to set up compression (GraSS/LoGra) for a model.
 
     Args:
         model: The model to set up compression for
         config: Benchmark configuration
-        use_meso_optimizer: If True, return MeSOAdamW optimizer. If False, return standard AdamW.
+        use_full_compression: If True, use FULL compression mode with MeSOAdamW optimizer.
+                              If False, use SCORE_ONLY mode with standard AdamW.
 
     Returns:
         Tuple of (grad_hook, optimizer)
@@ -1564,9 +1566,9 @@ def _setup_compression(model, config: BenchmarkConfig, use_meso_optimizer: bool 
         device=str(config.device),
     )
     grad_hook.set_compressors(compressors)
-    grad_hook.use_meso_optimizer = use_meso_optimizer
+    grad_hook.compression_mode = CompressionMode.FULL if use_full_compression else CompressionMode.SCORE_ONLY
 
-    if use_meso_optimizer:
+    if use_full_compression:
         optimizer = MeSOAdamW(
             model.parameters(),
             grad_hook=grad_hook,
@@ -1590,7 +1592,7 @@ def setup_NA_GraSS_full(config: BenchmarkConfig):
     model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=True)
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_full_compression=True)
 
     return model, optimizer, tokenizer, grad_hook
 
@@ -1605,7 +1607,7 @@ def setup_NA_GraSS_full_gc(config: BenchmarkConfig):
     model.gradient_checkpointing_enable()
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=True)
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_full_compression=True)
 
     return model, optimizer, tokenizer, grad_hook
 
@@ -1620,7 +1622,7 @@ def setup_Streaming_NA_full(config: BenchmarkConfig):
     model.train()
 
     # Need grad_hook for selection scoring but no compression, use standard optimizer
-    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=False)
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_full_compression=False)
     # Clear compressors to use full gradients for the actual update
     grad_hook.compressors = [None] * len(grad_hook.layer_names)
 
@@ -1637,7 +1639,7 @@ def setup_Streaming_NA_full_gc(config: BenchmarkConfig):
     model.gradient_checkpointing_enable()
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=False)
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_full_compression=False)
     grad_hook.compressors = [None] * len(grad_hook.layer_names)
 
     return model, optimizer, tokenizer, grad_hook
@@ -1653,7 +1655,7 @@ def setup_GREATS_NA_full(config: BenchmarkConfig):
     model.train()
 
     # Need grad_hook with compressors for scoring, but use standard optimizer
-    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=False)
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_full_compression=False)
 
     return model, optimizer, tokenizer, grad_hook
 
@@ -1668,7 +1670,7 @@ def setup_GREATS_NA_full_gc(config: BenchmarkConfig):
     model.gradient_checkpointing_enable()
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=False)
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_full_compression=False)
 
     return model, optimizer, tokenizer, grad_hook
 
@@ -1682,7 +1684,7 @@ def setup_Streaming_GraSS_full(config: BenchmarkConfig):
     model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=True)
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_full_compression=True)
 
     return model, optimizer, tokenizer, grad_hook
 
@@ -1696,12 +1698,12 @@ def setup_GREATS_GraSS_full(config: BenchmarkConfig):
     model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_meso_optimizer=True)
+    grad_hook, optimizer, tokenizer = _setup_compression(model, config, use_full_compression=True)
 
     return model, optimizer, tokenizer, grad_hook
 
 
-def _setup_logra_compression(model, config: BenchmarkConfig, use_meso_optimizer: bool = True):
+def _setup_logra_compression(model, config: BenchmarkConfig, use_full_compression: bool = True):
     """
     Helper to set up LoGra compression for a model.
 
@@ -1711,7 +1713,8 @@ def _setup_logra_compression(model, config: BenchmarkConfig, use_meso_optimizer:
     Args:
         model: The model to set up compression for
         config: Benchmark configuration
-        use_meso_optimizer: If True, return MeSOAdamW optimizer. If False, return standard AdamW.
+        use_full_compression: If True, use FULL compression mode with MeSOAdamW optimizer.
+                              If False, use SCORE_ONLY mode with standard AdamW.
 
     Returns:
         Tuple of (grad_hook, optimizer, tokenizer)
@@ -1761,9 +1764,9 @@ def _setup_logra_compression(model, config: BenchmarkConfig, use_meso_optimizer:
         device=str(config.device),
     )
     grad_hook.set_compressors(compressors)
-    grad_hook.use_meso_optimizer = use_meso_optimizer
+    grad_hook.compression_mode = CompressionMode.FULL if use_full_compression else CompressionMode.SCORE_ONLY
 
-    if use_meso_optimizer:
+    if use_full_compression:
         optimizer = MeSOAdamW(
             model.parameters(),
             grad_hook=grad_hook,
@@ -1787,7 +1790,7 @@ def setup_NA_LoGra_full(config: BenchmarkConfig):
     model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_meso_optimizer=True)
+    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_full_compression=True)
 
     return model, optimizer, tokenizer, grad_hook
 
@@ -1801,7 +1804,7 @@ def setup_Streaming_LoGra_full(config: BenchmarkConfig):
     model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_meso_optimizer=True)
+    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_full_compression=True)
 
     return model, optimizer, tokenizer, grad_hook
 
@@ -1816,7 +1819,7 @@ def setup_Streaming_LoGra_full_gc(config: BenchmarkConfig):
     model.gradient_checkpointing_enable()
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_meso_optimizer=True)
+    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_full_compression=True)
 
     return model, optimizer, tokenizer, grad_hook
 
@@ -1830,7 +1833,7 @@ def setup_GREATS_LoGra_full(config: BenchmarkConfig):
     model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_meso_optimizer=True)
+    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_full_compression=True)
 
     return model, optimizer, tokenizer, grad_hook
 
@@ -1845,7 +1848,7 @@ def setup_GREATS_LoGra_full_gc(config: BenchmarkConfig):
     model.gradient_checkpointing_enable()
     model.train()
 
-    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_meso_optimizer=True)
+    grad_hook, optimizer, tokenizer = _setup_logra_compression(model, config, use_full_compression=True)
 
     return model, optimizer, tokenizer, grad_hook
 
@@ -1913,9 +1916,8 @@ def _setup_score_compression(model, config: BenchmarkConfig):
     )
     grad_hook.set_compressors(compressors)
 
-    # KEY: Set use_meso_optimizer=False for hybrid mode
-    # This tells the backward pass to compute compressed scores but return full gradients
-    grad_hook.use_meso_optimizer = False
+    # Set SCORE_ONLY mode for hybrid: compressed scores + full gradient updates
+    grad_hook.compression_mode = CompressionMode.SCORE_ONLY
 
     # Use standard AdamW optimizer (not MeSO) for full gradient updates
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
@@ -1997,7 +1999,7 @@ def setup_GREATS_ScoreComp_Full_gc(config: BenchmarkConfig):
     return model, optimizer, tokenizer, grad_hook
 
 
-def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_meso_optimizer: bool = True, use_gc: bool = False):
+def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_full_compression: bool = True, use_gc: bool = False):
     """
     Helper to set up LoRA model with gradient hook for data selection.
 
@@ -2007,7 +2009,8 @@ def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_meso_optimizer: bool
 
     Args:
         config: Benchmark configuration
-        use_meso_optimizer: If True, return MeSOAdamW optimizer. If False, return standard AdamW.
+        use_full_compression: If True, use FULL compression mode with MeSOAdamW optimizer.
+                              If False, use SCORE_ONLY mode with standard AdamW.
         use_gc: If True, enable gradient checkpointing.
 
     Returns:
@@ -2077,8 +2080,9 @@ def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_meso_optimizer: bool
         device=str(config.device),
     )
     grad_hook.set_compressors(compressors)
+    grad_hook.compression_mode = CompressionMode.FULL if use_full_compression else CompressionMode.SCORE_ONLY
 
-    if use_meso_optimizer:
+    if use_full_compression:
         optimizer = MeSOAdamW(
             model.parameters(),
             grad_hook=grad_hook,
@@ -2095,7 +2099,7 @@ def _setup_lora_with_grad_hook(config: BenchmarkConfig, use_meso_optimizer: bool
 
 def setup_Streaming_NA_lora(config: BenchmarkConfig):
     """Streaming-NA-LoRA: Per-layer selection with full gradients, LoRA."""
-    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False)
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_full_compression=False)
     # Clear compressors to use full gradients for the actual update
     grad_hook.compressors = [None] * len(grad_hook.layer_names)
     return model, optimizer, tokenizer, grad_hook
@@ -2103,32 +2107,32 @@ def setup_Streaming_NA_lora(config: BenchmarkConfig):
 
 def setup_Streaming_NA_lora_gc(config: BenchmarkConfig):
     """Streaming-NA-LoRA with gradient checkpointing."""
-    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False, use_gc=True)
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_full_compression=False, use_gc=True)
     grad_hook.compressors = [None] * len(grad_hook.layer_names)
     return model, optimizer, tokenizer, grad_hook
 
 
 def setup_GREATS_NA_lora(config: BenchmarkConfig):
     """GREATS-NA-LoRA: Global selection with full gradients, LoRA."""
-    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False)
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_full_compression=False)
     return model, optimizer, tokenizer, grad_hook
 
 
 def setup_GREATS_NA_lora_gc(config: BenchmarkConfig):
     """GREATS-NA-LoRA with gradient checkpointing."""
-    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=False, use_gc=True)
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_full_compression=False, use_gc=True)
     return model, optimizer, tokenizer, grad_hook
 
 
 def setup_Streaming_GraSS_lora(config: BenchmarkConfig):
     """Streaming-GraSS-LoRA: Per-layer selection + MeSO, LoRA."""
-    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=True)
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_full_compression=True)
     return model, optimizer, tokenizer, grad_hook
 
 
 def setup_GREATS_GraSS_lora(config: BenchmarkConfig):
     """GREATS-GraSS-LoRA: Global selection + MeSO, LoRA."""
-    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_meso_optimizer=True)
+    model, grad_hook, optimizer, tokenizer = _setup_lora_with_grad_hook(config, use_full_compression=True)
     return model, optimizer, tokenizer, grad_hook
 
 

@@ -84,7 +84,6 @@ class GradientHook:
         self.compressors: List[Optional[Compressor]] = [None] * len(layer_names)
 
         # Compression mode configuration
-        # This replaces the old use_meso_optimizer flag with a clearer enum
         self._compression_mode: CompressionMode = CompressionMode.NONE
 
         # Track hook registration status
@@ -135,55 +134,6 @@ class GradientHook:
                 )
         self._compression_mode = mode
         logger.debug(f"Set compression mode to {mode.value}")
-
-    @property
-    def use_meso_optimizer(self) -> bool:
-        """
-        Check if MeSO optimizer mode is enabled.
-
-        This is True when compression_mode is FULL, meaning compressed
-        gradients are used for model updates (not just scoring).
-
-        Maintained for backward compatibility.
-        """
-        return self._compression_mode == CompressionMode.FULL
-
-    @use_meso_optimizer.setter
-    def use_meso_optimizer(self, value: bool) -> None:
-        """
-        Set MeSO optimizer mode.
-
-        Maintained for backward compatibility. Prefer setting compression_mode directly.
-        """
-        if value:
-            self._compression_mode = CompressionMode.FULL
-        elif self._compression_mode == CompressionMode.FULL:
-            # Downgrade to SCORE_ONLY if compressors exist, else NONE
-            if any(c is not None for c in self.compressors):
-                self._compression_mode = CompressionMode.SCORE_ONLY
-            else:
-                self._compression_mode = CompressionMode.NONE
-
-    def configure_compression(
-        self,
-        has_compressor: bool,
-        use_meso_optimizer: bool = False
-    ) -> None:
-        """
-        Configure compression mode from flags.
-
-        This is a convenience method for configuring compression from
-        legacy flag-based configuration.
-
-        Args:
-            has_compressor: Whether compressors are configured
-            use_meso_optimizer: Whether to use compressed gradient updates
-        """
-        self._compression_mode = CompressionMode.from_config(
-            has_compressor=has_compressor,
-            use_meso_optimizer=use_meso_optimizer
-        )
-        logger.info(f"Configured compression mode: {self._compression_mode.value}")
 
     # =========================================================================
     # Hook Registration
@@ -402,69 +352,6 @@ class GradientHook:
         """Get total tokens in validation batch."""
         return self._val_cache.total_tokens
 
-    # Backward compatibility: expose buffers as properties
-    @property
-    def val_grad_buffer(self) -> List[Optional[Tensor]]:
-        """Get full validation gradient buffer (backward compatibility)."""
-        return self._val_cache._full
-
-    @val_grad_buffer.setter
-    def val_grad_buffer(self, value: List[Optional[Tensor]]) -> None:
-        """Set full validation gradient buffer (backward compatibility)."""
-        self._val_cache._full = value
-
-    @property
-    def val_grad_output_buffer(self) -> List[Optional[Tensor]]:
-        """Get factorized grad_output buffer (backward compatibility)."""
-        return [
-            data[0] if data is not None else None
-            for data in self._val_cache._factorized
-        ]
-
-    @val_grad_output_buffer.setter
-    def val_grad_output_buffer(self, value: List[Optional[Tensor]]) -> None:
-        """Set factorized grad_output buffer (backward compatibility)."""
-        for idx, val in enumerate(value):
-            if val is not None:
-                existing = self._val_cache._factorized[idx]
-                if existing is not None:
-                    self._val_cache._factorized[idx] = (val, existing[1])
-                else:
-                    self._val_cache._factorized[idx] = (val, None)
-            else:
-                if self._val_cache._factorized[idx] is not None:
-                    _, inp = self._val_cache._factorized[idx]
-                    if inp is not None:
-                        self._val_cache._factorized[idx] = (None, inp)
-                    else:
-                        self._val_cache._factorized[idx] = None
-
-    @property
-    def val_input_buffer(self) -> List[Optional[Tensor]]:
-        """Get factorized input buffer (backward compatibility)."""
-        return [
-            data[1] if data is not None else None
-            for data in self._val_cache._factorized
-        ]
-
-    @val_input_buffer.setter
-    def val_input_buffer(self, value: List[Optional[Tensor]]) -> None:
-        """Set factorized input buffer (backward compatibility)."""
-        for idx, val in enumerate(value):
-            if val is not None:
-                existing = self._val_cache._factorized[idx]
-                if existing is not None:
-                    self._val_cache._factorized[idx] = (existing[0], val)
-                else:
-                    self._val_cache._factorized[idx] = (None, val)
-            else:
-                if self._val_cache._factorized[idx] is not None:
-                    go, _ = self._val_cache._factorized[idx]
-                    if go is not None:
-                        self._val_cache._factorized[idx] = (go, None)
-                    else:
-                        self._val_cache._factorized[idx] = None
-
     def start_val_capture(self, use_factorized: bool = True) -> None:
         """
         Start capturing validation gradients.
@@ -503,9 +390,6 @@ class GradientHook:
     def clear_val_buffer(self) -> None:
         """Clear all validation gradient buffers."""
         self._val_cache.clear()
-
-    # Alias for backward compatibility
-    clear_val_gradients = clear_val_buffer
 
     def setup_selection_with_stored_val(
         self,

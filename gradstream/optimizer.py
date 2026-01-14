@@ -13,6 +13,7 @@ import logging
 
 from .hook import GradientHook
 from .compressor import Compressor
+from .compression_mode import CompressionMode
 from .utils import apply_hadamard_matvec, stochastic_diagonal_estimation
 logger = logging.getLogger(__name__)
 
@@ -602,15 +603,14 @@ class MeSOAdamW(Optimizer):
         num_refreshed, old_compressors = self.grad_hook.refresh_compressors(next_step)
 
         if num_refreshed > 0:
-            # Only transform optimizer states when using MeSO optimizer (compressed states)
-            # In hybrid mode (use_meso_optimizer=False), optimizer states are in full space
-            # and don't need transformation
-            if self.grad_hook.use_meso_optimizer:
+            # Only transform optimizer states when using FULL compression mode (compressed states)
+            # In SCORE_ONLY mode, optimizer states are in full space and don't need transformation
+            if self.grad_hook.compression_mode == CompressionMode.FULL:
                 logger.info(f"Refreshed {num_refreshed} compressors, now transforming optimizer states...")
                 # Transform optimizer states after refresh
                 self._transform_optimizer_states(old_compressors)
             else:
-                logger.info(f"Refreshed {num_refreshed} compressors (hybrid mode: skipping state transformation)")
+                logger.info(f"Refreshed {num_refreshed} compressors (SCORE_ONLY mode: skipping state transformation)")
         else:
             logger.debug(f"No compressor refresh needed at step {next_step}")
 

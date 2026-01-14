@@ -411,7 +411,7 @@ class RLVROnlineSelectionManager:
             # Backward to capture gradients
             val_loss.backward()
 
-        # End capture - gradients are now stored in grad_hook.val_grad_buffer
+        # End capture - gradients are now stored in grad_hook._val_cache
         self.grad_hook.end_val_capture()
 
         logger.debug(f"Captured validation gradients for {len(val_indices)} samples")
@@ -574,7 +574,7 @@ class RLVROnlineSelectionManager:
     def clear_validation_cache(self) -> None:
         """Clear cached validation gradients."""
         if self.grad_hook is not None:
-            self.grad_hook.clear_val_gradients()
+            self.grad_hook.clear_val_buffer()
         self._val_batch_size = 0
 
     def cleanup(self) -> None:

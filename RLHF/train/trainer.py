@@ -557,7 +557,7 @@ class StreamingPPOTrainer:
             per_seq_loss = -(mb_seq_advantages * seq_log_probs)
             mb_val_loss = per_seq_loss.sum() / full_batch_size
 
-            # Backward - hooks accumulate gradients into val_grad_buffer
+            # Backward - hooks accumulate gradients into validation cache
             mb_val_loss.backward()
 
             total_val_loss += mb_val_loss.item()

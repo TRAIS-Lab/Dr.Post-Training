@@ -42,42 +42,6 @@ class CompressionMode(Enum):
     FULL = "full"
     """Full compression. Compressed gradients for both scoring and model updates."""
 
-    @classmethod
-    def from_config(
-        cls,
-        has_compressor: bool,
-        use_meso_optimizer: bool
-    ) -> "CompressionMode":
-        """
-        Determine compression mode from configuration flags.
-
-        This factory method maps the legacy configuration flags to the new
-        CompressionMode enum, ensuring backward compatibility.
-
-        Args:
-            has_compressor: Whether a compressor is configured for any layer.
-            use_meso_optimizer: Whether MeSO optimizer is being used.
-
-        Returns:
-            The appropriate CompressionMode.
-
-        Raises:
-            ValueError: If use_meso_optimizer is True but has_compressor is False.
-                       MeSO optimizer requires compression.
-        """
-        if use_meso_optimizer:
-            if not has_compressor:
-                raise ValueError(
-                    "MeSO optimizer requires compression. "
-                    "Set has_compressor=True or configure sparsification/projection."
-                )
-            return cls.FULL
-
-        if has_compressor:
-            return cls.SCORE_ONLY
-
-        return cls.NONE
-
     @property
     def uses_compression(self) -> bool:
         """Check if this mode uses any compression."""

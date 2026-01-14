@@ -22,7 +22,14 @@ from verl.utils.reward_score import gsm8k, math
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.teacher_utils import TeacherModelWorker
 
-from deepscaler.rewards.math_reward import deepscaler_reward_fn
+
+def deepscaler_reward_fn(solution_str, ground_truth, format_reward=False):
+    """
+    Reward function for DeepScaler dataset.
+    Uses the same math scoring logic as the MATH dataset.
+    """
+    return math.compute_score(solution_str, ground_truth)
+
 
 def _select_rm_score_fn(data_source):
     if data_source == 'openai/gsm8k':

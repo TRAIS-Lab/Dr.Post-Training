@@ -78,10 +78,16 @@ class MergedBatchStrategy(ABC):
 
     @property
     def has_compression(self) -> bool:
-        """Check if compression (MeSO) is enabled."""
+        """Check if compression (MeSO) is enabled for gradient updates.
+
+        This returns True only for FULL compression mode (MeSO optimizer).
+        SCORE_ONLY mode uses compression for scoring but full gradients for updates,
+        so has_compression should be False for proper Pass 2 behavior.
+        """
         if self.grad_hook is None:
             return False
-        return any(c is not None for c in self.grad_hook.compressors)
+        from gradstream.compression_mode import CompressionMode
+        return self.grad_hook.compression_mode == CompressionMode.FULL
 
     @abstractmethod
     def execute_training_step(
@@ -385,10 +391,16 @@ class SeparateBatchStrategy(ABC):
 
     @property
     def has_compression(self) -> bool:
-        """Check if compression (MeSO) is enabled."""
+        """Check if compression (MeSO) is enabled for gradient updates.
+
+        This returns True only for FULL compression mode (MeSO optimizer).
+        SCORE_ONLY mode uses compression for scoring but full gradients for updates,
+        so has_compression should be False for proper Pass 2 behavior.
+        """
         if self.grad_hook is None:
             return False
-        return any(c is not None for c in self.grad_hook.compressors)
+        from gradstream.compression_mode import CompressionMode
+        return self.grad_hook.compression_mode == CompressionMode.FULL
 
     @abstractmethod
     def execute_training_step(

@@ -435,6 +435,7 @@ def main():
         else:
             projector_kwargs = {
                 "proj_dim": -1,
+                "proj_max_batch_size": training_args.per_device_train_batch_size,
                 "proj_type": "identity",
                 "device": device,
             }

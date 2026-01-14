@@ -40,10 +40,10 @@ class ValidationCache:
     """
     Manages cached validation gradients for separate-batch strategies.
 
-    This class consolidates the three validation gradient buffers that were
-    previously scattered across GradientHook:
-    - val_grad_output_buffer + val_input_buffer (factorized mode)
-    - val_grad_buffer (full mode)
+    This class provides three storage modes for validation gradients:
+    - factorized: Store (grad_output, input) components separately
+    - full: Store total gradient [O, I] per layer
+    - compressed: Store compressed gradient [k] per layer
 
     Usage:
         # Start capture phase
@@ -251,8 +251,7 @@ class ValidationCache:
         self.capturing = False
 
     # =========================================================================
-    # Backward compatibility properties
-    # These allow gradual migration from direct buffer access
+    # Storage mode helpers
     # =========================================================================
 
     @property

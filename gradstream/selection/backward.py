@@ -53,13 +53,15 @@ def _get_val_components(
         Either (val_grad_output, val_input, None) for factorized mode,
         or (None, None, val_grad_total) for full gradient mode.
     """
-    val_grad_output = hook_manager.val_grad_output_buffer[layer_idx]
-    val_input = hook_manager.val_input_buffer[layer_idx]
+    val_cache = hook_manager._val_cache
 
+    # Try factorized mode first
+    val_grad_output, val_input = val_cache.get_factorized(layer_idx)
     if val_grad_output is not None and val_input is not None:
         return val_grad_output, val_input, None
 
-    val_grad_total = hook_manager.val_grad_buffer[layer_idx]
+    # Fall back to full gradient mode
+    val_grad_total = val_cache.get_full(layer_idx)
     return None, None, val_grad_total
 
 
@@ -233,7 +235,7 @@ class StreamingLinearBackward(Function):
         # === Get train/val gradients for score computation ===
         if use_stored_val:
             train_grads = compressed_grad
-            val_grad = hook_manager.val_grad_buffer[layer_idx]
+            val_grad = hook_manager._val_cache.get_compressed(layer_idx)
             score_correction = None  # Cached mode: no correction needed
         else:
             train_grads, val_grads = split_train_val_batch(compressed_grad, state.train_batch_size)
@@ -445,7 +447,7 @@ class GREATSLinearBackward(Function):
 
         if use_stored_val:
             train_grads = compressed_grad
-            val_grad = hook_manager.val_grad_buffer[layer_idx]
+            val_grad = hook_manager._val_cache.get_compressed(layer_idx)
             # Cached mode: gradients already correctly scaled
             score_correction = None
         else:
