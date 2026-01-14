@@ -598,7 +598,7 @@ run_single_method() {
     # Includes: validation settings, PPO epochs, mini-batch size, KL coefficient
     local JOB_NAME="${task}-${model_name}-${method_str}-${job_type}-lr${exp_lr}-b${batch_size}-${val_str}-pe${ppo_epochs}-mb${mini_batch_size}-kl${exp_init_kl_coef}-s${seed}"
 
-    local output_dir=/work/hdd/bfwm/phu1/Project/Gradient-Streaming/RLHF/${JOB_NAME}
+    local output_dir=/scratch/pbb/Project/Gradient-Streaming/RLHF/${JOB_NAME}
     if [[ ! -d $output_dir ]]; then
         mkdir -p $output_dir
     fi

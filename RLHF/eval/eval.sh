@@ -25,48 +25,48 @@ export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
 set -e
 
 # Default values
-MODELS_DIR="/scratch/pbb/Project/Gradient-Streaming/RLHF"
-TASK=""
-N_SAMPLES=400
-BATCH_SIZE=16
-MAX_NEW_TOKENS=30
-SEED=42
-CLASSIFIER="independent"  # Use independent classifier by default for unbiased evaluation
-DRY_RUN=false
+models_dir="/scratch/pbb/Project/Gradient-Streaming/RLHF"
+task=""
+n_samples=400
+batch_size=16
+max_new_tokens=30
+seed=42
+classifier="independent"  # Use independent classifier by default for unbiased evaluation
+dry_run=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --models_dir)
-            MODELS_DIR="$2"
+            models_dir="$2"
             shift 2
             ;;
         --task)
-            TASK="$2"
+            task="$2"
             shift 2
             ;;
         --n_samples)
-            N_SAMPLES="$2"
+            n_samples="$2"
             shift 2
             ;;
         --batch_size)
-            BATCH_SIZE="$2"
+            batch_size="$2"
             shift 2
             ;;
         --max_new_tokens)
-            MAX_NEW_TOKENS="$2"
+            max_new_tokens="$2"
             shift 2
             ;;
         --seed)
-            SEED="$2"
+            seed="$2"
             shift 2
             ;;
         --classifier)
-            CLASSIFIER="$2"
+            classifier="$2"
             shift 2
             ;;
         --dry-run)
-            DRY_RUN=true
+            dry_run=true
             shift
             ;;
         -h|--help)
@@ -96,34 +96,34 @@ echo ""
 echo "========================================================"
 echo "  RLHF Toxicity Evaluation"
 echo "========================================================"
-echo "Models dir:      $MODELS_DIR"
-echo "Task:            ${TASK:-all}"
+echo "Models dir:      $models_dir"
+echo "Task:            ${task:-all}"
 echo ""
 echo "Generation:"
-echo "  N samples:     $N_SAMPLES (-1 = all)"
-echo "  Batch size:    $BATCH_SIZE"
-echo "  Max new tokens: $MAX_NEW_TOKENS"
-echo "  Seed:          $SEED"
+echo "  N samples:     $n_samples (-1 = all)"
+echo "  Batch size:    $batch_size"
+echo "  Max new tokens: $max_new_tokens"
+echo "  Seed:          $seed"
 echo ""
 echo "Evaluation:"
-echo "  Classifier:    $CLASSIFIER"
+echo "  Classifier:    $classifier"
 echo "========================================================"
 
 # Build command
-CMD="python -m RLHF.eval.eval"
-CMD="$CMD --models_dir $MODELS_DIR"
-CMD="$CMD --n_samples $N_SAMPLES"
-CMD="$CMD --batch_size $BATCH_SIZE"
-CMD="$CMD --max_new_tokens $MAX_NEW_TOKENS"
-CMD="$CMD --seed $SEED"
-CMD="$CMD --classifier $CLASSIFIER"
+cmd="python -m RLHF.eval.eval"
+cmd="$cmd --models_dir $models_dir"
+cmd="$cmd --n_samples $n_samples"
+cmd="$cmd --batch_size $batch_size"
+cmd="$cmd --max_new_tokens $max_new_tokens"
+cmd="$cmd --seed $seed"
+cmd="$cmd --classifier $classifier"
 
-if [[ -n "$TASK" ]]; then
-    CMD="$CMD --task $TASK"
+if [[ -n "$task" ]]; then
+    cmd="$cmd --task $task"
 fi
 
-if [[ "$DRY_RUN" == true ]]; then
-    echo "Dry run: $CMD"
+if [[ "$dry_run" == true ]]; then
+    echo "Dry run: $cmd"
 else
-    eval "$CMD"
+    eval "$cmd"
 fi

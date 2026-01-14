@@ -43,7 +43,7 @@ export base_training_args="--do_train=True \
 
 # Default values
 model="meta-llama/Llama-3.2-1B"
-data_dir="/work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT/data"
+data_dir="/scratch/pbb/Project/Gradient-Streaming/SFT/data"
 train_dataset=""  # Training dataset (if empty, uses task-based default)
 percentage=0.05
 task="mmlu"
@@ -471,7 +471,7 @@ run_single_method() {
         JOB_NAME="${train_str}_${task}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
     fi
 
-    local output_dir=/work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT/${JOB_NAME}
+    local output_dir=/scratch/pbb/Project/Gradient-Streaming/SFT/${JOB_NAME}
     if [[ ! -d $output_dir ]]; then
         mkdir -p $output_dir
     fi
@@ -759,7 +759,7 @@ else
     JOB_NAME="${train_str}_${task}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
 fi
 
-output_dir=/work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT/${JOB_NAME}
+output_dir=/scratch/pbb/Project/Gradient-Streaming/SFT/${JOB_NAME}
 if [[ ! -d $output_dir ]]; then
     mkdir -p $output_dir
 fi

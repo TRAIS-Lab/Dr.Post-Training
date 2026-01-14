@@ -25,53 +25,58 @@ export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
 set -e
 
 # Default values
-MODELS_DIR="/scratch/pbb/Project/Gradient-Streaming/SFT"
-TRAIN=""
-TASK=""
-SUBJECT=""
-N_TEST=-1
-BATCH_SIZE=1
-MAX_NEW_TOKENS=128
-SEED=42
-DRY_RUN=false
+models_dir="/scratch/pbb/Project/Gradient-Streaming/SFT"
+data_dir="/scratch/pbb/Project/Gradient-Streaming/SFT/data"
+train=""
+task=""
+subject=""
+n_test=-1
+batch_size=1
+max_new_tokens=128
+seed=42
+dry_run=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --models_dir)
-            MODELS_DIR="$2"
+            models_dir="$2"
+            shift 2
+            ;;
+        --data_dir)
+            data_dir="$2"
             shift 2
             ;;
         --train)
-            TRAIN="$2"
+            train="$2"
             shift 2
             ;;
         --task)
-            TASK="$2"
+            task="$2"
             shift 2
             ;;
         --subject)
-            SUBJECT="$2"
+            subject="$2"
             shift 2
             ;;
         --n_test)
-            N_TEST="$2"
+            n_test="$2"
             shift 2
             ;;
         --batch_size)
-            BATCH_SIZE="$2"
+            batch_size="$2"
             shift 2
             ;;
         --max_new_tokens)
-            MAX_NEW_TOKENS="$2"
+            max_new_tokens="$2"
             shift 2
             ;;
         --seed)
-            SEED="$2"
+            seed="$2"
             shift 2
             ;;
         --dry-run)
-            DRY_RUN=true
+            dry_run=true
             shift
             ;;
         -h|--help)
@@ -79,6 +84,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --models_dir DIR     Models directory (default: /scratch/pbb/Project/Gradient-Streaming/SFT)"
+            echo "  --data_dir DIR       Data directory (default: /scratch/pbb/Project/Gradient-Streaming/SFT/data)"
             echo "  --train NAME         Filter by training dataset (alpaca, less, tulu3, wizardlm)"
             echo "  --task NAME          Override task (samsum, tydiqa, mmlu, bbh, gsm8k, math500)"
             echo "  --subject NAME       MMLU subject or BBH task to evaluate on (default: all)"
@@ -96,53 +102,48 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Get directories
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SFT_DIR="$(dirname "$SCRIPT_DIR")"
-DATA_DIR="$SFT_DIR/data"
-
 echo ""
 echo "========================================================"
 echo "  SFT Evaluation"
 echo "========================================================"
-echo "Models dir:      $MODELS_DIR"
-echo "Data dir:        $DATA_DIR"
+echo "Models dir:      $models_dir"
+echo "Data dir:        $data_dir"
 echo ""
 echo "Filters:"
-echo "  Train:         ${TRAIN:-all}"
-echo "  Task:          ${TASK:-auto-detect}"
-echo "  Subject:       ${SUBJECT:-all}"
+echo "  Train:         ${train:-all}"
+echo "  Task:          ${task:-auto-detect}"
+echo "  Subject:       ${subject:-all}"
 echo ""
 echo "Generation:"
-echo "  Batch size:    $BATCH_SIZE"
-echo "  Max new tokens: $MAX_NEW_TOKENS"
-echo "  N test:        $N_TEST (-1 = all)"
-echo "  Seed:          $SEED"
+echo "  Batch size:    $batch_size"
+echo "  Max new tokens: $max_new_tokens"
+echo "  N test:        $n_test (-1 = all)"
+echo "  Seed:          $seed"
 echo "========================================================"
 
 # Build command
-CMD="python -m SFT.eval.eval"
-CMD="$CMD --models_dir $MODELS_DIR"
-CMD="$CMD --data_dir $DATA_DIR"
-CMD="$CMD --n_test $N_TEST"
-CMD="$CMD --batch_size $BATCH_SIZE"
-CMD="$CMD --max_new_tokens $MAX_NEW_TOKENS"
-CMD="$CMD --seed $SEED"
+cmd="python -m SFT.eval.eval"
+cmd="$cmd --models_dir $models_dir"
+cmd="$cmd --data_dir $data_dir"
+cmd="$cmd --n_test $n_test"
+cmd="$cmd --batch_size $batch_size"
+cmd="$cmd --max_new_tokens $max_new_tokens"
+cmd="$cmd --seed $seed"
 
-if [[ -n "$TRAIN" ]]; then
-    CMD="$CMD --train $TRAIN"
+if [[ -n "$train" ]]; then
+    cmd="$cmd --train $train"
 fi
 
-if [[ -n "$TASK" ]]; then
-    CMD="$CMD --task $TASK"
+if [[ -n "$task" ]]; then
+    cmd="$cmd --task $task"
 fi
 
-if [[ -n "$SUBJECT" ]]; then
-    CMD="$CMD --subject $SUBJECT"
+if [[ -n "$subject" ]]; then
+    cmd="$cmd --subject $subject"
 fi
 
-if [[ "$DRY_RUN" == true ]]; then
-    echo "Dry run: $CMD"
+if [[ "$dry_run" == true ]]; then
+    echo "Dry run: $cmd"
 else
-    eval "$CMD"
+    eval "$cmd"
 fi
