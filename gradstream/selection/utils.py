@@ -163,7 +163,7 @@ def compute_selected_gradients(
     train_input: Tensor,
     selected_indices: Tensor,
     has_bias: bool,
-    scale_factor: float
+    scale_factor: Tensor
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """
     Compute aggregated gradients for selected samples.
@@ -173,7 +173,7 @@ def compute_selected_gradients(
         train_input: Training input [B, S, I] or [B, I]
         selected_indices: Indices of selected samples [K]
         has_bias: Whether to compute bias gradient
-        scale_factor: Scaling factor to normalize for selection
+        scale_factor: Scaling factor to normalize for selection (scalar Tensor)
 
     Returns:
         (grad_weight, grad_bias) tuple where grad_bias is None if not has_bias
