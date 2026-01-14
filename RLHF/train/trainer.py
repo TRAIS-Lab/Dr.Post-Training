@@ -1390,8 +1390,8 @@ class StreamingPPOTrainer:
 
             # Set token counts for this mini-batch
             mb_tokens = response_mask[mb_start:mb_end].sum(dim=1)
-            mb_total_tokens = mb_tokens.sum().item()
-            mb_state.set_token_counts(mb_tokens, int(mb_total_tokens), int(mb_total_tokens))
+            mb_total_tokens = mb_tokens.sum()  # Keep as tensor for set_token_counts
+            mb_state.set_token_counts(mb_tokens, mb_total_tokens, mb_total_tokens)
 
             # Mark to use pre-captured validation gradients from buffer
             mb_state._use_stored_val = True
