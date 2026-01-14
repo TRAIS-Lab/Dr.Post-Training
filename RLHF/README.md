@@ -14,18 +14,18 @@ The following methods have been run and can be rerun with the commands below.
 
 We consider the following 10 methods for the toxicity task:
 
-| #   | Selection | Compression | Training | Description                                      |
-| --- | --------- | ----------- | -------- | ------------------------------------------------ |
-| 1a  | NA        | NA          | Full     | Baseline PPO full fine-tuning                    |
-| 1b  | NA        | NA          | LoRA     | Baseline PPO LoRA fine-tuning                    |
-| 2a  | IIF       | NA          | Full     | Pre-filter rollout (original baseline)           |
-| 2b  | IIF       | NA          | LoRA     | Pre-filter rollout, LoRA                         |
-| 3a  | Streaming | NA          | Full     | Per-layer selection, full gradients              |
-| 3b  | Streaming | NA          | LoRA     | Per-layer selection, full gradients, LoRA        |
-| 4a  | GREATS    | NA          | Full     | Global selection, full gradients                 |
-| 4b  | GREATS    | NA          | LoRA     | Global selection, full gradients, LoRA           |
-| 5   | Streaming | LoGra       | Full     | Per-layer selection + MeSO                       |
-| 6   | GREATS    | LoGra       | Full     | Global selection + MeSO                          |
+| #   | Selection | Compression | Training | Description                               |
+| --- | --------- | ----------- | -------- | ----------------------------------------- |
+| 1a  | NA        | NA          | Full     | Baseline PPO full fine-tuning             |
+| 1b  | NA        | NA          | LoRA     | Baseline PPO LoRA fine-tuning             |
+| 2a  | IIF       | NA          | Full     | Pre-filter rollout (original baseline)    |
+| 2b  | IIF       | NA          | LoRA     | Pre-filter rollout, LoRA                  |
+| 3a  | Streaming | NA          | Full     | Per-layer selection, full gradients       |
+| 3b  | Streaming | NA          | LoRA     | Per-layer selection, full gradients, LoRA |
+| 4a  | GREATS    | NA          | Full     | Global selection, full gradients          |
+| 4b  | GREATS    | NA          | LoRA     | Global selection, full gradients, LoRA    |
+| 5   | Streaming | LoGra       | Full     | Per-layer selection + MeSO                |
+| 6   | GREATS    | LoGra       | Full     | Global selection + MeSO                   |
 
 **Selection Methods:**
 - **NA**: No data selection (baseline)
@@ -84,17 +84,17 @@ bash RLHF/train/train.sh --methods all --task toxicity --sbatch
 
 Available Categories:
 
-| Category         | Experiments                                                          |
-| ---------------- | -------------------------------------------------------------------- |
-| `all`            | All 10 methods                                                       |
-| `baseline`       | NA-NA-Full, NA-NA-LoRA                                               |
-| `iif`            | IIF-NA-Full, IIF-NA-LoRA                                             |
-| `streaming`      | Streaming-NA-Full, Streaming-NA-LoRA, Streaming-LoGra-Full           |
-| `greats`         | GREATS-NA-Full, GREATS-NA-LoRA, GREATS-LoGra-Full                    |
-| `full`           | All *-Full methods (6 total)                                         |
-| `lora`           | All *-LoRA methods (4 total)                                         |
-| `compression`    | Streaming-LoGra-Full, GREATS-LoGra-Full                              |
-| `no-compression` | All methods without compression (8 total)                            |
+| Category         | Experiments                                                |
+| ---------------- | ---------------------------------------------------------- |
+| `all`            | All 10 methods                                             |
+| `baseline`       | NA-NA-Full, NA-NA-LoRA                                     |
+| `iif`            | IIF-NA-Full, IIF-NA-LoRA                                   |
+| `streaming`      | Streaming-NA-Full, Streaming-NA-LoRA, Streaming-LoGra-Full |
+| `greats`         | GREATS-NA-Full, GREATS-NA-LoRA, GREATS-LoGra-Full          |
+| `full`           | All *-Full methods (6 total)                               |
+| `lora`           | All *-LoRA methods (4 total)                               |
+| `compression`    | Streaming-LoGra-Full, GREATS-LoGra-Full                    |
+| `no-compression` | All methods without compression (8 total)                  |
 
 #### Parameters
 
@@ -112,19 +112,11 @@ The unified training script accepts the following arguments:
      - `GREATS` - Global selection (two-pass, during PPO mini-batches)
    - `--use_second_order` - Enable greedy selection with second-order interactions (default: disabled)
 3. Compression Arguments
-   - `--compression <method>` - Gradient compression method:
-     - `LoGra` - Low-rank Gradient compression (Gaussian projection)
-     - `GraSS` - Gradient Sparsification with Sketching
-     - If not specified, uses full gradients for model updates
-   - `--score_compression_dim <dim>` - Auto score compression dimension (default: `64`, i.e., 64x64). Set to `0` to disable score compression.
+   - `--compression <method>` - Gradient compression method (implies MeSO optimizer):
+     - `LoGra` - Low-rank Gradient compression (Gaussian projection, default)
+     - `GraSS` - Gradient Sparsification with Sketching (available but not used in default methods)
+     - If not specified, uses full gradients and standard AdamW optimizer
    - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
-
-   **Compression Modes** (automatically determined):
-   | Mode | Condition | Scoring | Model Updates | Optimizer |
-   |------|-----------|---------|---------------|-----------|
-   | NONE | No compression args | Full gradients | Full gradients | AdamW |
-   | SCORE_ONLY | `--score_compression_dim > 0` (no explicit compression) | Compressed | Full gradients | AdamW |
-   | FULL | `--compression` specified | Compressed | Compressed | MeSO |
 4. Core Training Arguments
    - `--lr <lr>` - Learning rate override (if not specified, looked up from `config.json`; fallback: `1e-5`)
    - `--lr_vhead <lr>` - Value head learning rate override (if not specified, looked up from `config.json`; fallback: `5e-4`)
