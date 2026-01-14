@@ -17,19 +17,6 @@ Two evaluation classifiers are supported:
 2. "independent" (default): DaNLP/da-electra-hatespeech-detection (via evaluate library)
    - Different from reward model (recommended for unbiased evaluation)
    - Matches reference implementation from rlhf-toxicity
-
-Usage:
-    # Evaluate all models with independent classifier (recommended)
-    python -m RLHF.eval.eval --models_dir /scratch/pbb/Project/Gradient-Streaming/RLHF --classifier independent
-
-    # Evaluate with reward model classifier
-    python -m RLHF.eval.eval --models_dir /path/to/models --classifier reward
-
-    # Single model
-    python -m RLHF.eval.eval --model_path /path/to/model
-
-    # Filter by task
-    python -m RLHF.eval.eval --models_dir /path/to/models --task toxicity
 """
 
 import argparse

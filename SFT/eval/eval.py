@@ -9,16 +9,6 @@ Supports:
 - BBH: Big Bench Hard reasoning tasks (Accuracy)
 - GSM8K: Grade school math (Accuracy)
 - MATH500: Competition math (Accuracy)
-
-Usage:
-    # Evaluate all models (default)
-    python -m SFT.eval.eval --models_dir /scratch/pbb/Project/Gradient-Streaming/SFT
-
-    # Filter by pattern
-    python -m SFT.eval.eval --models_dir /path/to/models --filter alpaca
-
-    # Single model
-    python -m SFT.eval.eval --model_path /path/to/model --tasks samsum
 """
 
 import argparse
