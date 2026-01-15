@@ -374,8 +374,9 @@ class RLVROnlineSelectionManager:
         seq_advantages = (val_advantages * val_response_mask.float()).sum(dim=1)
 
         # Start validation gradient capture
-        # Use factorized mode for memory efficiency
+        # Use full mode (not factorized) for efficiency with larger batches
         self.grad_hook.start_val_capture(use_factorized=False)
+        self.grad_hook.enable_hooks()
 
         # Forward pass to get log probabilities
         response_length = val_responses.size(1)
@@ -411,7 +412,8 @@ class RLVROnlineSelectionManager:
             # Backward to capture gradients
             val_loss.backward()
 
-        # End capture - gradients are now stored in grad_hook._val_cache
+        # End capture and cleanup
+        self.model.zero_grad()  # Clear validation gradients from parameters
         self.grad_hook.end_val_capture()
 
         logger.debug(f"Captured validation gradients for {len(val_indices)} samples")
@@ -455,7 +457,7 @@ class RLVROnlineSelectionManager:
         batch_size = input_ids.size(0)
         num_to_select = max(1, int(batch_size * self.train_selection_ratio))
 
-        # Setup GREATS state
+        # Setup GREATS state for Pass 1 (score accumulation)
         self.grad_hook.setup_selection_with_stored_val(
             train_batch_size=batch_size,
             selection_method='GREATS',
@@ -463,8 +465,9 @@ class RLVROnlineSelectionManager:
             lr=1.0,  # We handle scaling elsewhere
             compute_scores_only=True,
             use_second_order=self.use_second_order,
-            selection_mode='topk',
+            selection_mode='filtering',
         )
+        self.grad_hook.enable_hooks()
 
         # Pass 1: Forward/backward to accumulate scores
         self.model.zero_grad()
@@ -505,8 +508,9 @@ class RLVROnlineSelectionManager:
         selected_indices = self.grad_hook.selection_state.get_final_selection()
         selected_indices = selected_indices.sort()[0]  # Sort for cache locality
 
-        # Cleanup
+        # Cleanup after Pass 1
         self.grad_hook.clear_selection()
+        self.grad_hook.disable_hooks()  # Disable hooks for Pass 2 (actual training)
 
         # Track stats
         self.selection_stats['train/num_selected'] = len(selected_indices)
@@ -541,8 +545,9 @@ class RLVROnlineSelectionManager:
             lr=1.0,
             compute_scores_only=False,
             use_second_order=self.use_second_order,
-            selection_mode='topk',
+            selection_mode='filtering',
         )
+        self.grad_hook.enable_hooks()
 
         # Set token counts for gradient scaling if labels provided
         if labels is not None:

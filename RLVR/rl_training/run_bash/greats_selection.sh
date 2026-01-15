@@ -38,7 +38,7 @@ SELECTION_METHOD="GREATS"  # Options: NA, GREATS, Streaming
 SELECTION_ALPHA=0.5        # Target difficulty for validation set (Goldilocks zone)
 SELECTION_TAU=0.1          # Temperature for validation selection
 VAL_RATIO=0.2              # Fraction of batch to use as validation
-TRAIN_SELECTION_RATIO=0.5  # Fraction of training samples to select
+TRAIN_SELECTION_RATIO=0.5  # Fraction of negative-influence samples to DROP (filtering mode)
 VAL_SELECTION_MODE="soft"  # "soft" (probabilistic) or "hard" (top-k)
 USE_SECOND_ORDER=False     # Whether to use second-order greedy selection
 
@@ -47,6 +47,11 @@ TAU=1e-3
 ALPHA=0.5
 BETA=0
 ENTROPY_COEFF=0
+
+# Replay buffer parameters (required by ray_trainer.py)
+SIGMA=0.5
+BUFFER_SIZE=512
+REPLAY_STRATEGY="random"
 
 NUM_GENERATIONS=8
 WORLD_SIZE=4
@@ -93,6 +98,9 @@ for DATASET_PATH in "${DATASET_PATHS[@]}"; do
             +data.ref_size=256 \
             +data.tau=$TAU \
             +data.alpha=$ALPHA \
+            +data.sigma=$SIGMA \
+            +data.buffer_size=$BUFFER_SIZE \
+            +data.replay_strategy=$REPLAY_STRATEGY \
             +data.random_selection=False \
             actor_rollout_ref.model.path=$MODEL_PATH \
             actor_rollout_ref.actor.optim.lr=$LEARNING_RATE \
@@ -125,7 +133,7 @@ for DATASET_PATH in "${DATASET_PATHS[@]}"; do
             actor_rollout_ref.rollout.n_val=8 \
             trainer.critic_warmup=0 \
             trainer.logger=['console','wandb'] \
-            trainer.project_name="rl_selection" \
+            trainer.project_name="rl" \
             trainer.experiment_name=$WANDB_NAME \
             +trainer.val_before_train=False \
             trainer.n_gpus_per_node=$WORLD_SIZE \

@@ -273,6 +273,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         # Start validation gradient capture
         self.grad_hook.start_val_capture(use_factorized=False)
+        self.grad_hook.enable_hooks()
 
         # Forward pass
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -304,7 +305,8 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             # Backward to capture gradients
             val_loss.backward()
 
-        # End capture
+        # End capture and cleanup
+        self.actor_optimizer.zero_grad()  # Clear validation gradients from parameters
         self.grad_hook.end_val_capture()
 
         logger.debug(f"Captured validation gradients for {val_input_ids.size(0)} samples")
@@ -329,7 +331,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         if not self._is_selection_enabled():
             return torch.arange(batch_size, device=train_batch['input_ids'].device)
 
-        # Setup GREATS state
+        # Setup GREATS state for Pass 1 (score accumulation)
         self.grad_hook.setup_selection_with_stored_val(
             train_batch_size=batch_size,
             selection_method='GREATS',
@@ -337,8 +339,9 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             lr=1.0,
             compute_scores_only=True,
             use_second_order=self.use_second_order,
-            selection_mode='topk',
+            selection_mode='filtering',
         )
+        self.grad_hook.enable_hooks()
 
         # Zero gradients
         self.actor_module.zero_grad()
@@ -388,8 +391,9 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         selected_indices = self.grad_hook.selection_state.get_final_selection()
         selected_indices = selected_indices.sort()[0]
 
-        # Cleanup
+        # Cleanup after Pass 1
         self.grad_hook.clear_selection()
+        self.grad_hook.disable_hooks()  # Disable hooks for Pass 2 (actual training)
 
         # Track stats
         self.selection_stats['train/num_selected'] = len(selected_indices)
@@ -409,8 +413,9 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             lr=1.0,
             compute_scores_only=False,
             use_second_order=self.use_second_order,
-            selection_mode='topk',
+            selection_mode='filtering',
         )
+        self.grad_hook.enable_hooks()
 
         if labels is not None:
             self.grad_hook.set_token_counts(labels, batch_size)

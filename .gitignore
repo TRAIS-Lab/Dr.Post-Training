@@ -52,6 +52,8 @@ dist
 */data/train
 */data/eval
 */out
+**/outputs
+**/output
 
 # debug
 *debug*
