@@ -369,9 +369,13 @@ class RLVROnlineSelectionManager:
         val_advantages = advantages[val_indices]
         val_response_mask = response_mask[val_indices]
 
-        # Compute sequence-level advantages (sum over response tokens)
-        # This gives us the "reward signal" for each validation sequence
-        seq_advantages = (val_advantages * val_response_mask.float()).sum(dim=1)
+        # Extract advantage at the LAST token (Â_{-1})
+        # This matches RLHF: use last-token advantage as the sequence-level signal
+        last_token_indices = val_response_mask.float().sum(dim=1) - 1  # [batch_size]
+        seq_advantages = val_advantages[
+            torch.arange(val_advantages.size(0), device=val_advantages.device),
+            last_token_indices.long()
+        ]
 
         # Start validation gradient capture
         # Use full mode (not factorized) for efficiency with larger batches

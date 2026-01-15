@@ -268,8 +268,13 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         response_length = val_responses.size(1)
         response_mask = val_attention_mask[:, -response_length:]
 
-        # Compute sequence-level advantages
-        seq_advantages = (val_advantages * response_mask.float()).sum(dim=1)
+        # Extract advantage at the LAST token (Â_{-1})
+        # This matches RLHF: use last-token advantage as the sequence-level signal
+        last_token_indices = response_mask.float().sum(dim=1) - 1  # [batch_size]
+        seq_advantages = val_advantages[
+            torch.arange(val_advantages.size(0), device=val_advantages.device),
+            last_token_indices.long()
+        ]
 
         # Start validation gradient capture
         self.grad_hook.start_val_capture(use_factorized=False)

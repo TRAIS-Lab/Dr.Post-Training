@@ -54,6 +54,7 @@ dist
 */out
 **/outputs
 **/output
+**/wandb
 
 # debug
 *debug*
