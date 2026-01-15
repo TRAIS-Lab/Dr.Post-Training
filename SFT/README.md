@@ -181,11 +181,11 @@ The unified training script accepts the following arguments:
    - `--update_compressor_freq <steps>` - Projector refresh interval (default: `200`)
 
    **Compression Modes** (automatically determined):
-   | Mode | Condition | Scoring | Model Updates | Optimizer |
-   |------|-----------|---------|---------------|-----------|
-   | NONE | No compression args | Full gradients | Full gradients | AdamW |
-   | SCORE_ONLY | `--score_compression_dim > 0` (no explicit compression) | Compressed | Full gradients | AdamW |
-   | FULL | `--compression` specified | Compressed | Compressed | MeSO |
+    | Mode       | Condition                                               | Scoring        | Model Updates  | Optimizer |
+    | ---------- | ------------------------------------------------------- | -------------- | -------------- | --------- |
+    | NONE       | No compression args                                     | Full gradients | Full gradients | AdamW     |
+    | SCORE_ONLY | `--score_compression_dim > 0` (no explicit compression) | Compressed     | Full gradients | AdamW     |
+    | FULL       | `--compression` specified                               | Compressed     | Compressed     | MeSO      |
 4. Core Training Arguments
    - `--model <model>` - HuggingFace model path (default: `meta-llama/Llama-3.2-1B`)
    - `--lr <lr>` - Learning rate override (if not specified, looked up from `lr_config.json`; fallback: `5e-05` for full, `2e-04` for LoRA)
