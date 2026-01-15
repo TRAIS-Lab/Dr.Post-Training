@@ -16,16 +16,13 @@ We consider the following 10 methods for the toxicity task:
 
 | #   | Selection | Compression | Training | Description                               |
 | --- | --------- | ----------- | -------- | ----------------------------------------- |
-| 1a  | NA        | NA          | Full     | Baseline PPO full fine-tuning             |
-| 1b  | NA        | NA          | LoRA     | Baseline PPO LoRA fine-tuning             |
-| 2a  | IIF       | NA          | Full     | Pre-filter rollout (original baseline)    |
-| 2b  | IIF       | NA          | LoRA     | Pre-filter rollout, LoRA                  |
-| 3a  | Streaming | NA          | Full     | Per-layer selection, full gradients       |
-| 3b  | Streaming | NA          | LoRA     | Per-layer selection, full gradients, LoRA |
-| 4a  | GREATS    | NA          | Full     | Global selection, full gradients          |
-| 4b  | GREATS    | NA          | LoRA     | Global selection, full gradients, LoRA    |
-| 5   | Streaming | LoGra       | Full     | Per-layer selection + MeSO                |
-| 6   | GREATS    | LoGra       | Full     | Global selection + MeSO                   |
+| 1   | NA        | NA          | LoRA     | Baseline PPO LoRA fine-tuning             |
+| 2   | IIF       | NA          | LoRA     | Pre-filter rollout, LoRA                  |
+| 3   | Streaming | NA          | LoRA     | Per-layer selection, full gradients, LoRA |
+| 4   | GREATS    | NA          | LoRA     | Global selection, full gradients, LoRA    |
+
+>[!Note]
+>In principle, you can also run Full parameter training. We choose to consider LoRA.
 
 **Selection Methods:**
 - **NA**: No data selection (baseline)

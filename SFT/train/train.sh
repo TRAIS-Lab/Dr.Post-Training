@@ -84,7 +84,7 @@ lora_target_modules=""  # Empty = PEFT auto-detects (out_proj for GPT-Neo, o_pro
 # Compression settings
 compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer and compressed gradient for data selection.
 update_compressor_freq=200
-score_compression_dim=32  # Auto score compression dimension (default: 32, i.e., 32*32). Set to 0 to disable.
+score_compression_dim=64  # Auto score compression dimension (default: 64, i.e., 64*64). Set to 0 to disable.
 
 # Multi-method mode
 methods=""  # Comma-separated list of methods or categories
@@ -270,7 +270,7 @@ while [[ $# -gt 0 ]]; do
             echo "Single Method Options:"
             echo "  --data_selection <method>              Data selection: NA, Streaming, GREATS (default: NA)"
             echo "  --compression <method>                 Compression: LoGra, GraSS (implies MeSO optimizer)"
-            echo "  --score_compression_dim <dim>          Score compression dimension (default: 32, set to 0 to disable)"
+            echo "  --score_compression_dim <dim>          Score compression dimension (default: 64, set to 0 to disable)"
             echo "  --use_second_order                     Use greedy selection with second-order interactions"
             echo "  --val_strategy <strategy>              Validation strategy: separate_batch_factorized (default), separate_batch, merged_batch"
             echo ""

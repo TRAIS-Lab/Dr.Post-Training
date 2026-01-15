@@ -45,8 +45,8 @@ ppo_epochs=4
 mini_batch_size=4
 kl_estimator="k1"  # Options: k1, k2, k3 (k3 recommended - unbiased, low variance, always positive)
 adap_kl_ctrl=true
-target=50.0  # Target KL for AdaptiveKLController
-target_kl=0.2  # Early stopping threshold in PPO epochs: skip step if KL > 1.5 * target_kl
+target=70.0  # Target KL for AdaptiveKLController
+target_kl=0.3  # Early stopping threshold in PPO epochs: skip step if KL > 1.5 * target_kl
 early_stopping=true  # Enable early stopping based on target_kl
 max_new_tokens="30"  # Will be set based on task if not specified
 min_new_tokens=0
@@ -86,7 +86,7 @@ lora_target_modules=""  # Empty = PEFT auto-detects (out_proj for GPT-Neo, o_pro
 # Compression settings
 compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer and compressed gradient for data selection.
 update_compressor_freq=200
-score_compression_dim=64  # Auto score compression dimension (default: 64, i.e., 64*64). Set to 0 to disable.
+score_compression_dim=0  # Auto score compression (LoGra factorized) dimension. Set to 0 to disable.
 
 # Multi-method mode
 methods="" # Comma-separated list of methods or categories
