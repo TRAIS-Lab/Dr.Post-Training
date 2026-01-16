@@ -54,6 +54,8 @@ import torch
 import torch.nn as nn
 import logging
 
+from verl.utils.torch_functional import logprobs_from_logits
+
 logger = logging.getLogger(__name__)
 
 
@@ -400,10 +402,7 @@ class RLVROnlineSelectionManager:
             # Get log probs for response tokens
             # Logits at position i predict token at i+1
             logits = logits[:, -response_length - 1:-1, :]  # [val_batch, response_len, vocab]
-            log_probs = torch.log_softmax(logits.float(), dim=-1)
-            token_log_probs = torch.gather(
-                log_probs, dim=-1, index=val_responses.unsqueeze(-1)
-            ).squeeze(-1)  # [val_batch, response_len]
+            token_log_probs = logprobs_from_logits(logits.float(), val_responses)
 
             # Sequence log probability (sum over valid response tokens)
             seq_log_probs = (token_log_probs * val_response_mask.float()).sum(dim=1)
@@ -491,10 +490,7 @@ class RLVROnlineSelectionManager:
 
             # Compute log probs
             logits = logits[:, -response_length - 1:-1, :]
-            log_probs = torch.log_softmax(logits.float(), dim=-1)
-            token_log_probs = torch.gather(
-                log_probs, dim=-1, index=responses.unsqueeze(-1)
-            ).squeeze(-1)
+            token_log_probs = logprobs_from_logits(logits.float(), responses)
 
             # PPO-style policy loss for scoring
             ratio = torch.exp(token_log_probs - old_log_probs)

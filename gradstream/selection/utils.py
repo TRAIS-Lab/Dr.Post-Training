@@ -111,6 +111,16 @@ def compute_scores_and_similarity(
     Returns:
         (scores, similarity) tuple where similarity is None if not use_second_order
     """
+    # Ensure validation tensors have same dtype as training tensors
+    # This is needed because validation capture may use a different autocast dtype
+    target_dtype = train_grad_output.dtype
+    if val_grad_output is not None:
+        val_grad_output = val_grad_output.to(target_dtype)
+    if val_input is not None:
+        val_input = val_input.to(target_dtype)
+    if val_grad_total is not None:
+        val_grad_total = val_grad_total.to(target_dtype)
+
     # Compute scores
     # Priority to factorized mode if available
     if val_grad_output is not None and val_input is not None:

@@ -553,6 +553,142 @@ class RayPPOTrainer(object):
 
         return metric_dict
 
+    def _capture_selection_validation_gradients(self) -> dict:
+        """
+        Capture validation gradients for Streaming/GREATS selection.
+
+        Called once per epoch at the beginning. Uses the validation dataset
+        to generate completions, compute rewards, and capture gradients.
+        The captured gradients are stored in the actor and used for all
+        training batches within that epoch.
+
+        Returns:
+            Dictionary with validation capture statistics
+        """
+        from torch.utils.data import DataLoader
+        from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+
+        # Check if selection method requires validation gradients
+        selection_method = self.config.actor_rollout_ref.actor.get('selection_method', 'NA')
+        if selection_method not in ['GREATS', 'Streaming']:
+            return {}
+
+        # Get selection validation batch size (configurable)
+        selection_val_batch_size = self.config.actor_rollout_ref.actor.get('selection_val_batch_size', 64)
+
+        print(f"[Selection] Capturing validation gradients for {selection_method} selection...")
+
+        # Load validation dataset if not already loaded
+        if not hasattr(self, '_selection_val_dataset'):
+            self._selection_val_dataset = RLHFDataset(
+                parquet_files=self.config.data.val_files,
+                tokenizer=self.tokenizer,
+                prompt_key=self.config.data.prompt_key,
+                max_prompt_length=self.config.data.max_prompt_length,
+                filter_prompts=True,
+                return_raw_chat=self.config.data.get('return_raw_chat', False),
+                truncation='error',
+                format_reward=self.config.data.get('format_reward', False)
+            )
+            print(f"[Selection] Loaded validation dataset with {len(self._selection_val_dataset)} samples")
+
+        # Create dataloader for validation batch
+        # Sample a random subset for this epoch
+        import random
+        val_indices = random.sample(
+            range(len(self._selection_val_dataset)),
+            min(selection_val_batch_size, len(self._selection_val_dataset))
+        )
+        val_subset = torch.utils.data.Subset(self._selection_val_dataset, indices=val_indices)
+        val_dataloader = DataLoader(
+            dataset=val_subset,
+            batch_size=len(val_subset),
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collate_fn
+        )
+
+        # Get the validation batch
+        val_batch_dict = next(iter(val_dataloader))
+        val_batch: DataProto = DataProto.from_single_dict(val_batch_dict)
+
+        # Generate completions for validation prompts (n completions per prompt)
+        # pop() removes tensor keys from val_batch but keeps non_tensor_batch (e.g., reward_model)
+        gen_batch = val_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+        val_temperature = self.config.actor_rollout_ref.rollout.get('val_temperature', 0.6)
+        gen_batch.meta_info = {
+            'eos_token_id': self.tokenizer.eos_token_id,
+            'pad_token_id': self.tokenizer.pad_token_id,
+            'recompute_log_prob': False,
+            'do_sample': True,  # Sample n completions per prompt
+            'validate': True,
+            'val_temperature': val_temperature,
+        }
+
+        # Add padding for world size (use same helper as _validate)
+        original_len = gen_batch.batch.batch_size[0]
+        gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, self.actor_rollout_wg.world_size)
+
+        # Generate sequences - vLLM will generate n completions per prompt
+        # Output batch size will be (original_len + pad_size) * n
+        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
+
+        # Get n from config (number of completions per prompt)
+        n_completions = self.config.actor_rollout_ref.rollout.n
+
+        # Remove padding - need to account for n expansion
+        if pad_size > 0:
+            # Output is expanded by n, so remove pad_size * n samples from the end
+            keep_size = original_len * n_completions
+            gen_batch_output = gen_batch_output[:keep_size]
+
+        # val_batch now contains non_tensor_batch (with reward_model/ground_truth)
+        # Repeat it n times to match the expanded gen_batch_output
+        val_batch_repeated = val_batch.repeat(repeat_times=n_completions, interleave=True)
+
+        # Union: gen_batch_output has tensors, val_batch_repeated has non_tensor_batch
+        val_batch = val_batch_repeated.union(gen_batch_output)
+
+        # Compute rewards
+        reward_tensor = self.reward_fn(val_batch)
+
+        # Sum rewards over sequence to get per-sample reward
+        rewards = reward_tensor.sum(dim=-1)  # [batch_size]
+
+        # Prepare data for validation gradient capture
+        val_data = DataProto.from_single_dict({
+            'input_ids': val_batch.batch['input_ids'],
+            'attention_mask': val_batch.batch['attention_mask'],
+            'position_ids': val_batch.batch['position_ids'],
+            'responses': val_batch.batch['responses'],
+            'rewards': rewards,
+        })
+        val_data.meta_info = {
+            'temperature': self.config.actor_rollout_ref.rollout.temperature,
+        }
+
+        # Call actor to capture validation gradients
+        output = self.actor_rollout_wg.capture_selection_validation_gradients(val_data)
+
+        # Extract metrics
+        metrics = output.meta_info.get('metrics', {})
+
+        # Add generation info to metrics
+        total_sequences = original_len * n_completions
+        print(f"[Selection] Validation gradient capture complete: "
+              f"{original_len} prompts × {n_completions} completions = {total_sequences} sequences, "
+              f"metrics={metrics}")
+
+        return metrics
+
+    def _clear_selection_validation_gradients(self):
+        """Clear cached validation gradients at the end of epoch."""
+        selection_method = self.config.actor_rollout_ref.actor.get('selection_method', 'NA')
+        if selection_method not in ['GREATS', 'Streaming']:
+            return
+
+        self.actor_rollout_wg.clear_selection_validation_gradients()
+
     def init_workers(self):
         self.prefix_name = "verl_controller"
         """Init resource pool and worker group"""
@@ -797,6 +933,11 @@ class RayPPOTrainer(object):
                         epoch_metrics = {}
 
                         with _timer('epoch', epoch_raw):
+                            # Capture validation gradients for Streaming/GREATS selection (once per epoch)
+                            with _timer('selection_val_capture', epoch_raw):
+                                selection_val_metrics = self._capture_selection_validation_gradients()
+                                epoch_metrics.update({f'selection/{k}': v for k, v in selection_val_metrics.items()})
+
                             with _timer('data_selection', epoch_raw):
                                 from torch.utils.data import DataLoader
                                 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
@@ -1161,6 +1302,9 @@ class RayPPOTrainer(object):
 
                             epoch_metrics.update(compute_epoch_metrics(epoch_raw=epoch_raw))
                             logger.log(data=epoch_metrics, step=self.global_steps-1)
+
+                            # Clear validation gradients at end of epoch
+                            self._clear_selection_validation_gradients()
 
                             # we dont need val for now
                             

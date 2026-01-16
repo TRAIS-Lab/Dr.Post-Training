@@ -439,6 +439,83 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def capture_selection_validation_gradients(self, data: DataProto):
+        """
+        Capture validation gradients for Streaming/GREATS selection.
+
+        This is called once per epoch with a separate validation dataset.
+        The validation gradients are stored and used for all training batches
+        within that epoch.
+
+        Args:
+            data: DataProto containing:
+                - input_ids: [batch, seq_len] full input (prompt + response)
+                - attention_mask: [batch, seq_len] attention mask
+                - position_ids: [batch, seq_len] position IDs
+                - responses: [batch, response_len] response tokens
+                - rewards: [batch] rewards for each sample (in meta_info or batch)
+
+        Returns:
+            DataProto with validation capture statistics
+        """
+        data = data.to('cuda')
+        assert self._is_actor
+
+        # Check if actor supports selection
+        if not hasattr(self.actor, 'capture_validation_gradients_external'):
+            logger.warning("Actor does not support external validation gradient capture")
+            return DataProto(meta_info={'metrics': {}})
+
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+
+        data.batch = data.batch.cuda()
+
+        # Extract tensors
+        val_input_ids = data.batch['input_ids']
+        val_attention_mask = data.batch['attention_mask']
+        val_position_ids = data.batch['position_ids']
+        val_responses = data.batch['responses']
+        val_rewards = data.batch['rewards']
+        temperature = data.meta_info.get('temperature', 1.0)
+
+        log_gpu_memory_usage('Before capture validation gradients', logger=logger)
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+
+            # Capture validation gradients
+            stats = self.actor.capture_validation_gradients_external(
+                val_input_ids=val_input_ids,
+                val_attention_mask=val_attention_mask,
+                val_position_ids=val_position_ids,
+                val_responses=val_responses,
+                val_rewards=val_rewards,
+                temperature=temperature,
+            )
+
+            log_gpu_memory_usage('After capture validation gradients', logger=logger)
+
+            output = DataProto(meta_info={'metrics': stats})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            output = output.to('cpu')
+
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+
+        torch.cuda.empty_cache()
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def clear_selection_validation_gradients(self):
+        """Clear cached validation gradients."""
+        if hasattr(self.actor, 'clear_validation_gradients'):
+            self.actor.clear_validation_gradients()
+        return DataProto(meta_info={'status': 'cleared'})
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         prompts = prompts.to('cuda')
         # set to False if it is validation

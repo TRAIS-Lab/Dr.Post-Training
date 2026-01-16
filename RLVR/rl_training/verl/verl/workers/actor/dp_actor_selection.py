@@ -53,17 +53,32 @@ logger = logging.getLogger(__name__)
 __all__ = ['DataParallelPPOActorWithSelection']
 
 
-def get_trainable_linear_layers(model: nn.Module) -> List[str]:
-    """Get names of trainable Linear layers, excluding embeddings and lm_head."""
+def get_trainable_linear_layers(model: nn.Module, skip_grad_check: bool = False, debug: bool = False) -> List[str]:
+    """Get names of trainable Linear layers, excluding embeddings and lm_head.
+
+    Args:
+        model: The model to search for Linear layers
+        skip_grad_check: If True, don't check requires_grad (needed for FSDP where
+                        parameters are managed differently)
+        debug: If True, print debug information
+    """
     layer_names = []
     exclude_patterns = ['embed', 'lm_head', 'norm', 'wte', 'wpe']
 
+    all_linear_count = 0
+    excluded_count = 0
+    not_trainable_count = 0
+
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
+            all_linear_count += 1
             if any(pattern in name.lower() for pattern in exclude_patterns):
+                excluded_count += 1
                 continue
-            if any(p.requires_grad for p in module.parameters()):
+            if skip_grad_check or any(p.requires_grad for p in module.parameters()):
                 layer_names.append(name)
+            else:
+                not_trainable_count += 1
 
     return layer_names
 
@@ -80,7 +95,19 @@ def select_validation_indices(
     tau: float = 0.1,
     mode: str = 'soft',
 ) -> torch.Tensor:
-    """Select validation indices using DOTS criterion."""
+    """Select validation indices using DOTS criterion.
+
+    Modes:
+        - 'none': No selection, return all indices (ignores num_to_select)
+        - 'hard': Top-k selection by Goldilocks scores
+        - 'soft': Softmax sampling by Goldilocks scores (default)
+    """
+    batch_size = difficulties.size(0)
+
+    # No selection - return all indices
+    if mode == 'none':
+        return torch.arange(batch_size, device=difficulties.device)
+
     scores = compute_goldilocks_scores(difficulties, alpha)
 
     if mode == 'hard':
@@ -153,7 +180,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         try:
             from gradstream.hook import GradientHook
-        except ImportError:
+        except ImportError as e:
             logger.error(
                 "gradstream not found. Install gradstream for GREATS/Streaming selection. "
                 "Falling back to NA (no selection)."
@@ -161,17 +188,25 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             self.selection_method = 'NA'
             return
 
-        # Get trainable layer names
-        layer_names = get_trainable_linear_layers(self.actor_module)
+        # Try to get unwrapped module for FSDP
+        unwrapped_module = self.actor_module
+        is_fsdp = hasattr(self.actor_module, '_fsdp_wrapped_module')
+        if is_fsdp:
+            unwrapped_module = self.actor_module._fsdp_wrapped_module
+
+        # Get trainable layer names from unwrapped module
+        # For FSDP, skip requires_grad check since parameters are managed differently
+        layer_names = get_trainable_linear_layers(unwrapped_module, skip_grad_check=is_fsdp)
 
         if len(layer_names) == 0:
             logger.warning("No trainable Linear layers found, falling back to NA selection")
             self.selection_method = 'NA'
             return
 
-        # Create GradientHook
+        # Create GradientHook - use the same module that layer_names came from
+        # For FSDP, use the unwrapped module so layer names match
         self.grad_hook = GradientHook(
-            model=self.actor_module,
+            model=unwrapped_module,
             layer_names=layer_names,
             device='cuda',
         )
@@ -182,6 +217,190 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
     def _is_selection_enabled(self) -> bool:
         """Check if gradient-based selection is enabled."""
         return self.selection_method in ['GREATS', 'Streaming'] and self._hook_initialized
+
+    def has_external_validation_gradients(self) -> bool:
+        """Check if validation gradients were captured externally."""
+        if not self._is_selection_enabled():
+            return False
+        return self.grad_hook._val_cache.get_num_captured() > 0
+
+    def capture_validation_gradients_external(
+        self,
+        val_input_ids: torch.Tensor,
+        val_attention_mask: torch.Tensor,
+        val_position_ids: torch.Tensor,
+        val_responses: torch.Tensor,
+        val_rewards: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Capture validation gradients from external validation data.
+
+        This is called once per epoch with a separate validation dataset.
+        The validation gradients are stored and used for all training batches
+        within that epoch.
+
+        Flow:
+        1. Compute difficulties from rewards
+        2. Select medium-difficulty samples (Goldilocks criterion)
+        3. Capture validation gradients from selected samples (in micro-batches)
+
+        Args:
+            val_input_ids: [batch, seq_len] full input (prompt + response)
+            val_attention_mask: [batch, seq_len] attention mask
+            val_position_ids: [batch, seq_len] position IDs
+            val_responses: [batch, response_len] response tokens
+            val_rewards: [batch] rewards for each sample
+            temperature: Temperature for log prob computation
+
+        Returns:
+            Dictionary with validation selection statistics
+        """
+        if not self._is_selection_enabled():
+            return {}
+
+        self.actor_module.train()
+        batch_size = val_input_ids.size(0)
+
+        # Step 1: Compute difficulties from rewards
+        # Normalize rewards to [0, 1] range
+        difficulties = self._compute_sample_difficulties(val_rewards)
+
+        # Step 2: Select medium-difficulty samples (Goldilocks)
+        val_indices = self._select_validation_set(batch_size, difficulties)
+
+        # Step 3: Extract selected samples
+        selected_input_ids = val_input_ids[val_indices]
+        selected_attention_mask = val_attention_mask[val_indices]
+        selected_position_ids = val_position_ids[val_indices]
+        selected_responses = val_responses[val_indices]
+
+        # Compute advantages from rewards for selected samples
+        selected_rewards = val_rewards[val_indices]
+        # Normalize selected rewards to get advantages
+        if len(selected_rewards) > 1:
+            selected_advantages = (selected_rewards - selected_rewards.mean()) / (selected_rewards.std() + 1e-8)
+        else:
+            selected_advantages = selected_rewards
+
+        # Step 4: Capture validation gradients in micro-batches
+        response_length = selected_responses.size(1)
+        num_selected = len(val_indices)
+
+        # Start validation gradient capture (FULL mode accumulates gradients)
+        self.grad_hook.start_val_capture(use_factorized=False)
+        self.grad_hook.enable_hooks()
+
+        # Clear GPU cache before processing to free up memory
+        torch.cuda.empty_cache()
+
+        # Calculate micro_batch_size based on token budget (same logic as training)
+        if self.config.use_dynamic_bsz:
+            # Use token-based batching: calculate how many sequences fit in max_token_len
+            max_token_len = self.config.ppo_max_token_len_per_gpu * getattr(self, 'ulysses_sequence_parallel_size', 1)
+            # Compute effective sequence lengths from attention mask
+            seq_lengths = selected_attention_mask.sum(dim=1)
+            max_seq_len = seq_lengths.max().item()
+            # Conservative estimate: use max sequence length for all sequences
+            micro_batch_size = max(1, int(max_token_len // max_seq_len))
+        else:
+            micro_batch_size = self.config.ppo_micro_batch_size
+
+        # Process in micro-batches to avoid OOM
+        total_val_loss = 0.0
+        num_micro_batches = (num_selected + micro_batch_size - 1) // micro_batch_size
+
+        for mb_idx in range(num_micro_batches):
+            start_idx = mb_idx * micro_batch_size
+            end_idx = min(start_idx + micro_batch_size, num_selected)
+
+            # Extract micro-batch
+            mb_input_ids = selected_input_ids[start_idx:end_idx]
+            mb_attention_mask = selected_attention_mask[start_idx:end_idx]
+            mb_position_ids = selected_position_ids[start_idx:end_idx]
+            mb_responses = selected_responses[start_idx:end_idx]
+            mb_advantages = selected_advantages[start_idx:end_idx]
+
+            mb_response_mask = mb_attention_mask[:, -response_length:]
+
+            # Forward pass
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                output = self.actor_module(
+                    input_ids=mb_input_ids,
+                    attention_mask=mb_attention_mask,
+                    position_ids=mb_position_ids,
+                    use_cache=False,
+                )
+                logits = output.logits
+
+                if temperature != 1.0:
+                    logits = logits / temperature
+
+                # Get log probs for response tokens
+                logits = logits[:, -response_length - 1:-1, :]
+                token_log_probs = logprobs_from_logits(logits.float(), mb_responses)
+
+                # Sequence log probability
+                seq_log_probs = (token_log_probs * mb_response_mask.float()).sum(dim=1)
+
+                # Validation loss: -E[log π_θ(y|x) * A(x,y)]
+                # Scale by micro-batch proportion for proper accumulation
+                per_seq_loss = -(mb_advantages * seq_log_probs)
+                val_loss = per_seq_loss.mean()
+
+                # Backward to capture gradients (accumulates in FULL mode)
+                val_loss.backward()
+
+            total_val_loss += val_loss.item() * (end_idx - start_idx)
+
+            # Zero optimizer gradients but keep val cache accumulating
+            self.actor_optimizer.zero_grad()
+
+            # Clear intermediate tensors to free memory for next micro-batch
+            del output, logits, token_log_probs, seq_log_probs, per_seq_loss, val_loss
+            torch.cuda.empty_cache()
+
+        # End capture and cleanup
+        self.grad_hook.end_val_capture()
+        self.grad_hook.disable_hooks()
+
+        # Verify hooks were called
+        hook_stats = self.grad_hook.get_hook_stats()
+        if hook_stats['total_calls'] == 0:
+            logger.warning("No hooks were called! The Linear layers may not be the ones used by FSDP.")
+
+        # Get number of layers with captured gradients
+        num_layers_captured = self.grad_hook._val_cache.get_num_captured()
+
+        # Compute average validation loss
+        avg_val_loss = total_val_loss / num_selected if num_selected > 0 else 0.0
+
+        # Return statistics
+        stats = {
+            'val/total_samples': batch_size,
+            'val/num_selected': num_selected,
+            'val/difficulty_mean': difficulties[val_indices].mean().item(),
+            'val/difficulty_std': difficulties[val_indices].std().item() if num_selected > 1 else 0,
+            'val/reward_mean': selected_rewards.mean().item(),
+            'val/loss': avg_val_loss,
+            'val/num_layers_captured': num_layers_captured,
+            'val/num_micro_batches': num_micro_batches,
+        }
+
+        logger.info(
+            f"Captured external validation gradients: "
+            f"{num_selected}/{batch_size} samples selected, "
+            f"num_layers={num_layers_captured}, "
+            f"micro_batches={num_micro_batches}, "
+            f"difficulty_mean={stats['val/difficulty_mean']:.3f}"
+        )
+
+        return stats
+
+    def clear_validation_gradients(self) -> None:
+        """Clear cached validation gradients."""
+        if self._is_selection_enabled():
+            self.grad_hook.clear_val_buffer()
 
     def _compute_sample_difficulties(
         self,
@@ -295,10 +514,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
             # Get log probs for response tokens
             logits = logits[:, -response_length - 1:-1, :]
-            log_probs = F.log_softmax(logits.float(), dim=-1)
-            token_log_probs = torch.gather(
-                log_probs, dim=-1, index=val_responses.unsqueeze(-1)
-            ).squeeze(-1)
+            token_log_probs = logprobs_from_logits(logits.float(), val_responses)
 
             # Sequence log probability
             seq_log_probs = (token_log_probs * response_mask.float()).sum(dim=1)
@@ -411,6 +627,11 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         if not self._is_selection_enabled():
             return
 
+        # Check validation gradient status
+        num_val_layers = self.grad_hook._val_cache.get_num_captured()
+        if num_val_layers == 0:
+            logger.warning("[Streaming] No validation gradients captured! Selection may not work.")
+
         self.grad_hook.setup_selection_with_stored_val(
             train_batch_size=batch_size,
             selection_method='Streaming',
@@ -435,6 +656,23 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         if hasattr(sel_state, '_layer_selections') and sel_state._layer_selections:
             n_selected = [n for _, n in sel_state._layer_selections]
             self.selection_stats['train/mean_selected_per_layer'] = sum(n_selected) / len(n_selected)
+            self.selection_stats['train/min_selected_per_layer'] = min(n_selected)
+            self.selection_stats['train/max_selected_per_layer'] = max(n_selected)
+            self.selection_stats['train/num_layers_processed'] = len(n_selected)
+
+            # Log detailed per-layer stats periodically (first micro-batch of each step)
+            if not hasattr(self, '_streaming_log_counter'):
+                self._streaming_log_counter = 0
+            self._streaming_log_counter += 1
+            if self._streaming_log_counter % 10 == 1:  # Log every 10th call
+                logger.info(
+                    f"[Streaming] Per-layer selection: "
+                    f"layers={len(n_selected)}, "
+                    f"mean={sum(n_selected)/len(n_selected):.1f}, "
+                    f"min={min(n_selected)}, max={max(n_selected)}, "
+                    f"batch_size={sel_state.train_batch_size}, "
+                    f"frac={sel_state.frac}"
+                )
 
         self.grad_hook.clear_selection()
         self.grad_hook.clear_token_counts()
@@ -444,8 +682,8 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         Update policy with GREATS/Streaming data selection.
 
         This extends the base update_policy with:
-        1. Validation set selection based on DOTS difficulty
-        2. Validation gradient capture
+        1. Validation set selection based on DOTS difficulty (if not using external validation)
+        2. Validation gradient capture (if not already captured externally)
         3. Per-step GREATS or Streaming selection during PPO updates
         """
         # If selection not enabled, use base implementation
@@ -475,36 +713,50 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         batch = data.select(batch_keys=select_keys).batch
 
         # =====================================================================
-        # Step 1: Select validation set based on DOTS difficulty criterion
+        # Step 1: Check for external validation gradients or capture from batch
         # =====================================================================
         batch_size = batch.batch_size[0]
 
-        # Compute difficulties from advantages (proxy for reward signal)
-        advantages = batch['advantages']
-        response_length = batch['responses'].size(1)
-        attention_mask = batch['attention_mask']
-        response_mask = attention_mask[:, -response_length:]
+        # If external validation gradients were captured (once per epoch),
+        # skip internal validation selection and capture
+        has_external_val = self.has_external_validation_gradients()
+        num_val_layers = self.grad_hook._val_cache.get_num_captured() if self._is_selection_enabled() else 0
+        logger.info(f"[Selection] update_policy: batch_size={batch_size}, "
+                    f"has_external_val={has_external_val}, num_val_layers={num_val_layers}, "
+                    f"method={self.selection_method}")
 
-        # Use mean advantage per sample as difficulty proxy
-        seq_advantages = (advantages * response_mask.float()).sum(dim=1) / response_mask.float().sum(dim=1).clamp(min=1)
-        difficulties = self._compute_sample_difficulties(seq_advantages)
+        if not has_external_val:
+            # Fallback: select validation set from training batch (original behavior)
+            logger.debug("No external validation gradients, using training batch for validation")
 
-        # Select validation indices
-        val_indices = self._select_validation_set(batch_size, difficulties)
+            # Compute difficulties from advantages (proxy for reward signal)
+            advantages = batch['advantages']
+            response_length = batch['responses'].size(1)
+            attention_mask = batch['attention_mask']
+            response_mask = attention_mask[:, -response_length:]
 
-        # =====================================================================
-        # Step 2: Capture validation gradients
-        # =====================================================================
-        val_batch = {
-            'input_ids': batch['input_ids'][val_indices],
-            'attention_mask': batch['attention_mask'][val_indices],
-            'position_ids': batch['position_ids'][val_indices],
-            'responses': batch['responses'][val_indices],
-            'advantages': batch['advantages'][val_indices],
-        }
+            # Use mean advantage per sample as difficulty proxy
+            seq_advantages = (advantages * response_mask.float()).sum(dim=1) / response_mask.float().sum(dim=1).clamp(min=1)
+            difficulties = self._compute_sample_difficulties(seq_advantages)
 
-        # Capture validation gradients
-        self._capture_validation_gradients(val_batch, temperature)
+            # Select validation indices
+            val_indices = self._select_validation_set(batch_size, difficulties)
+
+            # =====================================================================
+            # Step 2: Capture validation gradients from training batch
+            # =====================================================================
+            val_batch = {
+                'input_ids': batch['input_ids'][val_indices],
+                'attention_mask': batch['attention_mask'][val_indices],
+                'position_ids': batch['position_ids'][val_indices],
+                'responses': batch['responses'][val_indices],
+                'advantages': batch['advantages'][val_indices],
+            }
+
+            # Capture validation gradients
+            self._capture_validation_gradients(val_batch, temperature)
+        else:
+            logger.debug("Using pre-captured external validation gradients")
 
         # =====================================================================
         # Step 3: PPO update with selection
@@ -723,9 +975,11 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
 
-        # Clear validation gradients
-        if self._is_selection_enabled():
-            self.grad_hook.clear_val_buffer()
+        # NOTE: Don't clear validation gradients here!
+        # They are captured once per epoch by capture_validation_gradients_external()
+        # and should persist for all update_policy calls within that epoch.
+        # The next call to capture_validation_gradients_external() will clear them
+        # via start_val_capture() -> ValidationCache.start_capture().
 
         # Add selection stats to metrics
         for key, val in self.selection_stats.items():

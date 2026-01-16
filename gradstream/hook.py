@@ -171,6 +171,10 @@ class GradientHook:
         self.hooks_registered = True
         logger.info(f"Successfully wrapped {len(self.layer_names)} layers")
 
+        # Counter to verify hooks are being called
+        self._hook_call_count = 0
+        self._hook_call_count_by_layer = {}
+
     def _custom_linear_forward(self, module: nn.Linear, idx: int, input: Tensor) -> Tensor:
         """
         Replacement forward method that uses our custom autograd Function.
@@ -183,6 +187,11 @@ class GradientHook:
         5. If compressor present -> CompressedLinearBackward (compression only)
         6. Otherwise -> call original forward method
         """
+        # Track hook calls
+        self._hook_call_count += 1
+        layer_name = self.layer_names[idx]
+        self._hook_call_count_by_layer[layer_name] = self._hook_call_count_by_layer.get(layer_name, 0) + 1
+
         if not self.hooks_enabled:
             # Use original forward method to preserve any layer-specific behavior
             # This is important for LoRA layers where we hook lora_A/lora_B Linear modules
@@ -224,6 +233,19 @@ class GradientHook:
     def disable_hooks(self) -> None:
         """Disable hooks to allow standard gradient computation."""
         self.hooks_enabled = False
+
+    def get_hook_stats(self) -> dict:
+        """Get hook call statistics for verification."""
+        return {
+            'total_calls': getattr(self, '_hook_call_count', 0),
+            'unique_layers_called': len(getattr(self, '_hook_call_count_by_layer', {})),
+            'total_layers': len(self.layer_names),
+        }
+
+    def reset_hook_stats(self) -> None:
+        """Reset hook call counters."""
+        self._hook_call_count = 0
+        self._hook_call_count_by_layer = {}
 
     # =========================================================================
     # Selection State Management

@@ -14,6 +14,10 @@ if ray status &>/dev/null; then
     ray stop
 fi
 
+# Add gradstream to Python path for Ray workers
+export PYTHONPATH="/home/pbb/Project/Gradient-Streaming:${PYTHONPATH}"
+echo "PYTHONPATH is set to: $PYTHONPATH"
+
 # Warning: Export VLLM_ATTENTION_BACKEND on every machine before starting Ray cluster.
 export VLLM_ATTENTION_BACKEND=XFORMERS
 ray start --head --port 6379
@@ -37,10 +41,11 @@ USE_TEMP_LOG_PROB=True
 SELECTION_METHOD="Streaming"  # Options: NA, GREATS, Streaming
 SELECTION_ALPHA=0.5           # Target difficulty for validation set (Goldilocks zone)
 SELECTION_TAU=0.1             # Temperature for validation selection
-VAL_RATIO=0.2                 # Fraction of batch to use as validation
-TRAIN_SELECTION_RATIO=0.5     # Fraction of negative-influence samples to DROP (filtering mode)
-VAL_SELECTION_MODE="soft"     # "soft" (probabilistic) or "hard" (top-k)
+VAL_RATIO=0.2                 # Fraction of validation batch to use after difficulty selection (Goldilocks)
+TRAIN_SELECTION_RATIO=1.0     # Fraction of negative-influence samples to DROP (filtering mode) - 1.0 = drop ALL negative samples
+VAL_SELECTION_MODE="hard"     # "soft" (probabilistic) or "hard" (top-k)
 USE_SECOND_ORDER=False        # Whether to use second-order greedy selection
+SELECTION_VAL_BATCH_SIZE=64   # Batch size for separate validation set (used once per epoch)
 
 MU=2
 TAU=1e-3
@@ -125,6 +130,7 @@ for DATASET_PATH in "${DATASET_PATHS[@]}"; do
             +actor_rollout_ref.actor.train_selection_ratio=$TRAIN_SELECTION_RATIO \
             +actor_rollout_ref.actor.val_selection_mode=$VAL_SELECTION_MODE \
             +actor_rollout_ref.actor.use_second_order=$USE_SECOND_ORDER \
+            +actor_rollout_ref.actor.selection_val_batch_size=$SELECTION_VAL_BATCH_SIZE \
             actor_rollout_ref.rollout.name=vllm \
             actor_rollout_ref.rollout.temperature=0.6 \
             actor_rollout_ref.rollout.val_temperature=0.6 \
