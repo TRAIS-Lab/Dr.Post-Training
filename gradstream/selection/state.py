@@ -78,14 +78,15 @@ class SelectionState(ABC):
         self,
         tokens_per_sample: Tensor,
         total_train_tokens: Tensor,
-        batch_total_tokens: Tensor
+        batch_total_tokens: Tensor,
     ) -> None:
         """
         Set token counts for gradient scaling and score correction.
 
         Args:
-            tokens_per_sample: Token count per training sample [train_batch_size]
-            total_train_tokens: Sum of tokens in training samples (scalar Tensor)
+            tokens_per_sample: Response token count per training sample [train_batch_size].
+                              Used for gradient scaling (sum over selected samples).
+            total_train_tokens: Sum of response tokens in training samples (scalar Tensor)
             batch_total_tokens: Sum of tokens in entire batch (train + val for joint batch, scalar Tensor)
         """
         # Store for gradient scaling: train_total_tokens / selected_tokens
@@ -203,10 +204,6 @@ class StreamingState(SelectionState):
         # Track selection stats across all layers
         self._layer_selections: list = []  # (layer_idx, n_selected) tuples
 
-        # Track score statistics for debugging instability
-        self._score_stats: list = []  # List of per-layer score stats
-        self._scale_factors: list = []  # List of scale factors applied
-
     def process_layer_gradients(
         self,
         train_grads: Tensor,
@@ -259,9 +256,6 @@ class StreamingState(SelectionState):
         # _compute_scale_factor handles empty selection internally (returns 1.0)
         scale_factor = self._compute_scale_factor(selected_indices)
         reduced_grad = reduced_grad * scale_factor
-
-        # Track scale factor for debugging
-        self._scale_factors.append(scale_factor)
 
         self.num_selected = num_selected
         return reduced_grad, num_selected

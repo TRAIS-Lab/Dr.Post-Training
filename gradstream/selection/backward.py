@@ -31,7 +31,6 @@ from ..compression_mode import CompressionMode
 from .utils import (
     augment_input_for_bias,
     split_train_val_batch,
-    compute_total_gradient,
     compute_scores_and_similarity,
     compute_selected_gradients,
 )

@@ -1,10 +1,7 @@
 import torch
-import logging
 from typing import Dict, List, Optional, Callable
 from torch import Tensor
 
-# Configure logger
-logger = logging.getLogger(__name__)
 
 def _rademacher(
     matrix: Tensor,
@@ -377,20 +374,6 @@ def negative_filtering(scores, filter_frac: float = 1.0):
     # Get negative samples
     negative_indices = torch.where(negative_mask)[0]
     n_negative = negative_indices.shape[0]
-
-    # Log score statistics periodically
-    global _filter_log_counter
-    if '_filter_log_counter' not in dir():
-        _filter_log_counter = 0
-    _filter_log_counter = getattr(negative_filtering, '_counter', 0) + 1
-    negative_filtering._counter = _filter_log_counter
-    if _filter_log_counter % 100 == 1:  # Log every 100 calls
-        score_mean = scores.mean().item()
-        score_std = scores.std().item() if n_samples > 1 else 0
-        logger.info(
-            f"[negative_filtering] n={n_samples}, n_pos={n_positive}, n_neg={n_negative}, "
-            f"score_mean={score_mean:.4f}, score_std={score_std:.4f}, frac={filter_frac}"
-        )
 
     if n_negative == 0:
         # No negative samples, return all positive

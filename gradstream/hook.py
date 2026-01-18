@@ -171,10 +171,6 @@ class GradientHook:
         self.hooks_registered = True
         logger.info(f"Successfully wrapped {len(self.layer_names)} layers")
 
-        # Counter to verify hooks are being called
-        self._hook_call_count = 0
-        self._hook_call_count_by_layer = {}
-
     def _custom_linear_forward(self, module: nn.Linear, idx: int, input: Tensor) -> Tensor:
         """
         Replacement forward method that uses our custom autograd Function.
@@ -187,11 +183,6 @@ class GradientHook:
         5. If compressor present -> CompressedLinearBackward (compression only)
         6. Otherwise -> call original forward method
         """
-        # Track hook calls
-        self._hook_call_count += 1
-        layer_name = self.layer_names[idx]
-        self._hook_call_count_by_layer[layer_name] = self._hook_call_count_by_layer.get(layer_name, 0) + 1
-
         if not self.hooks_enabled:
             # Use original forward method to preserve any layer-specific behavior
             # This is important for LoRA layers where we hook lora_A/lora_B Linear modules
@@ -233,19 +224,6 @@ class GradientHook:
     def disable_hooks(self) -> None:
         """Disable hooks to allow standard gradient computation."""
         self.hooks_enabled = False
-
-    def get_hook_stats(self) -> dict:
-        """Get hook call statistics for verification."""
-        return {
-            'total_calls': getattr(self, '_hook_call_count', 0),
-            'unique_layers_called': len(getattr(self, '_hook_call_count_by_layer', {})),
-            'total_layers': len(self.layer_names),
-        }
-
-    def reset_hook_stats(self) -> None:
-        """Reset hook call counters."""
-        self._hook_call_count = 0
-        self._hook_call_count_by_layer = {}
 
     # =========================================================================
     # Selection State Management
@@ -323,12 +301,17 @@ class GradientHook:
     # Token Count Tracking
     # =========================================================================
 
-    def set_token_counts(self, labels: Tensor, train_batch_size: Optional[int] = None) -> None:
+    def set_token_counts(
+        self,
+        labels: Tensor,
+        train_batch_size: Optional[int] = None,
+    ) -> None:
         """
         Set token counts for proper gradient scaling.
 
         Args:
-            labels: Label tensor [batch_size, seq_length] with -100 for ignored positions
+            labels: Label tensor [batch_size, seq_length] with -100 for ignored positions.
+                    Used for gradient scaling (only response tokens count).
             train_batch_size: If provided, only count tokens for first train_batch_size samples
         """
         valid_mask = (labels != -100)
@@ -341,7 +324,9 @@ class GradientHook:
         if train_batch_size is not None and self.selection_state is not None:
             train_tokens = tokens_per_sample[:train_batch_size]
             total_train_tokens = train_tokens.sum()
-            self.selection_state.set_token_counts(train_tokens, total_train_tokens, self.total_tokens)
+            self.selection_state.set_token_counts(
+                train_tokens, total_train_tokens, self.total_tokens
+            )
 
         logger.debug(f"Set token counts: total={self.total_tokens}")
 
