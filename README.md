@@ -33,6 +33,9 @@ pip install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
 pip3 install -r requirements.txt
 ```
 
+>[!Note]
+>It is only required to install `cudatoolkit` with appropriate `torch` in order to build `sjlt`. Without `sjlt` installation, you can still run the experiment with other gradient compression methods (e.g., LoGra), which is the default.
+
 ### For RLVR
 
 >[!Note]
@@ -49,6 +52,9 @@ cd RLVR/verl
 pip install -e ".[vllm,math]"
 pip install flash-attn --no-build-isolation --no-cache-dir
 ```
+
+>[!Note]
+>Due to the complicated dependencies of VERL and vLLM, we recommend using a separate conda environment for RLVR experiments and let the VERL installation handle all the dependencies.
 
 ## Experiments
 
