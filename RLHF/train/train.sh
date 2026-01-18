@@ -60,7 +60,7 @@ use_second_order=false # If true, use greedy selection with second-order interac
 n_val=1024  # Number of validation samples for data selection (0 = self-referencing)
 val_batch_size=256  # Batch size for validation gradient computation
 val_generation_interval=1  # Steps between regenerating val completions (0 = once at start)
-val_loss_type="seqloss-lastadv"  # Options: seqloss-lastadv (GAE last-token), seqloss-reward (normalized reward)
+val_loss_type="seqloss-reward"  # Options: seqloss-lastadv (GAE last-token), seqloss-reward (normalized reward)
 val_generation_policy="current"  # Options: current (LDA-ORL reference), reference (stable target)
 
 # Config file (contains lr, lr_vhead, init_kl_coef per method)
