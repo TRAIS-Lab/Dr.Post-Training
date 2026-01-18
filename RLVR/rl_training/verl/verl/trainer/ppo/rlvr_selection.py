@@ -207,11 +207,21 @@ class RLVROnlineSelectionManager:
             return
 
         try:
-            from gradstream.hook import GradientHook
+            # Use RLVR-specific gradstream with packed sequence support
+            from gradstream_verl import GradientHookVerl as GradientHook
         except ImportError:
-            logger.error("gradstream not found. Please install gradstream for GREATS/Streaming selection.")
-            self.selection_method = 'NA'
-            return
+            try:
+                # Fallback: try relative import from rl_training
+                import sys
+                import os
+                rl_training_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..')
+                if rl_training_path not in sys.path:
+                    sys.path.insert(0, rl_training_path)
+                from gradstream_verl import GradientHookVerl as GradientHook
+            except ImportError as e:
+                logger.error(f"gradstream_verl not found: {e}. Falling back to NA selection.")
+                self.selection_method = 'NA'
+                return
 
         # Get trainable layer names
         layer_names = get_trainable_linear_layers(self.model)

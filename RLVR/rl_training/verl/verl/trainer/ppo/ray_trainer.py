@@ -588,7 +588,8 @@ class RayPPOTrainer(object):
                 filter_prompts=True,
                 return_raw_chat=self.config.data.get('return_raw_chat', False),
                 truncation='error',
-                format_reward=self.config.data.get('format_reward', False)
+                format_reward=self.config.data.get('format_reward', False),
+                max_samples=self.config.data.get('val_max_samples', -1)
             )
             print(f"[Selection] Loaded validation dataset with {len(self._selection_val_dataset)} samples")
 
@@ -948,7 +949,8 @@ class RayPPOTrainer(object):
                                         filter_prompts=True,
                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
                                         truncation='error',
-                                        format_reward=self.config.data.get('format_reward', False)
+                                        format_reward=self.config.data.get('format_reward', False),
+                                        max_samples=self.config.data.get('train_max_samples', -1)
                                         )
                                 
                                 if not self.config.data.random_selection:

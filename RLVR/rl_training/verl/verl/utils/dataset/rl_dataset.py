@@ -71,7 +71,8 @@ class RLHFDataset(Dataset):
                  return_raw_chat=False,
                  truncation='error',
                  format_reward=False,
-                 use_question=False):
+                 use_question=False,
+                 max_samples: int = -1):
         if not isinstance(parquet_files, (List, ListConfig)):
             parquet_files = [parquet_files]
 
@@ -86,9 +87,10 @@ class RLHFDataset(Dataset):
         self.return_raw_chat = return_raw_chat
         self.chat_template_func = chat_template_func
         self.truncation = truncation
-        
+
         self.format_reward = format_reward
         self.use_question = use_question
+        self.max_samples = max_samples
 
         self._download()
         self._read_files_and_tokenize()
@@ -121,6 +123,11 @@ class RLHFDataset(Dataset):
                                                                 axis=1)]
 
         print(f'filter dataset len: {len(self.dataframe)}')
+
+        # Apply max_samples limit if specified
+        if self.max_samples > 0 and len(self.dataframe) > self.max_samples:
+            self.dataframe = self.dataframe.iloc[:self.max_samples].reset_index(drop=True)
+            print(f'limited dataset len: {len(self.dataframe)} (max_samples={self.max_samples})')
 
     def __len__(self):
         return len(self.dataframe)

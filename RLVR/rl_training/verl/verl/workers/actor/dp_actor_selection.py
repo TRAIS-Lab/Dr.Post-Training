@@ -179,14 +179,19 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             return
 
         try:
-            from gradstream.hook import GradientHook
-        except ImportError as e:
-            logger.error(
-                "gradstream not found. Install gradstream for GREATS/Streaming selection. "
-                "Falling back to NA (no selection)."
-            )
-            self.selection_method = 'NA'
-            return
+            # Use RLVR-specific gradstream with packed sequence support
+            from gradstream_verl import GradientHookVerl as GradientHook
+        except ImportError:
+            try:
+                # Fallback: try relative import
+                from ....gradstream_verl import GradientHookVerl as GradientHook
+            except ImportError as e:
+                logger.error(
+                    f"gradstream_verl not found: {e}. "
+                    "Falling back to NA (no selection)."
+                )
+                self.selection_method = 'NA'
+                return
 
         # Try to get unwrapped module for FSDP
         unwrapped_module = self.actor_module
@@ -321,30 +326,69 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             mb_responses = selected_responses[start_idx:end_idx]
             mb_advantages = selected_advantages[start_idx:end_idx]
 
+            mb_batch_size, mb_seqlen = mb_input_ids.shape
             mb_response_mask = mb_attention_mask[:, -response_length:]
 
-            # Forward pass
+            # Forward pass - use same logic as _forward_micro_batch for memory efficiency
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                output = self.actor_module(
-                    input_ids=mb_input_ids,
-                    attention_mask=mb_attention_mask,
-                    position_ids=mb_position_ids,
-                    use_cache=False,
-                )
-                logits = output.logits
+                if self.use_remove_padding:
+                    # Pack sequences for memory-efficient forward pass
+                    input_ids_rmpad, indices, *_ = unpad_input(
+                        mb_input_ids.unsqueeze(-1), mb_attention_mask
+                    )
+                    input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
-                if temperature != 1.0:
-                    logits = logits / temperature
+                    position_ids_rmpad = index_first_axis(
+                        rearrange(mb_position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                        indices
+                    ).transpose(0, 1)
 
-                # Get log probs for response tokens
-                logits = logits[:, -response_length - 1:-1, :]
-                token_log_probs = logprobs_from_logits(logits.float(), mb_responses)
+                    # For log prob computation
+                    input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1).squeeze(0)
+
+                    # Forward with packed sequences (attention_mask=None enables flash_attn_varlen)
+                    output = self.actor_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        use_cache=False,
+                    )
+                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+
+                    if temperature != 1.0:
+                        logits_rmpad = logits_rmpad / temperature
+
+                    # Compute log probs on packed tensors
+                    log_probs_rmpad = logprobs_from_logits(logits_rmpad, input_ids_rmpad_rolled)
+
+                    # Pad back to (batch, seqlen)
+                    full_log_probs = pad_input(
+                        hidden_states=log_probs_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=mb_batch_size,
+                        seqlen=mb_seqlen
+                    )
+                    token_log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]
+                else:
+                    # Standard forward pass without packing
+                    output = self.actor_module(
+                        input_ids=mb_input_ids,
+                        attention_mask=mb_attention_mask,
+                        position_ids=mb_position_ids,
+                        use_cache=False,
+                    )
+                    logits = output.logits
+
+                    if temperature != 1.0:
+                        logits = logits / temperature
+
+                    logits = logits[:, -response_length - 1:-1, :]
+                    token_log_probs = logprobs_from_logits(logits.float(), mb_responses)
 
                 # Sequence log probability
                 seq_log_probs = (token_log_probs * mb_response_mask.float()).sum(dim=1)
 
                 # Validation loss: -E[log π_θ(y|x) * A(x,y)]
-                # Scale by micro-batch proportion for proper accumulation
                 per_seq_loss = -(mb_advantages * seq_log_probs)
                 val_loss = per_seq_loss.mean()
 
@@ -357,7 +401,11 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             self.actor_optimizer.zero_grad()
 
             # Clear intermediate tensors to free memory for next micro-batch
-            del output, logits, token_log_probs, seq_log_probs, per_seq_loss, val_loss
+            del output, token_log_probs, seq_log_probs, per_seq_loss, val_loss
+            if self.use_remove_padding:
+                del logits_rmpad, log_probs_rmpad, full_log_probs
+            else:
+                del logits
             torch.cuda.empty_cache()
 
         # End capture and cleanup
@@ -622,8 +670,19 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         return selected_indices
 
-    def _setup_streaming(self, batch_size: int, labels: Optional[torch.Tensor] = None) -> None:
-        """Setup Streaming selection state before forward pass."""
+    def _setup_streaming(
+        self,
+        batch_size: int,
+        labels: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> None:
+        """Setup Streaming selection state before forward pass.
+
+        Args:
+            batch_size: Number of samples in the micro-batch
+            labels: Labels tensor with -100 for ignored positions (for gradient scaling)
+            attention_mask: Attention mask (for packed sequence boundaries in cu_seqlens)
+        """
         if not self._is_selection_enabled():
             return
 
@@ -644,7 +703,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         self.grad_hook.enable_hooks()
 
         if labels is not None:
-            self.grad_hook.set_token_counts(labels, batch_size)
+            self.grad_hook.set_token_counts(labels, batch_size, attention_mask)
 
     def _cleanup_streaming(self) -> None:
         """Cleanup after streaming backward."""
@@ -659,20 +718,6 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             self.selection_stats['train/min_selected_per_layer'] = min(n_selected)
             self.selection_stats['train/max_selected_per_layer'] = max(n_selected)
             self.selection_stats['train/num_layers_processed'] = len(n_selected)
-
-            # Log detailed per-layer stats periodically (first micro-batch of each step)
-            if not hasattr(self, '_streaming_log_counter'):
-                self._streaming_log_counter = 0
-            self._streaming_log_counter += 1
-            if self._streaming_log_counter % 10 == 1:  # Log every 10th call
-                logger.info(
-                    f"[Streaming] Per-layer selection: "
-                    f"layers={len(n_selected)}, "
-                    f"mean={sum(n_selected)/len(n_selected):.1f}, "
-                    f"min={min(n_selected)}, max={max(n_selected)}, "
-                    f"batch_size={sel_state.train_batch_size}, "
-                    f"frac={sel_state.frac}"
-                )
 
         self.grad_hook.clear_selection()
         self.grad_hook.clear_token_counts()
@@ -875,7 +920,8 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                         # The response_mask already indicates valid response tokens
                         labels_for_streaming = torch.full_like(attn_mask, -100)
                         labels_for_streaming[:, -resp_length:] = responses * resp_mask.long() + (-100) * (~resp_mask.bool()).long()
-                        self._setup_streaming(micro_batch_size, labels_for_streaming)
+                        # Pass attention_mask for proper cu_seqlens computation in packed sequences
+                        self._setup_streaming(micro_batch_size, labels_for_streaming, attn_mask)
 
                         entropy, log_prob = self._forward_micro_batch(
                             micro_batch, temperature=temperature

@@ -23,9 +23,14 @@ MODEL_PATHs=(
     "Qwen/Qwen2.5-Math-1.5B"
 )
 
-DATASET_PATHS=(
-    "data/deepscaler.parquet"
-)
+# Use original small training set (1024 samples) for comparison with baselines
+# Use fresh held-out validation set for selection methods
+TRAIN_DATASET_PATH="data/deepscaler.parquet"
+VAL_DATASET_PATH="data/deepscaler_val.parquet"
+
+# Dataset sample limits (-1 for all samples)
+TRAIN_MAX_SAMPLES=-1
+VAL_MAX_SAMPLES=-1
 
 EMBEDDING_MODEL="Qwen/Qwen2.5-Math-1.5B-Instruct"
 
@@ -57,16 +62,15 @@ REPLAY_STRATEGY="random"
 NUM_GENERATIONS=8
 WORLD_SIZE=4
 
-for DATASET_PATH in "${DATASET_PATHS[@]}"; do
-    for MODEL_PATH in "${MODEL_PATHs[@]}"; do
+for MODEL_PATH in "${MODEL_PATHs[@]}"; do
 
-        TEACHER_MODEL_NAME="$EMBEDDING_MODEL"
-        TEACHER_MODEL_CHECKPOINT_PATH="adaptive_prediction_training/adaptive_prediction_model.pt"
-        TEACHER_MODEL_HIDDEN_SIZE=896
-        TEACHER_MODEL_SCALING=group_logit_temp
+    TEACHER_MODEL_NAME="$EMBEDDING_MODEL"
+    TEACHER_MODEL_CHECKPOINT_PATH="adaptive_prediction_training/adaptive_prediction_model.pt"
+    TEACHER_MODEL_HIDDEN_SIZE=896
+    TEACHER_MODEL_SCALING=group_logit_temp
 
-        MODEL_NAME=$(basename "$MODEL_PATH")
-        DATASET_NAME=$(basename "$DATASET_PATH" .parquet)
+    MODEL_NAME=$(basename "$MODEL_PATH")
+    DATASET_NAME=$(basename "$TRAIN_DATASET_PATH" .parquet)
 
         MAX_COMPLETION_LENGTH=4096
         if [[ "$MODEL_PATH" == *Math* ]]; then
@@ -89,10 +93,12 @@ for DATASET_PATH in "${DATASET_PATHS[@]}"; do
         # Train with wandb logging
         python3 -m verl.trainer.main_ppo \
             algorithm.adv_estimator=grpo \
-            data.train_files=$DATASET_PATH \
-            data.val_files=$DATASET_PATH \
+            data.train_files=$TRAIN_DATASET_PATH \
+            data.val_files=$VAL_DATASET_PATH \
             data.train_batch_size=$EFFECTIVE_BATCH_SIZE \
             data.val_batch_size=512 \
+            data.train_max_samples=$TRAIN_MAX_SAMPLES \
+            data.val_max_samples=$VAL_MAX_SAMPLES \
             data.max_prompt_length=1024 \
             data.max_response_length=$MAX_COMPLETION_LENGTH \
             +data.mu=$MU \
@@ -156,7 +162,6 @@ for DATASET_PATH in "${DATASET_PATHS[@]}"; do
             +teacher_model.num_layers=3 \
             +teacher_model.scaling=$TEACHER_MODEL_SCALING \
             +teacher_model.hidden_size=$TEACHER_MODEL_HIDDEN_SIZE
-    done
 done
 
 ray stop
