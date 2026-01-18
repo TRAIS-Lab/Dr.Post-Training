@@ -60,6 +60,8 @@ use_second_order=false # If true, use greedy selection with second-order interac
 n_val=1024  # Number of validation samples for data selection (0 = self-referencing)
 val_batch_size=256  # Batch size for validation gradient computation
 val_generation_interval=1  # Steps between regenerating val completions (0 = once at start)
+val_loss_type="seqloss-lastadv"  # Options: seqloss-lastadv (GAE last-token), seqloss-reward (normalized reward)
+val_generation_policy="current"  # Options: current (LDA-ORL reference), reference (stable target)
 
 # Config file (contains lr, lr_vhead, init_kl_coef per method)
 config_file="RLHF/train/config.json"
@@ -258,6 +260,14 @@ while [[ $# -gt 0 ]]; do
             val_generation_interval="$2"
             shift 2
             ;;
+        --val_loss_type)
+            val_loss_type="$2"
+            shift 2
+            ;;
+        --val_generation_policy)
+            val_generation_policy="$2"
+            shift 2
+            ;;
         --eval_interval)
             eval_interval="$2"
             shift 2
@@ -336,6 +346,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --n_val <n>                Number of validation samples (default: 1024, 0=self-ref)"
             echo "  --val_batch_size <n>       Batch size for validation gradients (default: 64)"
             echo "  --val_generation_interval <n>  Steps between regenerating val completions (default: 1)"
+            echo "  --val_loss_type <type>     Validation loss type: seqloss-lastadv (default), seqloss-reward"
+            echo "  --val_generation_policy <p>  Generation policy: current (default), reference"
             echo ""
             echo "Evaluation Options:"
             echo "  --eval_interval <n>        Evaluate every N steps (0=epoch end only, default: 1)"
@@ -734,6 +746,8 @@ run_single_method() {
     training_args="$training_args --n_val=$n_val"
     training_args="$training_args --val_batch_size=$val_batch_size"
     training_args="$training_args --val_generation_interval=$val_generation_interval"
+    training_args="$training_args --val_loss_type=$val_loss_type"
+    training_args="$training_args --val_generation_policy=$val_generation_policy"
 
     # Add evaluation settings (enable_eval and eval_on_step_generations are in base_training_args)
     training_args="$training_args --eval_interval=$eval_interval"
@@ -809,8 +823,12 @@ if [[ -n "$methods" ]]; then
         echo "  n_val: $n_val"
         echo "  val_batch_size: $val_batch_size"
         echo "  val_generation_interval: $val_generation_interval"
+        echo "  val_loss_type: $val_loss_type"
+        echo "  val_generation_policy: $val_generation_policy"
     else
         echo "  Mode: self-reference (training buffer)"
+        echo "  val_loss_type: $val_loss_type"
+        echo "  val_generation_policy: $val_generation_policy"
     fi
     echo ""
     echo "PPO Settings:"

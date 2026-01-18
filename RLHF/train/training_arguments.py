@@ -129,6 +129,29 @@ class TrainingArguments(TA):
             )
         },
     )
+    val_loss_type: str = field(
+        default="seqloss-lastadv",
+        metadata={
+            "help": (
+                "Validation loss type for data selection gradient computation. "
+                "Options: "
+                "'seqloss-lastadv' (default) - sequence log prob * last-token GAE advantage, "
+                "'seqloss-reward' - sequence log prob * normalized raw reward. "
+                "Matches LDA-ORL reference implementation options."
+            )
+        },
+    )
+    val_generation_policy: str = field(
+        default="current",
+        metadata={
+            "help": (
+                "Policy to use for generating validation responses. "
+                "Options: "
+                "'current' (default) - generate from current policy (matches LDA-ORL reference), "
+                "'reference' - generate from reference/base policy (provides stable target). "
+            )
+        },
+    )
 
     # ===================
     # Gradient Compression (following SFT conventions)
@@ -394,6 +417,11 @@ class TrainingArguments(TA):
         if self.kl_estimator not in valid_kl_estimators:
             raise ValueError(f"kl_estimator must be one of {valid_kl_estimators}, got {self.kl_estimator}")
 
+        # When n_val=0 (self-referencing), val_generation_policy must be 'current'
+        # because the training rollout data was generated from the current policy
+        if self.n_val == 0:
+            self.val_generation_policy = "current"
+
         super().__post_init__()
 
     @property
@@ -407,6 +435,6 @@ class TrainingArguments(TA):
         return self.method != "NA"
 
     @property
-    def use_fixed_validation(self) -> bool:
-        """Whether to use a fixed validation set (vs self-referencing validation)."""
+    def use_validation_set(self) -> bool:
+        """Whether to use a separate validation set (vs self-referencing with training buffer)."""
         return self.n_val > 0

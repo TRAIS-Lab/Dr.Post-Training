@@ -241,7 +241,7 @@ def main():
 
     # Load validation dataset for data selection (if n_val > 0)
     val_dataset = None
-    if training_args.use_fixed_validation:
+    if training_args.use_validation_set:
         val_dataset = get_validation_prompt_dataset(
             task=training_args.task,
             tokenizer=tokenizer,

@@ -181,7 +181,7 @@ class StreamingPPOTrainer:
             lr_scheduler: LR scheduler (optional)
             evaluator: ToxicityEvaluator instance for evaluation during training (optional)
             val_dataset: Fixed validation dataset for data selection (optional).
-                         If provided and args.use_fixed_validation is True, uses this
+                         If provided and args.use_validation_set is True, uses this
                          instead of self-referencing validation.
         """
         self.model = model
@@ -270,7 +270,7 @@ class StreamingPPOTrainer:
             logger.info(f"  IIF: Pre-filter entire rollout before PPO epochs")
         if self.method != "NA":
             logger.info(f"  Filter fraction (negative samples to drop): {self.filter_frac}")
-            if getattr(self.args, 'use_fixed_validation', False) and self.val_dataset is not None:
+            if getattr(self.args, 'use_validation_set', False) and self.val_dataset is not None:
                 n_val = len(self.val_dataset)
                 val_batch_size = getattr(self.args, 'val_batch_size', 1)
                 logger.info(f"  Validation: fixed dataset (n_val={n_val}, batch_size={val_batch_size}/step)")
@@ -842,6 +842,102 @@ class StreamingPPOTrainer:
         # Reference implementation keeps model in eval mode during forward passes
         return response_ids, response_mask, response_texts
 
+    @torch.no_grad()
+    def generate_ref_rollouts(
+        self,
+        query_ids: Tensor,
+        query_mask: Tensor,
+    ) -> Tuple[Tensor, Tensor, List[str]]:
+        """
+        Generate responses using the reference policy (frozen base model).
+
+        For validation gradient computation, generations should come from the
+        reference policy (π^ref) to provide a stable optimization target that
+        doesn't change during training.
+
+        For PEFT models: generates with adapters disabled (base model)
+        For non-PEFT models: uses the separate frozen reference model
+
+        Args:
+            query_ids: Query token IDs [batch, query_len]
+            query_mask: Query attention mask [batch, query_len]
+
+        Returns:
+            Tuple of (response_ids, response_mask, response_texts)
+        """
+        self.model.eval()
+
+        # Generation config (same as generate_rollouts)
+        gen_kwargs = {
+            "max_new_tokens": self.args.max_new_tokens,
+            "min_length": -1,
+            "do_sample": True,
+            "temperature": self.args.temperature,
+            "top_k": self.args.top_k,
+            "top_p": self.args.top_p,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+
+        # Generate using reference policy
+        if self.is_peft_model:
+            # For PEFT models, disable adapters to use base model
+            pretrained_model = self.model.pretrained_model
+            if hasattr(pretrained_model, "disable_adapter"):
+                with pretrained_model.disable_adapter():
+                    outputs = self.model.generate(
+                        input_ids=query_ids,
+                        attention_mask=query_mask,
+                        **gen_kwargs,
+                    )
+            else:
+                raise ValueError(
+                    "PEFT model does not support disable_adapter(). "
+                    "Please update your peft version."
+                )
+        else:
+            # For non-PEFT models, use the separate frozen reference model
+            if self.ref_model is not None:
+                outputs = self.ref_model.generate(
+                    input_ids=query_ids,
+                    attention_mask=query_mask,
+                    **gen_kwargs,
+                )
+            else:
+                raise ValueError(
+                    "No reference model available and model is not PEFT. "
+                    "Cannot generate from reference policy."
+                )
+
+        # Extract responses (remove query prefix)
+        query_len = query_ids.shape[1]
+        response_ids = outputs[:, query_len:]
+
+        # Truncate responses at EOS and fill rest with pad
+        if self.tokenizer.eos_token_id is not None:
+            response_ids = truncate_response(
+                self.tokenizer.eos_token_id,
+                self.tokenizer.pad_token_id,
+                response_ids,
+            )
+
+        # Compute sequence lengths
+        sequence_lengths = first_true_indices(response_ids == self.tokenizer.pad_token_id) - 1
+        sequence_lengths = sequence_lengths.clamp(min=0, max=response_ids.size(1) - 1)
+
+        # Create response mask
+        response_idxs = torch.arange(response_ids.size(1), device=response_ids.device)
+        padding_mask = response_idxs.unsqueeze(0) > sequence_lengths.unsqueeze(1)
+        response_mask = (~padding_mask).long()
+
+        # Decode responses
+        response_texts = self.tokenizer.batch_decode(
+            response_ids,
+            skip_special_tokens=True,
+        )
+
+        return response_ids, response_mask, response_texts
+
     def compute_log_probs(
         self,
         model: nn.Module,
@@ -1159,147 +1255,170 @@ class StreamingPPOTrainer:
         ref_logprobs = torch.cat(all_ref_logprobs, dim=0)
         return ref_logprobs
 
-    def capture_validation_gradients_from_buffer(
+    def capture_validation_gradients(
         self,
-        query_ids: Tensor,
-        query_mask: Tensor,
-        rollout_data: Dict[str, Any],
+        query_ids: Optional[Tensor] = None,
+        query_mask: Optional[Tensor] = None,
+        rollout_data: Optional[Dict[str, Any]] = None,
     ) -> float:
         """
-        Capture validation gradients using training rollout data (self-referencing validation).
-        Validation gradients are computed on the same responses used for training
+        Capture validation gradients for data selection.
 
-        The validation loss formula:
-            L_val = -E[log π_θ(y|x) * Â_{-1}(x,y)]
+        This method supports two modes:
+        1. Self-referencing (buffer): Pass query_ids, query_mask, and rollout_data
+           - Reuses training rollout data where advantages are already computed
+        2. Fixed validation: Pass None for all arguments
+           - Uses held-out validation dataset
+           - Generates responses from REFERENCE POLICY (π^ref) for stable target
+           - Computes fresh rewards and advantages
+
+        The validation loss formula depends on val_loss_type:
+        - 'seqloss-lastadv': L_val = -E[log π_θ(y|x) * Â_{-1}(x,y)]
+          Uses last-token GAE advantage (matches LDA-ORL reference)
+        - 'seqloss-reward': L_val = -E[log π_θ(y|x) * normalize(R(x,y))]
+          Uses normalized raw reward (for ablation studies)
 
         Where:
-        - y: Responses from policy model (reused from training rollouts)
-        - Â_{-1}: Advantage at the LAST token (emphasizes reward model feedback)
-        - log π_θ(y|x): Log probability under the current policy
+        - y ~ π^ref: Responses generated from reference policy (frozen)
+        - log π_θ(y|x): Sequence-level log probability under current policy
+        - Â_{-1}: Advantage at the LAST token (from GAE with KL-penalized rewards)
+        - R(x,y): Raw reward from reward model
 
         Args:
-            query_ids: Query token IDs [batch, query_len]
-            query_mask: Query attention mask [batch, query_len]
-            rollout_data: Dictionary containing training rollout data with keys:
+            query_ids: Query token IDs [batch, query_len] (for buffer mode)
+            query_mask: Query attention mask [batch, query_len] (for buffer mode)
+            rollout_data: Training rollout data dict (for buffer mode), containing:
                 - response_ids: Generated response token IDs
                 - response_mask: Response attention mask
                 - advantages: GAE advantages (already computed with KL penalty)
+                - raw_rewards: Raw rewards from reward model
 
         Returns:
             Validation loss value
         """
-        # Reuse training rollout data
-        response_ids = rollout_data["response_ids"]
-        response_mask = rollout_data["response_mask"]
-        advantages = rollout_data["advantages"]
+        # Determine mode based on arguments
+        use_buffer = rollout_data is not None
+        val_loss_type = getattr(self.args, 'val_loss_type', 'seqloss-lastadv')
 
-        # Prepare full sequence tensors
-        full_ids = torch.cat([query_ids, response_ids], dim=1)
-        full_mask = torch.cat([query_mask, response_mask], dim=1)
-        query_len = query_ids.shape[1]
-
-        # Extract advantage at the LAST token (Â_{-1})
-        # Note: advantages are already whitened (mean=0, std=1) at token-level by compute_gae()
-        last_token_indices = response_mask.sum(dim=1) - 1  # [batch_size]
-        seq_advantages = advantages[
-            torch.arange(advantages.size(0), device=advantages.device),
-            last_token_indices.long()
-        ]
-
-        # Start validation capture mode
-        self.grad_hook.start_val_capture(use_factorized=False)
-        self.grad_hook.enable_hooks()
-        self.model.train()
-
-        # Use core helper for gradient capture
-        total_val_loss = self._capture_validation_gradients_core(
-            full_ids, full_mask, response_ids, response_mask,
-            seq_advantages, query_len, self.mini_batch_size,
-        )
-
-        # Cleanup
-        self.optimizer.zero_grad()
-        self.grad_hook.end_val_capture()
-
-        return total_val_loss
-
-    def capture_validation_gradients_from_fixed_val(self) -> float:
-        """
-        Capture validation gradients using one batch from the fixed validation dataset.
-
-        This method follows the SFT pattern: at each training step, sample ONE batch
-        from the validation set, generate rollouts for it, and capture gradients.
-        This is more efficient than processing the entire validation set each time.
-
-        The validation loss formula:
-            L_val = -E[log π_θ(y|x) * A(x,y)]
-
-        Where:
-        - y: Responses generated from the sampled validation batch
-        - A(x,y): Normalized reward (advantage) for each sample in the batch
-        - log π_θ(y|x): Log probability under the current policy
-
-        Returns:
-            Validation loss value
-        """
-        # Get next validation batch (automatically cycles through dataset)
-        val_batch = self._get_next_val_batch()
-
-        # Prepare query tensors from batch (similar to _prepare_batch)
-        query_ids_list = val_batch["input_ids"]
-        all_query_ids = []
-        all_query_masks = []
-
-        for query_ids in query_ids_list:
-            if isinstance(query_ids, torch.Tensor):
-                query_ids = query_ids.unsqueeze(0) if query_ids.dim() == 1 else query_ids
-            else:
-                query_ids = torch.tensor([query_ids])
-            query_ids = query_ids.to(self.device)
-            query_mask = (query_ids != self.tokenizer.pad_token_id).long()
-            all_query_ids.append(query_ids)
-            all_query_masks.append(query_mask)
-
-        # Pad to same length and stack (left-padding for queries)
-        query_ids, query_mask = self._pad_and_stack(
-            all_query_ids, all_query_masks,
-            pad_value=self.tokenizer.pad_token_id,
-            pad_left=True,
-        )
-
-        # Generate rollouts for this batch
-        self.model.eval()
-        response_ids, response_mask, response_texts = self.generate_rollouts(
-            query_ids, query_mask
-        )
-
-        # Compute rewards for this batch
-        query_texts = self.tokenizer.batch_decode(query_ids, skip_special_tokens=True)
-        raw_rewards = self.reward_model.compute_rewards(query_texts, response_texts)
-
-        # Compute advantages (normalized rewards)
-        batch_size = len(raw_rewards)
-        if batch_size > 1:
-            advantages = (raw_rewards - raw_rewards.mean()) / (raw_rewards.std() + 1e-8)
+        if use_buffer:
+            # Mode 1: Self-referencing - reuse training rollout data
+            assert query_ids is not None and query_mask is not None, \
+                "query_ids and query_mask required for buffer mode"
+            response_ids = rollout_data["response_ids"]
+            response_mask = rollout_data["response_mask"]
+            advantages = rollout_data["advantages"]
+            raw_rewards = rollout_data["raw_rewards"]
         else:
-            # For single sample, use raw reward (centered around 0 if reward model is calibrated)
-            advantages = raw_rewards
+            # Mode 2: Fixed validation - generate fresh rollouts
+            val_batch = self._get_next_val_batch()
 
-        # Prepare full sequence tensors
+            # Prepare query tensors from batch
+            query_ids_list = val_batch["input_ids"]
+            all_query_ids = []
+            all_query_masks = []
+
+            for qids in query_ids_list:
+                if isinstance(qids, torch.Tensor):
+                    qids = qids.unsqueeze(0) if qids.dim() == 1 else qids
+                else:
+                    qids = torch.tensor([qids])
+                qids = qids.to(self.device)
+                qmask = (qids != self.tokenizer.pad_token_id).long()
+                all_query_ids.append(qids)
+                all_query_masks.append(qmask)
+
+            # Pad to same length and stack (left-padding for queries)
+            query_ids, query_mask = self._pad_and_stack(
+                all_query_ids, all_query_masks,
+                pad_value=self.tokenizer.pad_token_id,
+                pad_left=True,
+            )
+
+            # Generate rollouts based on val_generation_policy
+            val_generation_policy = getattr(self.args, 'val_generation_policy', 'current')
+            self.model.eval()
+            if val_generation_policy == 'reference':
+                # Generate from reference/base policy (provides stable target)
+                response_ids, response_mask, response_texts = self.generate_ref_rollouts(
+                    query_ids, query_mask
+                )
+            else:
+                # Generate from current policy (matches LDA-ORL reference)
+                response_ids, response_mask, response_texts = self.generate_rollouts(
+                    query_ids, query_mask
+                )
+
+            # Compute raw rewards
+            query_texts = self.tokenizer.batch_decode(query_ids, skip_special_tokens=True)
+            raw_rewards = self.reward_model.compute_rewards(query_texts, response_texts)
+
+            batch_size = query_ids.shape[0]
+            response_len = response_ids.shape[1]
+
+            # Compute log probs and values
+            self.model.eval()
+            with torch.no_grad():
+                logprobs, _, values = self.batched_forward_pass(
+                    query_ids, response_ids, query_mask, response_mask,
+                    batch_size=self.mini_batch_size,
+                )
+                ref_logprobs = self.batched_ref_forward_pass(
+                    query_ids, response_ids, query_mask, response_mask,
+                    batch_size=self.mini_batch_size,
+                )
+
+            # Create token-level rewards (outcome-based: reward only at last token)
+            token_level_rewards = torch.zeros(batch_size, response_len, device=self.device)
+            for i in range(batch_size):
+                nonzero_indices = response_mask[i].nonzero()
+                if len(nonzero_indices) > 0:
+                    last_idx = nonzero_indices[-1].item()
+                    token_level_rewards[i, last_idx] = raw_rewards[i]
+
+            # Apply KL penalty via reward shaping (matching training)
+            kl_penalty = self._compute_kl(logprobs, ref_logprobs)
+            non_score_rewards = -self.kl_ctl.value * kl_penalty
+            rewards = token_level_rewards + non_score_rewards * response_mask.float()
+
+            # Compute GAE advantages (with whitening)
+            advantages, _ = compute_gae(
+                rewards, values, response_mask.float(),
+                self.gamma, self.gae_lambda
+            )
+
+        # Common path: capture gradients
         full_ids = torch.cat([query_ids, response_ids], dim=1)
         full_mask = torch.cat([query_mask, response_mask], dim=1)
         query_len = query_ids.shape[1]
+        batch_size = query_ids.shape[0]
+
+        # Compute sequence-level scores based on val_loss_type
+        if val_loss_type == 'seqloss-lastadv':
+            # Extract advantage at the LAST token (Â_{-1}) - matches LDA-ORL reference
+            last_token_indices = response_mask.sum(dim=1) - 1
+            seq_scores = advantages[
+                torch.arange(batch_size, device=self.device),
+                last_token_indices.long()
+            ]
+        elif val_loss_type == 'seqloss-reward':
+            # Use normalized raw reward - for ablation studies
+            if batch_size > 1:
+                seq_scores = (raw_rewards - raw_rewards.mean()) / (raw_rewards.std() + 1e-8)
+            else:
+                seq_scores = raw_rewards - raw_rewards.mean()
+        else:
+            raise ValueError(f"Unknown val_loss_type: {val_loss_type}. "
+                           f"Supported: 'seqloss-lastadv', 'seqloss-reward'")
 
         # Start validation capture mode
         self.grad_hook.start_val_capture(use_factorized=False)
         self.grad_hook.enable_hooks()
         self.model.train()
 
-        # Use core helper for gradient capture
-        mini_batch_size = getattr(self.args, 'mini_batch_size', batch_size)
+        # Capture gradients
         total_val_loss = self._capture_validation_gradients_core(
             full_ids, full_mask, response_ids, response_mask,
-            advantages, query_len, mini_batch_size,
+            seq_scores, query_len, self.mini_batch_size,
         )
 
         # Cleanup
@@ -2075,7 +2194,7 @@ class StreamingPPOTrainer:
         """
         logger.info(f"Starting training with method={self.method}")
         if self.method != "NA":
-            if getattr(self.args, 'use_fixed_validation', False) and self.val_dataset is not None:
+            if getattr(self.args, 'use_validation_set', False) and self.val_dataset is not None:
                 logger.info(f"Using fixed validation dataset (n_val={len(self.val_dataset)})")
             else:
                 logger.info("Using self-reference validation (training buffer as validation set)")
@@ -2120,12 +2239,12 @@ class StreamingPPOTrainer:
 
                 # Capture validation gradients for selection methods
                 if self.method != "NA":
-                    if getattr(self.args, 'use_fixed_validation', False) and self.val_dataset is not None:
-                        # Use fixed validation dataset (one batch per step, like SFT)
-                        self.capture_validation_gradients_from_fixed_val()
+                    if getattr(self.args, 'use_validation_set', False) and self.val_dataset is not None:
+                        # Use fixed validation dataset (one batch per step)
+                        self.capture_validation_gradients()
                     else:
-                        # Use self-referencing validation (same rollout data) per LDA-ORL implementation
-                        self.capture_validation_gradients_from_buffer(query_ids, query_mask, rollout_data)
+                        # Use self-referencing validation (same rollout data)
+                        self.capture_validation_gradients(query_ids, query_mask, rollout_data)
 
                 # IIF: Pre-filter rollouts BEFORE PPO epochs (different from GREATS/Streaming)
                 # IIF filters the entire rollout once, then runs standard PPO on filtered data
