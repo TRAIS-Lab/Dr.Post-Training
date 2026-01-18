@@ -842,102 +842,6 @@ class StreamingPPOTrainer:
         # Reference implementation keeps model in eval mode during forward passes
         return response_ids, response_mask, response_texts
 
-    @torch.no_grad()
-    def generate_ref_rollouts(
-        self,
-        query_ids: Tensor,
-        query_mask: Tensor,
-    ) -> Tuple[Tensor, Tensor, List[str]]:
-        """
-        Generate responses using the reference policy (frozen base model).
-
-        For validation gradient computation, generations should come from the
-        reference policy (π^ref) to provide a stable optimization target that
-        doesn't change during training.
-
-        For PEFT models: generates with adapters disabled (base model)
-        For non-PEFT models: uses the separate frozen reference model
-
-        Args:
-            query_ids: Query token IDs [batch, query_len]
-            query_mask: Query attention mask [batch, query_len]
-
-        Returns:
-            Tuple of (response_ids, response_mask, response_texts)
-        """
-        self.model.eval()
-
-        # Generation config (same as generate_rollouts)
-        gen_kwargs = {
-            "max_new_tokens": self.args.max_new_tokens,
-            "min_length": -1,
-            "do_sample": True,
-            "temperature": self.args.temperature,
-            "top_k": self.args.top_k,
-            "top_p": self.args.top_p,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-        }
-
-        # Generate using reference policy
-        if self.is_peft_model:
-            # For PEFT models, disable adapters to use base model
-            pretrained_model = self.model.pretrained_model
-            if hasattr(pretrained_model, "disable_adapter"):
-                with pretrained_model.disable_adapter():
-                    outputs = self.model.generate(
-                        input_ids=query_ids,
-                        attention_mask=query_mask,
-                        **gen_kwargs,
-                    )
-            else:
-                raise ValueError(
-                    "PEFT model does not support disable_adapter(). "
-                    "Please update your peft version."
-                )
-        else:
-            # For non-PEFT models, use the separate frozen reference model
-            if self.ref_model is not None:
-                outputs = self.ref_model.generate(
-                    input_ids=query_ids,
-                    attention_mask=query_mask,
-                    **gen_kwargs,
-                )
-            else:
-                raise ValueError(
-                    "No reference model available and model is not PEFT. "
-                    "Cannot generate from reference policy."
-                )
-
-        # Extract responses (remove query prefix)
-        query_len = query_ids.shape[1]
-        response_ids = outputs[:, query_len:]
-
-        # Truncate responses at EOS and fill rest with pad
-        if self.tokenizer.eos_token_id is not None:
-            response_ids = truncate_response(
-                self.tokenizer.eos_token_id,
-                self.tokenizer.pad_token_id,
-                response_ids,
-            )
-
-        # Compute sequence lengths
-        sequence_lengths = first_true_indices(response_ids == self.tokenizer.pad_token_id) - 1
-        sequence_lengths = sequence_lengths.clamp(min=0, max=response_ids.size(1) - 1)
-
-        # Create response mask
-        response_idxs = torch.arange(response_ids.size(1), device=response_ids.device)
-        padding_mask = response_idxs.unsqueeze(0) > sequence_lengths.unsqueeze(1)
-        response_mask = (~padding_mask).long()
-
-        # Decode responses
-        response_texts = self.tokenizer.batch_decode(
-            response_ids,
-            skip_special_tokens=True,
-        )
-
-        return response_ids, response_mask, response_texts
-
     def compute_log_probs(
         self,
         model: nn.Module,
@@ -1334,19 +1238,11 @@ class StreamingPPOTrainer:
                 pad_left=True,
             )
 
-            # Generate rollouts based on val_generation_policy
-            val_generation_policy = getattr(self.args, 'val_generation_policy', 'current')
+            # Generate rollouts from current policy
             self.model.eval()
-            if val_generation_policy == 'reference':
-                # Generate from reference/base policy (provides stable target)
-                response_ids, response_mask, response_texts = self.generate_ref_rollouts(
-                    query_ids, query_mask
-                )
-            else:
-                # Generate from current policy (matches LDA-ORL reference)
-                response_ids, response_mask, response_texts = self.generate_rollouts(
-                    query_ids, query_mask
-                )
+            response_ids, response_mask, response_texts = self.generate_rollouts(
+                query_ids, query_mask
+            )
 
             # Compute raw rewards
             query_texts = self.tokenizer.batch_decode(query_ids, skip_special_tokens=True)

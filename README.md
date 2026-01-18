@@ -41,16 +41,13 @@ pip3 install -r requirements.txt
 To set up the environment for RLVR experiments, use the following commands:
 
 ```bash
-conda create -n GradStream_RLVR python=3.10
+conda create -n GradStream_RLVR python=3.12
 conda activate GradStream_RLVR
-
-conda install -c "nvidia/label/cuda-12.1.0" cudatoolkit
-pip3 install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
 
 # Install VERL (submodule)
 cd RLVR/verl
-pip install -e .
-pip install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
+pip install -e ".[vllm,math]"
+pip install flash-attn --no-build-isolation --no-cache-dir
 ```
 
 ## Experiments
