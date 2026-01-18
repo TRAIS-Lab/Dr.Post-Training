@@ -69,4 +69,5 @@ dist
 
 /test/
 /Figures/
-/archive/
+# Allow archive/RLVR for reference
+/archive/*
