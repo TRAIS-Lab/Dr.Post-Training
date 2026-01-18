@@ -6,7 +6,7 @@ This repository implements **Gradient Streaming** for fine-grained data selectio
 
 ```bash
 # Clone with submodules
-git clone --recursive https://github.com/your-username/Gradient-Streaming.git
+git clone --recursive https://github.com/TRAIS-Lab/Gradient-Streaming.git
 
 # Or if already cloned, initialize submodules
 git submodule update --init --recursive
