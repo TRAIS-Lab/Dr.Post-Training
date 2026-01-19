@@ -126,8 +126,16 @@ class ValidationPromptDataset(Dataset):
         for i in range(num_samples):
             prompt = df_dict[prompt_col][i]
 
-            # Tokenize to check length
-            tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+            # Handle chat message format (list of dicts) vs plain string
+            if isinstance(prompt, list):
+                # Chat message format: use apply_chat_template
+                tokens = self.tokenizer.apply_chat_template(
+                    prompt, add_generation_prompt=True, tokenize=True
+                )
+            else:
+                # Plain string format
+                tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+
             if len(tokens) > self.max_prompt_length:
                 continue
 
@@ -178,20 +186,37 @@ def collate_validation_prompts(
     """
     prompts = [item['prompt'] for item in batch]
 
-    # Tokenize with padding (left padding for generation)
+    # Handle chat message format (list of dicts) vs plain string
+    if prompts and isinstance(prompts[0], list):
+        # Chat message format: apply chat template to get strings, then tokenize
+        prompt_strings = [
+            tokenizer.apply_chat_template(p, add_generation_prompt=True, tokenize=False)
+            for p in prompts
+        ]
+    else:
+        # Plain string format
+        prompt_strings = prompts
+
+    # Set left padding for generation
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = 'left'
+
+    # Tokenize with padding
     encoded = tokenizer(
-        prompts,
+        prompt_strings,
         padding=True,
         truncation=True,
         max_length=max_length,
         return_tensors='pt',
-        padding_side='left',
     )
+
+    # Restore original padding side
+    tokenizer.padding_side = original_padding_side
 
     result = {
         'input_ids': encoded['input_ids'],
         'attention_mask': encoded['attention_mask'],
-        'prompts': prompts,
+        'prompts': prompts,  # Keep original format for downstream use
     }
 
     # Add data_source if available

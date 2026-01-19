@@ -291,6 +291,7 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
         from verl.trainer.ppo.reward import compute_reward_async
 
         # Initialize similar to base fit()
+        self.global_steps = 0
         self._load_checkpoint()
 
         # Log validation manager stats
@@ -298,6 +299,9 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
             logger.info(f"[Selection] Validation pool: {self.val_data_manager.get_stats()}")
 
         current_epoch = self.global_steps // len(self.train_dataloader)
+
+        # Start from step 1 (consistent with base class)
+        self.global_steps += 1
 
         prev_step_profile = False
         curr_step_profile = False
