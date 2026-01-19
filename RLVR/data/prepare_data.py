@@ -6,7 +6,7 @@ This script creates a validation prompts file from training data.
 The prompts will be used for online rollout generation during training.
 
 Usage:
-    python scripts/prepare_validation_prompts.py \
+    python data/prepare_data.py \
         --train_data data/gsm8k/train.parquet \
         --output data/gsm8k/val_prompts.parquet \
         --num_samples 500 \

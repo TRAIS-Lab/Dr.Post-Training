@@ -9,7 +9,7 @@
 #SBATCH --account=bfwm-delta-gpu
 #SBATCH --time=24:00:00
 #SBATCH --constraint="scratch"
-#SBATCH --output=/u/%u/Project/Gradient-Streaming/RLHF/log/%x-%j.log
+#SBATCH --output=/u/%u/Project/Gradient-Streaming/RLVR/log/%x-%j.log
 
 ### GPU options ###
 #SBATCH --gpus-per-node=4
@@ -90,9 +90,9 @@ done
 
 # Build experiment name
 if [ "$SELECTION_ENABLED" = "True" ]; then
-    EXP_NAME="qwen2.5_1.5b_grpo_gsm8k_online_${SELECTION_METHOD}_frac${SELECTION_FRAC}_vb${VAL_BATCH_SIZE}"
+    EXP_NAME="qwen3_1.7b_grpo_gsm8k_online_${SELECTION_METHOD}_frac${SELECTION_FRAC}_vb${VAL_BATCH_SIZE}"
 else
-    EXP_NAME="qwen2.5_1.5b_grpo_gsm8k_baseline"
+    EXP_NAME="qwen3_1.7b_grpo_gsm8k_baseline"
 fi
 
 OUTPUT_DIR="${OUTPUT_BASE}/${EXP_NAME}"
@@ -117,7 +117,7 @@ export PYTHONPATH=/home/pbb/Project/Gradient-Streaming/RLVR:/home/pbb/Project/Gr
 if [ "$SELECTION_ENABLED" = "True" ] && [ ! -f "$VAL_PROMPTS_PATH" ]; then
     echo "Validation prompts not found at $VAL_PROMPTS_PATH"
     echo "Creating validation prompts from training data..."
-    python3 /home/pbb/Project/Gradient-Streaming/RLVR/scripts/prepare_validation_prompts.py \
+    python3 /home/pbb/Project/Gradient-Streaming/RLVR/data/prepare_data.py \
         --train_data $gsm8k_train_path \
         --output $VAL_PROMPTS_PATH \
         --num_samples $VAL_POOL_SIZE \
@@ -139,7 +139,7 @@ python3 /home/pbb/Project/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     data.max_response_length=1024 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-Math-1.5B \
+    actor_rollout_ref.model.path=Qwen/Qwen3-1.7B-Base \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \

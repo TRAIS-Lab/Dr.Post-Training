@@ -568,18 +568,18 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         - GREATS: Two-pass per micro-batch (Pass 1: score, Pass 2: train on selected)
 
         If selection is not enabled or no validation gradients captured,
-        falls back to base implementation.
+        falls back to parent implementation.
         """
-        # If selection not enabled, use base implementation
+        # If selection not enabled, use parent implementation
         if not self._is_selection_enabled():
             return super().update_policy(data)
 
-        # If no validation gradients, fall back to base
+        # If no validation gradients, fall back to parent implementation
         if not self.has_external_validation_gradients():
-            logger.warning("No validation gradients captured, using base update_policy")
+            logger.warning("No validation gradients captured, using baseline update_policy")
             return super().update_policy(data)
 
-        # For Streaming, we can use the base implementation with hooks enabled
+        # For Streaming, use custom implementation with hooks
         if self.selection_method == 'Streaming':
             return self._update_policy_streaming(data)
         elif self.selection_method == 'GREATS':
@@ -968,6 +968,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                             metrics['actor/kl_loss'] = kl_loss.detach().item()
 
                         loss = policy_loss / gradient_accumulation
+
                         loss.backward()
 
                     # Track metrics
