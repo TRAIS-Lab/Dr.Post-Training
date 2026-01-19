@@ -300,6 +300,31 @@ class GradientHookVerl:
         self._val_total_tokens = val_total_tokens
         logger.debug(f"Ended val capture, {len(self._val_grad_cache)} layers captured")
 
+    def sync_val_grads(self) -> None:
+        """
+        Synchronize validation gradients across all ranks via all-reduce.
+
+        In data parallel training, each rank computes validation gradients on
+        different data shards. For consistent gradient-based selection, all ranks
+        must have the same validation gradient (sum of all shards).
+
+        This should be called after end_val_capture() and before using the
+        validation gradients for selection.
+        """
+        if not dist.is_initialized() or _get_world_size() == 1:
+            return
+
+        rank = _get_rank()
+        world_size = _get_world_size()
+
+        for layer_idx, val_grad in self._val_grad_cache.items():
+            # All-reduce to sum gradients across all ranks
+            dist.all_reduce(val_grad, op=dist.ReduceOp.SUM)
+            # Average by world_size to get mean gradient
+            val_grad.div_(world_size)
+
+        logger.debug(f"[Rank {rank}] Synchronized {len(self._val_grad_cache)} validation gradient layers across {world_size} ranks")
+
     def get_val_grad(self, layer_idx: int) -> Optional[Tensor]:
         """Get cached validation gradient for a layer."""
         return self._val_grad_cache.get(layer_idx)
@@ -457,8 +482,10 @@ class StreamingLinearBackwardVerl(Function):
                 grad_output.dim() == 3
             )
 
+            sample_ids = None
             if is_packed:
-                scores, similarity = compute_scores_packed_vectorized(
+                # Returns sample_ids for reuse in gradient computation
+                scores, similarity, sample_ids = compute_scores_packed_vectorized(
                     grad_output, input, val_grad_total,
                     state.cu_seqlens, state.use_second_order
                 )
@@ -467,16 +494,6 @@ class StreamingLinearBackwardVerl(Function):
                     grad_output, input, None, None, val_grad_total,
                     state.use_second_order
                 )
-
-            # Debug: Log score statistics before selection
-            rank = _get_rank()
-            num_samples = scores.shape[0]
-            score_mean = scores.mean().item()
-            score_std = scores.std().item()
-            score_min = scores.min().item()
-            score_max = scores.max().item()
-            num_positive = (scores > 0).sum().item()
-            num_negative = (scores < 0).sum().item()
 
             # Select samples
             selected_indices = state._select_indices(scores, similarity)
@@ -487,41 +504,18 @@ class StreamingLinearBackwardVerl(Function):
             if hasattr(state, '_layer_selections'):
                 state._layer_selections.append((layer_idx, state.num_selected))
 
-            # Debug: Log selection decision
-            selection_ratio = state.num_selected / num_samples if num_samples > 0 else 0.0
-
-            # Log every 10 layers or first/last few layers for brevity
-            num_layers = hook_manager._val_cache.get_num_captured()
-            should_log_layer = (layer_idx < 3) or (layer_idx >= num_layers - 3) or (layer_idx % 10 == 0)
-
-            if should_log_layer:
-                logger.debug(
-                    f"[Stream][Rank {rank}] Layer {layer_idx}: "
-                    f"scores(mean={score_mean:.4f}, std={score_std:.4f}, "
-                    f"min={score_min:.4f}, max={score_max:.4f}, "
-                    f"pos={num_positive}, neg={num_negative}), "
-                    f"selected={state.num_selected}/{num_samples} ({selection_ratio:.1%})"
-                )
-
             # Compute gradients
             scale_factor = state._compute_scale_factor(selected_indices)
 
             if is_packed:
                 grad_weight, grad_bias = compute_selected_gradients_packed_vectorized(
                     grad_output, input, selected_indices,
-                    state.cu_seqlens, bias is not None, scale_factor
+                    state.cu_seqlens, bias is not None, scale_factor,
+                    sample_ids=sample_ids  # Reuse sample_ids computed above
                 )
             else:
                 grad_weight, grad_bias = compute_selected_gradients_standard(
                     grad_output, input, selected_indices, bias is not None, scale_factor
-                )
-
-            # Debug: Log gradient statistics
-            grad_weight_norm = grad_weight.norm().item() if grad_weight is not None else 0.0
-            if should_log_layer:
-                logger.debug(
-                    f"[Stream][Rank {rank}] Layer {layer_idx}: "
-                    f"grad_weight_norm={grad_weight_norm:.6f}, scale_factor={scale_factor:.4f}"
                 )
 
         return grad_input, grad_weight, grad_bias, None, None
@@ -569,7 +563,8 @@ class GREATSLinearBackwardVerl(Function):
             )
 
             if is_packed:
-                scores, similarity = compute_scores_packed_vectorized(
+                # sample_ids not needed for GREATS (no gradient computation in this pass)
+                scores, similarity, _ = compute_scores_packed_vectorized(
                     grad_output, input, val_grad_total,
                     state.cu_seqlens, state.use_second_order
                 )
@@ -579,33 +574,7 @@ class GREATSLinearBackwardVerl(Function):
                     state.use_second_order
                 )
 
-            # Debug: Log score statistics
-            rank = _get_rank()
-            num_samples = scores.shape[0]
-            score_mean = scores.mean().item()
-            score_std = scores.std().item()
-
-            # Log every 10 layers for brevity
-            num_layers = hook_manager._val_cache.get_num_captured()
-            should_log_layer = (layer_idx < 3) or (layer_idx >= num_layers - 3) or (layer_idx % 10 == 0)
-
-            if should_log_layer:
-                logger.debug(
-                    f"[GREATS][Rank {rank}] Layer {layer_idx}: "
-                    f"scores(mean={score_mean:.4f}, std={score_std:.4f}), "
-                    f"num_samples={num_samples}"
-                )
-
             # Accumulate scores
             state.accumulate_precomputed_scores(scores, similarity, None)
-
-            # Debug: Log accumulated scores after this layer
-            if state.grad_dot_scores is not None and should_log_layer:
-                acc_mean = state.grad_dot_scores.mean().item()
-                acc_std = state.grad_dot_scores.std().item()
-                logger.debug(
-                    f"[GREATS][Rank {rank}] Layer {layer_idx}: "
-                    f"accumulated_scores(mean={acc_mean:.4f}, std={acc_std:.4f})"
-                )
 
         return grad_input, None, None, None, None

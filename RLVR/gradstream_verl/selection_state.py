@@ -95,25 +95,27 @@ class SelectionStateVerl(ABC):
             batch_total_tokens: Sum of tokens in entire batch
             packed_tokens_per_sample: Total token count per sample for packed sequences
         """
-        self.tokens_per_sample = tokens_per_sample
-        self.train_total_tokens_tensor = total_train_tokens.to(dtype=self.dtype)
+        # Move all tensors to the correct device to avoid CPU/GPU mismatches
+        self.tokens_per_sample = tokens_per_sample.to(self.device)
+        self.train_total_tokens_tensor = total_train_tokens.to(device=self.device, dtype=self.dtype)
 
         # Compute cu_seqlens for packed sequence handling
         cu_source = packed_tokens_per_sample if packed_tokens_per_sample is not None else tokens_per_sample
-        cu_seqlens = torch.zeros(len(cu_source) + 1, device=cu_source.device, dtype=torch.int32)
+        cu_source = cu_source.to(self.device)
+        cu_seqlens = torch.zeros(len(cu_source) + 1, device=self.device, dtype=torch.int32)
         cu_seqlens[1:] = torch.cumsum(cu_source, dim=0)
         self.cu_seqlens = cu_seqlens
 
         # Precompute score correction for joint batch mode
-        val_tokens = batch_total_tokens - total_train_tokens
-        correction = (batch_total_tokens.to(self.dtype) ** 2) / (
-            total_train_tokens.to(self.dtype) * val_tokens.to(self.dtype)
-        )
-        valid_mask = (val_tokens > 0) & (total_train_tokens > 0)
+        batch_total_tokens = batch_total_tokens.to(device=self.device, dtype=self.dtype)
+        total_train_tokens_f = total_train_tokens.to(device=self.device, dtype=self.dtype)
+        val_tokens = batch_total_tokens - total_train_tokens_f
+        correction = (batch_total_tokens ** 2) / (total_train_tokens_f * val_tokens)
+        valid_mask = (val_tokens > 0) & (total_train_tokens_f > 0)
         self.score_correction = torch.where(
             valid_mask,
             correction,
-            torch.ones((), device=tokens_per_sample.device, dtype=self.dtype)
+            torch.ones((), device=self.device, dtype=self.dtype)
         )
 
     def _select_indices(
@@ -139,6 +141,7 @@ class SelectionStateVerl(ABC):
             raise RuntimeError("Token counts not set. Call set_token_counts() first.")
         if selected_indices.numel() == 0:
             return torch.tensor(1.0, device=self.device, dtype=self.dtype)
+        # All tensors should be on self.device after set_token_counts
         selected_tokens = self.tokens_per_sample[selected_indices].sum()
         scale = self.train_total_tokens_tensor / selected_tokens
         return torch.where(selected_tokens == 0, torch.ones_like(scale), scale)
@@ -184,23 +187,10 @@ class StreamingStateVerl(SelectionStateVerl):
         score_correction: Optional[Tensor] = None,
     ) -> Tuple[Tensor, int]:
         """Immediately select and aggregate at this layer."""
-        import logging
-        logger = logging.getLogger(__name__)
-
         # Compute scores
         scores = train_grads @ val_grad
         if score_correction is not None:
             scores = scores * score_correction
-
-        # Debug: Log score distribution for this layer (every 50th layer to reduce spam)
-        if layer_idx % 50 == 0:
-            pos_count = (scores > 0).sum().item()
-            neg_count = (scores < 0).sum().item()
-            logger.info(
-                f"[DEBUG] Streaming Layer {layer_idx}: "
-                f"scores mean={scores.mean().item():.4f}, std={scores.std().item():.4f}, "
-                f"pos={pos_count}, neg={neg_count}"
-            )
 
         # Compute similarity if second-order
         similarity = None
@@ -216,13 +206,6 @@ class StreamingStateVerl(SelectionStateVerl):
         num_selected = selected_indices.shape[0]
 
         self._layer_selections.append((layer_idx, num_selected))
-
-        # Debug: Log selection details for this layer (every 50th layer)
-        if layer_idx % 50 == 0:
-            logger.info(
-                f"[DEBUG] Streaming Layer {layer_idx}: "
-                f"selected {num_selected}/{self.train_batch_size} samples"
-            )
 
         # Aggregate selected gradients
         selected_grads = train_grads[selected_indices]
@@ -276,12 +259,17 @@ class GREATSStateVerl(SelectionStateVerl):
         if val_grad.dtype != self.dtype:
             val_grad = val_grad.to(self.dtype)
 
-        alpha = score_correction.item() if score_correction is not None else 1.0
-        torch.addmv(self.grad_dot_scores, train_grads, val_grad, alpha=alpha, out=self.grad_dot_scores)
+        # Compute scores and apply correction as tensor ops (no .item() calls)
+        layer_scores = train_grads @ val_grad
+        if score_correction is not None:
+            layer_scores = layer_scores * score_correction
+        self.grad_dot_scores.add_(layer_scores)
 
         if self.similarity_matrix is not None:
-            alpha_sq = alpha ** 2
-            torch.addmm(self.similarity_matrix, train_grads, train_grads.t(), alpha=alpha_sq, out=self.similarity_matrix)
+            layer_similarity = train_grads @ train_grads.t()
+            if score_correction is not None:
+                layer_similarity = layer_similarity * (score_correction ** 2)
+            self.similarity_matrix.add_(layer_similarity)
 
         return None
 

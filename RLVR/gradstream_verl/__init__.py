@@ -84,22 +84,6 @@ except ImportError as e:
     SelectionRayPPOTrainerWithOnlineVal = None
     create_selection_trainer = None
 
-# Import debug utilities
-try:
-    from .debug_utils import (
-        SelectionDebugger,
-        get_debugger,
-        set_debugger,
-        LayerStats,
-        StepStats,
-    )
-except ImportError as e:
-    SelectionDebugger = None
-    get_debugger = None
-    set_debugger = None
-    LayerStats = None
-    StepStats = None
-
 __all__ = [
     # Hook manager
     "GradientHookVerl",
@@ -126,10 +110,4 @@ __all__ = [
     "SelectionTrainerConfig",
     "SelectionRayPPOTrainerWithOnlineVal",
     "create_selection_trainer",
-    # Debug utilities
-    "SelectionDebugger",
-    "get_debugger",
-    "set_debugger",
-    "LayerStats",
-    "StepStats",
 ]

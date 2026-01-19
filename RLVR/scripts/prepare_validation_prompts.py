@@ -79,6 +79,7 @@ def prepare_validation_prompts(
     all_prompts = []
     all_data_sources = []
     all_extra_info = []
+    all_reward_model = []
 
     for data_path in train_data_paths:
         logger.info(f"Loading {data_path}...")
@@ -87,26 +88,39 @@ def prepare_validation_prompts(
         prompt_col = find_prompt_column(df_dict)
         num_total = len(df_dict[prompt_col])
 
-        # Determine data source name
-        data_source = os.path.basename(os.path.dirname(data_path))  # e.g., 'gsm8k', 'math'
+        # Determine data source name - use the data_source field from the data if available
+        # This is important because reward functions expect specific data_source names
+        # (e.g., 'openai/gsm8k' not 'gsm8k', 'DigitalLearningGmbH/MATH-lighteval' not 'math')
+        if 'data_source' in df_dict and len(df_dict['data_source']) > 0:
+            # Get the first data_source value (assuming all rows have the same source)
+            data_source_default = df_dict['data_source'][0]
+            logger.info(f"  Using data_source from file: {data_source_default}")
+        else:
+            # Fall back to folder name if no data_source column
+            data_source_default = os.path.basename(os.path.dirname(data_path))  # e.g., 'gsm8k', 'math'
+            logger.info(f"  Using folder name as data_source: {data_source_default}")
 
-        # Get extra_info or reward_model if available
-        extra_info_col = None
-        for col in ['extra_info', 'reward_model']:
-            if col in df_dict:
-                extra_info_col = col
-                break
-
-        logger.info(f"  Found {num_total} prompts in {data_source}")
+        logger.info(f"  Found {num_total} prompts")
 
         for i in range(num_total):
             all_prompts.append(df_dict[prompt_col][i])
-            all_data_sources.append(data_source)
+            # Use per-row data_source if available, otherwise use default
+            if 'data_source' in df_dict:
+                all_data_sources.append(df_dict['data_source'][i])
+            else:
+                all_data_sources.append(data_source_default)
 
-            if extra_info_col:
-                all_extra_info.append(df_dict[extra_info_col][i])
+            # Store extra_info if available
+            if 'extra_info' in df_dict:
+                all_extra_info.append(df_dict['extra_info'][i])
             else:
                 all_extra_info.append(None)
+
+            # Store reward_model if available (contains ground_truth for reward computation)
+            if 'reward_model' in df_dict:
+                all_reward_model.append(df_dict['reward_model'][i])
+            else:
+                all_reward_model.append(None)
 
     # Sample from combined data
     total_available = len(all_prompts)
@@ -125,6 +139,10 @@ def prepare_validation_prompts(
     # Add extra_info if any were found
     if any(info is not None for info in all_extra_info):
         output_dict['extra_info'] = [all_extra_info[i] for i in indices]
+
+    # Add reward_model if any were found (needed for ground_truth in reward computation)
+    if any(rm is not None for rm in all_reward_model):
+        output_dict['reward_model'] = [all_reward_model[i] for i in indices]
 
     # Save
     os.makedirs(os.path.dirname(output_path), exist_ok=True)

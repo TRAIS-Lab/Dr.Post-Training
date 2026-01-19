@@ -151,7 +151,7 @@ class ValidationPromptDataset(Dataset):
             # Add any extra metadata
             if 'extra_info' in df_dict:
                 item['extra_info'] = df_dict['extra_info'][i]
-            elif 'reward_model' in df_dict:
+            if 'reward_model' in df_dict:
                 item['reward_model'] = df_dict['reward_model'][i]
 
             data.append(item)
@@ -172,51 +172,26 @@ def collate_validation_prompts(
     batch: List[Dict[str, Any]],
     tokenizer: "PreTrainedTokenizer",
     max_length: int = 1024,
-) -> Dict[str, torch.Tensor]:
+) -> Dict[str, Any]:
     """
     Collate validation prompts into a batch.
 
+    This follows the same pattern as the training dataloader (RLHFDataset):
+    - Return raw prompts and metadata only
+    - Don't tokenize - let agent_loop handle tokenization
+
     Args:
         batch: List of prompt dictionaries
-        tokenizer: Tokenizer for padding
-        max_length: Maximum sequence length
+        tokenizer: Tokenizer (kept for API compatibility, not used for tokenization)
+        max_length: Maximum sequence length (kept for API compatibility)
 
     Returns:
-        Dictionary with batched tensors
+        Dictionary with prompts and metadata (no tokenized tensors)
     """
     prompts = [item['prompt'] for item in batch]
 
-    # Handle chat message format (list of dicts) vs plain string
-    if prompts and isinstance(prompts[0], list):
-        # Chat message format: apply chat template to get strings, then tokenize
-        prompt_strings = [
-            tokenizer.apply_chat_template(p, add_generation_prompt=True, tokenize=False)
-            for p in prompts
-        ]
-    else:
-        # Plain string format
-        prompt_strings = prompts
-
-    # Set left padding for generation
-    original_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = 'left'
-
-    # Tokenize with padding
-    encoded = tokenizer(
-        prompt_strings,
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors='pt',
-    )
-
-    # Restore original padding side
-    tokenizer.padding_side = original_padding_side
-
     result = {
-        'input_ids': encoded['input_ids'],
-        'attention_mask': encoded['attention_mask'],
-        'prompts': prompts,  # Keep original format for downstream use
+        'prompts': prompts,  # Raw prompts for agent_loop to tokenize
     }
 
     # Add data_source if available
@@ -226,6 +201,10 @@ def collate_validation_prompts(
     # Add extra_info if available
     if 'extra_info' in batch[0]:
         result['extra_info'] = [item.get('extra_info') for item in batch]
+
+    # Add reward_model if available (contains ground_truth for reward computation)
+    if 'reward_model' in batch[0]:
+        result['reward_model'] = [item.get('reward_model') for item in batch]
 
     return result
 
@@ -350,6 +329,13 @@ def prepare_validation_batch_for_verl(
     """
     Prepare validation batch in VERL DataProto format.
 
+    This follows the same pattern as the training dataloader (RLHFDataset):
+    - Provide raw_prompt (chat messages) and metadata only
+    - Use a dummy_tensor placeholder for the batch
+    - Let agent_loop handle tokenization
+
+    This enables proper union() after rollout generation to preserve metadata.
+
     Args:
         val_batch: Validation batch from ValidationDataManager
         device: Target device for tensors
@@ -358,23 +344,75 @@ def prepare_validation_batch_for_verl(
         DataProto object ready for rollout generation
     """
     from verl import DataProto
+    import numpy as np
 
+    prompts = val_batch['prompts']
+    batch_size = len(prompts)
+
+    # Use dummy_tensor placeholder like the training dataloader (RLHFDataset)
+    # This avoids tensor conflicts when using union() after rollout generation
+    # The agent_loop will handle tokenization and produce input_ids, attention_mask, etc.
     batch_dict = {
-        'input_ids': val_batch['input_ids'].to(device),
-        'attention_mask': val_batch['attention_mask'].to(device),
+        'dummy_tensor': torch.zeros(batch_size, 1, dtype=torch.uint8, device=device),
     }
 
-    meta_info = {
-        'prompts': val_batch['prompts'],
-    }
+    # Use from_single_dict to properly create TensorDict from dict of tensors
+    data_proto = DataProto.from_single_dict(batch_dict)
+
+    # Add raw_prompt to non_tensor_batch (required by async_rollout_manager)
+    # raw_prompt must be a 1D numpy array where each element is a list (chat messages)
+    # np.array(prompts, dtype=object) doesn't work for list of lists - numpy tries to
+    # create a 2D array. We need to explicitly create a 1D object array.
+    raw_prompt = np.empty(batch_size, dtype=object)
+    raw_prompt[:] = prompts
+    data_proto.non_tensor_batch['raw_prompt'] = raw_prompt
+
+    # Add index field (required by agent_loop)
+    data_proto.non_tensor_batch['index'] = np.arange(batch_size)
+
+    # Add data_source to non_tensor_batch (required by RewardLoopWorker)
+    if 'data_source' in val_batch:
+        data_source = val_batch['data_source']
+        data_source_arr = np.empty(batch_size, dtype=object)
+        data_source_arr[:] = data_source
+        data_proto.non_tensor_batch['data_source'] = data_source_arr
+    else:
+        # Default data_source if not provided
+        data_proto.non_tensor_batch['data_source'] = np.array(['validation'] * batch_size, dtype=object)
+
+    # Add extra_info to non_tensor_batch (used by reward computation)
+    if 'extra_info' in val_batch:
+        extra_info = val_batch['extra_info']
+        extra_info_arr = np.empty(batch_size, dtype=object)
+        extra_info_arr[:] = extra_info
+        data_proto.non_tensor_batch['extra_info'] = extra_info_arr
+    else:
+        data_proto.non_tensor_batch['extra_info'] = np.array([{}] * batch_size, dtype=object)
+
+    # Add reward_model to non_tensor_batch (contains ground_truth for reward computation)
+    if 'reward_model' in val_batch:
+        reward_model = val_batch['reward_model']
+        reward_model_arr = np.empty(batch_size, dtype=object)
+        reward_model_arr[:] = reward_model
+        data_proto.non_tensor_batch['reward_model'] = reward_model_arr
+    else:
+        # Default with empty ground_truth if not provided
+        data_proto.non_tensor_batch['reward_model'] = np.array([{'ground_truth': '', 'style': 'rule'}] * batch_size, dtype=object)
+
+    # Debug: Log what we're adding
+    logger.info(f"[prepare_validation_batch] Created DataProto with non_tensor_batch keys: {list(data_proto.non_tensor_batch.keys())}")
+    logger.info(f"[prepare_validation_batch] raw_prompt shape: {data_proto.non_tensor_batch['raw_prompt'].shape}, type[0]: {type(data_proto.non_tensor_batch['raw_prompt'][0])}")
+
+    # Add meta_info
+    data_proto.meta_info['prompts'] = val_batch['prompts']
 
     if 'data_source' in val_batch:
-        meta_info['data_source'] = val_batch['data_source']
+        data_proto.meta_info['data_source'] = val_batch['data_source']
 
     if 'extra_info' in val_batch:
-        meta_info['extra_info'] = val_batch['extra_info']
+        data_proto.meta_info['extra_info'] = val_batch['extra_info']
 
-    return DataProto(batch=batch_dict, meta_info=meta_info)
+    return data_proto
 
 
 def create_validation_prompts_from_train(

@@ -34,9 +34,11 @@ def compute_sample_ids_from_cu_seqlens(
         sample_ids: [total_tokens] tensor where sample_ids[i] = sample index for token i
     """
     token_indices = torch.arange(total_tokens, device=device)
+    # Ensure cu_seqlens is on the same device
+    cu_seqlens_device = cu_seqlens.to(device) if cu_seqlens.device != device else cu_seqlens
     # bucketize assigns each token to the appropriate sample
     # right=True means cu_seqlens[i] <= token_idx < cu_seqlens[i+1] maps to sample i
-    sample_ids = torch.bucketize(token_indices, cu_seqlens[1:], right=True)
+    sample_ids = torch.bucketize(token_indices, cu_seqlens_device[1:], right=True)
     return sample_ids
 
 
@@ -46,7 +48,7 @@ def compute_scores_packed_vectorized(
     val_grad_total: Tensor,
     cu_seqlens: Tensor,
     use_second_order: bool,
-) -> Tuple[Tensor, Optional[Tensor]]:
+) -> Tuple[Tensor, Optional[Tensor], Tensor]:
     """
     Compute per-sample scores from packed sequences using vectorized operations.
 
@@ -61,9 +63,10 @@ def compute_scores_packed_vectorized(
         use_second_order: Whether to compute similarity matrix
 
     Returns:
-        (scores, similarity) tuple where:
+        (scores, similarity, sample_ids) tuple where:
         - scores: [batch_size] per-sample scores
         - similarity: [batch_size, batch_size] or None
+        - sample_ids: [total_nnz] sample index for each token (for reuse)
     """
     target_dtype = train_grad_output.dtype
     val_grad_total = val_grad_total.to(target_dtype)
@@ -91,29 +94,28 @@ def compute_scores_packed_vectorized(
     if use_second_order:
         # For second-order, we need per-sample gradients
         # grad_i = sum_t grad_output[t] ⊗ input[t] for t in sample i
-        # This is harder to vectorize efficiently, use segment-based approach
+        #
+        # Memory-efficient approach: compute per-sample gradients one at a time
+        # instead of materializing the full [total_nnz, O, I] outer product tensor.
+        # This trades some compute (Python loop) for massive memory savings.
 
-        # Compute per-token outer products flattened: [total_nnz, O*I]
         out_dim, in_dim = grad_output.shape[1], input_tensor.shape[1]
-
-        # For each sample, compute the gradient as outer product sum
-        # We'll use a loop here but with minimal overhead since we pre-compute indices
         sample_grads = torch.zeros(batch_size, out_dim * in_dim, device=device, dtype=target_dtype)
 
-        # Use segment_reduce if available (PyTorch 2.0+), otherwise fallback
-        # Compute outer products for all tokens
-        # [total_nnz, O, 1] * [total_nnz, 1, I] -> [total_nnz, O, I]
-        outer_products = grad_output.unsqueeze(2) * input_tensor.unsqueeze(1)
-        outer_products_flat = outer_products.view(total_tokens, -1)  # [total_nnz, O*I]
-
-        # Scatter-add to aggregate per sample
-        sample_ids_expanded = sample_ids.unsqueeze(1).expand(-1, out_dim * in_dim)
-        sample_grads.scatter_add_(0, sample_ids_expanded, outer_products_flat)
+        # Compute per-sample gradients using efficient einsum (no large intermediate)
+        for sample_idx in range(batch_size):
+            mask = (sample_ids == sample_idx)
+            if mask.any():
+                sample_go = grad_output[mask]  # [n_tokens_i, O]
+                sample_in = input_tensor[mask]  # [n_tokens_i, I]
+                # einsum computes sum of outer products without materializing [n, O, I]
+                sample_grad = torch.einsum('to,ti->oi', sample_go, sample_in)  # [O, I]
+                sample_grads[sample_idx] = sample_grad.flatten()
 
         # Compute similarity matrix: [batch_size, batch_size]
         similarity = sample_grads @ sample_grads.T
 
-    return scores, similarity
+    return scores, similarity, sample_ids
 
 
 def compute_selected_gradients_packed_vectorized(
@@ -123,6 +125,7 @@ def compute_selected_gradients_packed_vectorized(
     cu_seqlens: Tensor,
     has_bias: bool,
     scale_factor: Tensor,
+    sample_ids: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """
     Compute aggregated gradients for selected samples from packed sequences.
@@ -136,6 +139,7 @@ def compute_selected_gradients_packed_vectorized(
         cu_seqlens: Cumulative sequence lengths [batch_size + 1]
         has_bias: Whether to compute bias gradient
         scale_factor: Scaling factor to normalize for selection (scalar Tensor)
+        sample_ids: Optional pre-computed sample IDs [total_nnz] (from compute_scores_packed_vectorized)
 
     Returns:
         (grad_weight, grad_bias) tuple where grad_bias is None if not has_bias
@@ -148,8 +152,9 @@ def compute_selected_gradients_packed_vectorized(
     device = grad_output.device
     dtype = grad_output.dtype
 
-    # Compute sample IDs for all tokens
-    sample_ids = compute_sample_ids_from_cu_seqlens(total_tokens, cu_seqlens, device)
+    # Compute sample IDs for all tokens (reuse if provided)
+    if sample_ids is None:
+        sample_ids = compute_sample_ids_from_cu_seqlens(total_tokens, cu_seqlens, device)
 
     # Create mask for tokens belonging to selected samples
     # Use broadcasting: sample_ids [total_nnz] vs selected_indices [K]

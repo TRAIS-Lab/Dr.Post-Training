@@ -56,44 +56,6 @@ def _get_world_size() -> int:
     return dist.get_world_size() if dist.is_initialized() else 1
 
 
-def _sync_tensor_across_ranks(tensor: torch.Tensor, op: str = "sum") -> torch.Tensor:
-    """Synchronize tensor across all ranks for debugging."""
-    if not dist.is_initialized() or _get_world_size() == 1:
-        return tensor
-
-    if op == "sum":
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    elif op == "mean":
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        tensor = tensor / _get_world_size()
-    return tensor
-
-
-def _check_tensor_sync(tensor: torch.Tensor, name: str = "tensor") -> bool:
-    """Check if a tensor is synchronized across all ranks."""
-    if not dist.is_initialized() or _get_world_size() == 1:
-        return True
-
-    rank = _get_rank()
-    world_size = _get_world_size()
-
-    # Compute local checksum
-    local_sum = tensor.sum().item()
-
-    # Gather from all ranks
-    all_sums = [torch.tensor(0.0, device=tensor.device) for _ in range(world_size)]
-    dist.all_gather(all_sums, torch.tensor(local_sum, device=tensor.device))
-    all_sums = [s.item() for s in all_sums]
-
-    is_synced = all(abs(s - all_sums[0]) < 1e-4 * abs(all_sums[0] + 1e-8) for s in all_sums)
-
-    if not is_synced:
-        logger.warning(
-            f"[Sync][Rank {rank}] {name} NOT synchronized across ranks! "
-            f"local_sum={local_sum:.6f}, all_sums={all_sums}"
-        )
-    return is_synced
-
 __all__ = ['DataParallelPPOActorWithSelection']
 
 
@@ -155,11 +117,6 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         # Initialize hook if Streaming or GREATS is enabled
         if self.selection_method in ['Streaming', 'GREATS']:
             self._initialize_grad_hook()
-
-        logger.info(
-            f"Initialized DataParallelPPOActorWithSelection: "
-            f"method={self.selection_method}, frac={self.train_selection_ratio}"
-        )
 
     def _initialize_grad_hook(self) -> None:
         """Initialize GradientHook for gradient-based selection."""
@@ -235,15 +192,6 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         batch_size = val_input_ids.size(0)
         response_length = val_responses.size(1)
 
-        # Debug: Log validation capture start
-        reward_mean = val_rewards.mean().item()
-        reward_std = val_rewards.std().item()
-        logger.info(
-            f"[Val][Rank {rank}/{world_size}] Starting validation gradient capture: "
-            f"batch_size={batch_size}, response_len={response_length}, "
-            f"reward_mean={reward_mean:.4f}, reward_std={reward_std:.4f}"
-        )
-
         # Normalize rewards to get sequence scores (seqloss-reward objective)
         if batch_size > 1:
             seq_scores = (val_rewards - val_rewards.mean()) / (val_rewards.std() + 1e-8)
@@ -261,10 +209,15 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             max_seq_len = seq_lengths.max().item()
             micro_batch_size = max(1, int(max_token_len // max_seq_len))
         else:
-            micro_batch_size = self.config.ppo_micro_batch_size
+            # Use ppo_micro_batch_size_per_gpu (the correct attribute name in verl config)
+            micro_batch_size = getattr(self.config, 'ppo_micro_batch_size_per_gpu', None)
+            if micro_batch_size is None:
+                # Fallback to batch_size or a default
+                micro_batch_size = min(batch_size, 8)  # Default to 8 or batch_size
 
         # Process in micro-batches
-        total_val_loss = 0.0
+        # Use tensor for accumulation to avoid D2H transfers in the loop
+        total_val_loss = torch.tensor(0.0, device=val_input_ids.device)
         num_micro_batches = (batch_size + micro_batch_size - 1) // micro_batch_size
 
         for mb_idx in range(num_micro_batches):
@@ -340,73 +293,60 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                 # Backward to capture gradients
                 val_loss.backward()
 
-            total_val_loss += val_loss.item() * (end_idx - start_idx)
+            total_val_loss += val_loss.detach() * (end_idx - start_idx)
 
             # Zero optimizer gradients but keep val cache accumulating
             self.actor_optimizer.zero_grad()
 
-            # Clear intermediate tensors
+            # Clear intermediate tensors (no empty_cache - let PyTorch manage memory)
             del output, token_log_probs, seq_log_probs, per_seq_loss, val_loss
-            torch.cuda.empty_cache()
 
         # End capture
         self.grad_hook.end_val_capture()
         self.grad_hook.disable_hooks()
 
+        # Synchronize validation gradients across all ranks
+        # This ensures all ranks have the same validation gradient for consistent selection
+        self.grad_hook.sync_val_grads()
+
+        # Synchronize loss across ranks for consistent stats
+        if world_size > 1:
+            loss_tensor = torch.stack([total_val_loss, torch.tensor(float(batch_size), device=val_input_ids.device)])
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            # Single .item() calls at the end of capture (not in hot path)
+            total_val_loss_float = loss_tensor[0].item()
+            total_samples = int(loss_tensor[1].item())
+        else:
+            total_val_loss_float = total_val_loss.item()
+            total_samples = batch_size
+
         # Get stats
         num_layers_captured = self.grad_hook._val_cache.get_num_captured()
-        avg_val_loss = total_val_loss / batch_size if batch_size > 0 else 0.0
-
-        # Debug: Log validation gradient capture complete
-        logger.info(
-            f"[Val][Rank {rank}/{world_size}] Validation gradient capture complete: "
-            f"num_layers={num_layers_captured}, avg_loss={avg_val_loss:.6f}"
-        )
+        avg_val_loss = total_val_loss_float / total_samples if total_samples > 0 else 0.0
 
         stats = {
-            'val/num_samples': batch_size,
-            'val/loss': avg_val_loss,
+            'val/num_samples': total_samples,  # Total across all ranks after sync
+            'val/loss': avg_val_loss,  # Average loss across all ranks
             'val/num_layers_captured': num_layers_captured,
             'val/num_micro_batches': num_micro_batches,
             'val/rank': rank,
             'val/world_size': world_size,
         }
 
-        # Debug: Log validation gradient norms per layer with rank info
-        total_grad_norm_sq = 0.0
-        all_synced = True
-
+        # Compute total validation gradient norm efficiently (no .item() calls in loop)
+        grad_norms_sq = []
         for i in range(num_layers_captured):
             val_grad = self.grad_hook.get_val_grad(i)
             if val_grad is not None:
-                grad_norm = val_grad.norm().item()
-                grad_mean = val_grad.mean().item()
-                grad_std = val_grad.std().item()
-                total_grad_norm_sq += grad_norm ** 2
+                grad_norms_sq.append(val_grad.norm().square())
 
-                # Log first/last few layers only for brevity
-                if i < 3 or i >= num_layers_captured - 3:
-                    logger.info(
-                        f"[Val][Rank {rank}]   Layer {i}: shape={tuple(val_grad.shape)}, "
-                        f"norm={grad_norm:.6f}, mean={grad_mean:.8f}, std={grad_std:.6f}"
-                    )
-                elif i == 3:
-                    logger.info(f"[Val][Rank {rank}]   ... ({num_layers_captured - 6} more layers)")
-
-                # Check multi-GPU synchronization for first and last layer
-                if world_size > 1 and (i == 0 or i == num_layers_captured - 1):
-                    is_synced = _check_tensor_sync(val_grad, f"val_grad_layer_{i}")
-                    all_synced = all_synced and is_synced
-                    if is_synced:
-                        logger.info(f"[Sync][Rank {rank}] Layer {i} validation gradients: SYNCHRONIZED ✓")
-                    else:
-                        logger.warning(f"[Sync][Rank {rank}] Layer {i} validation gradients: NOT SYNCHRONIZED ✗")
-
-        total_grad_norm = total_grad_norm_sq ** 0.5
-        logger.info(f"[Val][Rank {rank}] Total validation gradient norm: {total_grad_norm:.6f}")
+        if grad_norms_sq:
+            total_grad_norm_sq = torch.stack(grad_norms_sq).sum()
+            total_grad_norm = total_grad_norm_sq.sqrt().item()  # Single .item() at the end
+        else:
+            total_grad_norm = 0.0
 
         stats['val/total_grad_norm'] = total_grad_norm
-        stats['val/gradients_synced'] = all_synced
 
         return stats
 
@@ -421,20 +361,29 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None
     ) -> None:
-        """Setup Streaming selection state before forward pass."""
+        """
+        Setup Streaming selection state before forward pass.
+
+        IMPORTANT: This should be called per micro-batch, not per full batch.
+        The batch_size should be the micro-batch size to ensure:
+        1. Selection indices are relative to the micro-batch
+        2. tokens_per_sample matches the micro-batch for correct scale factor
+        3. cu_seqlens matches the micro-batch for packed sequence handling
+        """
         if not self._is_selection_enabled():
             return
 
         rank = _get_rank()
-        world_size = _get_world_size()
 
         num_val_layers = self.grad_hook._val_cache.get_num_captured()
         if num_val_layers == 0:
-            logger.warning(f"[Stream][Rank {rank}] No validation gradients captured! Selection may not work.")
+            logger.warning("No validation gradients captured! Selection may not work.")
 
-        logger.info(
-            f"[Stream][Rank {rank}/{world_size}] Setting up Streaming selection: "
-            f"batch_size={batch_size}, frac={self.train_selection_ratio}, "
+        # Note: Removed verbose per-micro-batch logging to reduce noise
+        # Log only on first setup or at DEBUG level
+        logger.debug(
+            f"[Stream] Setting up Streaming selection: "
+            f"micro_batch_size={batch_size}, frac={self.train_selection_ratio}, "
             f"num_val_layers={num_val_layers}"
         )
 
@@ -453,54 +402,24 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             self.grad_hook.set_token_counts(labels, batch_size, attention_mask)
 
     def _cleanup_streaming(self) -> None:
-        """Cleanup after streaming backward."""
+        """
+        Cleanup after streaming backward for a single micro-batch.
+
+        This is called per micro-batch. Stats are tracked but not logged
+        per micro-batch to avoid overhead.
+        """
         if not self._is_selection_enabled():
             return
 
-        rank = _get_rank()
-        world_size = _get_world_size()
-
         sel_state = self.grad_hook.selection_state
-        if hasattr(sel_state, '_layer_selections') and sel_state._layer_selections:
-            n_selected = [n for _, n in sel_state._layer_selections]
-            mean_selected = sum(n_selected) / len(n_selected)
-            min_selected = min(n_selected)
-            max_selected = max(n_selected)
+        if sel_state is not None and hasattr(sel_state, '_layer_selections') and sel_state._layer_selections:
+            layer_selections = sel_state._layer_selections
+            n_selected = [n for _, n in layer_selections]
+            mean_selected = sum(n_selected) / len(n_selected) if n_selected else 0
 
+            # Update stats for metrics reporting (no printing)
             self.selection_stats['train/mean_selected_per_layer'] = mean_selected
             self.selection_stats['train/num_layers_processed'] = len(n_selected)
-            self.selection_stats['train/min_selected_per_layer'] = min_selected
-            self.selection_stats['train/max_selected_per_layer'] = max_selected
-            self.selection_stats['train/rank'] = rank
-
-            # Debug: Log per-layer selection summary
-            logger.info(
-                f"[Stream][Rank {rank}/{world_size}] Selection complete: "
-                f"{len(n_selected)} layers, "
-                f"mean={mean_selected:.1f}, min={min_selected}, max={max_selected}"
-            )
-
-            # Log first few and last few layers with more detail
-            for i, (layer_idx, n) in enumerate(sel_state._layer_selections[:3]):
-                logger.info(f"[Stream][Rank {rank}]   Layer {layer_idx}: {n} samples selected")
-            if len(sel_state._layer_selections) > 6:
-                logger.info(f"[Stream][Rank {rank}]   ... ({len(sel_state._layer_selections) - 6} more layers) ...")
-            for layer_idx, n in sel_state._layer_selections[-3:]:
-                logger.info(f"[Stream][Rank {rank}]   Layer {layer_idx}: {n} samples selected")
-
-            # Check if selection is consistent across ranks (for debugging)
-            if world_size > 1:
-                mean_tensor = torch.tensor(mean_selected, device='cuda')
-                dist.all_reduce(mean_tensor, op=dist.ReduceOp.SUM)
-                global_mean = mean_tensor.item() / world_size
-
-                if abs(global_mean - mean_selected) > 1e-3:
-                    logger.warning(
-                        f"[Sync][Rank {rank}] Selection may differ across ranks: "
-                        f"local_mean={mean_selected:.2f}, global_mean={global_mean:.2f}"
-                    )
-                else:
-                    logger.info(f"[Sync][Rank {rank}] Selection consistent across ranks ✓")
 
         self.grad_hook.clear_selection()
         self.grad_hook.clear_token_counts()
@@ -608,48 +527,22 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                 log_prob = logprobs_from_logits(logits.float(), responses)
 
             # Compute PPO loss for scoring
-            pg_loss, _, _ = core_algos.compute_policy_loss(
+            pg_loss, _ = core_algos.compute_policy_loss_vanilla(
                 old_log_prob=old_log_probs,
                 log_prob=log_prob,
                 advantages=advantages,
-                eos_mask=response_mask,
-                cliprange=self.config.clip_ratio,
+                response_mask=response_mask,
+                loss_agg_mode=self.config.loss_agg_mode,
+                config=self.config,
             )
 
             # Backward to accumulate scores
             pg_loss.backward()
 
-        # Debug: Log score distribution before selection
-        scores = self.grad_hook.selection_state.grad_dot_scores
-        if scores is not None:
-            pos_mask = scores > 0
-            neg_mask = scores < 0
-            logger.info(
-                f"[DEBUG] GREATS scores: shape={scores.shape}, "
-                f"mean={scores.mean().item():.4f}, std={scores.std().item():.4f}, "
-                f"min={scores.min().item():.4f}, max={scores.max().item():.4f}"
-            )
-            logger.info(
-                f"[DEBUG] GREATS score dist: "
-                f"positive={pos_mask.sum().item()}, negative={neg_mask.sum().item()}, "
-                f"zero={(~pos_mask & ~neg_mask).sum().item()}"
-            )
-
         # Get selected indices from accumulated scores
+        scores = self.grad_hook.selection_state.grad_dot_scores
         selected_indices = self.grad_hook.selection_state.get_final_selection()
         selected_indices = selected_indices.sort()[0]
-
-        # Debug: Log which samples were selected
-        logger.info(
-            f"[DEBUG] GREATS selection: {len(selected_indices)}/{batch_size} samples selected "
-            f"(ratio={len(selected_indices)/batch_size:.2%})"
-        )
-        if len(selected_indices) > 0 and len(selected_indices) <= 20:
-            logger.info(f"[DEBUG]   Selected indices: {selected_indices.tolist()}")
-        elif len(selected_indices) > 20:
-            logger.info(
-                f"[DEBUG]   Selected indices (first 10): {selected_indices[:10].tolist()}..."
-            )
 
         # Cleanup after Pass 1
         self.grad_hook.clear_selection()
@@ -695,36 +588,212 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             return super().update_policy(data)
 
     def _update_policy_streaming(self, data: DataProto):
-        """Update policy with Streaming selection (per-layer during backward)."""
+        """
+        Update policy with Streaming selection (per-layer during backward).
+
+        Unlike the previous implementation that called super().update_policy(),
+        this version handles micro-batches explicitly to ensure selection state
+        (tokens_per_sample, cu_seqlens, etc.) is correctly set per micro-batch.
+
+        This is critical because:
+        1. Selection indices are relative to the micro-batch (0 to micro_batch_size-1)
+        2. tokens_per_sample must match the micro-batch for correct scale factor computation
+        3. cu_seqlens must match the micro-batch for packed sequence handling
+        """
+        from verl.trainer.ppo import core_algos
+        from verl.utils.py_functional import append_to_dict
+        import verl.utils.torch_functional as verl_F
+        from verl.utils.torch_functional import masked_mean
+
         self.actor_module.train()
 
-        # Get batch info for streaming setup
-        batch = data.select(batch_keys=['responses', 'attention_mask']).batch
-        batch_size = batch.batch_size[0]
-        responses = batch['responses']
-        attention_mask = batch['attention_mask']
-        response_length = responses.size(1)
-        response_mask = attention_mask[:, -response_length:]
+        # Get micro-batch configuration from verl config
+        micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
+        assert self.config.ppo_mini_batch_size % micro_batch_size == 0
+        gradient_accumulation = self.config.ppo_mini_batch_size // micro_batch_size
+        temperature = data.meta_info.get('temperature', 1.0)
+        pad_token_id = data.meta_info.get('pad_token_id', 0)
 
-        # Create labels for token counting (response positions only)
-        labels = torch.full_like(attention_mask, -100)
-        labels[:, -response_length:] = responses * response_mask.long() + (-100) * (~response_mask.bool()).long()
+        # Select keys needed for training
+        select_keys = [
+            'responses', 'input_ids', 'attention_mask', 'position_ids',
+            'old_log_probs', 'advantages'
+        ]
+        if self.config.use_kl_loss:
+            select_keys.append('ref_log_prob')
 
-        # Setup streaming before calling base update_policy
-        self._setup_streaming(batch_size, labels, attention_mask)
+        batch = data.select(batch_keys=select_keys).batch
 
-        try:
-            # Call base update_policy - hooks will intercept backward
-            metrics = super().update_policy(data)
-        finally:
-            # Cleanup streaming state
-            self._cleanup_streaming()
-            self.grad_hook.disable_hooks()
+        # Create dataloader: first split into mini-batches, then micro-batches
+        dataloader = batch.split(self.config.ppo_mini_batch_size)
 
-        # Add selection stats to metrics
+        metrics = {}
+        total_selected = 0
+        total_samples = 0
+
+        rank = _get_rank()
+
+        for _ in range(self.config.ppo_epochs):
+            for mini_batch in dataloader:
+                micro_batches = mini_batch.split(micro_batch_size)
+
+                self.actor_optimizer.zero_grad()
+
+                for micro_batch in micro_batches:
+                    micro_batch = micro_batch.cuda()
+
+                    # Extract data for this micro-batch
+                    input_ids = micro_batch['input_ids']
+                    attention_mask = micro_batch['attention_mask']
+                    position_ids = micro_batch['position_ids']
+                    responses = micro_batch['responses']
+                    old_log_probs = micro_batch['old_log_probs']
+                    advantages = micro_batch['advantages']
+
+                    current_micro_batch_size = input_ids.size(0)
+                    response_length = responses.size(1)
+                    response_mask = attention_mask[:, -response_length:]
+
+                    # Create labels for token counting (response positions only)
+                    labels = torch.full_like(attention_mask, -100)
+                    labels[:, -response_length:] = responses * response_mask.long() + (-100) * (~response_mask.bool()).long()
+
+                    # Setup streaming selection for THIS micro-batch
+                    # This ensures tokens_per_sample and cu_seqlens match the micro-batch
+                    self._setup_streaming(current_micro_batch_size, labels, attention_mask)
+
+                    try:
+                        # Forward pass with hooks enabled
+                        with torch.autocast(device_type='cuda', dtype=self.param_dtype):
+                            if self.use_remove_padding and unpad_input is not None:
+                                # Packed sequences path
+                                input_ids_rmpad, indices, *_ = unpad_input(
+                                    input_ids.unsqueeze(-1), attention_mask
+                                )
+                                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
+
+                                position_ids_rmpad = index_first_axis(
+                                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                                    indices
+                                ).transpose(0, 1)
+
+                                output = self.actor_module(
+                                    input_ids=input_ids_rmpad,
+                                    attention_mask=None,
+                                    position_ids=position_ids_rmpad,
+                                    use_cache=False,
+                                )
+                                logits_rmpad = output.logits.squeeze(0)
+
+                                if temperature != 1.0:
+                                    logits_rmpad = logits_rmpad / temperature
+
+                                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1).squeeze(0)
+                                log_probs_rmpad = logprobs_from_logits(logits_rmpad, input_ids_rmpad_rolled)
+
+                                full_log_probs = pad_input(
+                                    hidden_states=log_probs_rmpad.unsqueeze(-1),
+                                    indices=indices,
+                                    batch=current_micro_batch_size,
+                                    seqlen=input_ids.size(1)
+                                )
+                                log_prob = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]
+
+                                # Compute entropy from packed logits first, then pad
+                                # (DON'T pad logits - they have vocab_size dimension which would be huge)
+                                entropy_rmpad = verl_F.entropy_from_logits(logits_rmpad)  # [total_nnz]
+                                full_entropy = pad_input(
+                                    hidden_states=entropy_rmpad.unsqueeze(-1),  # [total_nnz, 1]
+                                    indices=indices,
+                                    batch=current_micro_batch_size,
+                                    seqlen=input_ids.size(1)
+                                )
+                                entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # [batch, response_len]
+                            else:
+                                # Standard (non-packed) path
+                                output = self.actor_module(
+                                    input_ids=input_ids,
+                                    attention_mask=attention_mask,
+                                    position_ids=position_ids,
+                                    use_cache=False,
+                                )
+                                logits = output.logits
+
+                                if temperature != 1.0:
+                                    logits = logits / temperature
+
+                                logits = logits[:, -response_length - 1:-1, :]
+                                log_prob = logprobs_from_logits(logits.float(), responses)
+                                entropy = verl_F.entropy_from_logits(logits)
+
+                        # Compute PPO loss (on all samples - selection happens in backward)
+                        pg_loss, pg_metrics = core_algos.compute_policy_loss_vanilla(
+                            old_log_prob=old_log_probs,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=self.config.loss_agg_mode,
+                            config=self.config,
+                        )
+                        pg_clipfrac = pg_metrics.get('pg_clipfrac', 0.0)
+                        ppo_kl = pg_metrics.get('ppo_kl', 0.0)
+
+                        entropy_loss = verl_F.masked_mean(entropy, response_mask)
+                        policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
+
+                        if self.config.use_kl_loss:
+                            ref_log_prob = micro_batch['ref_log_prob']
+                            kld = core_algos.kl_penalty(
+                                logprob=log_prob,
+                                ref_logprob=ref_log_prob,
+                                kl_penalty=self.config.kl_loss_type,
+                            )
+                            kl_loss = masked_mean(kld, response_mask)
+                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                            metrics['actor/kl_loss'] = metrics.get('actor/kl_loss', 0) + kl_loss.detach().item() / gradient_accumulation
+
+                        loss = policy_loss / gradient_accumulation
+
+                        # Backward pass - hooks intercept gradients and apply selection
+                        loss.backward()
+
+                        # Track selection statistics for this micro-batch
+                        sel_state = self.grad_hook.selection_state
+                        if sel_state is not None and hasattr(sel_state, '_layer_selections') and sel_state._layer_selections:
+                            n_selected = [n for _, n in sel_state._layer_selections]
+                            mean_selected = sum(n_selected) / len(n_selected) if n_selected else 0
+                            total_selected += mean_selected
+                            total_samples += current_micro_batch_size
+
+                    finally:
+                        # Cleanup streaming state after each micro-batch
+                        self._cleanup_streaming()
+                        self.grad_hook.disable_hooks()
+
+                    # Track metrics for this micro-batch
+                    # Note: pg_clipfrac and ppo_kl are already floats from pg_metrics.get()
+                    step_data = {
+                        'actor/entropy_loss': entropy_loss.detach().item(),
+                        'actor/pg_loss': pg_loss.detach().item(),
+                        'actor/pg_clipfrac': pg_clipfrac,
+                        'actor/ppo_kl': ppo_kl,
+                    }
+                    append_to_dict(metrics, step_data)
+
+                # Optimizer step after accumulating gradients
+                grad_norm = self._optimizer_step()
+                append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
+
+        # Add selection stats
+        if total_samples > 0:
+            self.selection_stats['train/total_selected'] = total_selected
+            self.selection_stats['train/total_samples'] = total_samples
+            self.selection_stats['train/overall_selection_ratio'] = total_selected / total_samples
+
         for key, val in self.selection_stats.items():
             metrics[f'selection/{key}'] = val
 
+        self.actor_optimizer.zero_grad()
         return metrics
 
     def _update_policy_greats(self, data: DataProto):
@@ -736,8 +805,10 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         self.actor_module.train()
 
-        assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size == 0
-        gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
+        # Use ppo_micro_batch_size_per_gpu (correct attribute name in verl config)
+        micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
+        assert self.config.ppo_mini_batch_size % micro_batch_size == 0
+        gradient_accumulation = self.config.ppo_mini_batch_size // micro_batch_size
         temperature = data.meta_info.get('temperature', 1.0)
 
         # Select keys
@@ -759,7 +830,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         for _ in range(self.config.ppo_epochs):
             for mini_batch in dataloader:
-                micro_batches = mini_batch.split(self.config.ppo_micro_batch_size)
+                micro_batches = mini_batch.split(micro_batch_size)
 
                 self.actor_optimizer.zero_grad()
 
@@ -793,7 +864,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     total_samples += micro_batch_size
 
                     if len(selected_indices) == 0:
-                        logger.warning("[GREATS] No samples selected, skipping micro-batch")
+                        logger.warning("GREATS: No samples selected, skipping micro-batch")
                         continue
 
                     # Filter to selected samples
@@ -844,14 +915,16 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                             )
                             log_prob = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]
 
-                            # Compute entropy from logits
-                            logits_for_entropy = pad_input(
-                                hidden_states=logits_rmpad.unsqueeze(0),
+                            # Compute entropy from packed logits first, then pad
+                            # (DON'T pad logits - they have vocab_size dimension which would be huge)
+                            entropy_rmpad = verl_F.entropy_from_logits(logits_rmpad)  # [total_nnz]
+                            full_entropy = pad_input(
+                                hidden_states=entropy_rmpad.unsqueeze(-1),  # [total_nnz, 1]
                                 indices=indices,
                                 batch=sel_batch_size,
                                 seqlen=sel_seqlen
-                            )[:, -response_length - 1:-1, :]
-                            entropy = verl_F.entropy_from_logits(logits_for_entropy)
+                            )
+                            entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # [batch, response_len]
                         else:
                             output = self.actor_module(
                                 input_ids=sel_input_ids,
@@ -869,13 +942,16 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                             entropy = verl_F.entropy_from_logits(logits)
 
                         # Compute PPO loss
-                        pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
+                        pg_loss, pg_metrics = core_algos.compute_policy_loss_vanilla(
                             old_log_prob=sel_old_log_probs,
                             log_prob=log_prob,
                             advantages=sel_advantages,
-                            eos_mask=sel_response_mask,
-                            cliprange=self.config.clip_ratio,
+                            response_mask=sel_response_mask,
+                            loss_agg_mode=self.config.loss_agg_mode,
+                            config=self.config,
                         )
+                        pg_clipfrac = pg_metrics.get('pg_clipfrac', 0.0)
+                        ppo_kl = pg_metrics.get('ppo_kl', 0.0)
 
                         entropy_loss = verl_F.masked_mean(entropy, sel_response_mask)
                         policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
@@ -895,11 +971,12 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                         loss.backward()
 
                     # Track metrics
+                    # Note: pg_clipfrac and ppo_kl are already floats from pg_metrics.get()
                     step_data = {
                         'actor/entropy_loss': entropy_loss.detach().item(),
                         'actor/pg_loss': pg_loss.detach().item(),
-                        'actor/pg_clipfrac': pg_clipfrac.detach().item(),
-                        'actor/ppo_kl': ppo_kl.detach().item(),
+                        'actor/pg_clipfrac': pg_clipfrac,
+                        'actor/ppo_kl': ppo_kl,
                     }
                     append_to_dict(metrics, step_data)
 

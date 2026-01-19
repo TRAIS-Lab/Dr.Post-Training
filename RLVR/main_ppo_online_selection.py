@@ -49,6 +49,7 @@ from gradstream_verl.selection_trainer import (
     SelectionTrainerConfig,
 )
 from gradstream_verl.validation_manager import ValidationConfig
+from gradstream_verl.worker_selection import SelectionActorRolloutRefWorker
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples=-1):
@@ -81,6 +82,44 @@ def create_rl_sampler(data_config, dataset):
 
 class SelectionTaskRunner(BaseTaskRunner):
     """Task runner for selection-enabled PPO training."""
+
+    def add_actor_rollout_worker(self, config):
+        """Override to use selection-enabled worker for FSDP strategy."""
+        from verl.single_controller.ray import RayWorkerGroup
+        from verl.trainer.ppo.ray_trainer import Role
+
+        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+
+        # New engine implementation doesn't support selection yet
+        if use_legacy_worker_impl == "disable":
+            print("[Selection] WARNING: New engine implementation doesn't support selection yet.")
+            print("[Selection] Falling back to parent implementation.")
+            return super().add_actor_rollout_worker(config)
+
+        # Use selection-enabled worker for FSDP strategy
+        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+            # Check if selection is enabled
+            selection_enabled = config.get("selection", {}).get("enable", False)
+
+            if selection_enabled:
+                print("[Selection] Using SelectionActorRolloutRefWorker for gradient-based selection")
+                actor_rollout_cls = SelectionActorRolloutRefWorker
+            else:
+                from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
+                actor_rollout_cls = AsyncActorRolloutRefWorker
+
+            ray_worker_group_cls = RayWorkerGroup
+
+        elif config.actor_rollout_ref.actor.strategy == "megatron":
+            print("[Selection] WARNING: Megatron strategy doesn't support selection yet.")
+            return super().add_actor_rollout_worker(config)
+
+        else:
+            raise NotImplementedError(f"Unknown strategy: {config.actor_rollout_ref.actor.strategy}")
+
+        self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
+        self.mapping[Role.ActorRollout] = "global_pool"
+        return actor_rollout_cls, ray_worker_group_cls
 
     def run(self, config):
         """Execute the main PPO training workflow with online validation selection."""

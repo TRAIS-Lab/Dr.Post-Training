@@ -10,29 +10,15 @@ Reference: RLHF/train/trainer.py lines 500-565, 1162-1324
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from typing import Dict, Optional, Union
+    from typing import Dict, Optional
     from torch import Tensor
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 
 from .hook import GradientHookVerl
-
-logger = logging.getLogger(__name__)
-
-
-def _get_rank() -> int:
-    """Get current rank for logging."""
-    return dist.get_rank() if dist.is_initialized() else 0
-
-
-def _get_world_size() -> int:
-    """Get world size for logging."""
-    return dist.get_world_size() if dist.is_initialized() else 1
 
 
 def compute_token_logprobs(
@@ -87,23 +73,13 @@ def capture_seqloss_reward_gradients(
     Returns:
         Total validation loss (float)
     """
-    from .debug_utils import get_debugger
-    debugger = get_debugger()
-
     rewards = val_batch["rewards"]
-    device = rewards.device
-    rank = _get_rank()
-    world_size = _get_world_size()
 
     # Normalize rewards: seq_scores = (R - μ) / (σ + ε)
     if rewards.numel() > 1:
-        reward_mean = rewards.mean()
-        reward_std = rewards.std()
-        seq_scores = (rewards - reward_mean) / (reward_std + 1e-8)
+        seq_scores = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
     else:
-        reward_mean = rewards.mean()
-        reward_std = torch.tensor(0.0, device=device)
-        seq_scores = rewards - reward_mean
+        seq_scores = rewards - rewards.mean()
 
     # Start validation gradient capture
     grad_hook.start_val_capture()
@@ -112,26 +88,14 @@ def capture_seqloss_reward_gradients(
 
     batch_size = val_batch["input_ids"].shape[0]
     total_val_loss = 0.0
-    total_tokens = val_batch["response_mask"].sum().item() if "response_mask" in val_batch else 0
-
-    # Debug: Log validation start
-    logger.info(
-        f"[Val][Rank {rank}] Starting validation gradient capture: "
-        f"batch_size={batch_size}, total_tokens={total_tokens}, "
-        f"reward_mean={reward_mean.item():.4f}, reward_std={reward_std.item():.4f}"
-    )
-    debugger.log_validation_start(batch_size, int(total_tokens))
 
     # Process in micro-batches if specified
     if micro_batch_size is None:
         micro_batch_size = batch_size
 
-    num_micro_batches = (batch_size + micro_batch_size - 1) // micro_batch_size
-
-    for mb_idx, start_idx in enumerate(range(0, batch_size, micro_batch_size)):
+    for start_idx in range(0, batch_size, micro_batch_size):
         end_idx = min(start_idx + micro_batch_size, batch_size)
         mb_slice = slice(start_idx, end_idx)
-        mb_size = end_idx - start_idx
 
         # Forward pass
         outputs = model(
@@ -182,49 +146,8 @@ def capture_seqloss_reward_gradients(
 
         total_val_loss += mb_val_loss.item()
 
-        # Debug: Log micro-batch loss
-        logger.debug(
-            f"[Val][Rank {rank}] Micro-batch {mb_idx+1}/{num_micro_batches}: "
-            f"loss={mb_val_loss.item():.6f}, "
-            f"seq_log_probs_mean={seq_log_probs.mean().item():.4f}"
-        )
-        debugger.log_validation_loss(mb_val_loss.item(), mb_idx)
-
     # End validation gradient capture
     grad_hook.end_val_capture()
-
-    # Debug: Log captured gradients
-    num_layers = grad_hook._val_cache.get_num_captured()
-    logger.info(
-        f"[Val][Rank {rank}] Validation gradient capture complete: "
-        f"total_loss={total_val_loss:.6f}, num_layers={num_layers}"
-    )
-
-    # Log per-layer gradient statistics
-    total_grad_norm_sq = 0.0
-    for layer_idx in range(num_layers):
-        val_grad = grad_hook.get_val_grad(layer_idx)
-        if val_grad is not None:
-            grad_norm = val_grad.norm().item()
-            grad_mean = val_grad.mean().item()
-            grad_std = val_grad.std().item()
-            total_grad_norm_sq += grad_norm ** 2
-
-            # Log first few and last few layers
-            if layer_idx < 3 or layer_idx >= num_layers - 3:
-                logger.info(
-                    f"[Val][Rank {rank}]   Layer {layer_idx}: "
-                    f"shape={tuple(val_grad.shape)}, "
-                    f"norm={grad_norm:.6f}, mean={grad_mean:.8f}, std={grad_std:.6f}"
-                )
-            elif layer_idx == 3:
-                logger.info(f"[Val][Rank {rank}]   ... ({num_layers - 6} more layers)")
-
-    total_grad_norm = total_grad_norm_sq ** 0.5
-    logger.info(f"[Val][Rank {rank}] Total validation gradient norm: {total_grad_norm:.6f}")
-
-    debugger.log_validation_gradients(grad_hook, detailed=False)
-    debugger.log_validation_end(total_val_loss)
 
     # Clear model gradients (we only wanted to capture them in the hook)
     model.zero_grad()

@@ -29,7 +29,7 @@ import torch
 from omegaconf import open_dict
 
 from verl import DataProto
-from verl.workers.fsdp_workers import ActorRolloutRefWorker as BaseActorRolloutRefWorker
+from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker as BaseActorRolloutRefWorker
 from verl.single_controller.base.decorator import register, make_nd_compute_dataproto_dispatch_fn, Dispatch
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_id
@@ -81,13 +81,10 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
         method = selection_config.get("method", "NA")
 
         if method not in ["Streaming", "GREATS"]:
-            logger.info(f"[Rank {self.rank}] Selection disabled (method={method})")
             self._selection_enabled = False
             return
 
         self._selection_enabled = True
-        logger.info(f"[Rank {self.rank}] Setting up selection: method={method}, "
-                    f"frac={selection_config.get('frac', 0.5)}")
 
         # Upgrade actor to selection-aware version
         self._upgrade_to_selection_actor(selection_config)
@@ -106,8 +103,6 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
         actor_cfg = omega_conf_to_dataclass(self.config.actor)
 
         # Create selection-aware actor, reusing existing optimizer
-        logger.info(f"[Rank {self.rank}] Upgrading to DataParallelPPOActorWithSelection")
-
         self.actor = DataParallelPPOActorWithSelection(
             config=actor_cfg,
             actor_module=self.actor_module_fsdp,
@@ -116,10 +111,6 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
             train_selection_ratio=selection_config.get("frac", 0.5),
             use_second_order=selection_config.get("use_second_order", False),
         )
-
-        logger.info(f"[Rank {self.rank}] Selection actor initialized: "
-                    f"method={self.actor.selection_method}, "
-                    f"frac={self.actor.train_selection_ratio}")
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def capture_validation_gradients(self, val_batch: DataProto) -> DataProto:
@@ -170,18 +161,20 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
             temperature=temperature,
         )
 
-        logger.info(f"[Rank {self.rank}] Captured validation gradients: "
-                    f"num_samples={stats.get('val/num_samples', 0)}, "
-                    f"loss={stats.get('val/loss', 0):.4f}")
-
-        return DataProto(meta_info=stats)
+        # Stats are now synchronized across ranks via all-reduce in actor
+        # Return only rank-invariant stats to avoid DataProto.concat conflicts
+        return DataProto(meta_info={
+            'val/loss': stats.get('val/loss', 0.0),
+            'val/num_samples': stats.get('val/num_samples', 0),
+            'val/num_layers_captured': stats.get('val/num_layers_captured', 0),
+            'val/world_size': stats.get('val/world_size', 1),
+        })
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def clear_validation_gradients(self) -> None:
         """Clear cached validation gradients."""
         if self._is_actor and hasattr(self.actor, 'clear_validation_gradients'):
             self.actor.clear_validation_gradients()
-            logger.debug(f"[Rank {self.rank}] Cleared validation gradients")
 
     # Forward methods from parent that use @register with DIRECT_ROLLOUT_METHOD
     # These need to be re-registered in subclass for Ray to find them

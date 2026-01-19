@@ -16,6 +16,8 @@ git submodule update --init --recursive
 
 > [!IMPORTANT]
 > **SFT/RLHF** and **RLVR** require **different conda environments** due to incompatible dependencies (e.g., `transformers` version conflicts). Choose the appropriate setup below.
+>
+> Moreover, the trainer of SFT and RLHF is implemented in plain PyTorch without advanced distributed training frameworks (e.g., DeepSpeed, FairScale, or Hugging Face Accelerator) to maximize clarity and ease of understanding. For large-scale training, we provide our implementation in the RLVR experiment with [VERL](https://github.com/volcengine/verl) (Ray-based distributed RL) with vLLM for fast generation.
 
 ### For SFT and RLHF
 
@@ -34,12 +36,15 @@ pip3 install -r requirements.txt
 ```
 
 >[!Note]
->It is only required to install `cudatoolkit` with appropriate `torch` in order to build `sjlt`. Without `sjlt` installation, you can still run the experiment with other gradient compression methods (e.g., LoGra), which is the default.
+>It is only required to install `cudatoolkit` with appropriate `torch` in order to build `sjlt`. Without `sjlt` installation, you can still run the experiment with other gradient compression methods (e.g., LoGra), which is the default. For instance, the following should also work as long as you don't use `GraSS` compression (which requires `sjlt`):
+> ```bash
+> conda create -n GradStream python=3.10
+> conda activate GradStream
+> pip3 install -r requirements.txt
+> pip3 install flash-attn --no-build-isolation --no-cache-dir
+> ```
 
 ### For RLVR
-
->[!Note]
->The trainer of SFT and RLHF is implemented in plain PyTorch without advanced distributed training frameworks (e.g., DeepSpeed, FairScale, or Hugging Face Accelerator) to maximize clarity and ease of understanding. For large-scale training, we provide our implementation in the RLVR experiment with [VERL](https://github.com/volcengine/verl) (Ray-based distributed RL) with vLLM for fast generation. VERL is included as a git submodule.
 
 To set up the environment for RLVR experiments, use the following commands:
 
@@ -53,8 +58,7 @@ pip install -e ".[vllm,math]"
 pip install flash-attn --no-build-isolation --no-cache-dir
 ```
 
->[!Note]
->Due to the complicated dependencies of VERL and vLLM, we recommend using a separate conda environment for RLVR experiments and let the VERL installation handle all the dependencies.
+Note that due to the complicated dependencies of VERL (which is included as a git submodule) and vLLM, we recommend using a separate conda environment for RLVR experiments and let the VERL installation handle all the dependencies.
 
 ## Experiments
 
