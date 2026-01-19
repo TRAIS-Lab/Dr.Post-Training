@@ -1,32 +1,23 @@
 #!/bin/bash
-set -x
 
-# Gradient-based Data Selection with Online Validation Rollouts
-#
-# This script runs GRPO training with gradient-based data selection using
-# online validation rollout generation. Unlike the simple proxy-based approach,
-# this implementation:
-#   1. Generates fresh rollouts for validation prompts using current policy
-#   2. Computes rewards on validation responses
-#   3. Captures validation gradients for selection
-#   4. Applies Streaming or GREATS selection during training
-#
-# Selection methods:
-#   - Streaming: Per-layer selection during backward
-#   - GREATS: Two-pass global selection per micro-batch
-#
-# Usage:
-#   # First, prepare validation prompts (run once):
-#   python scripts/prepare_validation_prompts.py \
-#       --train_data data/gsm8k/train.parquet data/math/train.parquet \
-#       --output data/val_prompts.parquet \
-#       --num_samples 500
-#
-#   # Then run training:
-#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/run_qwen1.5b_gsm8k_online_selection.sh
-#
-#   # Run baseline (no selection):
-#   CUDA_VISIBLE_DEVICES=0,1,2,3 SELECTION_ENABLED=False bash scripts/run_qwen1.5b_gsm8k_online_selection.sh
+#SBATCH --job-name=RLVR-Train
+#SBATCH --mem=128g
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --partition=gpuA40x4
+#SBATCH --account=bfwm-delta-gpu
+#SBATCH --time=24:00:00
+#SBATCH --constraint="scratch"
+#SBATCH --output=/u/%u/Project/Gradient-Streaming/RLHF/log/%x-%j.log
+
+### GPU options ###
+#SBATCH --gpus-per-node=4
+#SBATCH --gpu-bind=none
+#SBATCH --mail-user=pbb@illinois.edu
+#SBATCH --mail-type="END"
+
+set -x
 
 # ============================================================================
 # GPU Configuration
@@ -46,14 +37,12 @@ echo "Using N_GPUS=$N_GPUS"
 DATA_DIR=/home/pbb/Project/Gradient-Streaming/RLVR/data
 gsm8k_train_path=$DATA_DIR/gsm8k/train.parquet
 gsm8k_test_path=$DATA_DIR/gsm8k/test.parquet
-math_train_path=$DATA_DIR/math/train.parquet
-math_test_path=$DATA_DIR/math/test.parquet
 
 # Validation prompts for online rollout generation
-VAL_PROMPTS_PATH=$DATA_DIR/val_prompts.parquet
+VAL_PROMPTS_PATH=$DATA_DIR/gsm8k/val_prompts.parquet
 
-train_files="['$gsm8k_train_path', '$math_train_path']"
-test_files="['$gsm8k_test_path', '$math_test_path']"
+train_files=$gsm8k_train_path
+test_files=$gsm8k_test_path
 
 # Output directory
 OUTPUT_BASE=/home/pbb/Project/Gradient-Streaming/RLVR/output
@@ -129,7 +118,7 @@ if [ "$SELECTION_ENABLED" = "True" ] && [ ! -f "$VAL_PROMPTS_PATH" ]; then
     echo "Validation prompts not found at $VAL_PROMPTS_PATH"
     echo "Creating validation prompts from training data..."
     python3 /home/pbb/Project/Gradient-Streaming/RLVR/scripts/prepare_validation_prompts.py \
-        --train_data $gsm8k_train_path $math_train_path \
+        --train_data $gsm8k_train_path \
         --output $VAL_PROMPTS_PATH \
         --num_samples $VAL_POOL_SIZE \
         --seed 42

@@ -11,13 +11,6 @@ Usage:
         --output data/gsm8k/val_prompts.parquet \
         --num_samples 500 \
         --seed 42
-
-Or for multiple datasets:
-    python scripts/prepare_validation_prompts.py \
-        --train_data data/gsm8k/train.parquet data/math/train.parquet \
-        --output data/val_prompts_combined.parquet \
-        --num_samples 500 \
-        --seed 42
 """
 
 import argparse
