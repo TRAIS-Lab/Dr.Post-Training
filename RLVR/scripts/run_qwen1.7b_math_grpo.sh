@@ -54,7 +54,7 @@ SELECTION_ENABLED=${SELECTION_ENABLED:-True}
 SELECTION_METHOD=${SELECTION_METHOD:-Streaming}
 SELECTION_FRAC=${SELECTION_FRAC:-1.0}
 VAL_POOL_SIZE=${VAL_POOL_SIZE:-500}
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-32}
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-8}
 REFRESH_FREQ=${REFRESH_FREQ:-1}
 RESUME_MODE=${RESUME_MODE:-disable}
 
@@ -136,7 +136,7 @@ python3 /home/pbb/Project/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
-    data.train_batch_size=256 \
+    data.train_batch_size=64 \
     data.max_prompt_length=1024 \
     data.max_response_length=4096 \
     data.filter_overlong_prompts=True \
@@ -145,7 +145,6 @@ python3 /home/pbb/Project/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -153,6 +152,8 @@ python3 /home/pbb/Project/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+	actor_rollout_ref.actor.use_dynamic_bsz=True \
+ 	actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
@@ -172,6 +173,7 @@ python3 /home/pbb/Project/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     trainer.total_epochs=15 \
     trainer.default_local_dir=$OUTPUT_DIR \
     trainer.resume_mode=$RESUME_MODE \
+	trainer.balance_batch=True \
     +selection.enable=$SELECTION_ENABLED \
     +selection.method=$SELECTION_METHOD \
     +selection.frac=$SELECTION_FRAC \
@@ -180,7 +182,7 @@ python3 /home/pbb/Project/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     +selection.val_pool_size=$VAL_POOL_SIZE \
     +selection.val_batch_size=$VAL_BATCH_SIZE \
     +selection.val_max_prompt_length=1024 \
-    +selection.val_max_response_length=2048 \
+    +selection.val_max_response_length=4096 \
     +selection.refresh_freq=$REFRESH_FREQ \
     +selection.val_loss_type=seqloss-reward \
     "$@"

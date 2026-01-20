@@ -607,10 +607,6 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         self.actor_module.train()
 
-        # Get micro-batch configuration from verl config
-        micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
-        assert self.config.ppo_mini_batch_size % micro_batch_size == 0
-        gradient_accumulation = self.config.ppo_mini_batch_size // micro_batch_size
         temperature = data.meta_info.get('temperature', 1.0)
         pad_token_id = data.meta_info.get('pad_token_id', 0)
 
@@ -624,7 +620,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         batch = data.select(batch_keys=select_keys).batch
 
-        # Create dataloader: first split into mini-batches, then micro-batches
+        # Create dataloader: split into mini-batches
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
@@ -635,6 +631,24 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         for _ in range(self.config.ppo_epochs):
             for mini_batch in dataloader:
+                # Calculate micro_batch_size dynamically or use fixed size
+                if self.config.use_dynamic_bsz:
+                    # Dynamic batch size: calculate based on max token length
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * getattr(self, 'ulysses_sequence_parallel_size', 1)
+                    # Get attention mask to calculate sequence lengths
+                    mini_batch_attention_mask = mini_batch['attention_mask']
+                    seq_lengths = mini_batch_attention_mask.sum(dim=1)
+                    max_seq_len = seq_lengths.max().item()
+                    micro_batch_size = max(1, int(max_token_len // max_seq_len))
+                else:
+                    # Fixed micro batch size from config
+                    micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
+
+                # Calculate gradient accumulation steps based on actual micro_batch_size
+                mini_batch_size = mini_batch['input_ids'].size(0)
+                num_micro_batches = (mini_batch_size + micro_batch_size - 1) // micro_batch_size
+                gradient_accumulation = num_micro_batches
+
                 micro_batches = mini_batch.split(micro_batch_size)
 
                 self.actor_optimizer.zero_grad()
@@ -805,10 +819,6 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         self.actor_module.train()
 
-        # Use ppo_micro_batch_size_per_gpu (correct attribute name in verl config)
-        micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
-        assert self.config.ppo_mini_batch_size % micro_batch_size == 0
-        gradient_accumulation = self.config.ppo_mini_batch_size // micro_batch_size
         temperature = data.meta_info.get('temperature', 1.0)
 
         # Select keys
@@ -830,6 +840,24 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         for _ in range(self.config.ppo_epochs):
             for mini_batch in dataloader:
+                # Calculate micro_batch_size dynamically or use fixed size
+                if self.config.use_dynamic_bsz:
+                    # Dynamic batch size: calculate based on max token length
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * getattr(self, 'ulysses_sequence_parallel_size', 1)
+                    # Get attention mask to calculate sequence lengths
+                    mini_batch_attention_mask = mini_batch['attention_mask']
+                    seq_lengths = mini_batch_attention_mask.sum(dim=1)
+                    max_seq_len = seq_lengths.max().item()
+                    micro_batch_size = max(1, int(max_token_len // max_seq_len))
+                else:
+                    # Fixed micro batch size from config
+                    micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
+
+                # Calculate gradient accumulation steps based on actual micro_batch_size
+                mini_batch_size = mini_batch['input_ids'].size(0)
+                num_micro_batches = (mini_batch_size + micro_batch_size - 1) // micro_batch_size
+                gradient_accumulation = num_micro_batches
+
                 micro_batches = mini_batch.split(micro_batch_size)
 
                 self.actor_optimizer.zero_grad()
