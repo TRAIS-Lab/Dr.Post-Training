@@ -5,71 +5,60 @@ This directory contains the implementation for online gradient-based data select
 ## Quick Start
 
 ```bash
-# 1. Prepare data (GSM8K or MATH)
-python verl/examples/data_preprocess/gsm8k.py --local_save_dir data/gsm8k
-python verl/examples/data_preprocess/math_dataset.py --local_save_dir data/math
+# 1. Prepare data
+python verl/examples/data_preprocess/math_dataset.py --local_save_dir $DATA_DIR/math
 
-# 2. Run training with Streaming selection (default)
-bash scripts/run_qwen1.7b_gsm8k_grpo.sh
+# 2. Split test set into validation + cleaned test
+python data/prepare_data.py \
+    --test_data $DATA_DIR/math/test.parquet \
+    --output $DATA_DIR/math/val_prompts.parquet \
+    --output_test $DATA_DIR/math/test_cleaned.parquet \
+    --num_samples 1000 \
+    --seed 42
 
-# 3. Or disable selection for baseline
-bash scripts/run_qwen1.7b_gsm8k_grpo.sh ++selection.enable=False
+# 3. Run training with Streaming selection (default)
+bash scripts/run_qwen1.7b_math_grpo.sh
+
+# 4. Or disable selection for baseline
+bash scripts/run_qwen1.7b_math_grpo.sh ++selection.enable=False
 ```
 
 ## Data Preparation
 
-### GSM8K (Grade School Math)
+### Step 1: Download and Preprocess MATH Dataset
 
 ```bash
-python verl/examples/data_preprocess/gsm8k.py --local_save_dir data/gsm8k
+python verl/examples/data_preprocess/math_dataset.py --local_save_dir $DATA_DIR/math
 ```
 
 This creates:
-- `data/gsm8k/train.parquet` (~7,473 problems)
-- `data/gsm8k/test.parquet` (~1,319 problems)
+- `$DATA_DIR/math/train.parquet` (~7,500 problems)
+- `$DATA_DIR/math/test.parquet` (~5,000 problems)
 
-### MATH (Competition Mathematics)
+### Step 2: Split Test Set for Validation
 
-```bash
-python verl/examples/data_preprocess/math_dataset.py --local_save_dir data/math
-```
-
-This creates:
-- `data/math/train.parquet` (~7,500 problems)
-- `data/math/test.parquet` (~5,000 problems)
-
-### Validation Prompts (Auto-Created)
-
-Validation prompts are used for online gradient-based selection. They are **auto-created** when you run training with selection enabled. To create manually:
+For gradient-based selection, we need validation prompts. We split the test set into:
+- **Validation prompts** (1,000 samples): Used to compute validation gradients
+- **Cleaned test set** (4,000 samples): Used for final evaluation
 
 ```bash
 python data/prepare_data.py \
-    --train_data data/gsm8k/train.parquet \
-    --output data/gsm8k/val_prompts.parquet \
-    --num_samples 500
+    --test_data $DATA_DIR/math/test.parquet \
+    --output $DATA_DIR/math/val_prompts.parquet \
+    --output_test $DATA_DIR/math/test_cleaned.parquet \
+    --num_samples 1000 \
+    --seed 42
 ```
+
+This creates:
+- `val_prompts.parquet`: Prompts only (responses generated online during training)
+- `test_cleaned.parquet`: Remaining samples for final evaluation
+
+**Important:** When evaluating, use `test_cleaned.parquet` instead of `test.parquet` to avoid evaluating on validation data.
 
 ## Running Experiments
 
-**Important:** Always run scripts from the `RLVR/` directory to ensure all output folders are created in consistent locations. This ensures:
-- `output/` - checkpoints and model outputs
-- `outputs/` - Hydra configuration logs
-- `wandb/` - Weights & Biases run logs
-
-### GSM8K
-
-```bash
-# With Streaming selection (default)
-bash scripts/run_qwen1.7b_gsm8k_grpo.sh
-
-# Baseline (no selection)
-bash scripts/run_qwen1.7b_gsm8k_grpo.sh ++selection.enable=False
-
-# With GREATS selection
-SELECTION_METHOD=GREATS bash scripts/run_qwen1.7b_gsm8k_grpo.sh
-```
-
-### MATH
+**Important:** Always run scripts from the `RLVR/` directory to ensure all output folders are created in consistent locations.
 
 ```bash
 # With Streaming selection (default)
@@ -103,26 +92,28 @@ Pass additional config via command line:
 
 ```bash
 # Disable selection
-bash scripts/run_qwen1.7b_gsm8k_grpo.sh ++selection.enable=False
+bash scripts/run_qwen1.7b_math_grpo.sh ++selection.enable=False
 
 # Change selection fraction
-bash scripts/run_qwen1.7b_gsm8k_grpo.sh ++selection.frac=0.5
+bash scripts/run_qwen1.7b_math_grpo.sh ++selection.frac=0.5
 
 # Change model
-bash scripts/run_qwen1.7b_gsm8k_grpo.sh actor_rollout_ref.model.path=Qwen/Qwen3-4B
+bash scripts/run_qwen1.7b_math_grpo.sh actor_rollout_ref.model.path=Qwen/Qwen3-4B
 
 # Set random seed for different runs
-bash scripts/run_qwen1.7b_gsm8k_grpo.sh seed=123
+bash scripts/run_qwen1.7b_math_grpo.sh seed=123
 
 # Multiple overrides
-bash scripts/run_qwen1.7b_gsm8k_grpo.sh ++selection.method=GREATS ++selection.frac=0.8
+bash scripts/run_qwen1.7b_math_grpo.sh ++selection.method=GREATS ++selection.frac=0.8
 ```
 
-## Dataset Comparison
+## MATH Dataset Info
 
-| Aspect              | GSM8K           | MATH                                 |
-| ------------------- | --------------- | ------------------------------------ |
-| Difficulty          | Grade school    | Competition level                    |
-| Answer format       | `#### <number>` | `\boxed{<answer>}`                   |
-| Max response length | 1024            | 4096                                 |
-| Data source         | `openai/gsm8k`  | `DigitalLearningGmbH/MATH-lighteval` |
+| Aspect              | Value                                |
+| ------------------- | ------------------------------------ |
+| Difficulty          | Competition level                    |
+| Train samples       | ~7,500                               |
+| Test samples        | ~5,000 (split: 1,000 val + 4,000 test) |
+| Answer format       | `\boxed{<answer>}`                   |
+| Max response length | 4096                                 |
+| Data source         | `DigitalLearningGmbH/MATH-lighteval` |

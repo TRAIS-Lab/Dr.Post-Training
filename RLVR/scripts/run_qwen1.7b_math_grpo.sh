@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpuH200x8
 #SBATCH --account=bfwm-delta-gpu
-#SBATCH --time=48:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/u/%u/Project/Gradient-Streaming/RLVR/logs/%x-%j.log
 
 ### GPU options ###
@@ -41,12 +41,14 @@ echo "Using N_GPUS=$N_GPUS"
 DATA_DIR=$SCRATCH_DIR/Gradient-Streaming/RLVR/data
 math_train_path=$DATA_DIR/math/train.parquet
 math_test_path=$DATA_DIR/math/test.parquet
+math_test_cleaned_path=$DATA_DIR/math/test_cleaned.parquet
 
-# Validation prompts for online rollout generation
+# Validation prompts for online rollout generation (split from test set)
 VAL_PROMPTS_PATH=$DATA_DIR/math/val_prompts.parquet
 
 train_files=$math_train_path
-test_files=$math_test_path
+# Use cleaned test set (excludes validation samples) for evaluation
+test_files=$math_test_cleaned_path
 
 # Output directory
 OUTPUT_BASE=$SCRATCH_DIR/Gradient-Streaming/RLVR/output
@@ -125,14 +127,15 @@ export PYTHONPATH=$CODE_DIR/Gradient-Streaming/RLVR:$CODE_DIR/Gradient-Streaming
 unset ROCR_VISIBLE_DEVICES
 
 # ============================================================================
-# Check/Prepare validation prompts
+# Check/Prepare validation prompts (split from test set for reproducibility)
 # ============================================================================
 if [ "$SELECTION_ENABLED" = "True" ] && [ ! -f "$VAL_PROMPTS_PATH" ]; then
     echo "Validation prompts not found at $VAL_PROMPTS_PATH"
-    echo "Creating validation prompts from training data..."
+    echo "Splitting test set into validation prompts and cleaned test set..."
     python3 $CODE_DIR/Gradient-Streaming/RLVR/data/prepare_data.py \
-        --train_data $math_train_path \
+        --test_data $math_test_path \
         --output $VAL_PROMPTS_PATH \
+        --output_test $math_test_cleaned_path \
         --num_samples $VAL_POOL_SIZE \
         --seed $SEED
 fi
@@ -180,13 +183,13 @@ python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name='verl_grpo_math_online_selection' \
+    trainer.project_name='verl_grpo_math' \
     trainer.experiment_name=$EXP_NAME \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
-    trainer.test_freq=5 \
-    trainer.total_epochs=15 \
+    trainer.test_freq=3 \
+    trainer.total_epochs=5 \
     trainer.default_local_dir=$OUTPUT_DIR \
     trainer.resume_mode=$RESUME_MODE \
 	trainer.balance_batch=True \

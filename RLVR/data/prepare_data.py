@@ -2,15 +2,28 @@
 """
 Prepare validation prompts for gradient-based data selection.
 
-This script creates a validation prompts file from training data.
-The prompts will be used for online rollout generation during training.
+This script creates a validation prompts file from either:
+1. Training data (legacy mode) - samples prompts from training set
+2. Test data (recommended) - splits test set into validation and cleaned test
 
-Usage:
+Mode 1: Sample from training data (legacy)
     python data/prepare_data.py \
         --train_data data/gsm8k/train.parquet \
         --output data/gsm8k/val_prompts.parquet \
         --num_samples 500 \
         --seed 42
+
+Mode 2: Split test set (recommended for reproducibility)
+    python data/prepare_data.py \
+        --test_data data/math/test.parquet \
+        --output data/math/val_prompts.parquet \
+        --output_test data/math/test_cleaned.parquet \
+        --num_samples 1000 \
+        --seed 42
+
+    This splits test.parquet into:
+    - val_prompts.parquet: 1000 prompts for validation gradient computation
+    - test_cleaned.parquet: remaining samples for final evaluation
 """
 
 import argparse
@@ -48,6 +61,97 @@ def find_prompt_column(df_dict: dict) -> str:
         if col in df_dict:
             return col
     raise ValueError(f"Could not find prompt column. Available: {list(df_dict.keys())}")
+
+
+def split_test_data(
+    test_data_path: str,
+    val_output_path: str,
+    test_output_path: str,
+    num_val_samples: int = 1000,
+    seed: int = 42,
+) -> None:
+    """
+    Split test data into validation prompts and cleaned test set.
+
+    This is the recommended approach for gradient-based selection as it:
+    - Ensures no overlap between validation and training data
+    - Provides a true generalization signal for selection
+    - Maintains reproducibility
+
+    Args:
+        test_data_path: Path to test parquet file
+        val_output_path: Path to save validation prompts (prompts only)
+        test_output_path: Path to save cleaned test set (full data)
+        num_val_samples: Number of samples for validation
+        seed: Random seed for sampling
+    """
+    random.seed(seed)
+
+    logger.info(f"Loading test data from {test_data_path}...")
+    df_dict = load_parquet(test_data_path)
+
+    prompt_col = find_prompt_column(df_dict)
+    num_total = len(df_dict[prompt_col])
+
+    if num_val_samples >= num_total:
+        raise ValueError(
+            f"num_val_samples ({num_val_samples}) must be less than total samples ({num_total})"
+        )
+
+    logger.info(f"  Found {num_total} test samples")
+    logger.info(f"  Splitting into {num_val_samples} validation + {num_total - num_val_samples} test")
+
+    # Randomly select indices for validation
+    all_indices = list(range(num_total))
+    random.shuffle(all_indices)
+    val_indices = set(all_indices[:num_val_samples])
+    test_indices = [i for i in range(num_total) if i not in val_indices]
+
+    # Get data source info
+    if 'data_source' in df_dict and len(df_dict['data_source']) > 0:
+        data_source_default = df_dict['data_source'][0]
+        logger.info(f"  Using data_source from file: {data_source_default}")
+    else:
+        data_source_default = os.path.basename(os.path.dirname(test_data_path))
+        logger.info(f"  Using folder name as data_source: {data_source_default}")
+
+    # Build validation output (prompts only, for online generation)
+    val_output_dict = {
+        'prompt': [df_dict[prompt_col][i] for i in val_indices],
+        'data_source': [
+            df_dict['data_source'][i] if 'data_source' in df_dict else data_source_default
+            for i in val_indices
+        ],
+    }
+
+    # Add extra_info if available
+    if 'extra_info' in df_dict:
+        val_output_dict['extra_info'] = [df_dict['extra_info'][i] for i in val_indices]
+
+    # Add reward_model if available (needed for ground_truth in reward computation)
+    if 'reward_model' in df_dict:
+        val_output_dict['reward_model'] = [df_dict['reward_model'][i] for i in val_indices]
+
+    # Build cleaned test output (full data, preserving all columns)
+    test_output_dict = {}
+    for col in df_dict.keys():
+        test_output_dict[col] = [df_dict[col][i] for i in test_indices]
+
+    # Save both outputs
+    os.makedirs(os.path.dirname(val_output_path), exist_ok=True)
+    save_parquet(val_output_dict, val_output_path)
+    logger.info(f"Saved {len(val_output_dict['prompt'])} validation prompts to {val_output_path}")
+
+    os.makedirs(os.path.dirname(test_output_path), exist_ok=True)
+    save_parquet(test_output_dict, test_output_path)
+    logger.info(f"Saved {len(test_output_dict[prompt_col])} cleaned test samples to {test_output_path}")
+
+    # Print summary
+    if 'data_source' in val_output_dict:
+        source_counts = {}
+        for source in val_output_dict['data_source']:
+            source_counts[source] = source_counts.get(source, 0) + 1
+        logger.info(f"Validation distribution by source: {source_counts}")
 
 
 def prepare_validation_prompts(
@@ -151,14 +255,43 @@ def prepare_validation_prompts(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare validation prompts for gradient-based selection")
+    parser = argparse.ArgumentParser(
+        description="Prepare validation prompts for gradient-based selection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Mode 1: Sample from training data (legacy)
+  python data/prepare_data.py --train_data data/gsm8k/train.parquet --output data/gsm8k/val_prompts.parquet
+
+  # Mode 2: Split test set (recommended)
+  python data/prepare_data.py --test_data data/math/test.parquet --output data/math/val_prompts.parquet --output_test data/math/test_cleaned.parquet --num_samples 1000
+        """,
+    )
+
+    # Mode 1: Sample from training data
     parser.add_argument(
         "--train_data",
         type=str,
         nargs="+",
-        required=True,
-        help="Path(s) to training parquet file(s)",
+        default=None,
+        help="Path(s) to training parquet file(s) (legacy mode)",
     )
+
+    # Mode 2: Split test data
+    parser.add_argument(
+        "--test_data",
+        type=str,
+        default=None,
+        help="Path to test parquet file (recommended mode - splits into val + cleaned test)",
+    )
+    parser.add_argument(
+        "--output_test",
+        type=str,
+        default=None,
+        help="Output path for cleaned test parquet (required when using --test_data)",
+    )
+
+    # Common arguments
     parser.add_argument(
         "--output",
         type=str,
@@ -169,7 +302,7 @@ def main():
         "--num_samples",
         type=int,
         default=500,
-        help="Number of prompts to extract (default: 500)",
+        help="Number of validation prompts to extract (default: 500)",
     )
     parser.add_argument(
         "--seed",
@@ -179,12 +312,31 @@ def main():
     )
     args = parser.parse_args()
 
-    prepare_validation_prompts(
-        train_data_paths=args.train_data,
-        output_path=args.output,
-        num_samples=args.num_samples,
-        seed=args.seed,
-    )
+    # Validate arguments
+    if args.test_data and args.train_data:
+        parser.error("Cannot use both --test_data and --train_data. Choose one mode.")
+
+    if args.test_data:
+        # Mode 2: Split test data
+        if not args.output_test:
+            parser.error("--output_test is required when using --test_data")
+        split_test_data(
+            test_data_path=args.test_data,
+            val_output_path=args.output,
+            test_output_path=args.output_test,
+            num_val_samples=args.num_samples,
+            seed=args.seed,
+        )
+    elif args.train_data:
+        # Mode 1: Sample from training data (legacy)
+        prepare_validation_prompts(
+            train_data_paths=args.train_data,
+            output_path=args.output,
+            num_samples=args.num_samples,
+            seed=args.seed,
+        )
+    else:
+        parser.error("Must specify either --train_data or --test_data")
 
 
 if __name__ == "__main__":
