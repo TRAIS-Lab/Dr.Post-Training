@@ -13,8 +13,8 @@
 #   bash benchmark.sh --methods all
 #   bash benchmark.sh --methods baseline --batch-size 32 --num-iterations 20
 
-SCRATCH_DIR=/workspace-vast/pbb
-CODE_DIR=/workspace-vast/pbb
+SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
+CODE_DIR=/u/phu1/Project
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"

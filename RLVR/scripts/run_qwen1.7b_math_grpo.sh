@@ -1,26 +1,27 @@
 #!/bin/bash
 
 #SBATCH --job-name=RLVR-MATH
-#SBATCH --partition=general
+#SBATCH --mem=128g
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:4
-#SBATCH --mem=0
-#SBATCH --time=24:00:00
-#SBATCH --output=logs/slurm-%j.out
-#SBATCH --error=logs/slurm-%j.err
+#SBATCH --cpus-per-task=8
+#SBATCH --partition=gpuH200x8
+#SBATCH --account=bfwm-delta-gpu
+#SBATCH --time=48:00:00
+#SBATCH --output=/u/%u/Project/Gradient-Streaming/RLVR/logs/%x-%j.log
+
+### GPU options ###
+#SBATCH --gpus-per-node=4
+#SBATCH --gpu-bind=none
+#SBATCH --mail-user=pbb@illinois.edu
+#SBATCH --mail-type="END"
 
 set -x
 
 # Custom configurations
 
-source /workspace-vast/pbb/GradStream_RLVR/bin/activate
-
-export WANDB_API_KEY="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"
-
-SCRATCH_DIR=/workspace-vast/pbb
-CODE_DIR=/workspace-vast/pbb
+SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
+CODE_DIR=/u/phu1/Project
 
 # ============================================================================
 # GPU Configuration
