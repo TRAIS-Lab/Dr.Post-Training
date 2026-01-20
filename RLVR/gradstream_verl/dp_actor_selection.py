@@ -33,6 +33,7 @@ from torch import nn
 from verl import DataProto
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 from verl.utils.torch_functional import logprobs_from_logits
+from verl.utils.device import get_device_id
 
 try:
     from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
@@ -607,76 +608,77 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         self.actor_module.train()
 
-        temperature = data.meta_info.get('temperature', 1.0)
-        pad_token_id = data.meta_info.get('pad_token_id', 0)
+        # Match verl's pattern for accessing meta_info
+        temperature = data.meta_info["temperature"]
+        pad_token_id = data.meta_info.get("pad_token_id", 0)
 
-        # Select keys needed for training
+        # Select keys needed for training (match verl's select_keys)
         select_keys = [
-            'responses', 'input_ids', 'attention_mask', 'position_ids',
-            'old_log_probs', 'advantages'
+            'responses',
+            'response_mask',
+            'input_ids',
+            'attention_mask',
+            'position_ids',
+            'old_log_probs',
+            'advantages',
         ]
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
 
-        batch = data.select(batch_keys=select_keys).batch
+        data = data.select(batch_keys=select_keys)
 
-        # Create dataloader: split into mini-batches
-        dataloader = batch.split(self.config.ppo_mini_batch_size)
+        # Split to make minibatch iterator for updating the actor
+        # See PPO paper for details. https://arxiv.org/abs/1707.06347
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
 
-        metrics = {}
+        # Initialize metrics like verl does
+        metrics = {
+            "actor/pg_loss": 0.0,
+            "actor/kl_loss": 0.0,
+        }
         total_selected = 0
         total_samples = 0
 
-        rank = _get_rank()
-
         for _ in range(self.config.ppo_epochs):
-            for mini_batch in dataloader:
+            for batch_idx, mini_batch in enumerate(mini_batches):
                 # Calculate micro_batch_size dynamically or use fixed size
                 if self.config.use_dynamic_bsz:
-                    # Dynamic batch size: calculate based on max token length
-                    max_token_len = self.config.ppo_max_token_len_per_gpu * getattr(self, 'ulysses_sequence_parallel_size', 1)
-                    # Get attention mask to calculate sequence lengths
-                    mini_batch_attention_mask = mini_batch['attention_mask']
-                    seq_lengths = mini_batch_attention_mask.sum(dim=1)
-                    max_seq_len = seq_lengths.max().item()
-                    micro_batch_size = max(1, int(max_token_len // max_seq_len))
+                    from verl.utils.seqlen_balancing import prepare_dynamic_batch
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches_list, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
-                    # Fixed micro batch size from config
-                    micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
-
-                # Calculate gradient accumulation steps based on actual micro_batch_size
-                mini_batch_size = mini_batch['input_ids'].size(0)
-                num_micro_batches = (mini_batch_size + micro_batch_size - 1) // micro_batch_size
-                gradient_accumulation = num_micro_batches
-
-                micro_batches = mini_batch.split(micro_batch_size)
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    micro_batches_list = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
-                    micro_batch = micro_batch.cuda()
+                for micro_batch in micro_batches_list:
+                    # Move to device and extract data (verl pattern)
+                    micro_batch = micro_batch.to(get_device_id())
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
 
                     # Extract data for this micro-batch
-                    input_ids = micro_batch['input_ids']
-                    attention_mask = micro_batch['attention_mask']
-                    position_ids = micro_batch['position_ids']
-                    responses = micro_batch['responses']
-                    old_log_probs = micro_batch['old_log_probs']
-                    advantages = micro_batch['advantages']
+                    input_ids = model_inputs['input_ids']
+                    attention_mask = model_inputs['attention_mask']
+                    position_ids = model_inputs['position_ids']
+                    responses = model_inputs['responses']
+                    old_log_probs = model_inputs['old_log_probs']
+                    advantages = model_inputs['advantages']
+                    response_mask = model_inputs['response_mask']
 
                     current_micro_batch_size = input_ids.size(0)
                     response_length = responses.size(1)
-                    response_mask = attention_mask[:, -response_length:]
 
                     # Create labels for token counting (response positions only)
                     labels = torch.full_like(attention_mask, -100)
                     labels[:, -response_length:] = responses * response_mask.long() + (-100) * (~response_mask.bool()).long()
 
-                    # Setup streaming selection for THIS micro-batch
-                    # This ensures tokens_per_sample and cu_seqlens match the micro-batch
-                    self._setup_streaming(current_micro_batch_size, labels, attention_mask)
-
                     try:
+                        # Setup streaming selection for THIS micro-batch
+                        # This ensures tokens_per_sample and cu_seqlens match the micro-batch
+                        self._setup_streaming(current_micro_batch_size, labels, attention_mask)
                         # Forward pass with hooks enabled
                         with torch.autocast(device_type='cuda', dtype=self.param_dtype):
                             if self.use_remove_padding and unpad_input is not None:
@@ -740,6 +742,12 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                                 log_prob = logprobs_from_logits(logits.float(), responses)
                                 entropy = verl_F.entropy_from_logits(logits)
 
+                        # Compute loss scale factor (must be before loss computation)
+                        if self.config.use_dynamic_bsz:
+                            loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        else:
+                            loss_scale_factor = 1 / self.gradient_accumulation
+
                         # Compute PPO loss (on all samples - selection happens in backward)
                         pg_loss, pg_metrics = core_algos.compute_policy_loss_vanilla(
                             old_log_prob=old_log_probs,
@@ -749,27 +757,37 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                             loss_agg_mode=self.config.loss_agg_mode,
                             config=self.config,
                         )
-                        pg_clipfrac = pg_metrics.get('pg_clipfrac', 0.0)
-                        ppo_kl = pg_metrics.get('ppo_kl', 0.0)
+                        micro_batch_metrics = dict(pg_metrics)
 
-                        entropy_loss = verl_F.masked_mean(entropy, response_mask)
-                        policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
+                        policy_loss = pg_loss
+
+                        # Entropy loss (match verl's pattern)
+                        entropy_coeff = self.config.entropy_coeff
+                        if entropy_coeff != 0:
+                            from verl.trainer.ppo.core_algos import agg_loss
+                            entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
+                            micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
+                            policy_loss = policy_loss - entropy_agg * entropy_coeff
 
                         if self.config.use_kl_loss:
-                            ref_log_prob = micro_batch['ref_log_prob']
-                            kld = core_algos.kl_penalty(
+                            from verl.trainer.ppo.core_algos import agg_loss, kl_penalty
+                            ref_log_prob = model_inputs['ref_log_prob']
+                            kld = kl_penalty(
                                 logprob=log_prob,
                                 ref_logprob=ref_log_prob,
                                 kl_penalty=self.config.kl_loss_type,
                             )
-                            kl_loss = masked_mean(kld, response_mask)
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                            metrics['actor/kl_loss'] = metrics.get('actor/kl_loss', 0) + kl_loss.detach().item() / gradient_accumulation
+                            metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                        loss = policy_loss / gradient_accumulation
-
-                        # Backward pass - hooks intercept gradients and apply selection
+                        loss = policy_loss * loss_scale_factor
                         loss.backward()
+
+                        # Accumulate pg_loss like verl does
+                        metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
+                        append_to_dict(metrics, micro_batch_metrics)
 
                         # Track selection statistics for this micro-batch
                         sel_state = self.grad_hook.selection_state
@@ -783,16 +801,6 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                         # Cleanup streaming state after each micro-batch
                         self._cleanup_streaming()
                         self.grad_hook.disable_hooks()
-
-                    # Track metrics for this micro-batch
-                    # Note: pg_clipfrac and ppo_kl are already floats from pg_metrics.get()
-                    step_data = {
-                        'actor/entropy_loss': entropy_loss.detach().item(),
-                        'actor/pg_loss': pg_loss.detach().item(),
-                        'actor/pg_clipfrac': pg_clipfrac,
-                        'actor/ppo_kl': ppo_kl,
-                    }
-                    append_to_dict(metrics, step_data)
 
                 # Optimizer step after accumulating gradients
                 grad_norm = self._optimizer_step()
@@ -815,66 +823,69 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         from verl.trainer.ppo import core_algos
         from verl.utils.py_functional import append_to_dict
         import verl.utils.torch_functional as verl_F
-        from verl.utils.torch_functional import masked_mean
 
         self.actor_module.train()
 
-        temperature = data.meta_info.get('temperature', 1.0)
+        temperature = data.meta_info["temperature"]
+        pad_token_id = data.meta_info.get("pad_token_id", 0)
 
-        # Select keys
+        # Select keys (match verl's select_keys)
         select_keys = [
-            'responses', 'input_ids', 'attention_mask', 'position_ids',
-            'old_log_probs', 'advantages'
+            'responses',
+            'response_mask',
+            'input_ids',
+            'attention_mask',
+            'position_ids',
+            'old_log_probs',
+            'advantages',
         ]
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
 
-        batch = data.select(batch_keys=select_keys).batch
+        data = data.select(batch_keys=select_keys)
 
-        # Create dataloader
-        dataloader = batch.split(self.config.ppo_mini_batch_size)
+        # Split to make minibatch iterator for updating the actor
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
 
-        metrics = {}
+        # Initialize metrics like verl does
+        metrics = {
+            "actor/pg_loss": 0.0,
+            "actor/kl_loss": 0.0,
+        }
         total_selected = 0
         total_samples = 0
 
         for _ in range(self.config.ppo_epochs):
-            for mini_batch in dataloader:
+            for batch_idx, mini_batch in enumerate(mini_batches):
                 # Calculate micro_batch_size dynamically or use fixed size
                 if self.config.use_dynamic_bsz:
-                    # Dynamic batch size: calculate based on max token length
-                    max_token_len = self.config.ppo_max_token_len_per_gpu * getattr(self, 'ulysses_sequence_parallel_size', 1)
-                    # Get attention mask to calculate sequence lengths
-                    mini_batch_attention_mask = mini_batch['attention_mask']
-                    seq_lengths = mini_batch_attention_mask.sum(dim=1)
-                    max_seq_len = seq_lengths.max().item()
-                    micro_batch_size = max(1, int(max_token_len // max_seq_len))
+                    # Use prepare_dynamic_batch for proper cross-rank coordination
+                    from verl.utils.seqlen_balancing import prepare_dynamic_batch
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches_list, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
-                    # Fixed micro batch size from config
-                    micro_batch_size = self.config.ppo_micro_batch_size_per_gpu
-
-                # Calculate gradient accumulation steps based on actual micro_batch_size
-                mini_batch_size = mini_batch['input_ids'].size(0)
-                num_micro_batches = (mini_batch_size + micro_batch_size - 1) // micro_batch_size
-                gradient_accumulation = num_micro_batches
-
-                micro_batches = mini_batch.split(micro_batch_size)
+                    self.gradient_accumulation = (
+                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    micro_batches_list = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
-                    micro_batch = micro_batch.cuda()
+                for micro_batch in micro_batches_list:
+                    # Move to device and extract data (verl pattern)
+                    micro_batch = micro_batch.to(get_device_id())
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
 
                     # Extract data
-                    input_ids = micro_batch['input_ids']
-                    attention_mask = micro_batch['attention_mask']
-                    position_ids = micro_batch['position_ids']
-                    responses = micro_batch['responses']
-                    old_log_probs = micro_batch['old_log_probs']
-                    advantages = micro_batch['advantages']
+                    input_ids = model_inputs['input_ids']
+                    attention_mask = model_inputs['attention_mask']
+                    position_ids = model_inputs['position_ids']
+                    responses = model_inputs['responses']
+                    old_log_probs = model_inputs['old_log_probs']
+                    advantages = model_inputs['advantages']
+                    response_mask = model_inputs['response_mask']
 
                     response_length = responses.size(1)
-                    response_mask = attention_mask[:, -response_length:]
                     micro_batch_size = responses.size(0)
 
                     # Pass 1: GREATS scoring to get selected indices
@@ -892,8 +903,13 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     total_samples += micro_batch_size
 
                     if len(selected_indices) == 0:
-                        logger.warning("GREATS: No samples selected, skipping micro-batch")
-                        continue
+                        # CRITICAL: Even with no samples selected, we must do a forward/backward
+                        # to keep FSDP ranks synchronized. Use first sample with zero weight.
+                        logger.warning("GREATS: No samples selected, using dummy backward for FSDP sync")
+                        selected_indices = torch.tensor([0], device=input_ids.device)
+                        use_zero_weight = True
+                    else:
+                        use_zero_weight = False
 
                     # Filter to selected samples
                     sel_input_ids = input_ids[selected_indices]
@@ -969,6 +985,12 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                             log_prob = logprobs_from_logits(logits.float(), sel_responses)
                             entropy = verl_F.entropy_from_logits(logits)
 
+                        # Compute loss scale factor (must be before loss computation)
+                        if self.config.use_dynamic_bsz:
+                            loss_scale_factor = sel_response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        else:
+                            loss_scale_factor = 1 / self.gradient_accumulation
+
                         # Compute PPO loss
                         pg_loss, pg_metrics = core_algos.compute_policy_loss_vanilla(
                             old_log_prob=sel_old_log_probs,
@@ -978,36 +1000,43 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                             loss_agg_mode=self.config.loss_agg_mode,
                             config=self.config,
                         )
-                        pg_clipfrac = pg_metrics.get('pg_clipfrac', 0.0)
-                        ppo_kl = pg_metrics.get('ppo_kl', 0.0)
+                        micro_batch_metrics = dict(pg_metrics)
 
-                        entropy_loss = verl_F.masked_mean(entropy, sel_response_mask)
-                        policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
+                        policy_loss = pg_loss
+
+                        # Entropy loss (match verl's pattern)
+                        entropy_coeff = self.config.entropy_coeff
+                        if entropy_coeff != 0:
+                            from verl.trainer.ppo.core_algos import agg_loss
+                            entropy_agg = agg_loss(loss_mat=entropy, loss_mask=sel_response_mask, loss_agg_mode=self.config.loss_agg_mode)
+                            micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
+                            policy_loss = policy_loss - entropy_agg * entropy_coeff
 
                         if self.config.use_kl_loss:
-                            ref_log_prob = micro_batch['ref_log_prob'][selected_indices]
-                            kld = core_algos.kl_penalty(
+                            from verl.trainer.ppo.core_algos import agg_loss, kl_penalty
+                            ref_log_prob = model_inputs['ref_log_prob'][selected_indices]
+                            kld = kl_penalty(
                                 logprob=log_prob,
                                 ref_logprob=ref_log_prob,
                                 kl_penalty=self.config.kl_loss_type,
                             )
-                            kl_loss = masked_mean(kld, sel_response_mask)
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=sel_response_mask, loss_agg_mode=self.config.loss_agg_mode)
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                            metrics['actor/kl_loss'] = kl_loss.detach().item()
+                            metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                        loss = policy_loss / gradient_accumulation
+                        loss = policy_loss * loss_scale_factor
+
+                        # Zero out loss if this is a dummy backward for FSDP sync
+                        if use_zero_weight:
+                            loss = loss * 0.0
 
                         loss.backward()
 
-                    # Track metrics
-                    # Note: pg_clipfrac and ppo_kl are already floats from pg_metrics.get()
-                    step_data = {
-                        'actor/entropy_loss': entropy_loss.detach().item(),
-                        'actor/pg_loss': pg_loss.detach().item(),
-                        'actor/pg_clipfrac': pg_clipfrac,
-                        'actor/ppo_kl': ppo_kl,
-                    }
-                    append_to_dict(metrics, step_data)
+                        # Accumulate pg_loss like verl does (skip if dummy backward)
+                        if not use_zero_weight:
+                            metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
+                            append_to_dict(metrics, micro_batch_metrics)
 
                 # Optimizer step
                 grad_norm = self._optimizer_step()
