@@ -31,8 +31,8 @@
 #   - Creates detailed results in SFT/lr_sweep_results/
 # =============================================================================
 
-SCRATCH_DIR=/workspace-vast/pbb
-CODE_DIR=/workspace-vast/pbb
+SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
+CODE_DIR=/u/phu1/Project
 
 cd $CODE_DIR/Gradient-Streaming
 
