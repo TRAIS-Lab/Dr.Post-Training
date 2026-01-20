@@ -93,6 +93,11 @@ class SelectionTrainerConfig:
     # Validation loss type: "seqloss-reward" or "seqloss-lastadv"
     val_loss_type: str = "seqloss-reward"
 
+    # Reward normalization for validation gradients: "batch" or "grpo"
+    # - "batch": batch-level normalization (rewards - mean) / std
+    # - "grpo": per-prompt-group GRPO normalization (matches training)
+    val_norm_type: str = "batch"
+
 
 class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
     """
@@ -285,6 +290,7 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
         # Pass GRPO parameters for per-prompt-group normalization (matching training)
         val_data.meta_info['n_responses'] = self.config.actor_rollout_ref.rollout.n
         val_data.meta_info['norm_adv_by_std'] = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+        val_data.meta_info['norm_type'] = self.selection_config.val_norm_type
 
         # Dispatch to workers for gradient capture
         stats = self.actor_rollout_wg.capture_validation_gradients(val_data)

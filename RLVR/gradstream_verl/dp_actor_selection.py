@@ -168,11 +168,12 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         temperature: float = 1.0,
         n_responses: int = 1,
         norm_adv_by_std: bool = True,
+        norm_type: str = "batch",
     ) -> Dict[str, Any]:
         """
         Capture validation gradients from external validation data.
 
-        Uses seqloss-reward objective with GRPO-style per-prompt-group normalization:
+        Uses seqloss-reward objective with configurable reward normalization:
             L = -E[seq_scores * log_prob]
 
         Args:
@@ -184,6 +185,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             temperature: Temperature for log prob computation
             n_responses: Number of responses per prompt (for GRPO grouping, default 1)
             norm_adv_by_std: Whether to divide by std (True for GRPO, False for Dr.GRPO)
+            norm_type: Normalization type - "batch" or "grpo"
 
         Returns:
             Dictionary with validation capture statistics
@@ -198,12 +200,13 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         batch_size = val_input_ids.size(0)
         response_length = val_responses.size(1)
 
-        # Normalize rewards using GRPO's per-prompt-group normalization
-        # This EXACTLY matches verl.trainer.ppo.core_algos.compute_grpo_outcome_advantage
+        # Normalize rewards based on norm_type
         from collections import defaultdict
         import numpy as np
 
-        if n_responses > 1:
+        if norm_type == "grpo" and n_responses > 1:
+            # GRPO per-prompt-group normalization
+            # This EXACTLY matches verl.trainer.ppo.core_algos.compute_grpo_outcome_advantage
             num_prompts = batch_size // n_responses
             # Create index array for grouping (same as training)
             index = np.repeat(np.arange(num_prompts), n_responses)
@@ -236,7 +239,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     else:
                         seq_scores[i] = scores[i] - id2mean[index[i]]
         else:
-            # Fallback for n_responses=1: batch-level normalization
+            # Batch-level normalization (default and fallback)
             if batch_size > 1:
                 seq_scores = (val_rewards - val_rewards.mean()) / (val_rewards.std() + 1e-8)
             else:

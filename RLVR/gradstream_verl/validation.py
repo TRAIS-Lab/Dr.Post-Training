@@ -53,6 +53,7 @@ def capture_seqloss_reward_gradients(
     temperature: float = 1.0,
     n_responses: int = 1,
     norm_adv_by_std: bool = True,
+    norm_type: str = "batch",
 ) -> float:
     """
     Capture validation gradients using seqloss-reward objective.
@@ -60,7 +61,7 @@ def capture_seqloss_reward_gradients(
     The validation loss is computed as:
         L_val = -E[seq_scores * seq_log_probs]
 
-    where seq_scores are GRPO-normalized rewards (per-prompt-group normalization).
+    where seq_scores are normalized rewards.
 
     Args:
         model: The policy model (actor)
@@ -75,15 +76,19 @@ def capture_seqloss_reward_gradients(
         temperature: Temperature for log prob computation (default 1.0)
         n_responses: Number of responses per prompt (for GRPO grouping, default 1)
         norm_adv_by_std: Whether to divide by std (True for GRPO, False for Dr.GRPO)
+        norm_type: Normalization type - "batch" or "grpo"
+            - "batch": batch-level normalization (rewards - mean) / std
+            - "grpo": per-prompt-group GRPO normalization (matches training)
 
     Returns:
         Total validation loss (float)
     """
     rewards = val_batch["rewards"]
 
-    # Normalize rewards using GRPO's per-prompt-group normalization
-    # This EXACTLY matches verl.trainer.ppo.core_algos.compute_grpo_outcome_advantage
-    if n_responses > 1:
+    # Normalize rewards based on norm_type
+    if norm_type == "grpo" and n_responses > 1:
+        # GRPO per-prompt-group normalization
+        # This EXACTLY matches verl.trainer.ppo.core_algos.compute_grpo_outcome_advantage
         batch_size = rewards.shape[0]
         num_prompts = batch_size // n_responses
         # Create index array for grouping (same as training)
@@ -117,7 +122,7 @@ def capture_seqloss_reward_gradients(
                 else:
                     seq_scores[i] = scores[i] - id2mean[index[i]]
     else:
-        # Fallback for n_responses=1: batch-level normalization
+        # Batch-level normalization (default and fallback)
         if rewards.numel() > 1:
             seq_scores = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         else:
