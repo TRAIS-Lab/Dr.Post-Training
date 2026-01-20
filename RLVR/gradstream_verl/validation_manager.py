@@ -249,7 +249,12 @@ class ValidationDataManager:
             max_samples=config.val_pool_size,
         )
 
-        # Create dataloader
+        # Create dataloader with seeded generator for reproducibility
+        generator = None
+        if config.shuffle and config.seed is not None:
+            generator = torch.Generator()
+            generator.manual_seed(config.seed)
+
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=config.val_batch_size,
@@ -258,6 +263,7 @@ class ValidationDataManager:
                 batch, tokenizer, config.max_prompt_length
             ),
             drop_last=True,  # Ensure consistent batch size
+            generator=generator,
         )
 
         # Create iterator

@@ -174,6 +174,7 @@ class SelectionAwareActor:
         self.grad_hook.clear_val_cache()
 
         # Capture validation gradients
+        # Note: For distributed training, parameters flow through worker_selection.py
         val_loss = capture_seqloss_reward_gradients(
             model=self.actor_module,
             grad_hook=self.grad_hook,

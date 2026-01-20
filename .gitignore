@@ -48,7 +48,7 @@ dist
 *.safetensors
 *.parquet
 
-*/log
+*/logs
 */data/train
 */data/eval
 */out

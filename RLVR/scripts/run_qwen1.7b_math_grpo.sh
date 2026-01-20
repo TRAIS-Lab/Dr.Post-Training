@@ -1,23 +1,26 @@
 #!/bin/bash
 
-#SBATCH --job-name=RLVR-MATH-Train
-#SBATCH --mem=128g
+#SBATCH --job-name=RLVR-MATH
+#SBATCH --partition=general
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --partition=gpuA40x4
-#SBATCH --account=bfwm-delta-gpu
+#SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:4
+#SBATCH --mem=0
 #SBATCH --time=24:00:00
-#SBATCH --constraint="scratch"
-#SBATCH --output=/u/%u/Project/Gradient-Streaming/RLVR/log/%x-%j.log
-
-### GPU options ###
-#SBATCH --gpus-per-node=4
-#SBATCH --gpu-bind=none
-#SBATCH --mail-user=pbb@illinois.edu
-#SBATCH --mail-type="END"
+#SBATCH --output=logs/slurm-%j.out
+#SBATCH --error=logs/slurm-%j.err
 
 set -x
+
+# Custom configurations
+
+source /workspace-vast/pbb/GradStream_RLVR/bin/activate
+
+export WANDB_API_KEY="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"
+
+SCRATCH_DIR=/workspace-vast/pbb
+CODE_DIR=/workspace-vast/pbb
 
 # ============================================================================
 # GPU Configuration
@@ -34,7 +37,7 @@ echo "Using N_GPUS=$N_GPUS"
 # ============================================================================
 # Data paths
 # ============================================================================
-DATA_DIR=/home/pbb/Project/Gradient-Streaming/RLVR/data
+DATA_DIR=$SCRATCH_DIR/Gradient-Streaming/RLVR/data
 math_train_path=$DATA_DIR/math/train.parquet
 math_test_path=$DATA_DIR/math/test.parquet
 
@@ -45,22 +48,26 @@ train_files=$math_train_path
 test_files=$math_test_path
 
 # Output directory
-OUTPUT_BASE=/home/pbb/Project/Gradient-Streaming/RLVR/output
+OUTPUT_BASE=$SCRATCH_DIR/Gradient-Streaming/RLVR/output
 
 # ============================================================================
 # Experiment Configuration
 # ============================================================================
+SEED=${SEED:-42}
 SELECTION_ENABLED=${SELECTION_ENABLED:-True}
 SELECTION_METHOD=${SELECTION_METHOD:-Streaming}
 SELECTION_FRAC=${SELECTION_FRAC:-1.0}
 VAL_POOL_SIZE=${VAL_POOL_SIZE:-500}
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-8}
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-32}
 REFRESH_FREQ=${REFRESH_FREQ:-1}
 RESUME_MODE=${RESUME_MODE:-disable}
 
 # Parse Hydra overrides from command line args
 for arg in "$@"; do
     case "$arg" in
+        *seed=*)
+            SEED=$(echo "$arg" | sed 's/.*seed=//')
+            ;;
         *selection.enable=False*|*selection.enable=false*)
             SELECTION_ENABLED=False
             ;;
@@ -100,6 +107,7 @@ HYDRA_DIR="${OUTPUT_BASE}/hydra/${EXP_NAME}"
 
 echo "Experiment: $EXP_NAME"
 echo "Output dir: $OUTPUT_DIR"
+echo "Random seed: $SEED"
 echo "Selection config:"
 echo "  enabled=$SELECTION_ENABLED"
 echo "  method=$SELECTION_METHOD"
@@ -109,7 +117,11 @@ echo "  val_batch_size=$VAL_BATCH_SIZE"
 echo "  refresh_freq=$REFRESH_FREQ"
 
 # Add project root to PYTHONPATH
-export PYTHONPATH=/home/pbb/Project/Gradient-Streaming/RLVR:/home/pbb/Project/Gradient-Streaming:${PYTHONPATH}
+export PYTHONPATH=$CODE_DIR/Gradient-Streaming/RLVR:$CODE_DIR/Gradient-Streaming:${PYTHONPATH}
+
+# Unset ROCR_VISIBLE_DEVICES to avoid conflict with CUDA_VISIBLE_DEVICES
+# (ROCR is for AMD ROCm, we're using NVIDIA GPUs)
+unset ROCR_VISIBLE_DEVICES
 
 # ============================================================================
 # Check/Prepare validation prompts
@@ -117,11 +129,11 @@ export PYTHONPATH=/home/pbb/Project/Gradient-Streaming/RLVR:/home/pbb/Project/Gr
 if [ "$SELECTION_ENABLED" = "True" ] && [ ! -f "$VAL_PROMPTS_PATH" ]; then
     echo "Validation prompts not found at $VAL_PROMPTS_PATH"
     echo "Creating validation prompts from training data..."
-    python3 /home/pbb/Project/Gradient-Streaming/RLVR/data/prepare_data.py \
+    python3 $CODE_DIR/Gradient-Streaming/RLVR/data/prepare_data.py \
         --train_data $math_train_path \
         --output $VAL_PROMPTS_PATH \
         --num_samples $VAL_POOL_SIZE \
-        --seed 42
+        --seed $SEED
 fi
 
 # ============================================================================
@@ -131,12 +143,13 @@ echo "Starting training with $N_GPUS GPUs..."
 
 # Note: MATH problems and solutions are typically longer than GSM8K
 # Increased max_response_length to 2048 to accommodate more detailed reasoning
-python3 /home/pbb/Project/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
+python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     hydra.run.dir=$HYDRA_DIR \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
-    data.train_batch_size=64 \
+    data.seed=$SEED \
+    data.train_batch_size=256 \
     data.max_prompt_length=1024 \
     data.max_response_length=4096 \
     data.filter_overlong_prompts=True \
@@ -150,17 +163,19 @@ python3 /home/pbb/Project/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.seed=$SEED \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-	actor_rollout_ref.actor.use_dynamic_bsz=True \
- 	actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
+	actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.seed=$SEED \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.seed=$SEED \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
@@ -174,6 +189,7 @@ python3 /home/pbb/Project/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     trainer.default_local_dir=$OUTPUT_DIR \
     trainer.resume_mode=$RESUME_MODE \
 	trainer.balance_batch=True \
+    trainer.log_val_generations=5 \
     +selection.enable=$SELECTION_ENABLED \
     +selection.method=$SELECTION_METHOD \
     +selection.frac=$SELECTION_FRAC \
@@ -183,6 +199,7 @@ python3 /home/pbb/Project/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     +selection.val_batch_size=$VAL_BATCH_SIZE \
     +selection.val_max_prompt_length=1024 \
     +selection.val_max_response_length=4096 \
+    +selection.val_seed=$SEED \
     +selection.refresh_freq=$REFRESH_FREQ \
     +selection.val_loss_type=seqloss-reward \
     "$@"

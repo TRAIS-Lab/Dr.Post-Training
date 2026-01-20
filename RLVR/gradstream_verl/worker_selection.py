@@ -151,6 +151,10 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
         # Get temperature from config (default 1.0)
         temperature = self.config.actor.get('temperature', 1.0)
 
+        # Get GRPO normalization parameters from meta_info (matching training)
+        n_responses = val_batch.meta_info.get('n_responses', 1)
+        norm_adv_by_std = val_batch.meta_info.get('norm_adv_by_std', True)
+
         # Call actor's validation gradient capture
         stats = self.actor.capture_validation_gradients_external(
             val_input_ids=val_batch.batch['input_ids'],
@@ -159,6 +163,8 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
             val_responses=val_batch.batch['responses'],
             val_rewards=val_batch.batch['rewards'],
             temperature=temperature,
+            n_responses=n_responses,
+            norm_adv_by_std=norm_adv_by_std,
         )
 
         # Stats are now synchronized across ranks via all-reduce in actor

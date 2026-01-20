@@ -17,15 +17,18 @@
 #SBATCH --mail-user=pbb@illinois.edu
 #SBATCH --mail-type="END"
 
-cd $HOME/Project/Gradient-Streaming
+SCRATCH_DIR=/workspace-vast/pbb
+CODE_DIR=/workspace-vast/pbb
+
+cd $CODE_DIR/Gradient-Streaming
 
 # Set PYTHONPATH to include project root for imports
-export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
+export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
 
 set -e
 
 # Default values
-models_dir="/scratch/pbb/Project/Gradient-Streaming/RLHF"
+models_dir="$SCRATCH_DIR/Gradient-Streaming/RLHF"
 task=""
 n_samples=400
 batch_size=16

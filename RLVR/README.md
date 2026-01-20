@@ -89,6 +89,7 @@ SELECTION_METHOD=GREATS bash scripts/run_qwen1.7b_math_grpo.sh
 | Variable            | Default   | Description                                |
 | ------------------- | --------- | ------------------------------------------ |
 | `N_GPUS`            | auto      | Number of GPUs                             |
+| `SEED`              | 42        | Random seed for reproducibility            |
 | `SELECTION_ENABLED` | True      | Enable/disable selection                   |
 | `SELECTION_METHOD`  | Streaming | Selection method: `Streaming` or `GREATS`  |
 | `SELECTION_FRAC`    | 1.0       | Fraction of samples to select              |
@@ -109,6 +110,9 @@ bash scripts/run_qwen1.7b_gsm8k_grpo.sh ++selection.frac=0.5
 
 # Change model
 bash scripts/run_qwen1.7b_gsm8k_grpo.sh actor_rollout_ref.model.path=Qwen/Qwen3-4B
+
+# Set random seed for different runs
+bash scripts/run_qwen1.7b_gsm8k_grpo.sh seed=123
 
 # Multiple overrides
 bash scripts/run_qwen1.7b_gsm8k_grpo.sh ++selection.method=GREATS ++selection.frac=0.8

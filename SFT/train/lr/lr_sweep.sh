@@ -31,9 +31,12 @@
 #   - Creates detailed results in SFT/lr_sweep_results/
 # =============================================================================
 
-cd $HOME/Project/Gradient-Streaming
+SCRATCH_DIR=/workspace-vast/pbb
+CODE_DIR=/workspace-vast/pbb
 
-export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
+cd $CODE_DIR/Gradient-Streaming
+
+export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
 
 # Base training arguments (same as train.sh but with fewer epochs/steps)
 export base_training_args="--do_train=True \

@@ -17,10 +17,13 @@
 #SBATCH --mail-user=pbb@illinois.edu
 #SBATCH --mail-type="END"
 
-cd $HOME/Project/Gradient-Streaming
+SCRATCH_DIR=/workspace-vast/pbb
+CODE_DIR=/workspace-vast/pbb
+
+cd $CODE_DIR/Gradient-Streaming
 
 # Set PYTHONPATH to include project root for imports
-export PYTHONPATH="$HOME/Project/Gradient-Streaming:$PYTHONPATH"
+export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
 
 # Base training arguments (static, never change)
 export base_training_args="--bf16=True \
@@ -603,7 +606,7 @@ run_single_method() {
     # Includes: validation settings, PPO epochs, mini-batch size, KL coefficient
     local JOB_NAME="${task}-${model_name}-${method_str}-${job_type}-lr${exp_lr}-b${batch_size}-${val_str}-pe${ppo_epochs}-mb${mini_batch_size}-kl${exp_init_kl_coef}-s${seed}"
 
-    local output_dir=/scratch/pbb/Project/Gradient-Streaming/RLHF/${JOB_NAME}
+    local output_dir=$SCRATCH_DIR/Gradient-Streaming/RLHF/${JOB_NAME}
     if [[ ! -d $output_dir ]]; then
         mkdir -p $output_dir
     fi

@@ -166,11 +166,14 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         val_responses: torch.Tensor,
         val_rewards: torch.Tensor,
         temperature: float = 1.0,
+        n_responses: int = 1,
+        norm_adv_by_std: bool = True,
     ) -> Dict[str, Any]:
         """
         Capture validation gradients from external validation data.
 
-        Uses seqloss-reward objective: L = -E[normalize(reward) * log_prob]
+        Uses seqloss-reward objective with GRPO-style per-prompt-group normalization:
+            L = -E[seq_scores * log_prob]
 
         Args:
             val_input_ids: [batch, seq_len] full input (prompt + response)
@@ -179,6 +182,8 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             val_responses: [batch, response_len] response tokens
             val_rewards: [batch] rewards for each sample
             temperature: Temperature for log prob computation
+            n_responses: Number of responses per prompt (for GRPO grouping, default 1)
+            norm_adv_by_std: Whether to divide by std (True for GRPO, False for Dr.GRPO)
 
         Returns:
             Dictionary with validation capture statistics
@@ -193,11 +198,49 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         batch_size = val_input_ids.size(0)
         response_length = val_responses.size(1)
 
-        # Normalize rewards to get sequence scores (seqloss-reward objective)
-        if batch_size > 1:
-            seq_scores = (val_rewards - val_rewards.mean()) / (val_rewards.std() + 1e-8)
+        # Normalize rewards using GRPO's per-prompt-group normalization
+        # This EXACTLY matches verl.trainer.ppo.core_algos.compute_grpo_outcome_advantage
+        from collections import defaultdict
+        import numpy as np
+
+        if n_responses > 1:
+            num_prompts = batch_size // n_responses
+            # Create index array for grouping (same as training)
+            index = np.repeat(np.arange(num_prompts), n_responses)
+
+            # EXACT copy of GRPO advantage computation logic
+            scores = val_rewards  # Already sequence-level
+            id2score = defaultdict(list)
+            id2mean = {}
+            id2std = {}
+            epsilon = 1e-6
+
+            with torch.no_grad():
+                bsz = scores.shape[0]
+                for i in range(bsz):
+                    id2score[index[i]].append(scores[i])
+                for idx in id2score:
+                    if len(id2score[idx]) == 1:
+                        id2mean[idx] = torch.tensor(0.0)
+                        id2std[idx] = torch.tensor(1.0)
+                    elif len(id2score[idx]) > 1:
+                        scores_tensor = torch.stack(id2score[idx])
+                        id2mean[idx] = torch.mean(scores_tensor)
+                        id2std[idx] = torch.std(scores_tensor)
+                    else:
+                        raise ValueError(f"no score in prompt index: {idx}")
+                seq_scores = torch.zeros_like(scores)
+                for i in range(bsz):
+                    if norm_adv_by_std:
+                        seq_scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                    else:
+                        seq_scores[i] = scores[i] - id2mean[index[i]]
         else:
-            seq_scores = val_rewards - val_rewards.mean()
+            # Fallback for n_responses=1: batch-level normalization
+            if batch_size > 1:
+                seq_scores = (val_rewards - val_rewards.mean()) / (val_rewards.std() + 1e-8)
+            else:
+                seq_scores = val_rewards - val_rewards.mean()
 
         # Start validation gradient capture
         self.grad_hook.start_val_capture(use_factorized=False)

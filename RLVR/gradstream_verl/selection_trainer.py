@@ -85,6 +85,7 @@ class SelectionTrainerConfig:
     val_batch_size: int = 32
     val_max_prompt_length: int = 1024
     val_max_response_length: int = 1024
+    val_seed: Optional[int] = None
 
     # How often to refresh validation gradients (1 = every step)
     refresh_freq: int = 1
@@ -174,6 +175,7 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
             max_prompt_length=self.selection_config.val_max_prompt_length,
             max_response_length=self.selection_config.val_max_response_length,
             shuffle=True,
+            seed=self.selection_config.val_seed if self.selection_config.val_seed is not None else 42,
         )
 
         self.val_data_manager = ValidationDataManager(
@@ -280,6 +282,9 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
             'rewards': rewards,
         })
         val_data.meta_info['temperature'] = self.config.actor_rollout_ref.rollout.temperature
+        # Pass GRPO parameters for per-prompt-group normalization (matching training)
+        val_data.meta_info['n_responses'] = self.config.actor_rollout_ref.rollout.n
+        val_data.meta_info['norm_adv_by_std'] = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
 
         # Dispatch to workers for gradient capture
         stats = self.actor_rollout_wg.capture_validation_gradients(val_data)

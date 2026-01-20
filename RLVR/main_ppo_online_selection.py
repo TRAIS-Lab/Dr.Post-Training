@@ -198,6 +198,7 @@ class SelectionTaskRunner(BaseTaskRunner):
                 val_batch_size=selection_cfg.get("val_batch_size", 32),
                 val_max_prompt_length=selection_cfg.get("val_max_prompt_length", 1024),
                 val_max_response_length=selection_cfg.get("val_max_response_length", 1024),
+                val_seed=selection_cfg.get("val_seed"),
                 refresh_freq=selection_cfg.get("refresh_freq", 1),
                 val_loss_type=selection_cfg.get("val_loss_type", "seqloss-reward"),
             )
@@ -287,6 +288,7 @@ def main(config):
                 "val_batch_size": 32,
                 "val_max_prompt_length": 1024,
                 "val_max_response_length": 1024,
+                "val_seed": None,
                 "refresh_freq": 1,
                 "val_loss_type": "seqloss-reward",
             }

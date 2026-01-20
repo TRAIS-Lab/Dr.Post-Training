@@ -15,8 +15,10 @@ if TYPE_CHECKING:
     from typing import Dict, Optional
     from torch import Tensor
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from collections import defaultdict
 
 from .hook import GradientHookVerl
 
@@ -49,6 +51,8 @@ def capture_seqloss_reward_gradients(
     val_batch: Dict[str, Tensor],
     micro_batch_size: Optional[int] = None,
     temperature: float = 1.0,
+    n_responses: int = 1,
+    norm_adv_by_std: bool = True,
 ) -> float:
     """
     Capture validation gradients using seqloss-reward objective.
@@ -56,7 +60,7 @@ def capture_seqloss_reward_gradients(
     The validation loss is computed as:
         L_val = -E[seq_scores * seq_log_probs]
 
-    where seq_scores are normalized rewards: (R - mean) / (std + eps)
+    where seq_scores are GRPO-normalized rewards (per-prompt-group normalization).
 
     Args:
         model: The policy model (actor)
@@ -69,17 +73,55 @@ def capture_seqloss_reward_gradients(
             - rewards: [batch] - per-sequence rewards
         micro_batch_size: If set, process in mini-batches to save memory
         temperature: Temperature for log prob computation (default 1.0)
+        n_responses: Number of responses per prompt (for GRPO grouping, default 1)
+        norm_adv_by_std: Whether to divide by std (True for GRPO, False for Dr.GRPO)
 
     Returns:
         Total validation loss (float)
     """
     rewards = val_batch["rewards"]
 
-    # Normalize rewards: seq_scores = (R - μ) / (σ + ε)
-    if rewards.numel() > 1:
-        seq_scores = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+    # Normalize rewards using GRPO's per-prompt-group normalization
+    # This EXACTLY matches verl.trainer.ppo.core_algos.compute_grpo_outcome_advantage
+    if n_responses > 1:
+        batch_size = rewards.shape[0]
+        num_prompts = batch_size // n_responses
+        # Create index array for grouping (same as training)
+        index = np.repeat(np.arange(num_prompts), n_responses)
+
+        # EXACT copy of GRPO advantage computation logic
+        scores = rewards  # Already sequence-level (not token-level like training)
+        id2score = defaultdict(list)
+        id2mean = {}
+        id2std = {}
+        epsilon = 1e-6
+
+        with torch.no_grad():
+            bsz = scores.shape[0]
+            for i in range(bsz):
+                id2score[index[i]].append(scores[i])
+            for idx in id2score:
+                if len(id2score[idx]) == 1:
+                    id2mean[idx] = torch.tensor(0.0)
+                    id2std[idx] = torch.tensor(1.0)
+                elif len(id2score[idx]) > 1:
+                    scores_tensor = torch.stack(id2score[idx])
+                    id2mean[idx] = torch.mean(scores_tensor)
+                    id2std[idx] = torch.std(scores_tensor)
+                else:
+                    raise ValueError(f"no score in prompt index: {idx}")
+            seq_scores = torch.zeros_like(scores)
+            for i in range(bsz):
+                if norm_adv_by_std:
+                    seq_scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                else:
+                    seq_scores[i] = scores[i] - id2mean[index[i]]
     else:
-        seq_scores = rewards - rewards.mean()
+        # Fallback for n_responses=1: batch-level normalization
+        if rewards.numel() > 1:
+            seq_scores = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        else:
+            seq_scores = rewards - rewards.mean()
 
     # Start validation gradient capture
     grad_hook.start_val_capture()
