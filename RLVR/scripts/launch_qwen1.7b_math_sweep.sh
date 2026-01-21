@@ -22,19 +22,19 @@ for SEED in "${SEEDS[@]}"; do
     echo "Submitting: Baseline (seed=$SEED)"
     sbatch --job-name="RLVR-MATH-baseline-s${SEED}" \
         --export=ALL,SEED=$SEED,SELECTION_ENABLED=False \
-        "$MAIN_SCRIPT" ++seed=$SEED ++selection.enable=False
+        "$MAIN_SCRIPT"
 
     # 2. Streaming (default selection method)
     echo "Submitting: Streaming (seed=$SEED)"
     sbatch --job-name="RLVR-MATH-streaming-s${SEED}" \
         --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=Streaming \
-        "$MAIN_SCRIPT" ++seed=$SEED ++selection.enable=True ++selection.method=Streaming
+        "$MAIN_SCRIPT"
 
     # 3. GREATS selection
     echo "Submitting: GREATS (seed=$SEED)"
     sbatch --job-name="RLVR-MATH-greats-s${SEED}" \
         --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=GREATS \
-        "$MAIN_SCRIPT" ++seed=$SEED ++selection.enable=True ++selection.method=GREATS
+        "$MAIN_SCRIPT"
 done
 
 echo ""

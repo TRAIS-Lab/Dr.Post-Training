@@ -176,7 +176,6 @@ python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=8 \
-    actor_rollout_ref.rollout.seed=$SEED \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.seed=$SEED \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
