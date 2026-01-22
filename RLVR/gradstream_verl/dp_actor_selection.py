@@ -520,6 +520,11 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         )
         self.grad_hook.enable_hooks()
 
+        # Set token counts for proper packed sequence handling (cu_seqlens)
+        # Create pseudo-labels from response_mask: -100 for masked, 0 for valid
+        labels = torch.where(response_mask == 1, torch.zeros_like(response_mask), torch.full_like(response_mask, -100))
+        self.grad_hook.set_token_counts(labels, batch_size, attention_mask)
+
         # Zero gradients before scoring pass
         self.actor_module.zero_grad()
 
@@ -1082,7 +1087,9 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                         # Accumulate pg_loss like verl does (skip if dummy backward)
                         if not use_zero_weight:
                             metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
-                            append_to_dict(metrics, micro_batch_metrics)
+                        # Always append micro_batch_metrics to maintain consistent structure across GPUs
+                        # (metrics like pg_clipfrac, ppo_kl are valid even for dummy backward)
+                        append_to_dict(metrics, micro_batch_metrics)
 
                 # Optimizer step
                 grad_norm = self._optimizer_step()

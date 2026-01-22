@@ -43,8 +43,9 @@ math_train_path=$DATA_DIR/math/train.parquet
 math_test_path=$DATA_DIR/math/test.parquet
 math_test_cleaned_path=$DATA_DIR/math/test_cleaned.parquet
 
-# Validation prompts for online rollout generation (split from test set)
-VAL_PROMPTS_PATH=$DATA_DIR/math/val_prompts.parquet
+# Validation prompts for online rollout generation
+# Options: val_from_test.parquet (default) or val_from_train.parquet (ablation)
+VAL_PROMPTS_PATH=${VAL_PROMPTS_PATH:-$DATA_DIR/math/val_from_test.parquet}
 
 train_files=$math_train_path
 # Use cleaned test set (excludes validation samples) for evaluation
@@ -100,9 +101,9 @@ done
 
 # Build experiment name
 if [ "$SELECTION_ENABLED" = "True" ]; then
-    EXP_NAME="qwen3_1.7b_grpo_math_online_${SELECTION_METHOD}_frac${SELECTION_FRAC}_vb${VAL_BATCH_SIZE}"
+    EXP_NAME="Qwen3-1.7B_${SELECTION_METHOD}_s${SEED}"
 else
-    EXP_NAME="qwen3_1.7b_grpo_math_baseline"
+    EXP_NAME="Qwen3-1.7B_s${SEED}"
 fi
 
 OUTPUT_DIR="${OUTPUT_BASE}/${EXP_NAME}"
@@ -127,17 +128,34 @@ export PYTHONPATH=$CODE_DIR/Gradient-Streaming/RLVR:$CODE_DIR/Gradient-Streaming
 unset ROCR_VISIBLE_DEVICES
 
 # ============================================================================
-# Check/Prepare validation prompts (split from test set for reproducibility)
+# Check/Prepare validation prompts
 # ============================================================================
-if [ "$SELECTION_ENABLED" = "True" ] && [ ! -f "$VAL_PROMPTS_PATH" ]; then
-    echo "Validation prompts not found at $VAL_PROMPTS_PATH"
-    echo "Splitting test set into validation prompts and cleaned test set..."
-    python3 $CODE_DIR/Gradient-Streaming/RLVR/data/prepare_data.py \
-        --test_data $math_test_path \
-        --output $VAL_PROMPTS_PATH \
-        --output_test $math_test_cleaned_path \
-        --num_samples $VAL_POOL_SIZE \
-        --seed $SEED
+VAL_FROM_TEST_PATH=$DATA_DIR/math/val_from_test.parquet
+VAL_FROM_TRAIN_PATH=$DATA_DIR/math/val_from_train.parquet
+
+if [ "$SELECTION_ENABLED" = "True" ]; then
+    # Generate val_from_test and test_cleaned if needed
+    if [ ! -f "$VAL_FROM_TEST_PATH" ]; then
+        echo "Generating val_from_test.parquet and test_cleaned.parquet..."
+        python3 $CODE_DIR/Gradient-Streaming/RLVR/data/prepare_data.py \
+            --test_data $math_test_path \
+            --output $VAL_FROM_TEST_PATH \
+            --output_test $math_test_cleaned_path \
+            --num_samples $VAL_POOL_SIZE \
+            --seed $SEED
+    fi
+
+    # Generate val_from_train if needed
+    if [ ! -f "$VAL_FROM_TRAIN_PATH" ]; then
+        echo "Generating val_from_train.parquet..."
+        python3 $CODE_DIR/Gradient-Streaming/RLVR/data/prepare_data.py \
+            --train_data $math_train_path \
+            --output $VAL_FROM_TRAIN_PATH \
+            --num_samples $VAL_POOL_SIZE \
+            --seed $SEED
+    fi
+
+    echo "Using validation prompts from: $VAL_PROMPTS_PATH"
 fi
 
 # ============================================================================
@@ -153,7 +171,7 @@ python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.seed=$SEED \
-    data.train_batch_size=256 \
+    data.train_batch_size=128 \
     data.max_prompt_length=1024 \
     data.max_response_length=4096 \
     data.filter_overlong_prompts=True \

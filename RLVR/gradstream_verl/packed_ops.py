@@ -87,7 +87,8 @@ def compute_scores_packed_vectorized(
     # Aggregate per-token scores to per-sample scores using scatter_add
     sample_ids = compute_sample_ids_from_cu_seqlens(total_tokens, cu_seqlens, device)
     scores = torch.zeros(batch_size, device=device, dtype=target_dtype)
-    scores.scatter_add_(0, sample_ids, per_token_scores)
+    # Ensure per_token_scores has the same dtype as scores for scatter_add_
+    scores.scatter_add_(0, sample_ids, per_token_scores.to(target_dtype))
 
     # Compute similarity if needed
     similarity = None

@@ -35,26 +35,84 @@ This creates:
 - `$DATA_DIR/math/train.parquet` (~7,500 problems)
 - `$DATA_DIR/math/test.parquet` (~5,000 problems)
 
-### Step 2: Split Test Set for Validation
+### Step 2: Prepare Validation Prompts
 
-For gradient-based selection, we need validation prompts. We split the test set into:
-- **Validation prompts** (1,000 samples): Used to compute validation gradients
-- **Cleaned test set** (4,000 samples): Used for final evaluation
+For gradient-based selection, we need validation prompts. There are two options:
+
+#### Option A: Validation from Test Set (Default)
+
+Split the test set into validation prompts and cleaned test set:
 
 ```bash
 python data/prepare_data.py \
     --test_data $DATA_DIR/math/test.parquet \
-    --output $DATA_DIR/math/val_prompts.parquet \
+    --output $DATA_DIR/math/val_from_test.parquet \
     --output_test $DATA_DIR/math/test_cleaned.parquet \
     --num_samples 1000 \
     --seed 42
 ```
 
 This creates:
-- `val_prompts.parquet`: Prompts only (responses generated online during training)
+- `val_from_test.parquet`: Validation prompts (disjoint from test_cleaned)
 - `test_cleaned.parquet`: Remaining samples for final evaluation
 
 **Important:** When evaluating, use `test_cleaned.parquet` instead of `test.parquet` to avoid evaluating on validation data.
+
+#### Option B: Validation from Training Set (For Ablation)
+
+Sample validation prompts from the training set:
+
+```bash
+python data/prepare_data.py \
+    --train_data $DATA_DIR/math/train.parquet \
+    --output $DATA_DIR/math/val_from_train.parquet \
+    --num_samples 1000 \
+    --seed 42
+```
+
+This creates:
+- `val_from_train.parquet`: Validation prompts sampled from training data
+
+Note: `val_from_train` can overlap with the training set (it's just a random sample, not a split).
+
+#### Preparing Both (Recommended for Experiments)
+
+To run ablation studies comparing validation sources, prepare both:
+
+```bash
+# 1. Split test → val_from_test + test_cleaned
+python data/prepare_data.py \
+    --test_data $DATA_DIR/math/test.parquet \
+    --output $DATA_DIR/math/val_from_test.parquet \
+    --output_test $DATA_DIR/math/test_cleaned.parquet \
+    --num_samples 1000 \
+    --seed 42
+
+# 2. Sample train → val_from_train
+python data/prepare_data.py \
+    --train_data $DATA_DIR/math/train.parquet \
+    --output $DATA_DIR/math/val_from_train.parquet \
+    --num_samples 1000 \
+    --seed 42
+```
+
+This creates 4 files:
+| File | Source | Description |
+|------|--------|-------------|
+| `train.parquet` | original | Training data (unchanged) |
+| `test_cleaned.parquet` | test | Test data minus validation samples |
+| `val_from_test.parquet` | test | Validation prompts (disjoint from test_cleaned) |
+| `val_from_train.parquet` | train | Validation prompts (can overlap with train) |
+
+To switch which validation set is used, set `VAL_PROMPTS_PATH` before running:
+
+```bash
+# Use validation from test (default)
+VAL_PROMPTS_PATH=$DATA_DIR/math/val_from_test.parquet bash scripts/run_qwen1.7b_math_grpo.sh
+
+# Use validation from train (ablation)
+VAL_PROMPTS_PATH=$DATA_DIR/math/val_from_train.parquet bash scripts/run_qwen1.7b_math_grpo.sh
+```
 
 ## Running Experiments
 
