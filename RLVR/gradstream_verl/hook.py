@@ -308,6 +308,10 @@ class GradientHookVerl:
         different data shards. For consistent gradient-based selection, all ranks
         must have the same validation gradient (sum of all shards).
 
+        Since validation loss is normalized by GLOBAL token count (synced before
+        capture), the all-reduce SUM directly gives us the correct global gradient.
+        No division by world_size is needed.
+
         This should be called after end_val_capture() and before using the
         validation gradients for selection.
         """
@@ -319,9 +323,9 @@ class GradientHookVerl:
 
         for layer_idx, val_grad in self._val_grad_cache.items():
             # All-reduce to sum gradients across all ranks
+            # Since each rank's gradient is already normalized by global token count,
+            # the sum gives us the correct global gradient (no averaging needed)
             dist.all_reduce(val_grad, op=dist.ReduceOp.SUM)
-            # Average by world_size to get mean gradient
-            val_grad.div_(world_size)
 
         logger.debug(f"[Rank {rank}] Synchronized {len(self._val_grad_cache)} validation gradient layers across {world_size} ranks")
 

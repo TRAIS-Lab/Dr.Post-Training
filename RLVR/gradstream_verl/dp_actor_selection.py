@@ -34,6 +34,7 @@ from verl import DataProto
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.device import get_device_id
+from verl.trainer.ppo.core_algos import agg_loss
 
 try:
     from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
@@ -294,6 +295,20 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                 # Fallback to batch_size or a default
                 micro_batch_size = min(batch_size, 8)  # Default to 8 or batch_size
 
+        # Pre-compute total response tokens for token-mean normalization
+        # This ensures validation gradient uses the same normalization as training (loss_agg_mode="token-mean")
+        full_response_mask = val_attention_mask[:, -response_length:]
+        local_response_tokens = full_response_mask.sum().to(dtype=torch.float32)
+
+        # For distributed training, sync token counts to get GLOBAL total
+        # This ensures all ranks use the same normalization factor for consistent gradient scales
+        if world_size > 1:
+            global_response_tokens = local_response_tokens.clone()
+            dist.all_reduce(global_response_tokens, op=dist.ReduceOp.SUM)
+            total_response_tokens_tensor = global_response_tokens
+        else:
+            total_response_tokens_tensor = local_response_tokens
+
         # Process in micro-batches
         # Use tensor for accumulation to avoid D2H transfers in the loop
         total_val_loss = torch.tensor(0.0, device=val_input_ids.device)
@@ -362,23 +377,34 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     logits = logits[:, -response_length - 1:-1, :]
                     token_log_probs = logprobs_from_logits(logits.float(), mb_responses)
 
-                # Sequence log probability
-                seq_log_probs = (token_log_probs * mb_response_mask.float()).sum(dim=1)
+                # Token-mean validation loss using verl's agg_loss for consistency with training
+                # Per-token loss: -seq_score * log_prob for each token
+                # seq_scores is [mb_batch_size], broadcast to [mb_batch_size, response_length]
+                per_token_loss = -(mb_seq_scores.unsqueeze(1) * token_log_probs)
 
-                # Validation loss: L = -E[seq_scores * seq_log_probs]
-                per_seq_loss = -(mb_seq_scores * seq_log_probs)
-                val_loss = per_seq_loss.mean()
+                # Use verl's agg_loss with token-mean normalization
+                # - dp_size=1: We do explicit all-reduce SUM, not relying on optimizer's averaging
+                # - batch_num_tokens: Pre-synced GLOBAL token count for correct gradient scaling
+                val_loss = agg_loss(
+                    loss_mat=per_token_loss,
+                    loss_mask=mb_response_mask,
+                    loss_agg_mode="token-mean",
+                    dp_size=1,
+                    batch_num_tokens=total_response_tokens_tensor,
+                )
 
                 # Backward to capture gradients
                 val_loss.backward()
 
-            total_val_loss += val_loss.detach() * (end_idx - start_idx)
+            # Track raw loss sum for statistics (will normalize by total tokens later)
+            mb_loss_sum = (per_token_loss * mb_response_mask.float()).sum()
+            total_val_loss += mb_loss_sum.detach()
 
             # Zero optimizer gradients but keep val cache accumulating
             self.actor_optimizer.zero_grad()
 
             # Clear intermediate tensors (no empty_cache - let PyTorch manage memory)
-            del output, token_log_probs, seq_log_probs, per_seq_loss, val_loss
+            del output, token_log_probs, per_token_loss, val_loss, mb_loss_sum
 
         # End capture
         self.grad_hook.end_val_capture()
@@ -389,23 +415,34 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         self.grad_hook.sync_val_grads()
 
         # Synchronize loss across ranks for consistent stats
+        # total_val_loss is now the raw sum of per-token losses (before normalization)
+        # Note: total_response_tokens_tensor is already the GLOBAL token count (synced above)
+        global_total_tokens = total_response_tokens_tensor.item()
+
         if world_size > 1:
-            loss_tensor = torch.stack([total_val_loss, torch.tensor(float(batch_size), device=val_input_ids.device)])
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            # Single .item() calls at the end of capture (not in hot path)
-            total_val_loss_float = loss_tensor[0].item()
-            total_samples = int(loss_tensor[1].item())
+            # Sync: [raw_loss_sum, num_samples]
+            sync_tensor = torch.stack([
+                total_val_loss,
+                torch.tensor(float(batch_size), device=val_input_ids.device)
+            ])
+            dist.all_reduce(sync_tensor, op=dist.ReduceOp.SUM)
+
+            global_loss_sum = sync_tensor[0].item()
+            total_samples = int(sync_tensor[1].item())
+
+            # Token-mean average loss
+            avg_val_loss = global_loss_sum / global_total_tokens if global_total_tokens > 0 else 0.0
         else:
-            total_val_loss_float = total_val_loss.item()
             total_samples = batch_size
+            avg_val_loss = total_val_loss.item() / global_total_tokens if global_total_tokens > 0 else 0.0
 
         # Get stats
         num_layers_captured = self.grad_hook._val_cache.get_num_captured()
-        avg_val_loss = total_val_loss_float / total_samples if total_samples > 0 else 0.0
 
         stats = {
             'val/num_samples': total_samples,  # Total across all ranks after sync
-            'val/loss': avg_val_loss,  # Average loss across all ranks
+            'val/num_tokens': global_total_tokens,  # Total response tokens (for token-mean normalization)
+            'val/loss': avg_val_loss,  # Token-mean average loss across all ranks
             'val/num_layers_captured': num_layers_captured,
             'val/num_micro_batches': num_micro_batches,
             'val/rank': rank,
