@@ -90,7 +90,11 @@ class SelectionTrainerConfig:
     # How often to refresh validation gradients (1 = every step)
     refresh_freq: int = 1
 
-    # Validation loss type: "seqloss-reward" or "seqloss-lastadv"
+    # Validation loss type:
+    # - "seqloss-reward": L = -E[normalized_reward * log_prob] (original)
+    # - "seqloss": L = -E[log_prob] (pure log probability, no reward weighting)
+    # - "seqloss-correct-only": L = -E[log_prob] for correct samples only (reward > 0.5)
+    # - "seqloss-binary": L = -E[sign(reward - 0.5) * log_prob] (+1/-1 weighting)
     val_loss_type: str = "seqloss-reward"
 
     # Reward normalization for validation gradients: "batch" or "grpo"
@@ -291,6 +295,7 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
         val_data.meta_info['n_responses'] = self.config.actor_rollout_ref.rollout.n
         val_data.meta_info['norm_adv_by_std'] = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
         val_data.meta_info['norm_type'] = self.selection_config.val_norm_type
+        val_data.meta_info['val_loss_type'] = self.selection_config.val_loss_type
 
         # Dispatch to workers for gradient capture
         stats = self.actor_rollout_wg.capture_validation_gradients(val_data)

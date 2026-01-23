@@ -155,6 +155,7 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
         n_responses = val_batch.meta_info.get('n_responses', 1)
         norm_adv_by_std = val_batch.meta_info.get('norm_adv_by_std', True)
         norm_type = val_batch.meta_info.get('norm_type', 'batch')
+        val_loss_type = val_batch.meta_info.get('val_loss_type', 'seqloss-reward')
 
         # Call actor's validation gradient capture
         stats = self.actor.capture_validation_gradients_external(
@@ -167,6 +168,7 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
             n_responses=n_responses,
             norm_adv_by_std=norm_adv_by_std,
             norm_type=norm_type,
+            val_loss_type=val_loss_type,
         )
 
         # Stats are now synchronized across ranks via all-reduce in actor
@@ -176,6 +178,9 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
             'val/num_samples': stats.get('val/num_samples', 0),
             'val/num_layers_captured': stats.get('val/num_layers_captured', 0),
             'val/world_size': stats.get('val/world_size', 1),
+            'val/loss_type': stats.get('val/loss_type', 'seqloss-reward'),
+            'val/num_correct': stats.get('val/num_correct', -1),
+            'val/num_samples_used': stats.get('val/num_samples_used', 0),
         })
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

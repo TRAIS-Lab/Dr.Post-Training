@@ -1,41 +1,22 @@
 """
 Gradient streaming module for RLVR with Verl.
 
-This is a specialized version of gradstream optimized for multi-GPU training
-with Verl's packed sequence format (use_remove_padding=True).
+This module provides gradient-based data selection for PPO training with Verl.
 
 Key features:
-- Native cu_seqlens support for packed sequences
-- Vectorized operations to avoid D2H memory copies
-- FSDP-aware layer detection
-- seqloss-reward validation gradient capture for GRPO
 - Streaming and GREATS selection methods
-- Online validation rollout generation (matching RLHF design)
+- Online validation rollout generation
+- Zero-variance handling for validation gradients
+- FSDP-compatible gradient capture
 
 Usage:
-    from gradstream_verl import SelectionAwareActor, SelectionConfig
-
-    config = SelectionConfig(method="Streaming", frac=0.5)
-    selection_actor = SelectionAwareActor(actor, config)
-
-    # During training:
-    selection_actor.capture_validation_gradients(val_batch)
-    selection_actor.setup_selection(train_batch_size, lr)
-    metrics = selection_actor.update_policy_with_selection(data)
-
-For online validation rollouts (recommended):
-    from gradstream_verl import ValidationDataManager, ValidationConfig
-    from gradstream_verl import SelectionRayPPOTrainerWithOnlineVal, SelectionTrainerConfig
-
-    # Create validation manager with prompt pool
-    val_config = ValidationConfig(
-        val_prompts_path="data/val_prompts.parquet",
-        val_pool_size=500,
-        val_batch_size=32,
+    from gradstream_verl import (
+        DataParallelPPOActorWithSelection,
+        SelectionRayPPOTrainerWithOnlineVal,
+        SelectionTrainerConfig,
     )
-    val_manager = ValidationDataManager(val_config, tokenizer)
 
-    # Training with online validation rollouts
+    # Create trainer with selection
     trainer = SelectionRayPPOTrainerWithOnlineVal(
         config=config,
         selection_config=SelectionTrainerConfig(enable=True, method="Streaming"),
@@ -45,18 +26,19 @@ For online validation rollouts (recommended):
 
 from .hook import GradientHookVerl
 from .selection_state import SelectionStateVerl, StreamingStateVerl, GREATSStateVerl
-from .validation import capture_seqloss_reward_gradients, prepare_val_batch_from_rollout
-from .actor_selection import SelectionAwareActor, SelectionConfig, get_trainable_linear_layers
+from .validation import (
+    normalize_rewards_for_validation,
+    VAR_THRESHOLD,
+    BINARY_BASELINE,
+)
 
-# Import the archive's complete actor implementation
-# This is a drop-in replacement for DataParallelPPOActor with selection support
+# Import the main actor implementation with selection support
 try:
     from .dp_actor_selection import DataParallelPPOActorWithSelection
-except ImportError as e:
-    # verl may not be installed, make it optional
+except ImportError:
     DataParallelPPOActorWithSelection = None
 
-# Import validation data manager (online rollout support)
+# Import validation data manager
 try:
     from .validation_manager import (
         ValidationConfig,
@@ -65,21 +47,21 @@ try:
         prepare_validation_batch_for_verl,
         create_validation_prompts_from_train,
     )
-except ImportError as e:
+except ImportError:
     ValidationConfig = None
     ValidationDataManager = None
     ValidationPromptDataset = None
     prepare_validation_batch_for_verl = None
     create_validation_prompts_from_train = None
 
-# Import selection trainer (online validation rollouts)
+# Import selection trainer
 try:
     from .selection_trainer import (
         SelectionTrainerConfig,
         SelectionRayPPOTrainerWithOnlineVal,
         create_selection_trainer,
     )
-except ImportError as e:
+except ImportError:
     SelectionTrainerConfig = None
     SelectionRayPPOTrainerWithOnlineVal = None
     create_selection_trainer = None
@@ -91,22 +73,19 @@ __all__ = [
     "SelectionStateVerl",
     "StreamingStateVerl",
     "GREATSStateVerl",
-    # Validation gradient capture
-    "capture_seqloss_reward_gradients",
-    "prepare_val_batch_from_rollout",
-    # Actor wrapper (simple)
-    "SelectionAwareActor",
-    "SelectionConfig",
-    "get_trainable_linear_layers",
-    # Actor with selection (complete, from archive)
+    # Validation utilities
+    "normalize_rewards_for_validation",
+    "VAR_THRESHOLD",
+    "BINARY_BASELINE",
+    # Actor with selection
     "DataParallelPPOActorWithSelection",
-    # Validation data manager (online rollout support)
+    # Validation data manager
     "ValidationConfig",
     "ValidationDataManager",
     "ValidationPromptDataset",
     "prepare_validation_batch_for_verl",
     "create_validation_prompts_from_train",
-    # Selection trainer (online validation rollouts)
+    # Selection trainer
     "SelectionTrainerConfig",
     "SelectionRayPPOTrainerWithOnlineVal",
     "create_selection_trainer",

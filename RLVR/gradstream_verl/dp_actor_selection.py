@@ -169,12 +169,16 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         n_responses: int = 1,
         norm_adv_by_std: bool = True,
         norm_type: str = "batch",
+        val_loss_type: str = "seqloss-reward",
     ) -> Dict[str, Any]:
         """
         Capture validation gradients from external validation data.
 
-        Uses seqloss-reward objective with configurable reward normalization:
-            L = -E[seq_scores * log_prob]
+        Supports multiple validation loss types:
+            - "seqloss-reward": L = -E[normalized_reward * log_prob] (original)
+            - "seqloss": L = -E[log_prob] (pure log probability, no reward weighting)
+            - "seqloss-correct-only": L = -E[log_prob] for correct samples only (reward > 0.5)
+            - "seqloss-binary": L = -E[sign(reward - 0.5) * log_prob] (+1/-1 weighting)
 
         Args:
             val_input_ids: [batch, seq_len] full input (prompt + response)
@@ -186,6 +190,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             n_responses: Number of responses per prompt (for GRPO grouping, default 1)
             norm_adv_by_std: Whether to divide by std (True for GRPO, False for Dr.GRPO)
             norm_type: Normalization type - "batch" or "grpo"
+            val_loss_type: Validation loss type (see above)
 
         Returns:
             Dictionary with validation capture statistics
@@ -200,50 +205,77 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         batch_size = val_input_ids.size(0)
         response_length = val_responses.size(1)
 
-        # Normalize rewards based on norm_type
-        from collections import defaultdict
-        import numpy as np
+        # Compute seq_scores based on val_loss_type
+        norm_stats = {'val_loss_type': val_loss_type}
 
-        if norm_type == "grpo" and n_responses > 1:
-            # GRPO per-prompt-group normalization
-            # This EXACTLY matches verl.trainer.ppo.core_algos.compute_grpo_outcome_advantage
-            num_prompts = batch_size // n_responses
-            # Create index array for grouping (same as training)
-            index = np.repeat(np.arange(num_prompts), n_responses)
+        if val_loss_type == "seqloss":
+            # Pure log probability - no reward weighting
+            # All samples get weight 1.0
+            seq_scores = torch.ones(batch_size, device=val_input_ids.device)
+            norm_stats['used_fallback'] = False
+            norm_stats['num_samples_used'] = batch_size
+            logger.info(f"[Val Grad] Using seqloss (pure log prob) on {batch_size} samples")
 
-            # EXACT copy of GRPO advantage computation logic
-            scores = val_rewards  # Already sequence-level
-            id2score = defaultdict(list)
-            id2mean = {}
-            id2std = {}
-            epsilon = 1e-6
+        elif val_loss_type == "seqloss-correct-only":
+            # Only use correct samples (reward > 0.5)
+            correct_mask = (val_rewards > 0.5)
+            num_correct = correct_mask.sum().item()
 
-            with torch.no_grad():
-                bsz = scores.shape[0]
-                for i in range(bsz):
-                    id2score[index[i]].append(scores[i])
-                for idx in id2score:
-                    if len(id2score[idx]) == 1:
-                        id2mean[idx] = torch.tensor(0.0)
-                        id2std[idx] = torch.tensor(1.0)
-                    elif len(id2score[idx]) > 1:
-                        scores_tensor = torch.stack(id2score[idx])
-                        id2mean[idx] = torch.mean(scores_tensor)
-                        id2std[idx] = torch.std(scores_tensor)
-                    else:
-                        raise ValueError(f"no score in prompt index: {idx}")
-                seq_scores = torch.zeros_like(scores)
-                for i in range(bsz):
-                    if norm_adv_by_std:
-                        seq_scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-                    else:
-                        seq_scores[i] = scores[i] - id2mean[index[i]]
-        else:
-            # Batch-level normalization (default and fallback)
-            if batch_size > 1:
-                seq_scores = (val_rewards - val_rewards.mean()) / (val_rewards.std() + 1e-8)
+            if num_correct == 0:
+                # No correct samples - fall back to seqloss on all samples
+                logger.warning(
+                    f"[Val Grad] seqloss-correct-only: No correct samples in batch! "
+                    f"Falling back to seqloss on all {batch_size} samples"
+                )
+                seq_scores = torch.ones(batch_size, device=val_input_ids.device)
+                norm_stats['used_fallback'] = True
+                norm_stats['num_correct'] = 0
+                norm_stats['num_samples_used'] = batch_size
             else:
-                seq_scores = val_rewards - val_rewards.mean()
+                # Weight: 1.0 for correct, 0.0 for incorrect
+                seq_scores = correct_mask.float()
+                norm_stats['used_fallback'] = False
+                norm_stats['num_correct'] = num_correct
+                norm_stats['num_samples_used'] = num_correct
+                logger.info(
+                    f"[Val Grad] Using seqloss-correct-only: {num_correct}/{batch_size} correct samples"
+                )
+
+        elif val_loss_type == "seqloss-binary":
+            # Binary weighting: +1 for correct, -1 for incorrect
+            # Avoids normalization issues entirely
+            seq_scores = torch.where(
+                val_rewards > 0.5,
+                torch.ones_like(val_rewards),
+                -torch.ones_like(val_rewards)
+            )
+            num_correct = (val_rewards > 0.5).sum().item()
+            norm_stats['used_fallback'] = False
+            norm_stats['num_correct'] = num_correct
+            norm_stats['num_samples_used'] = batch_size
+            logger.info(
+                f"[Val Grad] Using seqloss-binary: {num_correct}/{batch_size} correct, "
+                f"{batch_size - num_correct} incorrect"
+            )
+
+        elif val_loss_type == "seqloss-reward":
+            # Original: normalized reward weighting
+            from .validation import normalize_rewards_for_validation
+            seq_scores, reward_norm_stats = normalize_rewards_for_validation(
+                rewards=val_rewards,
+                norm_type=norm_type,
+                n_responses=n_responses,
+                norm_adv_by_std=norm_adv_by_std,
+                device=val_input_ids.device,
+            )
+            norm_stats.update(reward_norm_stats)
+            norm_stats['num_samples_used'] = batch_size
+
+        else:
+            raise ValueError(
+                f"Unknown val_loss_type: {val_loss_type}. "
+                f"Supported: seqloss-reward, seqloss, seqloss-correct-only, seqloss-binary"
+            )
 
         # Start validation gradient capture
         self.grad_hook.start_val_capture(use_factorized=False)
@@ -378,7 +410,15 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             'val/num_micro_batches': num_micro_batches,
             'val/rank': rank,
             'val/world_size': world_size,
+            'val/loss_type': norm_stats.get('val_loss_type', 'seqloss-reward'),
         }
+        # Add loss-type specific stats
+        if 'num_correct' in norm_stats:
+            stats['val/num_correct'] = norm_stats['num_correct']
+        if 'num_samples_used' in norm_stats:
+            stats['val/num_samples_used'] = norm_stats['num_samples_used']
+        if 'used_fallback' in norm_stats:
+            stats['val/used_fallback'] = int(norm_stats['used_fallback'])
 
         # Compute total validation gradient norm efficiently (no .item() calls in loop)
         grad_norms_sq = []

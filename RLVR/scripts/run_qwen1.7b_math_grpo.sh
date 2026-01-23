@@ -61,10 +61,16 @@ SEED=${SEED:-42}
 SELECTION_ENABLED=${SELECTION_ENABLED:-True}
 SELECTION_METHOD=${SELECTION_METHOD:-Streaming}
 SELECTION_FRAC=${SELECTION_FRAC:-1.0}
-VAL_POOL_SIZE=${VAL_POOL_SIZE:-500}
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-32}
+VAL_POOL_SIZE=${VAL_POOL_SIZE:-100}
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-8}
 REFRESH_FREQ=${REFRESH_FREQ:-1}
 RESUME_MODE=${RESUME_MODE:-disable}
+# Validation loss type options:
+# - seqloss-reward: L = -E[normalized_reward * log_prob] (original)
+# - seqloss: L = -E[log_prob] (pure log probability)
+# - seqloss-correct-only: L = -E[log_prob] for correct samples only
+# - seqloss-binary: L = -E[sign(reward - 0.5) * log_prob]
+VAL_LOSS_TYPE=${VAL_LOSS_TYPE:-seqloss-reward}
 
 # Parse Hydra overrides from command line args
 for arg in "$@"; do
@@ -93,6 +99,9 @@ for arg in "$@"; do
         *selection.refresh_freq=*)
             REFRESH_FREQ=$(echo "$arg" | sed 's/.*selection.refresh_freq=//')
             ;;
+        *selection.val_loss_type=*)
+            VAL_LOSS_TYPE=$(echo "$arg" | sed 's/.*selection.val_loss_type=//')
+            ;;
         *trainer.resume_mode=*)
             RESUME_MODE=$(echo "$arg" | sed 's/.*trainer.resume_mode=//')
             ;;
@@ -119,6 +128,7 @@ echo "  frac=$SELECTION_FRAC"
 echo "  val_pool_size=$VAL_POOL_SIZE"
 echo "  val_batch_size=$VAL_BATCH_SIZE"
 echo "  refresh_freq=$REFRESH_FREQ"
+echo "  val_loss_type=$VAL_LOSS_TYPE"
 
 # Add project root to PYTHONPATH
 export PYTHONPATH=$CODE_DIR/Gradient-Streaming/RLVR:$CODE_DIR/Gradient-Streaming:${PYTHONPATH}
@@ -179,7 +189,7 @@ python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     actor_rollout_ref.model.path=Qwen/Qwen3-1.7B-Base \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -222,5 +232,5 @@ python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     +selection.val_max_response_length=4096 \
     +selection.val_seed=$SEED \
     +selection.refresh_freq=$REFRESH_FREQ \
-    +selection.val_loss_type=seqloss-reward \
+    +selection.val_loss_type=$VAL_LOSS_TYPE \
     "$@"
