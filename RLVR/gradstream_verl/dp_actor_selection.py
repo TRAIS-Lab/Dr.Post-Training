@@ -169,17 +169,18 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         temperature: float = 1.0,
         n_responses: int = 1,
         norm_adv_by_std: bool = True,
-        norm_type: str = "batch",
         val_loss_type: str = "seqloss-reward",
     ) -> Dict[str, Any]:
         """
         Capture validation gradients from external validation data.
 
-        Supports multiple validation loss types:
-            - "seqloss-reward": L = -E[normalized_reward * log_prob] (original)
-            - "seqloss": L = -E[log_prob] (pure log probability, no reward weighting)
-            - "seqloss-correct-only": L = -E[log_prob] for correct samples only (reward > 0.5)
-            - "seqloss-binary": L = -E[sign(reward - 0.5) * log_prob] (+1/-1 weighting)
+        Supports two validation loss types:
+            - "seqloss-reward": L = -E[normalized_reward * log_prob]
+                Uses batch-level reward normalization: (reward - mean) / std
+            - "grpo-loss": L = -E[advantages * log_prob] using GRPO-normalized advantages
+                Matches training loss formulation exactly (PPO with ratio=1).
+                Uses per-prompt-group GRPO normalization (same as training).
+                Recommended for best alignment between validation and training gradients.
 
         Args:
             val_input_ids: [batch, seq_len] full input (prompt + response)
@@ -190,7 +191,6 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             temperature: Temperature for log prob computation
             n_responses: Number of responses per prompt (for GRPO grouping, default 1)
             norm_adv_by_std: Whether to divide by std (True for GRPO, False for Dr.GRPO)
-            norm_type: Normalization type - "batch" or "grpo"
             val_loss_type: Validation loss type (see above)
 
         Returns:
@@ -209,62 +209,12 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         # Compute seq_scores based on val_loss_type
         norm_stats = {'val_loss_type': val_loss_type}
 
-        if val_loss_type == "seqloss":
-            # Pure log probability - no reward weighting
-            # All samples get weight 1.0
-            seq_scores = torch.ones(batch_size, device=val_input_ids.device)
-            norm_stats['used_fallback'] = False
-            norm_stats['num_samples_used'] = batch_size
-            logger.info(f"[Val Grad] Using seqloss (pure log prob) on {batch_size} samples")
-
-        elif val_loss_type == "seqloss-correct-only":
-            # Only use correct samples (reward > 0.5)
-            correct_mask = (val_rewards > 0.5)
-            num_correct = correct_mask.sum().item()
-
-            if num_correct == 0:
-                # No correct samples - fall back to seqloss on all samples
-                logger.warning(
-                    f"[Val Grad] seqloss-correct-only: No correct samples in batch! "
-                    f"Falling back to seqloss on all {batch_size} samples"
-                )
-                seq_scores = torch.ones(batch_size, device=val_input_ids.device)
-                norm_stats['used_fallback'] = True
-                norm_stats['num_correct'] = 0
-                norm_stats['num_samples_used'] = batch_size
-            else:
-                # Weight: 1.0 for correct, 0.0 for incorrect
-                seq_scores = correct_mask.float()
-                norm_stats['used_fallback'] = False
-                norm_stats['num_correct'] = num_correct
-                norm_stats['num_samples_used'] = num_correct
-                logger.info(
-                    f"[Val Grad] Using seqloss-correct-only: {num_correct}/{batch_size} correct samples"
-                )
-
-        elif val_loss_type == "seqloss-binary":
-            # Binary weighting: +1 for correct, -1 for incorrect
-            # Avoids normalization issues entirely
-            seq_scores = torch.where(
-                val_rewards > 0.5,
-                torch.ones_like(val_rewards),
-                -torch.ones_like(val_rewards)
-            )
-            num_correct = (val_rewards > 0.5).sum().item()
-            norm_stats['used_fallback'] = False
-            norm_stats['num_correct'] = num_correct
-            norm_stats['num_samples_used'] = batch_size
-            logger.info(
-                f"[Val Grad] Using seqloss-binary: {num_correct}/{batch_size} correct, "
-                f"{batch_size - num_correct} incorrect"
-            )
-
-        elif val_loss_type == "seqloss-reward":
-            # Original: normalized reward weighting
+        if val_loss_type == "seqloss-reward":
+            # Batch-normalized reward weighting: L = -E[normalized_reward * log_prob]
             from .validation import normalize_rewards_for_validation
             seq_scores, reward_norm_stats = normalize_rewards_for_validation(
                 rewards=val_rewards,
-                norm_type=norm_type,
+                norm_type="batch",  # Always use batch normalization for seqloss-reward
                 n_responses=n_responses,
                 norm_adv_by_std=norm_adv_by_std,
                 device=val_input_ids.device,
@@ -272,10 +222,21 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             norm_stats.update(reward_norm_stats)
             norm_stats['num_samples_used'] = batch_size
 
+        elif val_loss_type == "grpo-loss":
+            # Training-style loss: L = -E[advantages * log_prob]
+            # Uses GRPO per-prompt-group normalization (matches training exactly)
+            seq_scores = None  # Signal to use advantages instead
+            norm_stats['used_fallback'] = False
+            norm_stats['num_samples_used'] = batch_size
+            logger.info(
+                f"[Val Grad] Using grpo-loss (training-style loss with GRPO advantages) "
+                f"on {batch_size} samples, n_responses={n_responses}"
+            )
+
         else:
             raise ValueError(
                 f"Unknown val_loss_type: {val_loss_type}. "
-                f"Supported: seqloss-reward, seqloss, seqloss-correct-only, seqloss-binary"
+                f"Supported: seqloss-reward, grpo-loss"
             )
 
         # Start validation gradient capture
@@ -309,6 +270,37 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         else:
             total_response_tokens_tensor = local_response_tokens
 
+        # For grpo-loss: Pre-compute GRPO advantages for the full batch
+        # This matches training's advantage computation exactly
+        use_grpo_loss = (val_loss_type == "grpo-loss")
+        full_batch_advantages = None
+        if use_grpo_loss:
+            from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
+            import numpy as np
+
+            # Create token-level rewards from sequence-level rewards (same as training)
+            # For outcome supervision, reward is only at the last token
+            token_level_rewards = torch.zeros(batch_size, response_length, device=val_input_ids.device)
+            # Find the last valid token position for each sample
+            response_lengths = full_response_mask.sum(dim=1).long()
+            for i in range(batch_size):
+                if response_lengths[i] > 0:
+                    token_level_rewards[i, response_lengths[i] - 1] = val_rewards[i]
+
+            # Create index array for per-prompt grouping (same as training)
+            # With n_responses per prompt, index groups responses to the same prompt
+            num_prompts = batch_size // n_responses
+            index = np.repeat(np.arange(num_prompts), n_responses)
+
+            # Compute GRPO advantages (matches training exactly)
+            full_batch_advantages, _ = compute_grpo_outcome_advantage(
+                token_level_rewards=token_level_rewards,
+                response_mask=full_response_mask,
+                index=index,
+                epsilon=1e-6,
+                norm_adv_by_std_in_grpo=norm_adv_by_std,
+            )
+
         # Process in micro-batches
         # Use tensor for accumulation to avoid D2H transfers in the loop
         total_val_loss = torch.tensor(0.0, device=val_input_ids.device)
@@ -322,7 +314,12 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             mb_attention_mask = val_attention_mask[start_idx:end_idx]
             mb_position_ids = val_position_ids[start_idx:end_idx]
             mb_responses = val_responses[start_idx:end_idx]
-            mb_seq_scores = seq_scores[start_idx:end_idx]
+
+            # Get per-sample weights (seq_scores) or advantages depending on loss type
+            if use_grpo_loss:
+                mb_advantages = full_batch_advantages[start_idx:end_idx]
+            else:
+                mb_seq_scores = seq_scores[start_idx:end_idx]
 
             mb_batch_size, mb_seqlen = mb_input_ids.shape
             mb_response_mask = mb_attention_mask[:, -response_length:]
@@ -377,10 +374,18 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     logits = logits[:, -response_length - 1:-1, :]
                     token_log_probs = logprobs_from_logits(logits.float(), mb_responses)
 
-                # Token-mean validation loss using verl's agg_loss for consistency with training
-                # Per-token loss: -seq_score * log_prob for each token
-                # seq_scores is [mb_batch_size], broadcast to [mb_batch_size, response_length]
-                per_token_loss = -(mb_seq_scores.unsqueeze(1) * token_log_probs)
+                # Compute per-token loss based on loss type
+                if use_grpo_loss:
+                    # grpo-loss: L = -advantages (matches training exactly)
+                    # This is equivalent to PPO loss with ratio=1 (no old policy)
+                    # The gradient is: d(-adv)/dW = -adv * d(log_prob)/dW
+                    # We need to include log_prob in the computation graph for gradients
+                    # So loss = -advantages * log_prob (gradient flows through log_prob)
+                    per_token_loss = -mb_advantages * token_log_probs
+                else:
+                    # seqloss variants: L = -seq_score * log_prob
+                    # seq_scores is [mb_batch_size], broadcast to [mb_batch_size, response_length]
+                    per_token_loss = -(mb_seq_scores.unsqueeze(1) * token_log_probs)
 
                 # Use verl's agg_loss with token-mean normalization
                 # - dp_size=1: We do explicit all-reduce SUM, not relying on optimizer's averaging

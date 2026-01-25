@@ -19,10 +19,10 @@ for SEED in "${SEEDS[@]}"; do
     echo "=== Seed $SEED ==="
 
     # 1. Baseline (selection disabled)
-    echo "Submitting: Baseline (seed=$SEED)"
-    sbatch --job-name="RLVR-MATH-baseline-s${SEED}" \
-        --export=ALL,SEED=$SEED,SELECTION_ENABLED=False \
-        "$MAIN_SCRIPT"
+    # echo "Submitting: Baseline (seed=$SEED)"
+    # sbatch --job-name="RLVR-MATH-baseline-s${SEED}" \
+    #     --export=ALL,SEED=$SEED,SELECTION_ENABLED=False \
+    #     "$MAIN_SCRIPT"
 
     # 2. Streaming (default selection method)
     echo "Submitting: Streaming (seed=$SEED)"
@@ -30,11 +30,11 @@ for SEED in "${SEEDS[@]}"; do
         --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=Streaming \
         "$MAIN_SCRIPT"
 
-    # 3. GREATS selection
-    echo "Submitting: GREATS (seed=$SEED)"
-    sbatch --job-name="RLVR-MATH-greats-s${SEED}" \
-        --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=GREATS \
-        "$MAIN_SCRIPT"
+    # # 3. GREATS selection
+    # echo "Submitting: GREATS (seed=$SEED)"
+    # sbatch --job-name="RLVR-MATH-greats-s${SEED}" \
+    #     --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=GREATS \
+    #     "$MAIN_SCRIPT"
 done
 
 echo ""
