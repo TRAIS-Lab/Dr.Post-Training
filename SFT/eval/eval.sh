@@ -33,6 +33,7 @@ data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
 train=""
 task=""
 subject=""
+method=""
 n_test=-1
 batch_size=1
 max_new_tokens=128
@@ -60,6 +61,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --subject)
             subject="$2"
+            shift 2
+            ;;
+        --method)
+            method="$2"
             shift 2
             ;;
         --n_test)
@@ -91,6 +96,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --train NAME         Filter by training dataset (alpaca, less, tulu3, wizardlm)"
             echo "  --task NAME          Override task (samsum, tydiqa, mmlu, bbh, gsm8k, math500)"
             echo "  --subject NAME       MMLU subject or BBH task to evaluate on (default: all)"
+            echo "  --method NAME        Filter by method (e.g., NA-LoGra-Full, Streaming-NA-Full)"
             echo "  --n_test N           Number of test examples (-1 for all)"
             echo "  --batch_size N       Batch size for generation (default: 1)"
             echo "  --max_new_tokens N   Max tokens to generate (default: 128)"
@@ -116,6 +122,7 @@ echo "Filters:"
 echo "  Train:         ${train:-all}"
 echo "  Task:          ${task:-auto-detect}"
 echo "  Subject:       ${subject:-all}"
+echo "  Method:        ${method:-all}"
 echo ""
 echo "Generation:"
 echo "  Batch size:    $batch_size"
@@ -143,6 +150,10 @@ fi
 
 if [[ -n "$subject" ]]; then
     cmd="$cmd --subject $subject"
+fi
+
+if [[ -n "$method" ]]; then
+    cmd="$cmd --method $method"
 fi
 
 if [[ "$dry_run" == true ]]; then
