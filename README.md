@@ -1,4 +1,4 @@
-# One Stream to Rule Them All
+# Dr. Post-Training
 
 This repository implements **Gradient Streaming** for fine-grained data selection for modern model training.
 
