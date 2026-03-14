@@ -175,8 +175,14 @@ def parse_model_name(model_name: str) -> Dict[str, str]:
     return config
 
 
-def find_models(models_dir: str, train_dataset: Optional[str] = None) -> List[str]:
-    """Find all model directories, optionally filtering by prefix pattern."""
+def find_models(models_dir: str, train_dataset: Optional[str] = None, method: Optional[str] = None) -> List[str]:
+    """Find all model directories, optionally filtering by prefix pattern and method.
+
+    Args:
+        models_dir: Directory containing model directories
+        train_dataset: Filter prefix (e.g., "tulu3_tydiqa")
+        method: Method filter (e.g., "NA-LoGra-Full", "Streaming-NA-Full")
+    """
     model_paths = []
     for entry in os.listdir(models_dir):
         entry_path = os.path.join(models_dir, entry)
@@ -187,12 +193,20 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None) -> List[st
             os.path.exists(os.path.join(entry_path, "adapter_config.json"))
         )
         if has_model:
-            if train_dataset is None:
-                model_paths.append(entry_path)
-            else:
-                # Match if entry starts with the filter pattern (followed by - or _)
-                if entry.startswith(train_dataset + "-") or entry.startswith(train_dataset + "_"):
-                    model_paths.append(entry_path)
+            # Check train_dataset filter
+            if train_dataset is not None:
+                if not (entry.startswith(train_dataset + "-") or entry.startswith(train_dataset + "_")):
+                    continue
+
+            # Check method filter (e.g., "NA-LoGra-Full" matches "-NA-LoGra-Full-")
+            if method is not None:
+                # Method appears in directory name as -{selection}-{compression}-{training_type}-
+                # e.g., tulu3_tydiqa-Llama-3.2-1B-NA-LoGra-Full-p0.01-...
+                method_pattern = f"-{method}-"
+                if method_pattern not in entry:
+                    continue
+
+            model_paths.append(entry_path)
     return sorted(model_paths)
 
 
@@ -450,6 +464,8 @@ def main():
         help="Override auto-detected task (optional)")
     parser.add_argument("--subject", type=str, default=None,
         help="MMLU subject or BBH task to evaluate on (default: all)")
+    parser.add_argument("--method", type=str, default=None,
+        help="Filter by method (e.g., NA-LoGra-Full, Streaming-NA-Full)")
     parser.add_argument("--data_dir", type=str, default=None,
         help="Data directory (default: auto-detect)")
     parser.add_argument("--n_test", type=int, default=-1,
@@ -503,8 +519,10 @@ def main():
         filter_prefix = f"{filter_prefix}_{args.task}"
         if args.subject:
             filter_prefix = f"{filter_prefix}_{args.subject}"
-    model_paths = find_models(args.models_dir, filter_prefix)
+    model_paths = find_models(args.models_dir, filter_prefix, args.method)
     logger.info(f"Found {len(model_paths)} models to evaluate")
+    if args.method:
+        logger.info(f"Filtering by method: {args.method}")
 
     if not model_paths:
         logger.error(f"No models found in {args.models_dir}")

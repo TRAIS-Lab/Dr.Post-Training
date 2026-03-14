@@ -154,7 +154,6 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
         # Get GRPO normalization parameters from meta_info (matching training)
         n_responses = val_batch.meta_info.get('n_responses', 1)
         norm_adv_by_std = val_batch.meta_info.get('norm_adv_by_std', True)
-        norm_type = val_batch.meta_info.get('norm_type', 'batch')
         val_loss_type = val_batch.meta_info.get('val_loss_type', 'seqloss-reward')
 
         # Call actor's validation gradient capture
@@ -167,7 +166,6 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
             temperature=temperature,
             n_responses=n_responses,
             norm_adv_by_std=norm_adv_by_std,
-            norm_type=norm_type,
             val_loss_type=val_loss_type,
         )
 

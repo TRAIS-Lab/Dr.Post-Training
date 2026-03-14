@@ -45,7 +45,7 @@ math_test_cleaned_path=$DATA_DIR/math/test_cleaned.parquet
 
 # Validation prompts for online rollout generation
 # Options: val_from_test.parquet (default) or val_from_train.parquet (ablation)
-VAL_PROMPTS_PATH=${VAL_PROMPTS_PATH:-$DATA_DIR/math/val_from_test.parquet}
+VAL_PROMPTS_PATH=${VAL_PROMPTS_PATH:-$DATA_DIR/math/val_from_train.parquet}
 
 train_files=$math_train_path
 # Use cleaned test set (excludes validation samples) for evaluation
@@ -61,16 +61,14 @@ SEED=${SEED:-42}
 SELECTION_ENABLED=${SELECTION_ENABLED:-True}
 SELECTION_METHOD=${SELECTION_METHOD:-Streaming}
 SELECTION_FRAC=${SELECTION_FRAC:-1.0}
-VAL_POOL_SIZE=${VAL_POOL_SIZE:-100}
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-8}
+VAL_POOL_SIZE=${VAL_POOL_SIZE:-512}
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}
 REFRESH_FREQ=${REFRESH_FREQ:-1}
 RESUME_MODE=${RESUME_MODE:-disable}
 # Validation loss type options:
-# - seqloss-reward: L = -E[normalized_reward * log_prob] (original)
-# - seqloss: L = -E[log_prob] (pure log probability)
-# - seqloss-correct-only: L = -E[log_prob] for correct samples only
-# - seqloss-binary: L = -E[sign(reward - 0.5) * log_prob]
-VAL_LOSS_TYPE=${VAL_LOSS_TYPE:-seqloss-reward}
+# - seqloss-reward: L = -E[normalized_reward * log_prob] (batch normalization)
+# - grpo-loss: L = -E[advantages * log_prob] (GRPO normalization, matches training)
+VAL_LOSS_TYPE=${VAL_LOSS_TYPE:-grpo-loss}
 
 # Parse Hydra overrides from command line args
 for arg in "$@"; do
@@ -174,7 +172,7 @@ fi
 echo "Starting training with $N_GPUS GPUs..."
 
 # Note: MATH problems and solutions are typically longer than GSM8K
-# Increased max_response_length to 2048 to accommodate more detailed reasoning
+# Increased max_response_length to 1024 to accommodate more detailed reasoning
 python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     hydra.run.dir=$HYDRA_DIR \
     algorithm.adv_estimator=grpo \
@@ -214,7 +212,7 @@ python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     trainer.experiment_name=$EXP_NAME \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
+    trainer.save_freq=1000 \
     trainer.test_freq=3 \
     trainer.total_epochs=5 \
     trainer.default_local_dir=$OUTPUT_DIR \

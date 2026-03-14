@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --partition=gpuA40x4
 #SBATCH --account=bfwm-delta-gpu
-#SBATCH --time=12:00:00
+#SBATCH --time=0:30:00
 #SBATCH --constraint="scratch"
 #SBATCH --output=/u/%u/Project/Gradient-Streaming/SFT/log/%x-%j.log
 
@@ -101,6 +101,8 @@ dry_run=false
 declare -A METHOD_DEFS=(
     ["NA-NA-Full"]="NA::false"
     ["NA-NA-LoRA"]="NA::true"
+    ["NA-LoGra-Full"]="NA:LoGra:false"
+    ["NA-LoGra-LoRA"]="NA:LoGra:true"
     ["Streaming-NA-Full"]="Streaming::false"
     ["Streaming-NA-LoRA"]="Streaming::true"
     ["GREATS-NA-Full"]="GREATS::false"
@@ -111,13 +113,13 @@ declare -A METHOD_DEFS=(
 
 # Category mappings
 declare -A CATEGORY_METHODS=(
-    ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["all"]="NA-NA-Full,NA-NA-LoRA,NA-LoGra-Full,NA-LoGra-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
     ["baseline"]="NA-NA-Full,NA-NA-LoRA"
     ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
     ["greats"]="GREATS-NA-Full,GREATS-NA-LoRA,GREATS-LoGra-Full"
-    ["full"]="NA-NA-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
-    ["lora"]="NA-NA-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
-    ["compression"]="Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["full"]="NA-NA-Full,NA-LoGra-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
+    ["lora"]="NA-NA-LoRA,NA-LoGra-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
+    ["compression"]="NA-LoGra-Full,NA-LoGra-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
     ["no-compression"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
 )
 
@@ -259,8 +261,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --methods <list>                       Run multiple methods (see below)"
             echo "  --dry-run                              Print commands without executing"
             echo ""
-            echo "  Method names: NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, Streaming-NA-LoRA,"
-            echo "                GREATS-NA-Full, GREATS-NA-LoRA, Streaming-LoGra-Full, GREATS-LoGra-Full"
+            echo "  Method names: NA-NA-Full, NA-NA-LoRA, NA-LoGra-Full, NA-LoGra-LoRA,"
+            echo "                Streaming-NA-Full, Streaming-NA-LoRA, GREATS-NA-Full, GREATS-NA-LoRA,"
+            echo "                Streaming-LoGra-Full, GREATS-LoGra-Full"
             echo ""
             echo "  Categories: all, baseline, streaming, greats, Full, LoRA, compression, no-compression"
             echo ""
