@@ -20,8 +20,8 @@ set -x
 
 # Custom configurations
 
-SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
-CODE_DIR=/u/phu1/Project
+SCRATCH_DIR=/home/pbb/Project
+CODE_DIR=/home/pbb/Project
 
 # ============================================================================
 # GPU Configuration
@@ -183,7 +183,7 @@ python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     data.seed=$SEED \
     data.train_batch_size=128 \
     data.max_prompt_length=1024 \
-    data.max_response_length=4096 \
+    data.max_response_length=1024 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     actor_rollout_ref.model.path=Qwen/Qwen3-1.7B-Base \
@@ -198,11 +198,11 @@ python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     actor_rollout_ref.actor.fsdp_config.seed=$SEED \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-	actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+	actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.seed=$SEED \
@@ -229,7 +229,7 @@ python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
     +selection.val_pool_size=$VAL_POOL_SIZE \
     +selection.val_batch_size=$VAL_BATCH_SIZE \
     +selection.val_max_prompt_length=1024 \
-    +selection.val_max_response_length=4096 \
+    +selection.val_max_response_length=1024 \
     +selection.val_seed=$SEED \
     +selection.refresh_freq=$REFRESH_FREQ \
     +selection.val_loss_type=$VAL_LOSS_TYPE \

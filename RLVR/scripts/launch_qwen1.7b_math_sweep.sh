@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN_SCRIPT="$SCRIPT_DIR/run_qwen1.7b_math_grpo.sh"
 
 # Seeds to run
-SEEDS=(2 22 42 62 82)
+SEEDS=(2)
 
 # Submit jobs for each setting and seed
 echo "Submitting jobs for 3 settings × 5 seeds = 15 total jobs"

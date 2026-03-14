@@ -404,6 +404,9 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
                 # ============================================================
                 if self._should_capture_validation_gradients():
                     with marked_timer("val_grad", timing_raw, color="green"):
+                        # Clear CUDA cache before validation rollouts to reduce memory pressure
+                        # vLLM competes with FSDP model for GPU memory
+                        torch.cuda.empty_cache()
                         val_batch = self._generate_validation_rollouts()
                         val_stats = self._capture_validation_gradients(val_batch)
 

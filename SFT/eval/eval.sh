@@ -17,8 +17,8 @@
 #SBATCH --mail-user=pbb@illinois.edu
 #SBATCH --mail-type="END"
 
-SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
-CODE_DIR=/u/phu1/Project
+SCRATCH_DIR=/scratch/pbb/Project
+CODE_DIR=/home/pbb/Project
 
 cd $CODE_DIR/Gradient-Streaming
 

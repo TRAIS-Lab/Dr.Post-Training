@@ -17,8 +17,8 @@
 #SBATCH --mail-user=pbb@illinois.edu
 #SBATCH --mail-type="END"
 
-SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
-CODE_DIR=/u/phu1/Project
+SCRATCH_DIR=/scratch/pbb/Project
+CODE_DIR=/home/pbb/Project
 
 cd $CODE_DIR/Gradient-Streaming
 
@@ -63,7 +63,7 @@ use_second_order=false # If true, use greedy selection with second-order interac
 n_val=1024  # Number of validation samples for data selection (0 = self-referencing)
 val_batch_size=256  # Batch size for validation gradient computation
 val_generation_interval=1  # Steps between regenerating val completions (0 = once at start)
-val_loss_type="seqloss-reward"  # Options: seqloss-lastadv (GAE last-token), seqloss-reward (normalized reward)
+val_loss_type="seqloss-lastadv"  # Options: seqloss-lastadv (GAE last-token), seqloss-reward (normalized reward)
 # Config file (contains lr, lr_vhead, init_kl_coef per method)
 config_file="RLHF/train/config.json"
 lr_override=""  # Set when --lr is explicitly passed
@@ -597,9 +597,16 @@ run_single_method() {
     fi
 
     # Build validation string
-    local val_str="v${n_val}"
+    # Abbreviate val_loss_type: seqloss-lastadv -> adv, seqloss-reward -> rew
+    local val_type_short
+    case "$val_loss_type" in
+        seqloss-lastadv) val_type_short="adv" ;;
+        seqloss-reward) val_type_short="rew" ;;
+        *) val_type_short="$val_loss_type" ;;
+    esac
+    local val_str="v${n_val}-${val_type_short}"
     if [[ "$n_val" -gt 0 ]]; then
-        val_str="${val_str}b${val_batch_size}"
+        val_str="${val_str}-b${val_batch_size}"
     fi
 
     # Job name format: task-model-method-job_type-lr-b-v-ppo-mb-kl-s
