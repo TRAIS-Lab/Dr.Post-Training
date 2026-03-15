@@ -16,8 +16,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Source cluster config
-source "$PROJECT_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found. See README.md for cluster setup."; exit 1; }
-activate_env
+# Source cluster config (skip if already set by submit.sh)
+if [[ -z "$CODE_DIR" ]]; then
+    source "$PROJECT_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found."; exit 1; }
+    activate_env
+fi
 
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 

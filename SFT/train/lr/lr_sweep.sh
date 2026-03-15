@@ -14,10 +14,12 @@
 #   - Creates detailed results in SFT/lr_sweep_results/
 # =============================================================================
 
-# Source cluster config
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found. See README.md for cluster setup."; exit 1; }
-activate_env
+# Source cluster config (skip if already set by submit.sh)
+if [[ -z "$CODE_DIR" ]]; then
+    source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found."; exit 1; }
+    activate_env
+fi
 
 cd $CODE_DIR/Gradient-Streaming
 
