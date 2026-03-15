@@ -62,27 +62,73 @@ Note that due to the complicated dependencies of VERL (which is included as a gi
 
 ## Cluster Setup
 
-All shell scripts source a gitignored `cluster_env.sh` at the repo root for cluster-specific paths. Create it before running any scripts:
+Both `cluster_env.sh` and `submit.sh` are **gitignored** — each user creates their own at the repo root. Every script sources `cluster_env.sh` for paths and conda activation, while `submit.sh` wraps `sbatch` with cluster-specific SLURM defaults.
+
+### 1. Create `cluster_env.sh`
 
 ```bash
-# cluster_env.sh
+cat > cluster_env.sh << 'EOF'
+# Cluster-specific configuration
+# This file is gitignored — safe to edit without merge conflicts.
+
+# Directory paths
 export SCRATCH_DIR="/scratch/$USER/Project"   # where data/checkpoints live
 export CODE_DIR="$HOME/Project"               # where this repo is cloned
-activate_env() { conda activate drpt; }       # or: export PATH="...envs/drpt/bin:$PATH"
+
+# Conda environment activation
+activate_env() { conda activate drpt; }
+# Or if conda activate doesn't work in non-interactive shells:
+# activate_env() { export PATH="$HOME/.conda/envs/drpt/bin:$PATH"; }
+
+# SLURM defaults
+export SLURM_ACCOUNT="my-account"
+export SLURM_PARTITION="gpuA40x4"
+export SLURM_MAIL_USER="user@example.edu"
+EOF
 ```
 
-This file is gitignored so it never causes merge conflicts between machines.
-
-For SLURM clusters, you can optionally create a `submit.sh` wrapper (also gitignored) to pass cluster-specific SLURM flags:
+### 2. Create `submit.sh`
 
 ```bash
-# submit.sh
-source "$(dirname "$0")/cluster_env.sh"
-sbatch --account=my-acct --partition=gpuA40x4 --gpus-per-node=4 \
-       --mem=128g --time=12:00:00 "$@"
+cat > submit.sh << 'SCRIPT'
+#!/bin/bash
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found."; exit 1; }
+
+SCRIPT="$1"; shift
+JOB_NAME="${JOB_NAME:-$(basename "$SCRIPT" .sh)}"
+GPUS="${GPUS:-4}"
+MEM="${MEM:-128g}"
+CPUS="${CPUS:-16}"
+TIME="${TIME:-12:00:00}"
+CONSTRAINT="${CONSTRAINT:-scratch}"
+LOG_DIR="${CODE_DIR}/Gradient-Streaming/log"
+mkdir -p "$LOG_DIR"
+
+sbatch --job-name="$JOB_NAME" --account="$SLURM_ACCOUNT" --partition="$SLURM_PARTITION" \
+    --mail-user="$SLURM_MAIL_USER" --mail-type="END" --mem="$MEM" --nodes=1 \
+    --ntasks-per-node=1 --cpus-per-task="$CPUS" --gpus-per-node="$GPUS" \
+    --gpu-bind=none --time="$TIME" --constraint="$CONSTRAINT" \
+    --output="$LOG_DIR/%x-%j.log" "$SCRIPT" "$@"
+SCRIPT
+chmod +x submit.sh
 ```
 
-Then submit jobs with `./submit.sh SFT/train/train.sh --methods baseline`.
+### 3. Submit jobs
+
+```bash
+# SFT training
+./submit.sh SFT/train/train.sh --methods baseline
+
+# RLHF training
+./submit.sh RLHF/train/train.sh --methods all
+
+# RLVR training
+./submit.sh RLVR/scripts/run_qwen1.7b_math_grpo.sh
+
+# Override SLURM defaults per-invocation
+GPUS=1 TIME=1:00:00 MEM=64g ./submit.sh SFT/eval/eval.sh --task samsum
+```
 
 ## Experiments
 

@@ -17,6 +17,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Source cluster config
 source "$PROJECT_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found. See README.md for cluster setup."; exit 1; }
+activate_env
 
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 

@@ -3,6 +3,7 @@
 # Source cluster config
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found. See README.md for cluster setup."; exit 1; }
+activate_env
 
 cd $CODE_DIR/Gradient-Streaming
 
