@@ -45,10 +45,10 @@ min_new_tokens=0
 max_steps=-1
 use_flash_attention=true
 
-# Data curation
+# Data curation (defaults; overridden by config YAML, then by CLI)
 filter_frac=1.0
 use_second_order=false
-n_val=1024
+n_val=0
 val_batch_size=256
 val_loss_type="seqloss-reward"
 update_compressor_freq=200
@@ -113,9 +113,9 @@ while [[ $# -gt 0 ]]; do
         --early_stopping)   early_stopping=true; shift 1 ;;
         --max_new_tokens)   max_new_tokens="$2"; shift 2 ;;
         --use_second_order) use_second_order=true; shift 1 ;;
-        --n_val)            n_val="$2"; shift 2 ;;
+        --n_val)            n_val="$2"; _cli_n_val="$2"; shift 2 ;;
         --val_batch_size)   val_batch_size="$2"; shift 2 ;;
-        --val_loss_type)    val_loss_type="$2"; shift 2 ;;
+        --val_loss_type)    val_loss_type="$2"; _cli_val_loss_type="$2"; shift 2 ;;
         --eval_interval)    eval_interval="$2"; shift 2 ;;
         --n_eval)           n_eval="$2"; shift 2 ;;
         --eval_batch_size)  eval_batch_size="$2"; shift 2 ;;
@@ -215,6 +215,10 @@ read_yaml() {
     cfg_opt_projector=""
     cfg_lora_r=""
     cfg_lora_alpha=""
+    cfg_n_val=""
+    cfg_val_loss_type=""
+    cfg_val_batch_size=""
+    cfg_filter_frac=""
 
     # Parse YAML with one level of nesting support (section.key)
     local section=""
@@ -248,6 +252,10 @@ read_yaml() {
             score_grad_compression.projector)    cfg_score_projector="$val" ;;
             opt_grad_compression.sparsifier)     cfg_opt_sparsifier="$val" ;;
             opt_grad_compression.projector)      cfg_opt_projector="$val" ;;
+            n_val)                               cfg_n_val="$val" ;;
+            val_loss_type)                       cfg_val_loss_type="$val" ;;
+            val_batch_size)                      cfg_val_batch_size="$val" ;;
+            filter_frac)                         cfg_filter_frac="$val" ;;
         esac
     done < "$config_file"
 
@@ -361,6 +369,13 @@ run_method() {
     local exp_lr_vhead=$(lookup_config_value "$config_key" "$exp_name" "lr_vhead" "$lr_vhead_override" "$default_lr_vhead")
     local exp_init_kl_coef=$(lookup_config_value "$config_key" "$exp_name" "init_kl_coef" "$init_kl_coef_override" "$default_init_kl_coef")
 
+    # Effective values: config YAML provides per-method defaults.
+    # If a CLI flag was passed, it takes precedence (tracked via _cli_* vars).
+    local eff_n_val="${_cli_n_val:-${cfg_n_val:-$n_val}}"
+    local eff_val_loss_type="${_cli_val_loss_type:-${cfg_val_loss_type:-$val_loss_type}}"
+    local eff_val_batch_size="${cfg_val_batch_size:-$val_batch_size}"
+    local eff_filter_frac="${cfg_filter_frac:-$filter_frac}"
+
     # Build job name
     local method_str="${cfg_method}"
     if [[ "$cfg_internal_method" != "NA" ]] && [ "$use_second_order" = true ]; then
@@ -368,15 +383,15 @@ run_method() {
     fi
 
     local val_type_short
-    case "$val_loss_type" in
+    case "$eff_val_loss_type" in
         seqloss-lastadv) val_type_short="adv" ;;
         seqloss-reward) val_type_short="rew" ;;
         tokenpg) val_type_short="tpg" ;;
         *) val_type_short="$val_loss_type" ;;
     esac
-    local val_str="v${n_val}-${val_type_short}"
-    if [[ "$n_val" -gt 0 ]]; then
-        val_str="${val_str}-b${val_batch_size}"
+    local val_str="v${eff_n_val}-${val_type_short}"
+    if [[ "$eff_n_val" -gt 0 ]]; then
+        val_str="${val_str}-b${eff_val_batch_size}"
     fi
 
     local JOB_NAME="${task}-${model_name}-${method_str}-${cfg_finetuning}-lr${exp_lr}-b${batch_size}-${val_str}-pe${ppo_epochs}-mb${mini_batch_size}-kl${exp_init_kl_coef}-s${seed}"
@@ -406,7 +421,7 @@ run_method() {
 --per_device_train_batch_size=$batch_size \
 --learning_rate=$exp_lr \
 --learning_rate_vhead=$exp_lr_vhead \
---filter_frac=$filter_frac \
+--filter_frac=$eff_filter_frac \
 --max_steps=$max_steps \
 --num_train_epochs=$epochs \
 --seed=$seed \
@@ -455,7 +470,7 @@ run_method() {
     fi
 
     # Validation settings (for data curation)
-    training_args="$training_args --n_val=$n_val --val_batch_size=$val_batch_size --val_loss_type=$val_loss_type"
+    training_args="$training_args --n_val=$eff_n_val --val_batch_size=$eff_val_batch_size --val_loss_type=$eff_val_loss_type"
 
     # Evaluation settings
     training_args="$training_args --eval_interval=$eval_interval --n_eval=$n_eval --eval_batch_size=$eval_batch_size"

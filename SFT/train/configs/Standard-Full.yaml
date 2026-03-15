@@ -1,3 +1,4 @@
-# Standard full fine-tuning with AdamW (no selection, no compression)
+# Standard full fine-tuning with AdamW (no data curation, no compression)
+# Note: curation params (n_val, selection_frac, val_strategy, val_batch_size) are ignored for Standard
 method: Standard
 finetuning: Full

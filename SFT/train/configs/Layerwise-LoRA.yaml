@@ -1,4 +1,4 @@
-# Layerwise selection with LoRA fine-tuning
+# Layerwise data curation with LoRA fine-tuning
 # See configs/README.md for compression format details (LoGra, GraSS, etc.)
 method: Layerwise
 finetuning: LoRA
@@ -9,3 +9,12 @@ lora_dropout: 0.1
 score_grad_compression:
   sparsifier: normal-64*64
   projector: none
+
+# Curation fraction: keep top fraction of samples per layer (default: 0.5)
+selection_frac: 0.5
+
+# Number of held-out validation samples for computing the target gradient.
+# Unlike RLHF, SFT always uses a held-out set (no self-referencing mode).
+n_val: 8
+val_batch_size: 1
+val_strategy: merged_batch

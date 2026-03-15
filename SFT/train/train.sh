@@ -191,6 +191,10 @@ read_yaml() {
     cfg_lora_r=""
     cfg_lora_alpha=""
     cfg_lora_dropout=""
+    cfg_selection_frac=""
+    cfg_n_val=""
+    cfg_val_batch_size=""
+    cfg_val_strategy=""
 
     # Parse YAML with one level of nesting support (section.key)
     local section=""
@@ -225,6 +229,10 @@ read_yaml() {
             score_grad_compression.projector)    cfg_score_projector="$val" ;;
             opt_grad_compression.sparsifier)     cfg_opt_sparsifier="$val" ;;
             opt_grad_compression.projector)      cfg_opt_projector="$val" ;;
+            selection_frac)                      cfg_selection_frac="$val" ;;
+            n_val)                               cfg_n_val="$val" ;;
+            val_batch_size)                      cfg_val_batch_size="$val" ;;
+            val_strategy)                        cfg_val_strategy="$val" ;;
         esac
     done < "$config_file"
 
@@ -321,6 +329,12 @@ run_method() {
     # Read method config
     read_yaml "$config_file"
 
+    # Resolve: config yaml > shell default (for method-specific params)
+    local eff_selection_frac="${cfg_selection_frac:-$selection_frac}"
+    local eff_n_val="${cfg_n_val:-$n_val}"
+    local eff_val_batch_size="${cfg_val_batch_size:-$val_batch_size}"
+    local eff_val_strategy="${cfg_val_strategy:-$val_strategy}"
+
     # Look up LR
     local train_str="${train_dataset:-default}"
     local config_key
@@ -355,7 +369,7 @@ run_method() {
     echo "Job: $JOB_NAME"
     echo "Model: $model | Task: $task | LR: $exp_lr"
     echo "Method: $cfg_method | Finetuning: $cfg_finetuning"
-    echo "Batch: $batch_size | Val: ${val_batch_size} | Curation: $selection_frac"
+    echo "Batch: $batch_size | Val: ${eff_val_batch_size} | Curation: $eff_selection_frac"
     echo "Output: $output_dir"
     echo "=============================================="
 
@@ -387,20 +401,20 @@ run_method() {
 --per_device_train_batch_size $batch_size \
 --method $cfg_internal_method \
 --subject $subject \
---n_val $n_val \
+--n_val $eff_n_val \
 --n_eval $n_eval \
 --analysis_dataset $task \
 --learning_rate $exp_lr \
 --gradient_accumulation_steps $gradient_accumulation_steps \
 --seed $seed \
 --optim $optim \
---selection_frac $selection_frac \
---val_strategy $val_strategy \
+--selection_frac $eff_selection_frac \
+--val_strategy $eff_val_strategy \
 --use_flash_attention $use_flash_attention"
 
     # Optional: train dataset
     [[ -n "$train_dataset" ]] && training_args="$training_args --train_dataset_names $train_dataset"
-    [[ -n "$val_batch_size" ]] && training_args="$training_args --val_batch_size_for_selection $val_batch_size"
+    [[ -n "$eff_val_batch_size" ]] && training_args="$training_args --val_batch_size_for_selection $eff_val_batch_size"
 
     # LoRA (from config, with shell defaults as fallback)
     if [ "$cfg_lora" = true ]; then

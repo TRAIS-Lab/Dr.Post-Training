@@ -77,16 +77,16 @@ def _load_toxicity_prompts(
 
     ds = ds.filter(filter_fn, batched=False)
 
-    # Length sampler for variable input lengths
+    # Length sampler with isolated RNG (avoids polluting global random state)
     import random
-    random.seed(seed)
+    rng = random.Random(seed)
 
     def tokenize(sample):
         prompt = sample["prompt"]["text"]
         continuation = sample["continuation"]["text"]
 
         # Sample input length
-        input_size = random.randint(input_min_length, input_max_length)
+        input_size = rng.randint(input_min_length, input_max_length)
 
         # Encode prompt + continuation, truncate to sampled length
         sample["input_ids"] = tokenizer.encode(prompt + continuation)[:input_size]
@@ -188,16 +188,16 @@ def _load_toxicity_validation_prompts(
     if n_val > 0 and n_val < len(ds):
         ds = ds.select(range(n_val))
 
-    # Length sampler for variable input lengths
+    # Length sampler with isolated RNG (avoids polluting global random state)
     import random
-    random.seed(seed)
+    rng = random.Random(seed)
 
     def tokenize(sample):
         prompt = sample["prompt"]["text"]
         continuation = sample["continuation"]["text"]
 
         # Sample input length
-        input_size = random.randint(input_min_length, input_max_length)
+        input_size = rng.randint(input_min_length, input_max_length)
 
         # Encode prompt + continuation, truncate to sampled length
         sample["input_ids"] = tokenizer.encode(prompt + continuation)[:input_size]

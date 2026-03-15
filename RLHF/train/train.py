@@ -239,18 +239,22 @@ def main():
     )
     logger.info(f"  Train dataset: {len(train_dataset)} samples")
 
-    # Load validation dataset for data selection (if n_val > 0)
+    # Load validation dataset (if n_val > 0 AND method needs it)
+    # Skip for Standard (NA) to avoid perturbing the global RNG state,
+    # which would cause Standard results to differ across n_val settings.
     val_dataset = None
-    if training_args.use_validation_set:
+    if training_args.use_validation_set and training_args.has_selection:
         val_dataset = get_validation_prompt_dataset(
             task=training_args.task,
             tokenizer=tokenizer,
             n_val=training_args.n_val,
             seed=training_args.seed,
         )
-        logger.info(f"  Validation dataset: {len(val_dataset)} samples (fixed set for data selection)")
+        logger.info(f"  Validation dataset: {len(val_dataset)} samples (fixed set)")
+    elif training_args.has_selection:
+        logger.info("  Validation: self-referencing (training buffer)")
     else:
-        logger.info("  Validation: self-referencing (training buffer as validation set)")
+        logger.info("  Validation: none (Standard method)")
 
     # Load policy model with value head for PPO
     logger.info("Loading policy model with value head...")

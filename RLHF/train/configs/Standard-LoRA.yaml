@@ -1,4 +1,5 @@
-# Standard PPO with LoRA (no data selection, no compression)
+# Standard PPO with LoRA (no data curation)
+# n_val and val_loss_type are ignored — Standard skips data curation entirely.
 method: Standard
 finetuning: LoRA
 lora_r: 16
