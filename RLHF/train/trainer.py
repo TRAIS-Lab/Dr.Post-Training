@@ -1,5 +1,5 @@
 """
-Streaming PPO trainer with unified data selection and model update.
+Layerwise PPO trainer with unified data selection and model update.
 """
 
 import logging
@@ -12,8 +12,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
 
-from gradstream.hook import GradientHook
-from gradstream.selection import create_separate_batch_strategy
+from drpt.hook import GradientHook
+from drpt.selection import create_separate_batch_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +149,7 @@ def compute_gae(
     return advantages, returns
 
 
-class StreamingPPOTrainer:
+class LayerwisePPOTrainer:
     """
     PPO Trainer supporting gradient-based data selection with optional compression.
     """
@@ -264,7 +264,7 @@ class StreamingPPOTrainer:
 
         # Log configuration
         logger.info("=" * 60)
-        logger.info("StreamingPPOTrainer Configuration")
+        logger.info("LayerwisePPOTrainer Configuration")
         logger.info(f"  Method: {self.method}")
         if self.method == "IIF":
             logger.info(f"  IIF: Pre-filter entire rollout before PPO epochs")
@@ -560,6 +560,187 @@ class StreamingPPOTrainer:
             # Backward - hooks accumulate gradients into validation cache
             mb_val_loss.backward()
 
+            total_val_loss += mb_val_loss.item()
+
+        return total_val_loss
+
+    def _capture_tokenpg_validation_gradients(
+        self,
+        full_ids: Tensor,
+        full_mask: Tensor,
+        response_ids: Tensor,
+        response_mask: Tensor,
+        advantages: Tensor,
+        query_len: int,
+        batch_size: int,
+    ) -> float:
+        """
+        Capture validation gradients using token-level policy gradient loss.
+
+        Loss: L = -(token_log_probs * per_token_advantages * mask).sum() / N
+
+        Unlike the sequence-level losses, this uses per-token GAE advantages,
+        matching the actual PPO policy gradient direction more closely.
+
+        Args:
+            full_ids: Full sequence (query + response) [N, seq_len]
+            full_mask: Full attention mask [N, seq_len]
+            response_ids: Response token IDs [N, response_len]
+            response_mask: Response attention mask [N, response_len]
+            advantages: Per-token GAE advantages [N, response_len]
+            query_len: Length of query portion
+            batch_size: Mini-batch size for processing
+
+        Returns:
+            Total validation loss value
+        """
+        full_batch_size = full_ids.shape[0]
+        total_val_loss = 0.0
+
+        for i in range(0, full_batch_size, batch_size):
+            end_idx = min(i + batch_size, full_batch_size)
+
+            mb_full_ids = full_ids[i:end_idx]
+            mb_full_mask = full_mask[i:end_idx]
+            mb_response_ids = response_ids[i:end_idx]
+            mb_response_mask = response_mask[i:end_idx]
+            mb_advantages = advantages[i:end_idx]
+
+            # Forward pass
+            outputs = self.model(
+                input_ids=mb_full_ids,
+                attention_mask=mb_full_mask,
+            )
+
+            logits, _ = self._extract_model_outputs(outputs, need_values=False)
+
+            # Log probs for response tokens
+            logits = logits[:, query_len - 1:-1, :]
+            token_log_probs = self._compute_token_logprobs(logits, mb_response_ids)
+
+            # Token-level policy gradient loss
+            mb_val_loss = -(token_log_probs * mb_advantages * mb_response_mask.float()).sum() / full_batch_size
+
+            mb_val_loss.backward()
+            total_val_loss += mb_val_loss.item()
+
+        return total_val_loss
+
+    def _capture_ppo_validation_gradients(
+        self,
+        full_ids: Tensor,
+        full_mask: Tensor,
+        response_ids: Tensor,
+        response_mask: Tensor,
+        rollout_data: Dict[str, Any],
+        query_len: int,
+        batch_size: int,
+    ) -> float:
+        """
+        Capture validation gradients using the actual PPO loss.
+
+        Uses the same clipped surrogate policy gradient + clipped value loss
+        as the training step, so the validation gradient measures exactly
+        "which direction reduces the PPO objective."
+
+        This requires rollout_data with old_logprobs, old_values, advantages,
+        and returns — only available in self-referencing (buffer) mode.
+
+        Args:
+            full_ids: Full sequence (query + response) [N, seq_len]
+            full_mask: Full attention mask [N, seq_len]
+            response_ids: Response token IDs [N, response_len]
+            response_mask: Response attention mask [N, response_len]
+            rollout_data: Dictionary containing old_logprobs, old_values,
+                         advantages, returns from the rollout
+            query_len: Length of query portion
+            batch_size: Mini-batch size for processing
+
+        Returns:
+            Total validation loss value
+        """
+        if rollout_data is None:
+            raise ValueError(
+                "PPO validation loss requires rollout_data (self-referencing mode). "
+                "Set n_val=0 or use a different val_loss_type for fixed validation."
+            )
+
+        old_logprobs = rollout_data["old_logprobs"]
+        old_values = rollout_data["old_values"]
+        advantages = rollout_data["advantages"]
+        returns = rollout_data["returns"]
+
+        full_batch_size = full_ids.shape[0]
+        response_len = response_ids.shape[1]
+        total_val_loss = 0.0
+
+        for i in range(0, full_batch_size, batch_size):
+            end_idx = min(i + batch_size, full_batch_size)
+
+            mb_full_ids = full_ids[i:end_idx]
+            mb_full_mask = full_mask[i:end_idx]
+            mb_response_ids = response_ids[i:end_idx]
+            mb_response_mask = response_mask[i:end_idx]
+            mb_old_logprobs = old_logprobs[i:end_idx]
+            mb_old_values = old_values[i:end_idx]
+            mb_advantages = advantages[i:end_idx]
+            mb_returns = returns[i:end_idx]
+
+            # Forward pass
+            position_ids = mb_full_mask.cumsum(1) - mb_full_mask.long()
+            input_ids_masked = torch.masked_fill(mb_full_ids, ~mb_full_mask.bool(), 0)
+
+            outputs = self.model(
+                input_ids=input_ids_masked,
+                attention_mask=mb_full_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+
+            logits, values_full = self._extract_model_outputs(outputs)
+            if values_full is None:
+                values_full = torch.zeros(end_idx - i, mb_full_ids.shape[1], device=self.device)
+
+            start_idx, end_idx_slice = self._get_response_slice_indices(query_len, response_len)
+            values = values_full[:, start_idx:end_idx_slice]
+
+            logits_for_probs = logits[:, start_idx:end_idx_slice, :]
+            temperature = getattr(self.args, 'temperature', 1.0)
+            new_logprobs = self._compute_token_logprobs(
+                logits_for_probs, mb_response_ids, temperature=temperature
+            )
+
+            # Mask invalid positions
+            padding_mask = (mb_response_mask == 0)
+            new_logprobs = torch.masked_fill(new_logprobs, padding_mask, INVALID_LOGPROB)
+
+            # PPO policy loss (clipped surrogate)
+            logprob_diff = new_logprobs - mb_old_logprobs
+            ratio = torch.exp(logprob_diff)
+            clipped_ratio = torch.clamp(ratio, 1 - self.cliprange, 1 + self.cliprange)
+            pg_loss1 = -mb_advantages * ratio
+            pg_loss2 = -mb_advantages * clipped_ratio
+            pg_loss = torch.max(pg_loss1, pg_loss2)
+            pg_loss = (pg_loss * mb_response_mask).sum() / mb_response_mask.sum().clamp(min=1)
+
+            # Value loss (clipped)
+            seq_lens = mb_response_mask.sum(dim=1) - 1
+            seq_lens_p1 = (seq_lens + 1).clamp(max=response_len - 1)
+            response_idxs = torch.arange(response_len, device=mb_response_mask.device).unsqueeze(0)
+            value_mask = (response_idxs <= seq_lens_p1.unsqueeze(1)).long()
+
+            values = values * value_mask
+            values_clipped = mb_old_values + torch.clamp(
+                values - mb_old_values, -self.cliprange_value, self.cliprange_value)
+            vf_loss1 = (values - mb_returns) ** 2
+            vf_loss2 = (values_clipped - mb_returns) ** 2
+            vf_loss = 0.5 * torch.max(vf_loss1, vf_loss2)
+            vf_loss = (vf_loss * value_mask).sum() / value_mask.sum().clamp(min=1)
+
+            # Total PPO loss (same as training)
+            mb_val_loss = (pg_loss + self.vf_coef * vf_loss) / (full_batch_size / batch_size)
+
+            mb_val_loss.backward()
             total_val_loss += mb_val_loss.item()
 
         return total_val_loss
@@ -1302,9 +1483,17 @@ class StreamingPPOTrainer:
                 seq_scores = (raw_rewards - raw_rewards.mean()) / (raw_rewards.std() + 1e-8)
             else:
                 seq_scores = raw_rewards - raw_rewards.mean()
+        elif val_loss_type == 'tokenpg':
+            # Token-level REINFORCE: uses per-token GAE advantages
+            # Will be handled separately below
+            seq_scores = None
+        elif val_loss_type == 'ppo':
+            # Actual PPO loss (clipped surrogate + value loss)
+            # Will be handled separately below
+            seq_scores = None
         else:
             raise ValueError(f"Unknown val_loss_type: {val_loss_type}. "
-                           f"Supported: 'seqloss-lastadv', 'seqloss-reward'")
+                           f"Supported: 'seqloss-lastadv', 'seqloss-reward', 'tokenpg', 'ppo'")
 
         # Start validation capture mode
         self.grad_hook.start_val_capture(use_factorized=False)
@@ -1312,10 +1501,23 @@ class StreamingPPOTrainer:
         self.model.train()
 
         # Capture gradients
-        total_val_loss = self._capture_validation_gradients_core(
-            full_ids, full_mask, response_ids, response_mask,
-            seq_scores, query_len, self.mini_batch_size,
-        )
+        if val_loss_type == 'ppo':
+            # Actual PPO loss: clipped surrogate policy gradient + value loss
+            total_val_loss = self._capture_ppo_validation_gradients(
+                full_ids, full_mask, response_ids, response_mask,
+                rollout_data, query_len, self.mini_batch_size,
+            )
+        elif val_loss_type == 'tokenpg':
+            # Token-level policy gradient: L = -mean(sum_t(log_prob_t * A_t * mask_t))
+            total_val_loss = self._capture_tokenpg_validation_gradients(
+                full_ids, full_mask, response_ids, response_mask,
+                advantages, query_len, self.mini_batch_size,
+            )
+        else:
+            total_val_loss = self._capture_validation_gradients_core(
+                full_ids, full_mask, response_ids, response_mask,
+                seq_scores, query_len, self.mini_batch_size,
+            )
 
         # Cleanup
         self.optimizer.zero_grad()
@@ -1336,15 +1538,15 @@ class StreamingPPOTrainer:
         validation gradient, then filters out samples with negative influence
         BEFORE starting PPO epochs.
 
-        This is different from GREATS/Streaming which filter during each mini-batch.
+        This is different from Subset/Layerwise which filter during each mini-batch.
 
         Key differences:
         - IIF: Pre-filter entire rollout ONCE → train on filtered data for ALL PPO epochs
-        - GREATS: Filter EACH mini-batch during PPO epochs
-        - Streaming: Per-layer, per-mini-batch filtering
+        - Subset: Filter EACH mini-batch during PPO epochs
+        - Layerwise: Per-layer, per-mini-batch filtering
 
         Implementation:
-        - Uses GREATS-style batched score computation (efficient)
+        - Uses Subset-style batched score computation (efficient)
         - Processes mini-batches to accumulate scores for all samples
         - Applies global selection after all scores are computed
         - No model update during score computation
@@ -1357,8 +1559,8 @@ class StreamingPPOTrainer:
         Returns:
             Tensor of selected sample indices
         """
-        from gradstream.selection.state import GREATSState
-        from gradstream.utils import negative_filtering
+        from drpt.selection.state import SubsetState
+        from drpt.utils import negative_filtering
 
         response_ids = rollout_data["response_ids"]
         response_mask = rollout_data["response_mask"]
@@ -1378,7 +1580,7 @@ class StreamingPPOTrainer:
         # Save original state
         original_state = self.grad_hook.selection_state
 
-        # Enable hooks for GREATS-style score computation
+        # Enable hooks for Subset-style score computation
         self.grad_hook.enable_hooks()
         self.model.train()
 
@@ -1391,8 +1593,8 @@ class StreamingPPOTrainer:
             mb_end = min(mb_start + mini_batch_size, batch_size)
             mb_size = mb_end - mb_start
 
-            # Create a GREATSState sized for this mini-batch
-            mb_state = GREATSState(
+            # Create a SubsetState sized for this mini-batch
+            mb_state = SubsetState(
                 train_batch_size=mb_size,
                 num_layers=num_layers,
                 frac=self.filter_frac,  # Not used for selection here, just for state init
@@ -1448,7 +1650,7 @@ class StreamingPPOTrainer:
             per_sample_loss = -masked_term.sum(dim=1) / mb_response_mask.sum(dim=1).clamp(min=1)
             mb_loss = per_sample_loss.sum()  # Sum for per-sample gradient semantics
 
-            # Backward pass - this triggers GREATS score accumulation via hooks
+            # Backward pass - this triggers Subset score accumulation via hooks
             mb_loss.backward()
 
             # Collect accumulated scores for this mini-batch
@@ -1630,8 +1832,8 @@ class StreamingPPOTrainer:
 
         Uses the selection strategy pattern for clean separation of methods:
         - NA: Standard PPO update
-        - Streaming: Per-layer selection during backward (uses stored val grads)
-        - GREATS: Global selection (two-pass for training)
+        - Layerwise: Per-layer selection during backward (uses stored val grads)
+        - Subset: Global selection (two-pass for training)
 
         Args:
             query_ids, response_ids: Token IDs
@@ -1662,7 +1864,7 @@ class StreamingPPOTrainer:
                 old_logprobs, advantages, returns, old_values,
             )
 
-        # For GREATS, create filter_batch_fn to get filtered compute_loss_fn
+        # For Subset, create filter_batch_fn to get filtered compute_loss_fn
         def filter_batch_fn(selected_indices: Tensor) -> Callable[[], Tuple[Tensor, Dict]]:
             def filtered_compute_loss_fn() -> Tuple[Tensor, Dict]:
                 return self.compute_ppo_loss(
@@ -1708,11 +1910,11 @@ class StreamingPPOTrainer:
         if self.method != "NA" and self.grad_hook is not None:
             sel_state = getattr(self.grad_hook, 'selection_state', None)
             if sel_state is not None:
-                if self.method == "Streaming":
+                if self.method == "Layerwise":
                     if hasattr(sel_state, '_layer_selections') and sel_state._layer_selections:
                         n_selected_list = [n for _, n in sel_state._layer_selections]
                         stats["selection/avg_selected"] = sum(n_selected_list) / len(n_selected_list)
-                elif self.method == "GREATS":
+                elif self.method == "Subset":
                     n_selected = getattr(sel_state, 'num_selected', None)
                     if n_selected is not None:
                         stats["selection/n_selected"] = n_selected
@@ -2142,7 +2344,7 @@ class StreamingPPOTrainer:
                         # Use self-referencing validation (same rollout data)
                         self.capture_validation_gradients(query_ids, query_mask, rollout_data)
 
-                # IIF: Pre-filter rollouts BEFORE PPO epochs (different from GREATS/Streaming)
+                # IIF: Pre-filter rollouts BEFORE PPO epochs (different from Subset/Layerwise)
                 # IIF filters the entire rollout once, then runs standard PPO on filtered data
                 if self.method == "IIF":
                     original_batch_size = query_ids.shape[0]

@@ -1,0 +1,12 @@
+# TEST: Layerwise with MeSO, different compression for score vs update
+# Expected: separate compressor sets — 64*64 for scoring, 512*512 for MeSO
+method: Layerwise
+finetuning: MeSO
+
+score_grad_compression:
+  sparsifier: normal-64*64
+  projector: none
+
+opt_grad_compression:
+  sparsifier: normal-512*512
+  projector: none

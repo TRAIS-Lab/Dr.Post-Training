@@ -1,0 +1,11 @@
+# Layerwise selection with LoRA fine-tuning
+# See configs/README.md for compression format details (LoGra, GraSS, etc.)
+method: Layerwise
+finetuning: LoRA
+lora_r: 32
+lora_alpha: 1
+lora_dropout: 0.1
+
+score_grad_compression:
+  sparsifier: normal-64*64
+  projector: none

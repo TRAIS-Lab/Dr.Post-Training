@@ -77,7 +77,7 @@ train_dataset=""
 subject="sociology"
 compression=""
 use_second_order=false  # If true, use greedy selection with second-order interactions
-selection_frac="0.5"  # Fraction of samples to select (for Streaming/GREATS)
+selection_frac="0.5"  # Fraction of samples to select (for Layerwise/Subset)
 val_strategy="merged_batch"  # Validation strategy: separate_batch_factorized, separate_batch, merged_batch
 use_lora=false
 use_flash_attention=true
@@ -114,29 +114,79 @@ lora_dropout=0.1
 update_compressor_freq=200
 
 # Experiment definitions (same as train.sh)
-# Format: "NAME:data_selection:compression:use_lora"
-# Note: use_second_order is controlled by the --use_second_order flag, not per-method
-declare -A METHOD_DEFS=(
-    ["NA-NA-Full"]="NA::false"
-    ["NA-NA-LoRA"]="NA::true"
-    ["Streaming-NA-Full"]="Streaming::false"
-    ["Streaming-NA-LoRA"]="Streaming::true"
-    ["GREATS-NA-Full"]="GREATS::false"
-    ["GREATS-NA-LoRA"]="GREATS::true"
-    ["Streaming-LoGra-Full"]="Streaming:LoGra:false"
-    ["GREATS-LoGra-Full"]="GREATS:LoGra:false"
-)
+# Config directory (same as train.sh)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="$SCRIPT_DIR/../configs"
+
+# Read YAML config and set exp_* variables for sweep trial
+read_sweep_config() {
+    local config_file="$1"
+    exp_data_selection="NA"
+    exp_use_lora="false"
+    exp_compression=""
+
+    local cfg_method="" cfg_finetuning="" cfg_opt_sparsifier="" cfg_score_sparsifier=""
+    local section=""
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        local full_key="" val=""
+        if [[ "$line" =~ ^[[:space:]] ]]; then
+            val=$(echo "$line" | cut -d: -f2- | xargs | sed 's/^"//;s/"$//' | sed "s/^'//;s/'$//")
+            full_key="${section}.$(echo "$line" | cut -d: -f1 | xargs)"
+        else
+            local top_key top_val
+            top_key=$(echo "$line" | cut -d: -f1 | xargs)
+            top_val=$(echo "$line" | cut -d: -f2- | xargs | sed 's/^"//;s/"$//' | sed "s/^'//;s/'$//")
+            if [[ -z "$top_val" ]]; then
+                section="$top_key"; continue
+            fi
+            section=""
+            full_key="$top_key"
+            val="$top_val"
+        fi
+
+        case "$full_key" in
+            method)                              cfg_method="$val" ;;
+            finetuning)                          cfg_finetuning="$val" ;;
+            lora_r)                              lora_r="$val" ;;
+            lora_alpha)                          lora_alpha="$val" ;;
+            lora_dropout)                        lora_dropout="$val" ;;
+            opt_grad_compression.sparsifier)     cfg_opt_sparsifier="$val" ;;
+            score_grad_compression.sparsifier)   cfg_score_sparsifier="$val" ;;
+        esac
+    done < "$config_file"
+
+    # Map method
+    case "$cfg_method" in
+        Standard) exp_data_selection="NA" ;;
+        *)        exp_data_selection="$cfg_method" ;;
+    esac
+    # Map finetuning
+    case "$cfg_finetuning" in
+        LoRA|MeSO-LoRA) exp_use_lora="true" ;;
+        *)              exp_use_lora="false" ;;
+    esac
+    # MeSO sparsifier takes priority; fall back to score sparsifier for the sweep
+    exp_compression=""
+    if [[ -n "$cfg_opt_sparsifier" && "$cfg_opt_sparsifier" != "none" ]]; then
+        exp_compression="$cfg_opt_sparsifier"
+    elif [[ -n "$cfg_score_sparsifier" && "$cfg_score_sparsifier" != "none" ]]; then
+        exp_compression="$cfg_score_sparsifier"
+    fi
+}
 
 # Category mappings (same as train.sh)
 declare -A CATEGORY_METHODS=(
-    ["all"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
-    ["baseline"]="NA-NA-Full,NA-NA-LoRA"
-    ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
-    ["greats"]="GREATS-NA-Full,GREATS-NA-LoRA,GREATS-LoGra-Full"
-    ["full"]="NA-NA-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
-    ["lora"]="NA-NA-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
-    ["compression"]="Streaming-LoGra-Full,GREATS-LoGra-Full"
-    ["no-compression"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
+    ["all"]="Standard-Full,Standard-LoRA,Standard-MeSO,Standard-MeSO-LoRA,Layerwise-Full,Layerwise-LoRA,Subset-Full,Subset-LoRA,Layerwise-MeSO,Subset-MeSO"
+    ["baseline"]="Standard-Full,Standard-LoRA"
+    ["layerwise"]="Layerwise-Full,Layerwise-LoRA,Layerwise-MeSO"
+    ["subset"]="Subset-Full,Subset-LoRA,Subset-MeSO"
+    ["full"]="Standard-Full,Standard-MeSO,Layerwise-Full,Subset-Full,Layerwise-MeSO,Subset-MeSO"
+    ["lora"]="Standard-LoRA,Standard-MeSO-LoRA,Layerwise-LoRA,Subset-LoRA"
+    ["compression"]="Standard-MeSO,Standard-MeSO-LoRA,Layerwise-MeSO,Subset-MeSO"
+    ["no-compression"]="Standard-Full,Standard-LoRA,Layerwise-Full,Layerwise-LoRA,Subset-Full,Subset-LoRA"
 )
 
 # Parse named arguments
@@ -311,8 +361,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --methods <list>                   Run sweep for multiple methods"
             echo "  --dry-run                              Print commands without executing"
             echo ""
-            echo "  Experiment names: NA-NA-Full, NA-NA-LoRA, Streaming-NA-Full, etc."
-            echo "  Categories: all, baseline, streaming, greats, Full, LoRA, compression"
+            echo "  Experiment names: Standard-Full, Standard-LoRA, Layerwise-Full, etc."
+            echo "  Categories: all, baseline, layerwise, subset, Full, LoRA, compression"
             echo ""
             echo "Shared Options (same as train.sh):"
             echo "  --model <model>                        HuggingFace model path (default: meta-llama/Llama-3.2-1B)"
@@ -356,7 +406,7 @@ resolve_methods() {
             else
                 resolved="${CATEGORY_METHODS[$item]}"
             fi
-        elif [[ -n "${METHOD_DEFS[$item]}" ]]; then
+        elif [[ -f "$CONFIG_DIR/${item}.yaml" ]]; then
             if [[ -n "$resolved" ]]; then
                 resolved="$resolved,$item"
             else
@@ -375,7 +425,7 @@ resolve_methods() {
 # ========================================
 # We use eval_loss (evaluation/test set) for LR selection, NOT val_loss (validation set).
 # This prevents overfitting to the validation set which is also used for data selection
-# during Streaming/GREATS training.
+# during Layerwise/Subset training.
 extract_eval_loss() {
     local output_dir="$1"
     local eval_loss=""
@@ -475,33 +525,6 @@ run_lr_trial() {
 
     local exp_base_training_args="$base_training_args"
 
-    # Compression configuration
-    local sparsification=""
-    local projection=""
-    if [[ -n "$exp_compression" ]]; then
-        case "$exp_compression" in
-            LoGra)
-                if [ "$exp_use_lora" = true ]; then
-                    sparsification="normal-128*128"
-                else
-                    sparsification="normal-512*512"
-                fi
-                ;;
-            GraSS)
-                if [ "$exp_use_lora" = true ]; then
-                    sparsification="random_mask-256*256"
-                    projection="sjlt-16384"
-                else
-                    sparsification="random_mask-1024*1024"
-                    projection="sjlt-262144"
-                fi
-                ;;
-        esac
-    fi
-
-    # Use model path directly
-    local MODEL_PATH="$model"
-
     # Model-specific configurations (match by path pattern)
     case "$model" in
         *Llama-2-13b*|*llama-2-13b*)
@@ -521,7 +544,7 @@ run_lr_trial() {
 -m SFT.train.train"
 
     local training_args="$exp_base_training_args \
---model_name_or_path $MODEL_PATH \
+--model_name_or_path $model \
 --output_dir $trial_output_dir \
 --data_dir $data_dir \
 --percentage $sweep_percentage \
@@ -546,19 +569,15 @@ run_lr_trial() {
     if [[ -n "$val_batch_size" ]]; then
         training_args="$training_args --val_batch_size_for_selection $val_batch_size"
     fi
+    # LoRA
     if [ "$exp_use_lora" = true ]; then
         training_args="$training_args --lora True --lora_alpha $lora_alpha --lora_r $lora_r --lora_dropout $lora_dropout --lora_target_modules q_proj k_proj v_proj o_proj"
     else
         training_args="$training_args --lora False"
     fi
-    if [[ -n "$sparsification" ]]; then
-        training_args="$training_args --sparsification $sparsification"
-    fi
-    if [[ -n "$projection" ]]; then
-        training_args="$training_args --projection $projection"
-    fi
+    # MeSO compression (passed directly as sparsification string, e.g. "normal-512*512")
     if [[ -n "$exp_compression" ]]; then
-        training_args="$training_args --update_compressor_freq $update_compressor_freq"
+        training_args="$training_args --sparsification $exp_compression --update_compressor_freq $update_compressor_freq"
     fi
     if [[ "$exp_data_selection" != "NA" ]] && [ "$exp_use_second_order" = true ]; then
         training_args="$training_args --use_second_order True"
@@ -704,12 +723,13 @@ if [[ -n "$methods" ]]; then
         echo "  [$current/$method_count] $exp_name"
         echo "========================================================"
 
-        # Parse method definition
-        IFS=':' read -ra exp_parts <<< "${METHOD_DEFS[$exp_name]}"
-        exp_data_selection="${exp_parts[0]}"
-        exp_compression="${exp_parts[1]}"
-        exp_use_lora="${exp_parts[2]}"
-        # use_second_order is controlled globally via --use_second_order flag
+        # Read config from YAML file
+        local config_file="$CONFIG_DIR/${exp_name}.yaml"
+        if [[ ! -f "$config_file" ]]; then
+            echo "ERROR: Config not found: $config_file"
+            continue
+        fi
+        read_sweep_config "$config_file"
         exp_use_second_order="$use_second_order"
 
         echo "" >> "$summary_file"
@@ -939,7 +959,7 @@ else
     echo "ERROR: Please specify methods with --methods"
     echo "Example: --methods all"
     echo "         --methods baseline"
-    echo "         --methods NA-NA-Full,Streaming-NA-Full"
+    echo "         --methods Standard-Full,Layerwise-Full"
     exit 1
 fi
 

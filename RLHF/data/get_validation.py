@@ -2,7 +2,7 @@
 Validation dataset loading for RLHF experiments.
 
 This module provides utilities for loading validation datasets used
-for data selection during gradient streaming.
+for data selection during layer-wise descent.
 """
 
 from typing import Optional
@@ -23,7 +23,7 @@ def get_validation_dataset(
     Load validation dataset for data selection.
 
     The validation dataset represents "good" examples that we want
-    the model to learn from. During gradient streaming, we compute
+    the model to learn from. During layer-wise descent, we compute
     gradients on this dataset to determine which training samples
     are most beneficial.
 

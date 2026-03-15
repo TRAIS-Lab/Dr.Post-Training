@@ -1,0 +1,8 @@
+# Standard fine-tuning with MeSO optimizer (no selection)
+# See configs/README.md for compression format details (LoGra, GraSS, etc.)
+method: Standard
+finetuning: MeSO
+
+opt_grad_compression:
+  sparsifier: normal-512*512
+  projector: none

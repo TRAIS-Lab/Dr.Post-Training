@@ -16,7 +16,7 @@ python data/prepare_data.py \
     --num_samples 1000 \
     --seed 42
 
-# 3. Run training with Streaming selection (default)
+# 3. Run training with Layerwise selection (default)
 bash scripts/run_qwen1.7b_math_grpo.sh
 
 # 4. Or disable selection for baseline
@@ -119,14 +119,14 @@ VAL_PROMPTS_PATH=$DATA_DIR/math/val_from_train.parquet bash scripts/run_qwen1.7b
 **Important:** Always run scripts from the `RLVR/` directory to ensure all output folders are created in consistent locations.
 
 ```bash
-# With Streaming selection (default)
+# With Layerwise selection (default)
 bash scripts/run_qwen1.7b_math_grpo.sh
 
 # Baseline (no selection)
 bash scripts/run_qwen1.7b_math_grpo.sh ++selection.enable=False
 
-# With GREATS selection
-SELECTION_METHOD=GREATS bash scripts/run_qwen1.7b_math_grpo.sh
+# With Subset selection
+SELECTION_METHOD=Subset bash scripts/run_qwen1.7b_math_grpo.sh
 ```
 
 ## Configuration
@@ -138,7 +138,7 @@ SELECTION_METHOD=GREATS bash scripts/run_qwen1.7b_math_grpo.sh
 | `N_GPUS`            | auto      | Number of GPUs                             |
 | `SEED`              | 42        | Random seed for reproducibility            |
 | `SELECTION_ENABLED` | True      | Enable/disable selection                   |
-| `SELECTION_METHOD`  | Streaming | Selection method: `Streaming` or `GREATS`  |
+| `SELECTION_METHOD`  | Layerwise | Selection method: `Layerwise` or `Subset`  |
 | `SELECTION_FRAC`    | 1.0       | Fraction of samples to select              |
 | `VAL_POOL_SIZE`     | 500       | Number of validation prompts               |
 | `VAL_BATCH_SIZE`    | 32        | Batch size for validation gradient capture |
@@ -162,7 +162,7 @@ bash scripts/run_qwen1.7b_math_grpo.sh actor_rollout_ref.model.path=Qwen/Qwen3-4
 bash scripts/run_qwen1.7b_math_grpo.sh seed=123
 
 # Multiple overrides
-bash scripts/run_qwen1.7b_math_grpo.sh ++selection.method=GREATS ++selection.frac=0.8
+bash scripts/run_qwen1.7b_math_grpo.sh ++selection.method=Subset ++selection.frac=0.8
 ```
 
 ## MATH Dataset Info

@@ -1,5 +1,5 @@
 """
-Streaming SFT trainer with unified data selection and model update.
+Layer-wise SFT trainer with unified data selection and model update.
 """
 
 import json
@@ -16,14 +16,14 @@ from torch import Tensor
 
 from transformers import Trainer
 
-from gradstream.optimizer import MeSOAdamW
-from gradstream.hook import GradientHook
-from gradstream.selection import create_separate_batch_strategy, create_merged_batch_strategy
+from drpt.optimizer import MeSOAdamW
+from drpt.hook import GradientHook
+from drpt.selection import create_separate_batch_strategy, create_merged_batch_strategy
 
 logger = logging.getLogger(__name__)
 
 
-class StreamingTrainer(Trainer):
+class LayerwiseTrainer(Trainer):
     """
     SFT Trainer supporting gradient-based data selection with optional compression.
     """
@@ -44,7 +44,7 @@ class StreamingTrainer(Trainer):
         # Extract eval_dataset from kwargs before passing to parent
         eval_dataset = kwargs.get('eval_dataset', None)
         if eval_dataset is None:
-            raise ValueError("StreamingTrainer requires an eval_dataset to be passed in kwargs")
+            raise ValueError("LayerwiseTrainer requires an eval_dataset to be passed in kwargs")
 
         # Pass eval_dataset to parent Trainer
         super().__init__(*args, **kwargs)
@@ -80,7 +80,7 @@ class StreamingTrainer(Trainer):
         )
 
         # Create validation dataloader iterator for efficient batch sampling during training
-        # Only needed if we're doing gradient streaming (data selection)
+        # Only needed if we're doing layer-wise data selection
         if val_dataset is not None:
             self.val_dataloader_iter = iter(
                 self.get_val_dataloader(self.val_dataset, batch_size=self.val_batch_size_for_selection, shuffle=True)
@@ -88,11 +88,16 @@ class StreamingTrainer(Trainer):
         else:
             self.val_dataloader_iter = None
 
-        # Determine if we have compression (which implies MeSO)
+        # Determine if we have update compression (which implies MeSO)
         self.has_compression = (
             self.grad_hook is not None and
-            any(c is not None for c in self.grad_hook.compressors)
+            self.grad_hook.compression_mode.uses_compressed_updates
         )
+
+        # Selection recording for case study analysis
+        self._record_selections = getattr(self.args, 'record_selections', False)
+        self._record_selections_freq = max(1, getattr(self.args, 'record_selections_freq', 1))
+        self._selection_records = []
 
         # Create selection strategy for clean separation of selection methods
         # SFT uses topk mode: select top frac samples by alignment score
@@ -108,6 +113,7 @@ class StreamingTrainer(Trainer):
                 frac=getattr(self.args, 'selection_frac', 0.5),
                 use_second_order=getattr(self.args, 'use_second_order', False),
                 selection_mode="topk",
+                record_selections=self._record_selections,
             )
         else:
             # separate_batch_factorized or separate_batch
@@ -117,11 +123,12 @@ class StreamingTrainer(Trainer):
                 frac=getattr(self.args, 'selection_frac', 0.5),
                 use_second_order=getattr(self.args, 'use_second_order', False),
                 selection_mode="topk",
+                record_selections=self._record_selections,
             )
         self.val_strategy = val_strategy
 
         logger.info("="*60)
-        logger.info("Initialized StreamingTrainer")
+        logger.info("Initialized LayerwiseTrainer")
         selection_frac = getattr(self.args, 'selection_frac', None)
         logger.info(f"  Method: {self.args.method} (selection fraction: {selection_frac})")
         logger.info(f"  Validation strategy: {self.val_strategy}")
@@ -130,10 +137,12 @@ class StreamingTrainer(Trainer):
         logger.info(f"  Evaluation set size: {len(eval_dataset) if eval_dataset is not None else 0}")
         logger.info(f"  Training batch size: {self.args.per_device_train_batch_size}")
         logger.info(f"  Validation batch size (for selection): {self.val_batch_size_for_selection}")
+        if self._record_selections:
+            logger.info(f"  Selection recording: enabled (every {self._record_selections_freq} steps)")
 
         # Log the training mode based on configuration
         # Naming convention: {selection}-{compression}-{training_type}
-        if self.args.method in ('Streaming', 'GREATS'):
+        if self.args.method in ('Layerwise', 'Subset'):
             if self.has_compression:
                 logger.info(f"  Mode: {self.args.method} with compression (MeSO optimizer)")
             else:
@@ -280,8 +289,8 @@ class StreamingTrainer(Trainer):
         Training step using selection strategy pattern.
 
         The selection strategy handles the difference between:
-        - Streaming: Single-pass, per-layer selection
-        - GREATS: Two-pass, global selection
+        - Layerwise: Single-pass, per-layer selection
+        - Subset: Two-pass, global selection
         - NA: Baseline (no selection)
 
         With or without compression (MeSO).
@@ -295,8 +304,8 @@ class StreamingTrainer(Trainer):
             if isinstance(unwrapped_optimizer, MeSOAdamW):
                 unwrapped_optimizer.refresh_compressors_if_needed()
 
-        # === DATA SELECTION MODE (Streaming or GREATS) ===
-        if args.method in ('Streaming', 'GREATS'):
+        # === DATA SELECTION MODE (Layerwise or Subset) ===
+        if args.method in ('Layerwise', 'Subset'):
             # Get validation batch for selection
             try:
                 val_batch = next(self.val_dataloader_iter)
@@ -329,7 +338,7 @@ class StreamingTrainer(Trainer):
                     train_batch_size=train_batch_size,
                     compute_loss_fn=compute_loss,
                     lr=lr,
-                    batch_train=batch_train,  # For GREATS pass 2
+                    batch_train=batch_train,  # For Subset pass 2
                 )
             else:
                 # === SEPARATE BATCH MODE: Separate val pass, then train with stored grads ===
@@ -356,7 +365,7 @@ class StreamingTrainer(Trainer):
                     lr=lr,
                     # Pass labels for token-based gradient scaling
                     labels=batch_train.get('labels'),
-                    # For GREATS pass 2, provide filter function
+                    # For Subset pass 2, provide filter function
                     filter_batch_fn=lambda indices: (
                         lambda: (self._compute_loss_for_selection(model, {
                             'input_ids': batch_train['input_ids'][indices],
@@ -368,6 +377,10 @@ class StreamingTrainer(Trainer):
 
                 # Cleanup val buffer
                 self.grad_hook.clear_val_buffer()
+
+            # Record selection data for case study
+            if self._record_selections and self.state.global_step % self._record_selections_freq == 0:
+                self._capture_selection_record(batch_train, batch_val)
 
             return loss
 
@@ -415,6 +428,64 @@ class StreamingTrainer(Trainer):
             self.grad_hook.enable_hooks()
 
         return loss.detach()
+
+    def _capture_selection_record(
+        self,
+        batch_train: Dict[str, Tensor],
+        batch_val: Dict[str, Tensor],
+    ):
+        """Capture selection record from the last training step.
+
+        Records decoded text for both training and validation samples,
+        along with per-layer (Layerwise) or global (Subset) selection data.
+        """
+        record = getattr(self.selection_strategy, 'last_selection_record', None)
+        if record is None:
+            return
+
+        # Decode training and validation samples to text
+        tokenizer = self.processing_class
+        train_texts = tokenizer.batch_decode(batch_train['input_ids'], skip_special_tokens=False)
+        val_texts = tokenizer.batch_decode(batch_val['input_ids'], skip_special_tokens=False)
+
+        step_record = {
+            'step': self.state.global_step,
+            'train_samples': train_texts,
+            'val_samples': val_texts,
+        }
+
+        if self.args.method == 'Layerwise':
+            step_record['layers'] = record
+        else:
+            # Subset: single global selection
+            step_record['selection'] = record[0] if record else {}
+
+        self._selection_records.append(step_record)
+
+    def _save_selection_records(self):
+        """Save accumulated selection records to JSON file."""
+        if not self._selection_records:
+            return
+
+        output_file = os.path.join(self.args.output_dir, "selection_records.json")
+        Path(self.args.output_dir).mkdir(parents=True, exist_ok=True)
+
+        data = {
+            'metadata': {
+                'method': self.args.method,
+                'selection_frac': self.args.selection_frac,
+                'train_batch_size': self.args.per_device_train_batch_size,
+                'record_freq': self._record_selections_freq,
+                'num_layers': len(self.grad_hook.layer_names) if self.grad_hook else 0,
+                'layer_names': self.grad_hook.layer_names if self.grad_hook else [],
+            },
+            'steps': self._selection_records,
+        }
+
+        with open(output_file, 'w') as f:
+            json.dump(data, f)
+
+        logger.info(f"Saved {len(self._selection_records)} selection records to {output_file}")
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         """
@@ -480,6 +551,7 @@ class StreamingTrainer(Trainer):
         }
         self.evaluation_results.append(result_entry)
         self._save_evaluation_results()
+        self._save_selection_records()
 
         logger.info(
             f"Step {self.state.global_step}: "
@@ -489,7 +561,7 @@ class StreamingTrainer(Trainer):
         )
 
         # Re-enable hooks after evaluation if selection method is active OR compression is used
-        # Hooks are needed for both: (1) streaming data selection, (2) MeSO compressed gradients
+        # Hooks are needed for both: (1) layer-wise data selection, (2) MeSO compressed gradients
         if self.grad_hook is not None and (self.args.method != "NA" or self.has_compression):
             self.grad_hook.enable_hooks()
 
@@ -589,4 +661,5 @@ class StreamingTrainer(Trainer):
     def on_train_end(self):
         """Called at the end of training to save final results."""
         self._save_evaluation_results()
+        self._save_selection_records()
         logger.info(f"Training completed. Final results saved to {self.args.output_dir}/evaluation_results.json")

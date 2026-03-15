@@ -1,6 +1,6 @@
 #!/bin/bash
 # Launch script for running Qwen 1.7B GRPO on MATH with multiple seeds and settings
-# Settings: Baseline, Streaming (default), GREATS
+# Settings: Baseline, Layerwise (default), Subset
 
 set -e
 
@@ -24,16 +24,16 @@ for SEED in "${SEEDS[@]}"; do
     #     --export=ALL,SEED=$SEED,SELECTION_ENABLED=False \
     #     "$MAIN_SCRIPT"
 
-    # 2. Streaming (default selection method)
-    echo "Submitting: Streaming (seed=$SEED)"
-    sbatch --job-name="RLVR-MATH-streaming-s${SEED}" \
-        --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=Streaming \
+    # 2. Layerwise (default selection method)
+    echo "Submitting: Layerwise (seed=$SEED)"
+    sbatch --job-name="RLVR-MATH-layerwise-s${SEED}" \
+        --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=Layerwise \
         "$MAIN_SCRIPT"
 
-    # # 3. GREATS selection
-    # echo "Submitting: GREATS (seed=$SEED)"
-    # sbatch --job-name="RLVR-MATH-greats-s${SEED}" \
-    #     --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=GREATS \
+    # # 3. Subset selection
+    # echo "Submitting: Subset (seed=$SEED)"
+    # sbatch --job-name="RLVR-MATH-subset-s${SEED}" \
+    #     --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=Subset \
     #     "$MAIN_SCRIPT"
 done
 

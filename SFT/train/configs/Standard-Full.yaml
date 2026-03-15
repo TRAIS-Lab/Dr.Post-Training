@@ -1,0 +1,3 @@
+# Standard full fine-tuning with AdamW (no selection, no compression)
+method: Standard
+finetuning: Full

@@ -1,0 +1,9 @@
+# Subset selection with LoRA (exact scoring, no compression)
+method: Subset
+finetuning: LoRA
+lora_r: 16
+lora_alpha: 32
+
+score_grad_compression:
+  sparsifier: none
+  projector: none

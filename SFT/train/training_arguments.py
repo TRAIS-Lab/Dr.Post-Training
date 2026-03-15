@@ -85,7 +85,7 @@ class TrainingArguments(TA):
         metadata={
             "help": (
                 "Data selection method: 'NA' (no selection), "
-                "'Streaming' (per-layer selection), or 'GREATS' (global selection)"
+                "'Layerwise' (per-layer selection), or 'Subset' (global selection)"
             )
         },
     )
@@ -144,13 +144,14 @@ class TrainingArguments(TA):
             )
         },
     )
-    score_compression_dim: int = field(
-        default=64,
+    score_compression: str = field(
+        default=None,
         metadata={
             "help": (
-                "Dimension for score-only compression (factorized, so actual dim is score_compression_dim^2). "
-                "Used when data selection is enabled but no explicit compression is specified. "
-                "Set to 0 to disable auto score compression. Default: 64 (i.e., 64*64)"
+                "Score-only compression for influence score computation. "
+                "Same format as sparsification: 'METHOD-DIM*DIM'. "
+                "Examples: 'normal-64*64' (Gaussian, 64x64 factorized). "
+                "Set to None to disable (use exact scoring). Default: None"
             )
         },
     )
@@ -173,6 +174,27 @@ class TrainingArguments(TA):
                 "'separate_batch': Separate val pass, store mean gradient [O,I] per layer. "
                 "'merged_batch': Merge train+val into single batch, compute val grad in same pass. "
                 "All modes should produce identical gradients when selection_frac=1.0."
+            )
+        },
+    )
+
+    # Selection Recording (Case Study)
+    record_selections: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Record selected sample indices and scores per step for case study analysis. "
+                "For Layerwise: records per-layer selections. For Subset: records global selection. "
+                "Saves to output_dir/selection_records.json."
+            )
+        },
+    )
+    record_selections_freq: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Record selections every N steps. Default: 1 (every step). "
+                "Increase to reduce file size for long training runs."
             )
         },
     )

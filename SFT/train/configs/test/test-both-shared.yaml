@@ -1,0 +1,12 @@
+# TEST: Layerwise with MeSO, same compression for both (shared compressors)
+# Expected: single set of compressors used for both scoring and updates
+method: Layerwise
+finetuning: MeSO
+
+score_grad_compression:
+  sparsifier: normal-512*512
+  projector: none
+
+opt_grad_compression:
+  sparsifier: normal-512*512
+  projector: none

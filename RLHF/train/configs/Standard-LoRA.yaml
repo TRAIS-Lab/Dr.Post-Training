@@ -1,0 +1,5 @@
+# Standard PPO with LoRA (no data selection, no compression)
+method: Standard
+finetuning: LoRA
+lora_r: 16
+lora_alpha: 32

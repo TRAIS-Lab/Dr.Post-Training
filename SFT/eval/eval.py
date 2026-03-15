@@ -181,7 +181,7 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None, method: Op
     Args:
         models_dir: Directory containing model directories
         train_dataset: Filter prefix (e.g., "tulu3_tydiqa")
-        method: Method filter (e.g., "NA-LoGra-Full", "Streaming-NA-Full")
+        method: Method filter (e.g., "Standard-MeSO", "Layerwise-Full")
     """
     model_paths = []
     for entry in os.listdir(models_dir):
@@ -198,10 +198,10 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None, method: Op
                 if not (entry.startswith(train_dataset + "-") or entry.startswith(train_dataset + "_")):
                     continue
 
-            # Check method filter (e.g., "NA-LoGra-Full" matches "-NA-LoGra-Full-")
+            # Check method filter (e.g., "Standard-MeSO" matches "-Standard-MeSO-")
             if method is not None:
-                # Method appears in directory name as -{selection}-{compression}-{training_type}-
-                # e.g., tulu3_tydiqa-Llama-3.2-1B-NA-LoGra-Full-p0.01-...
+                # Method appears in directory name as -{method}-{finetuning}-
+                # e.g., tulu3_tydiqa-Llama-3.2-1B-Standard-MeSO-p0.01-...
                 method_pattern = f"-{method}-"
                 if method_pattern not in entry:
                     continue
@@ -465,7 +465,7 @@ def main():
     parser.add_argument("--subject", type=str, default=None,
         help="MMLU subject or BBH task to evaluate on (default: all)")
     parser.add_argument("--method", type=str, default=None,
-        help="Filter by method (e.g., NA-LoGra-Full, Streaming-NA-Full)")
+        help="Filter by method (e.g., Standard-MeSO, Layerwise-Full)")
     parser.add_argument("--data_dir", type=str, default=None,
         help="Data directory (default: auto-detect)")
     parser.add_argument("--n_test", type=int, default=-1,

@@ -22,10 +22,15 @@ CODE_DIR=/home/pbb/Project
 
 cd $CODE_DIR/Gradient-Streaming
 
-# Set PYTHONPATH to include project root for imports
 export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
 
-# Base training arguments (static, never change)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="$SCRIPT_DIR/configs"
+
+# =============================================================================
+# Common settings (shared across all methods, overridden via CLI)
+# =============================================================================
+
 export base_training_args="--do_train=True \
 --do_eval=True \
 --max_seq_length=512 \
@@ -44,347 +49,230 @@ export base_training_args="--do_train=True \
 --overwrite_output_dir=True \
 --report_to=none"
 
-# Default values
 model="meta-llama/Llama-3.2-1B"
 data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
-train_dataset=""  # Training dataset (if empty, uses task-based default)
+train_dataset=""
 percentage=0.05
 task="mmlu"
 subject="sociology"
 seed=42
 
-# Training settings
-optim="adamw_torch"  # Standard HF optimizer (adamw_torch, adamw_hf, etc.)
+optim="adamw_torch"
 batch_size=8
 gradient_accumulation_steps=1
 use_flash_attention=true
 
-# data selection
-data_selection="NA"  # NA, Streaming, or GREATS
-selection_frac="0.5"  # Fraction of samples to select
-use_second_order=false  # If true, use greedy selection with second-order interactions
-n_val=8  # Number of validation samples for data selection
-val_batch_size="1"  # Defaults to batch_size if not specified
-val_strategy="merged_batch"  # Validation strategy: separate_batch_factorized, separate_batch, merged_batch
+selection_frac="0.5"
+use_second_order=false
+n_val=8
+val_batch_size="1"
+val_strategy="merged_batch"
 
 # LR configuration
 lr_config_file="SFT/train/lr/config.json"
-lr_override=""  # Set when --lr is explicitly passed
-# Default LRs (used when lr_config.json has no entry for the method)
+lr_override=""
 default_lr_full="5e-05"
 default_lr_lora="2e-04"
 
-# Evaluation settings
+# Evaluation
 n_eval=500
 
-# LoRA settings
-use_lora=false
+# LoRA defaults (can be overridden per config)
 lora_r=32
 lora_alpha=1
 lora_dropout=0.1
-lora_target_modules=""  # Empty = PEFT auto-detects (out_proj for GPT-Neo, o_proj for LLaMA)
 
-# Compression settings
-compression=""  # NA, GraSS, or LoGra. Compression implies MeSO optimizer and compressed gradient for data selection.
+# Compressor update frequency (for compression methods)
 update_compressor_freq=200
-score_compression_dim=64  # Auto score compression dimension (default: 64, i.e., 64*64). Set to 0 to disable.
+
+# Selection recording
+record_selections=false
+record_selections_freq=1
 
 # Multi-method mode
-methods=""  # Comma-separated list of methods or categories
+methods=""
 dry_run=false
 
-# ========================================
-# Experiment Definitions
-# ========================================
-# Format: "data_selection:compression:use_lora"
-# Note: use_second_order is controlled by the --use_second_order flag, not per-method
-declare -A METHOD_DEFS=(
-    ["NA-NA-Full"]="NA::false"
-    ["NA-NA-LoRA"]="NA::true"
-    ["NA-LoGra-Full"]="NA:LoGra:false"
-    ["NA-LoGra-LoRA"]="NA:LoGra:true"
-    ["Streaming-NA-Full"]="Streaming::false"
-    ["Streaming-NA-LoRA"]="Streaming::true"
-    ["GREATS-NA-Full"]="GREATS::false"
-    ["GREATS-NA-LoRA"]="GREATS::true"
-    ["Streaming-LoGra-Full"]="Streaming:LoGra:false"
-    ["GREATS-LoGra-Full"]="GREATS:LoGra:false"
-)
-
-# Category mappings
+# =============================================================================
+# Category mappings (for --methods shorthand)
+# =============================================================================
 declare -A CATEGORY_METHODS=(
-    ["all"]="NA-NA-Full,NA-NA-LoRA,NA-LoGra-Full,NA-LoGra-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
-    ["baseline"]="NA-NA-Full,NA-NA-LoRA"
-    ["streaming"]="Streaming-NA-Full,Streaming-NA-LoRA,Streaming-LoGra-Full"
-    ["greats"]="GREATS-NA-Full,GREATS-NA-LoRA,GREATS-LoGra-Full"
-    ["full"]="NA-NA-Full,NA-LoGra-Full,Streaming-NA-Full,GREATS-NA-Full,Streaming-LoGra-Full,GREATS-LoGra-Full"
-    ["lora"]="NA-NA-LoRA,NA-LoGra-LoRA,Streaming-NA-LoRA,GREATS-NA-LoRA"
-    ["compression"]="NA-LoGra-Full,NA-LoGra-LoRA,Streaming-LoGra-Full,GREATS-LoGra-Full"
-    ["no-compression"]="NA-NA-Full,NA-NA-LoRA,Streaming-NA-Full,Streaming-NA-LoRA,GREATS-NA-Full,GREATS-NA-LoRA"
+    ["all"]="Standard-Full,Standard-LoRA,Standard-MeSO,Layerwise-Full,Layerwise-LoRA,Subset-Full,Subset-LoRA,Layerwise-MeSO,Subset-MeSO"
+    ["baseline"]="Standard-Full,Standard-LoRA"
+    ["layerwise"]="Layerwise-Full,Layerwise-LoRA,Layerwise-MeSO"
+    ["subset"]="Subset-Full,Subset-LoRA,Subset-MeSO"
+    ["full"]="Standard-Full,Standard-MeSO,Layerwise-Full,Subset-Full,Layerwise-MeSO,Subset-MeSO"
+    ["lora"]="Standard-LoRA,Layerwise-LoRA,Subset-LoRA"
+    ["compression"]="Standard-MeSO,Layerwise-MeSO,Subset-MeSO"
+    ["no-compression"]="Standard-Full,Standard-LoRA,Layerwise-Full,Layerwise-LoRA,Subset-Full,Subset-LoRA"
 )
 
-# Parse named arguments
+# =============================================================================
+# Parse CLI arguments
+# =============================================================================
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --data_selection)
-            data_selection="$2"
-            shift 2
-            ;;
-        --optim)
-            optim="$2"
-            shift 2
-            ;;
-        --batch_size)
-            batch_size="$2"
-            shift 2
-            ;;
-        --val_batch_size)
-            val_batch_size="$2"
-            shift 2
-            ;;
-        --percentage)
-            percentage="$2"
-            shift 2
-            ;;
-        --n_val)
-            n_val="$2"
-            shift 2
-            ;;
-        --n_eval)
-            n_eval="$2"
-            shift 2
-            ;;
-        --model)
-            model="$2"
-            shift 2
-            ;;
-        --lr)
-            lr_override="$2"
-            shift 2
-            ;;
-        --lr_config)
-            lr_config_file="$2"
-            shift 2
-            ;;
-        --seed)
-            seed="$2"
-            shift 2
-            ;;
-        --gradient_accumulation_steps)
-            gradient_accumulation_steps="$2"
-            shift 2
-            ;;
-        --task)
-            task="$2"
-            shift 2
-            ;;
-        --train)
-            train_dataset="$2"
-            shift 2
-            ;;
-        --subject)
-            subject="$2"
-            shift 2
-            ;;
-        --compression)
-            compression="$2"
-            shift 2
-            ;;
-        --use_second_order)
-            use_second_order=true
-            shift 1
-            ;;
-        --selection_frac)
-            selection_frac="$2"
-            shift 2
-            ;;
-        --val_strategy)
-            val_strategy="$2"
-            shift 2
-            ;;
-        --update_compressor_freq)
-            update_compressor_freq="$2"
-            shift 2
-            ;;
-        --score_compression_dim)
-            score_compression_dim="$2"
-            shift 2
-            ;;
-        --lora)
-            use_lora=true
-            shift 1
-            ;;
-        --flash_attention)
-            use_flash_attention=true
-            shift 1
-            ;;
-        --lora_alpha)
-            lora_alpha="$2"
-            shift 2
-            ;;
-        --lora_r)
-            lora_r="$2"
-            shift 2
-            ;;
-        --lora_dropout)
-            lora_dropout="$2"
-            shift 2
-            ;;
-        --lora_target_modules)
-            lora_target_modules="$2"
-            shift 2
-            ;;
-        --data_dir)
-            data_dir="$2"
-            shift 2
-            ;;
-        --lr_lora)
-            # Deprecated: LRs are now managed via lr_config.json
-            # This sets the default LR for LoRA methods when not found in config
-            default_lr_lora="$2"
-            shift 2
-            ;;
-        --methods)
-            methods="$2"
-            shift 2
-            ;;
-        --dry-run)
-            dry_run=true
-            shift
+        --methods)        methods="$2"; shift 2 ;;
+        --model)          model="$2"; shift 2 ;;
+        --task)           task="$2"; shift 2 ;;
+        --train)          train_dataset="$2"; shift 2 ;;
+        --subject)        subject="$2"; shift 2 ;;
+        --batch_size)     batch_size="$2"; shift 2 ;;
+        --val_batch_size) val_batch_size="$2"; shift 2 ;;
+        --percentage)     percentage="$2"; shift 2 ;;
+        --n_val)          n_val="$2"; shift 2 ;;
+        --n_eval)         n_eval="$2"; shift 2 ;;
+        --lr)             lr_override="$2"; shift 2 ;;
+        --lr_config)      lr_config_file="$2"; shift 2 ;;
+        --seed)           seed="$2"; shift 2 ;;
+        --selection_frac) selection_frac="$2"; shift 2 ;;
+        --val_strategy)   val_strategy="$2"; shift 2 ;;
+        --use_second_order) use_second_order=true; shift 1 ;;
+        --data_dir)       data_dir="$2"; shift 2 ;;
+        --gradient_accumulation_steps) gradient_accumulation_steps="$2"; shift 2 ;;
+        --record_selections) record_selections=true; shift 1 ;;
+        --record_selections_freq) record_selections_freq="$2"; shift 2 ;;
+        --dry-run)        dry_run=true; shift ;;
+        --list)
+            echo "Available methods (config files in $CONFIG_DIR):"
+            for f in "$CONFIG_DIR"/*.yaml; do
+                basename "$f" .yaml
+            done
+            echo ""
+            echo "Categories: ${!CATEGORY_METHODS[*]}"
+            exit 0
             ;;
         --help|-h)
-            echo "Usage: $0 [options]"
-            echo ""
-            echo "Run single or multiple training methods."
-            echo ""
-            echo "Multi-Method Mode:"
-            echo "  --methods <list>                       Run multiple methods (see below)"
-            echo "  --dry-run                              Print commands without executing"
-            echo ""
-            echo "  Method names: NA-NA-Full, NA-NA-LoRA, NA-LoGra-Full, NA-LoGra-LoRA,"
-            echo "                Streaming-NA-Full, Streaming-NA-LoRA, GREATS-NA-Full, GREATS-NA-LoRA,"
-            echo "                Streaming-LoGra-Full, GREATS-LoGra-Full"
-            echo ""
-            echo "  Categories: all, baseline, streaming, greats, Full, LoRA, compression, no-compression"
-            echo ""
-            echo "  Examples:"
-            echo "    --methods all                        Run all 8 methods"
-            echo "    --methods baseline                   Run NA-NA-Full and NA-NA-LoRA"
-            echo "    --methods \"streaming,greats\"         Run all Streaming and GREATS methods"
-            echo "    --methods \"NA-NA-Full,Streaming-LoGra-Full\"  Run specific methods"
-            echo ""
-            echo "Single Method Options:"
-            echo "  --data_selection <method>              Data selection: NA, Streaming, GREATS (default: NA)"
-            echo "  --compression <method>                 Compression: LoGra, GraSS (implies MeSO optimizer)"
-            echo "  --score_compression_dim <dim>          Score compression dimension (default: 64, set to 0 to disable)"
-            echo "  --use_second_order                     Use greedy selection with second-order interactions"
-            echo "  --val_strategy <strategy>              Validation strategy: separate_batch_factorized (default), separate_batch, merged_batch"
-            echo ""
-            echo "  --lora                                 Use LoRA fine-tuning (default: full fine-tuning)"
-            echo "  --lora_alpha <alpha>                   LoRA alpha (default: 1)"
-            echo "  --lora_r <r>                           LoRA rank (default: 32)"
-            echo "  --lora_dropout <dropout>               LoRA dropout (default: 0.1)"
-            echo "  --lora_target_modules <modules>        Target modules (default: auto-detect)"
-            echo ""
-            echo "Shared Options (apply to all methods):"
-            echo "  --model <model>                        HuggingFace model path (default: meta-llama/Llama-3.2-1B)"
-            echo "  --task <task>                          Task: mmlu, bbh, tydiqa, samsum, gsm8k (default: mmlu)"
-            echo "  --train <dataset>                      Training dataset (default: task-based)"
-            echo "  --subject <subject>                    MMLU/BBH subject (default: world_religions)"
-            echo ""
-            echo "  --batch_size <size>                    Training batch size (default: 8)"
-            echo "  --val_batch_size <size>                Validation batch size for selection (default: 1)"
-            echo "  --lr <lr>                              Learning rate override (ignores config file)"
-            echo "  --lr_config <path>                     LR config file (default: SFT/train/lr/config.json)"
-            echo "  --percentage <pct>                     Data sampling percentage (default: 0.05)"
-            echo ""
-            echo "Learning Rate Resolution:"
-            echo "  1. If --lr is specified, use that value"
-            echo "  2. Otherwise, look up from lr_config.json based on {train}_{task} + method"
-            echo "  3. If not found, use fallback (5e-05 for full, 2e-04 for LoRA)"
-            echo ""
-            echo "  Run lr_sweep.sh first to populate lr_config.json with optimal LRs."
-            echo "  --n_val <n>                            Validation examples (default: 8)"
-            echo "  --n_eval <n>                           Evaluation examples (default: 500)"
-            echo "  --seed <seed>                          Random seed (default: 42)"
-            echo ""
-            echo "  --update_compressor_freq <steps>       Projector refresh interval (default: 200)"
-            echo "  --data_dir <dir>                       Data directory (default: SFT/data)"
-            echo ""
-            echo "Naming convention: {selection}-{compression}-{training_type}"
-            echo "  Examples: Streaming-NA-Full, GREATS-LoGra-Full, NA-NA-LoRA"
+            cat <<'HELP'
+Usage: bash train.sh --methods <methods> [options]
+
+Run training with method configs from SFT/train/configs/*.yaml.
+
+Method Selection:
+  --methods <list>         Methods or categories (comma-separated)
+  --list                   List available methods and exit
+  --dry-run                Print commands without executing
+
+  Categories: all, baseline, layerwise, subset, full, lora, compression, no-compression
+
+  Examples:
+    --methods all                              Run all methods
+    --methods baseline                         Run Standard-Full and Standard-LoRA
+    --methods "Layerwise-Full,Subset-Full"       Run specific methods
+
+Experiment Settings:
+  --model <path>           Model path (default: meta-llama/Llama-3.2-1B)
+  --task <task>            Task: mmlu, bbh, tydiqa, samsum, gsm8k
+  --train <dataset>        Training dataset (default: task-based)
+  --subject <subject>      MMLU/BBH subject (default: sociology)
+  --batch_size <n>         Batch size (default: 8)
+  --val_batch_size <n>     Val batch size for selection (default: 1)
+  --lr <lr>                Learning rate override
+  --lr_config <path>       LR config file (default: SFT/train/lr/config.json)
+  --percentage <pct>       Data percentage (default: 0.05)
+  --n_val <n>              Validation examples (default: 8)
+  --n_eval <n>             Evaluation examples (default: 500)
+  --seed <seed>            Random seed (default: 42)
+  --selection_frac <frac>  Selection fraction (default: 0.5)
+  --val_strategy <strat>   Val strategy (default: merged_batch)
+  --use_second_order       Enable second-order selection
+HELP
             exit 0
             ;;
         *)
-            echo "Unknown argument: $1"
-            echo "Use --help for usage information."
+            echo "Unknown argument: $1 (use --help for usage)"
             exit 1
             ;;
     esac
 done
 
-# Extract model name from path for use in output directories
-# e.g., "meta-llama/Llama-3.2-1B" -> "Llama-3.2-1B"
 model_name=$(basename "$model")
 
-# ========================================
-# Resolve method names from categories
-# ========================================
-resolve_methods() {
-    local input="$1"
-    local resolved=""
+# =============================================================================
+# Helper: Read YAML config (lightweight, no pyyaml dependency)
+# =============================================================================
+read_yaml() {
+    # Reads a config YAML and sets cfg_* variables.
+    # The config is the source of truth for method hyperparameters.
+    local config_file="$1"
 
-    # Split by comma
-    IFS=',' read -ra items <<< "$input"
-    for item in "${items[@]}"; do
-        item=$(echo "$item" | xargs)  # trim whitespace
+    # Reset all config fields
+    cfg_method="Standard"
+    cfg_finetuning="Full"
+    cfg_score_sparsifier=""
+    cfg_score_projector=""
+    cfg_opt_sparsifier=""
+    cfg_opt_projector=""
+    cfg_lora_r=""
+    cfg_lora_alpha=""
+    cfg_lora_dropout=""
 
-        # Check if it's a category
-        if [[ -n "${CATEGORY_METHODS[$item]}" ]]; then
-            if [[ -n "$resolved" ]]; then
-                resolved="$resolved,${CATEGORY_METHODS[$item]}"
-            else
-                resolved="${CATEGORY_METHODS[$item]}"
-            fi
-        # Check if it's a valid method name
-        elif [[ -n "${METHOD_DEFS[$item]}" ]]; then
-            if [[ -n "$resolved" ]]; then
-                resolved="$resolved,$item"
-            else
-                resolved="$item"
-            fi
+    # Parse YAML with one level of nesting support (section.key)
+    local section=""
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        local full_key="" val=""
+        if [[ "$line" =~ ^[[:space:]] ]]; then
+            # Indented: child of current section
+            val=$(echo "$line" | cut -d: -f2- | xargs | sed 's/^"//;s/"$//' | sed "s/^'//;s/'$//")
+            full_key="${section}.$(echo "$line" | cut -d: -f1 | xargs)"
         else
-            echo "ERROR: Unknown method or category: $item"
-            echo "Valid methods: ${!METHOD_DEFS[*]}"
-            echo "Valid categories: ${!CATEGORY_METHODS[*]}"
-            exit 1
+            local top_key top_val
+            top_key=$(echo "$line" | cut -d: -f1 | xargs)
+            top_val=$(echo "$line" | cut -d: -f2- | xargs | sed 's/^"//;s/"$//' | sed "s/^'//;s/'$//")
+            if [[ -z "$top_val" ]]; then
+                section="$top_key"; continue
+            fi
+            section=""
+            full_key="$top_key"
+            val="$top_val"
         fi
-    done
 
-    # Remove duplicates while preserving order
-    echo "$resolved" | tr ',' '\n' | awk '!seen[$0]++' | tr '\n' ',' | sed 's/,$//'
+        case "$full_key" in
+            method)                              cfg_method="$val" ;;
+            finetuning)                          cfg_finetuning="$val" ;;
+            lora_r)                              cfg_lora_r="$val" ;;
+            lora_alpha)                          cfg_lora_alpha="$val" ;;
+            lora_dropout)                        cfg_lora_dropout="$val" ;;
+            score_grad_compression.sparsifier)   cfg_score_sparsifier="$val" ;;
+            score_grad_compression.projector)    cfg_score_projector="$val" ;;
+            opt_grad_compression.sparsifier)     cfg_opt_sparsifier="$val" ;;
+            opt_grad_compression.projector)      cfg_opt_projector="$val" ;;
+        esac
+    done < "$config_file"
+
+    # Map method name to internal selection name
+    case "$cfg_method" in
+        Standard) cfg_internal_method="NA" ;;
+        *)        cfg_internal_method="$cfg_method" ;;
+    esac
+
+    # Derive whether LoRA is enabled from finetuning type
+    case "$cfg_finetuning" in
+        LoRA|MeSO-LoRA) cfg_lora="true" ;;
+        *)              cfg_lora="false" ;;
+    esac
 }
 
-# ========================================
-# Look up LR from config file
-# ========================================
+# =============================================================================
+# Helper: Look up LR from config file
+# =============================================================================
 lookup_lr() {
-    local config_key="$1"  # e.g., "alpaca_samsum"
-    local exp_name="$2"    # e.g., "NA-NA-Full"
-    local is_lora="$3"     # "true" or "false"
+    local config_key="$1"
+    local exp_name="$2"
+    local is_lora="$3"
 
-    # If lr_override is set, use it
     if [[ -n "$lr_override" ]]; then
         echo "$lr_override"
         return
     fi
 
-    # Try to look up from config file
     if [[ -f "$lr_config_file" ]]; then
         local looked_up_lr
         looked_up_lr=$(python3 -c "
-import json
-import sys
+import json, sys
 try:
     with open('$lr_config_file', 'r') as f:
         config = json.load(f)
@@ -396,14 +284,12 @@ try:
 except:
     sys.exit(1)
 " 2>/dev/null)
-
         if [[ $? -eq 0 ]] && [[ -n "$looked_up_lr" ]]; then
             echo "$looked_up_lr"
             return
         fi
     fi
 
-    # Fallback to defaults
     if [ "$is_lora" = true ]; then
         echo "$default_lr_lora"
     else
@@ -411,131 +297,110 @@ except:
     fi
 }
 
-# ========================================
-# Function to run a single method
-# ========================================
-run_single_method() {
-    local exp_data_selection="$1"
-    local exp_compression="$2"
-    local exp_use_lora="$3"
-    local exp_use_second_order="$4"
-    local exp_lr="$5"
-    local exp_name="$6"
+# =============================================================================
+# Helper: Resolve method names from categories
+# =============================================================================
+resolve_methods() {
+    local input="$1"
+    local resolved=""
 
-    local exp_base_training_args="$base_training_args"
+    IFS=',' read -ra items <<< "$input"
+    for item in "${items[@]}"; do
+        item=$(echo "$item" | xargs)
+        if [[ -n "${CATEGORY_METHODS[$item]}" ]]; then
+            resolved="${resolved:+$resolved,}${CATEGORY_METHODS[$item]}"
+        elif [[ -f "$CONFIG_DIR/${item}.yaml" ]]; then
+            resolved="${resolved:+$resolved,}$item"
+        else
+            echo "ERROR: Unknown method or category: $item"
+            echo "Use --list to see available methods."
+            exit 1
+        fi
+    done
 
-    # ========================================
-    # Compression Configuration
-    # ========================================
-    local sparsification=""
-    local projection=""
-    if [[ -n "$exp_compression" ]]; then
-        case "$exp_compression" in
-            LoGra)
-                if [ "$exp_use_lora" = true ]; then
-                    sparsification="normal-128*128"
-                else
-                    sparsification="normal-512*512"
-                fi
-                ;;
-            GraSS)
-                if [ "$exp_use_lora" = true ]; then
-                    sparsification="random_mask-256*256"
-                    projection="sjlt-16384"
-                else
-                    sparsification="random_mask-1024*1024"
-                    projection="sjlt-262144"
-                fi
-                ;;
-            *)
-                echo "ERROR: Invalid compression method: $exp_compression"
-                exit 1
-                ;;
-        esac
+    echo "$resolved" | tr ',' '\n' | awk '!seen[$0]++' | tr '\n' ',' | sed 's/,$//'
+}
+
+# =============================================================================
+# Run a single method from its config file
+# =============================================================================
+run_method() {
+    local exp_name="$1"
+    local config_file="$CONFIG_DIR/${exp_name}.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        echo "ERROR: Config not found: $config_file"
+        return 1
     fi
 
-    # ========================================
-    # Build Job Name
-    # ========================================
-    local job_type
-    if [ "$exp_use_lora" = true ]; then
-        job_type="LoRA"
+    # Read method config
+    read_yaml "$config_file"
+
+    # Look up LR
+    local train_str="${train_dataset:-default}"
+    local config_key
+    if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
+        config_key="${train_str}_${task}_${subject}"
     else
-        job_type="Full"
+        config_key="${train_str}_${task}"
     fi
+    local exp_lr=$(lookup_lr "$config_key" "$exp_name" "$cfg_lora")
 
-    local method_str="${exp_data_selection}-${exp_compression:-NA}"
-    if [[ "$exp_data_selection" != "NA" ]] && [ "$exp_use_second_order" = true ]; then
+    # Build job name: use config name directly (e.g., Layerwise-Full)
+    local method_str="$exp_name"
+    if [[ "$cfg_internal_method" != "NA" ]] && [ "$use_second_order" = true ]; then
         method_str="${method_str}-2nd"
     fi
 
-    local train_str="${train_dataset:-default}"
     local JOB_NAME
     if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
-        JOB_NAME="${train_str}_${task}_${subject}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
+        JOB_NAME="${train_str}_${task}_${subject}-${model_name}-${method_str}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
     else
-        JOB_NAME="${train_str}_${task}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
+        JOB_NAME="${train_str}_${task}-${model_name}-${method_str}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
     fi
 
     local output_dir=$SCRATCH_DIR/Gradient-Streaming/SFT/${JOB_NAME}
-    if [[ ! -d $output_dir ]]; then
-        mkdir -p $output_dir
-    fi
+    mkdir -p "$output_dir"
 
     echo ""
     echo "=============================================="
-    if [[ -n "$exp_name" ]]; then
-        echo "  Running: $exp_name"
-    fi
+    echo "  Running: $exp_name"
     echo "=============================================="
-    echo "Job name: $JOB_NAME"
-    echo "Method: ${method_str}-${job_type}"
-    echo "Model: $model"
-    echo "Training type: $([ "$exp_use_lora" = true ] && echo "LoRA (alpha=$lora_alpha, r=$lora_r)" || echo "Full")"
-    echo "Task: $task"
-    echo "Training data: ${train_dataset:-default for $task}"
-    echo "Selection: $exp_data_selection"
-    if [[ "$exp_data_selection" != "NA" ]]; then
-        echo "  Second-order: $([ "$exp_use_second_order" = true ] && echo "yes" || echo "no")"
-    fi
-    echo "Compression: ${exp_compression:-None}"
-    echo "Batch size: $batch_size (val: ${val_batch_size:-$batch_size})"
-    echo "Learning rate: $exp_lr"
-    echo "Data percentage: $percentage"
-    echo "Validation examples: $n_val"
+    echo "Config: $config_file"
+    echo "Job: $JOB_NAME"
+    echo "Model: $model | Task: $task | LR: $exp_lr"
+    echo "Method: $cfg_method | Finetuning: $cfg_finetuning"
+    echo "Batch: $batch_size | Val: ${val_batch_size} | Selection: $selection_frac"
     echo "Output: $output_dir"
     echo "=============================================="
 
-    local DATA_SEED=$((seed + 1))
+    # Build training arguments
+    local exp_base_training_args="$base_training_args"
 
-    # Use model path directly
-    local MODEL_PATH="$model"
-
-    # Model-specific configurations (match by path pattern)
+    # Model-specific FSDP config
     case "$model" in
         *Llama-2-13b*|*llama-2-13b*)
-            exp_base_training_args="$exp_base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config llama2_13b_finetune"
-            ;;
+            exp_base_training_args="$exp_base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config llama2_13b_finetune" ;;
         *Mistral-7B*|*mistral-7b*)
-            exp_base_training_args="$exp_base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config mistral_7b_finetune"
-            ;;
+            exp_base_training_args="$exp_base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config mistral_7b_finetune" ;;
     esac
 
+    local DATA_SEED=$((seed + 1))
     local ID=$RANDOM
     local PORT=$((29400 + RANDOM % 10000))
+
     local header="torchrun --nproc_per_node 1 --nnodes 1 \
 --rdzv_id=$ID --rdzv_backend c10d --rdzv_endpoint=localhost:$PORT \
 -m SFT.train.train"
 
-    # Build training arguments
     local training_args="$exp_base_training_args \
---model_name_or_path $MODEL_PATH \
+--model_name_or_path $model \
 --output_dir $output_dir \
 --data_dir $data_dir \
 --percentage $percentage \
 --data_seed $DATA_SEED \
 --per_device_train_batch_size $batch_size \
---method $exp_data_selection \
+--method $cfg_internal_method \
 --subject $subject \
 --n_val $n_val \
 --n_eval $n_eval \
@@ -548,354 +413,76 @@ run_single_method() {
 --val_strategy $val_strategy \
 --use_flash_attention $use_flash_attention"
 
-    if [[ -n "$train_dataset" ]]; then
-        training_args="$training_args --train_dataset_names $train_dataset"
-    fi
+    # Optional: train dataset
+    [[ -n "$train_dataset" ]] && training_args="$training_args --train_dataset_names $train_dataset"
+    [[ -n "$val_batch_size" ]] && training_args="$training_args --val_batch_size_for_selection $val_batch_size"
 
-    if [[ -n "$val_batch_size" ]]; then
-        training_args="$training_args --val_batch_size_for_selection $val_batch_size"
-    fi
-
-    if [ "$exp_use_lora" = true ]; then
-        training_args="$training_args --lora True --lora_alpha $lora_alpha --lora_r $lora_r --lora_dropout $lora_dropout"
-        # Only add target_modules if explicitly specified (empty = PEFT auto-detects)
-        if [[ -n "$lora_target_modules" ]]; then
-            training_args="$training_args --lora_target_modules $lora_target_modules"
-        fi
+    # LoRA (from config, with shell defaults as fallback)
+    if [ "$cfg_lora" = true ]; then
+        local eff_lora_r="${cfg_lora_r:-$lora_r}"
+        local eff_lora_alpha="${cfg_lora_alpha:-$lora_alpha}"
+        local eff_lora_dropout="${cfg_lora_dropout:-$lora_dropout}"
+        training_args="$training_args --lora True --lora_r $eff_lora_r --lora_alpha $eff_lora_alpha --lora_dropout $eff_lora_dropout"
     else
         training_args="$training_args --lora False"
     fi
 
-    if [[ -n "$sparsification" ]]; then
-        training_args="$training_args --sparsification $sparsification"
-    fi
-    if [[ -n "$projection" ]]; then
-        training_args="$training_args --projection $projection"
-    fi
-    if [[ -n "$exp_compression" ]]; then
-        training_args="$training_args --update_compressor_freq $update_compressor_freq"
-    fi
+    # Update compression (opt_grad_compression → --sparsification for MeSO)
+    [[ -n "$cfg_opt_sparsifier" && "$cfg_opt_sparsifier" != "none" ]] && training_args="$training_args --sparsification $cfg_opt_sparsifier --update_compressor_freq $update_compressor_freq"
+    [[ -n "$cfg_opt_projector" && "$cfg_opt_projector" != "none" ]] && training_args="$training_args --projection $cfg_opt_projector"
 
-    # Add score compression dimension for data selection methods without explicit compression
-    if [[ "$exp_data_selection" != "NA" ]] && [[ -z "$exp_compression" ]]; then
-        training_args="$training_args --score_compression_dim $score_compression_dim"
-    fi
+    # Score compression (score_grad_compression → --score_compression for influence scoring)
+    [[ -n "$cfg_score_sparsifier" && "$cfg_score_sparsifier" != "none" ]] && training_args="$training_args --score_compression $cfg_score_sparsifier"
 
-    if [[ "$exp_data_selection" != "NA" ]] && [ "$exp_use_second_order" = true ]; then
+    # Second-order selection
+    if [[ "$cfg_internal_method" != "NA" ]] && [ "$use_second_order" = true ]; then
         training_args="$training_args --use_second_order True"
+    fi
+
+    # Selection recording
+    if [ "$record_selections" = true ]; then
+        training_args="$training_args --record_selections True --record_selections_freq $record_selections_freq"
     fi
 
     training_args="$training_args 2>&1 | tee $output_dir/train.log"
 
-    # Execute or print command
     if [ "$dry_run" = true ]; then
-        echo "[DRY-RUN] Would execute: $header $training_args"
+        echo "[DRY-RUN] $header $training_args"
     else
         eval "$header" "$training_args"
     fi
 }
 
-# ========================================
-# Main execution logic
-# ========================================
-if [[ -n "$methods" ]]; then
-    # Multi-method mode
-    resolved_methods=$(resolve_methods "$methods")
-
-    echo ""
-    echo "========================================================"
-    echo "  Multi-Method Mode"
-    echo "========================================================"
-    echo "Task: $task"
-    echo "Training data: ${train_dataset:-default}"
-    echo "Model: $model"
-    if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
-        echo "Subject: $subject"
-    fi
-    echo "Percentage: $percentage"
-    echo "Seed: $seed"
-    echo ""
-    echo "Training Settings:"
-    echo "  Batch size: $batch_size"
-    echo "  Val batch size: ${val_batch_size:-same as batch_size}"
-    echo "  Default LR (Full): $default_lr_full"
-    echo "  Default LR (LoRA): $default_lr_lora"
-    echo "  N_val: $n_val"
-    echo ""
-    echo "Methods to run: $resolved_methods"
-    echo "========================================================"
-
-    # Count methods
-    method_count=$(echo "$resolved_methods" | tr ',' '\n' | wc -l)
-    current=0
-
-    # Run each method
-    IFS=',' read -ra method_list <<< "$resolved_methods"
-    for method_name in "${method_list[@]}"; do
-        current=$((current + 1))
-        echo ""
-        echo "========================================================"
-        echo "  [$current/$method_count] $method_name"
-        echo "========================================================"
-
-        # Parse method definition
-        IFS=':' read -ra exp_parts <<< "${METHOD_DEFS[$method_name]}"
-        exp_data_selection="${exp_parts[0]}"
-        exp_compression="${exp_parts[1]}"
-        exp_use_lora="${exp_parts[2]}"
-        # use_second_order is controlled globally via --use_second_order flag
-        exp_use_second_order="$use_second_order"
-
-        # Build config key for LR lookup (includes subject for mmlu/bbh)
-        train_str="${train_dataset:-default}"
-        if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
-            config_key="${train_str}_${task}_${subject}"
-        else
-            config_key="${train_str}_${task}"
-        fi
-
-        # Look up learning rate from config
-        exp_lr=$(lookup_lr "$config_key" "$method_name" "$exp_use_lora")
-
-        run_single_method "$exp_data_selection" "$exp_compression" "$exp_use_lora" "$exp_use_second_order" "$exp_lr" "$method_name"
-    done
-
-    echo ""
-    echo "========================================================"
-    echo "  All methods completed!"
-    echo "========================================================"
-    echo "Total: $method_count methods"
-
-else
-    # Single method mode (original behavior)
-
-    # ========================================
-    # Compression Configuration
-    # ========================================
-# Compression implies MeSO optimizer. No compression = standard optimizer.
-
-# Validate and configure compression method
-# Default: LoGra (Gaussian projection). GraSS (random mask + SJLT) also available.
-sparsification=""
-projection=""
-if [[ -n "$compression" ]]; then
-    case "$compression" in
-        LoGra)
-            # LoGra: Gaussian random projection, no additional projection
-            if [ "$use_lora" = true ]; then
-                sparsification="normal-128*128"
-                projection=""
-            else
-                sparsification="normal-512*512"
-                projection=""
-            fi
-            ;;
-        GraSS)
-            # GraSS: Random mask sparsification + SJLT projection
-            # (Available but not used in default methods)
-            if [ "$use_lora" = true ]; then
-                sparsification="random_mask-256*256"
-                projection="sjlt-16384"
-            else
-                sparsification="random_mask-1024*1024"
-                projection="sjlt-262144"
-            fi
-            ;;
-        *)
-            echo "ERROR: Invalid compression method: $compression"
-            echo "Valid options: LoGra (default), GraSS"
-            exit 1
-            ;;
-    esac
+# =============================================================================
+# Main
+# =============================================================================
+if [[ -z "$methods" ]]; then
+    echo "Usage: bash train.sh --methods <methods> [options]"
+    echo "       bash train.sh --help"
+    exit 1
 fi
 
+resolved_methods=$(resolve_methods "$methods")
+IFS=',' read -ra method_list <<< "$resolved_methods"
+TOTAL=${#method_list[@]}
 
-# ========================================
-# Build Job Name
-# ========================================
-# Naming convention: {selection}-{compression}-{training_type}
-# Examples: Streaming-NA-Full, GREATS-GraSS-LoRA, NA-LoGra-Full
-
-if [ "$use_lora" = true ]; then
-    job_type="LoRA"
-else
-    job_type="Full"
-fi
-
-# Validate data_selection
-# - NA: no data selection
-# - Streaming: per-layer selection
-# - GREATS: global selection
-case "$data_selection" in
-    NA|Streaming|GREATS)
-        ;;
-    *)
-        echo "ERROR: Invalid data_selection: $data_selection"
-        echo "Valid options: NA, Streaming, GREATS"
-        exit 1
-        ;;
-esac
-
-# Build method string: {selection}-{compression}
-method_str="${data_selection}-${compression:-NA}"
-
-# Add second-order suffix for data selection methods
-if [[ "$data_selection" != "NA" ]] && [ "$use_second_order" = true ]; then
-    method_str="${method_str}-2nd"
-fi
-
-# Build train string for job name
-train_str="${train_dataset:-default}"
-
-# Build method name for LR lookup
-exp_name="${data_selection}-${compression:-NA}-${job_type}"
-
-# Look up learning rate from config (includes subject for mmlu/bbh)
-if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
-    config_key="${train_str}_${task}_${subject}"
-else
-    config_key="${train_str}_${task}"
-fi
-lr=$(lookup_lr "$config_key" "$exp_name" "$use_lora")
-
-# For MMLU/BBH, include subject in job name
-if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
-    JOB_NAME="${train_str}_${task}_${subject}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
-else
-    JOB_NAME="${train_str}_${task}-${model_name}-${method_str}-${job_type}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
-fi
-
-output_dir=$SCRATCH_DIR/Gradient-Streaming/SFT/${JOB_NAME}
-if [[ ! -d $output_dir ]]; then
-    mkdir -p $output_dir
-fi
-
-echo "=== Training Configuration ==="
-echo "Job name: $JOB_NAME"
-echo "Method: ${method_str}-${job_type}"
 echo ""
-echo "Model: $model"
-echo "Training type: $([ "$use_lora" = true ] && echo "LoRA (alpha=$lora_alpha, r=$lora_r)" || echo "Full")"
-echo "Task: $task"
-echo "Training data: ${train_dataset:-default for $task}"
+echo "========================================================"
+echo "  SFT Training"
+echo "========================================================"
+echo "Methods: $resolved_methods ($TOTAL total)"
+echo "Model: $model | Task: $task | Seed: $seed"
+echo "========================================================"
+
+current=0
+for method_name in "${method_list[@]}"; do
+    current=$((current + 1))
+    echo ""
+    echo "[$current/$TOTAL] $method_name"
+    run_method "$method_name"
+done
+
 echo ""
-echo "Selection: $data_selection"
-if [[ "$data_selection" != "NA" ]]; then
-    echo "  Second-order: $([ "$use_second_order" = true ] && echo "yes" || echo "no")"
-fi
-echo "Compression: ${compression:-None}"
-if [[ -n "$compression" ]]; then
-    echo "  Optimizer: MeSO (compressed)"
-else
-    echo "  Optimizer: AdamW (standard)"
-fi
-echo ""
-# Indicate LR source
-if [[ -n "$lr_override" ]]; then
-    lr_source="(--lr override)"
-elif [[ -f "$lr_config_file" ]]; then
-    lr_source="(from $lr_config_file)"
-else
-    lr_source="(fallback default)"
-fi
-
-echo "Batch size: $batch_size (val: ${val_batch_size:-$batch_size})"
-echo "Learning rate: $lr $lr_source"
-echo "Data percentage: $percentage"
-echo "Validation examples: $n_val"
-echo "Evaluation examples: $n_eval"
-echo ""
-echo "Output: $output_dir"
-echo "==============================="
-
-
-DATA_SEED=$((seed + 1))
-
-# Use model path directly
-MODEL_PATH="$model"
-
-# Model-specific configurations (match by path pattern)
-case "$model" in
-    *Llama-2-13b*|*llama-2-13b*)
-        base_training_args="$base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config llama2_13b_finetune"
-        ;;
-    *Mistral-7B*|*mistral-7b*)
-        base_training_args="$base_training_args --fsdp 'full_shard auto_wrap' --fsdp_config mistral_7b_finetune"
-        ;;
-esac
-
-ID=$RANDOM
-# Generate a unique port for this job to avoid conflicts with other jobs
-PORT=$((29400 + RANDOM % 10000))
-export header="torchrun --nproc_per_node 1 --nnodes 1 \
---rdzv_id=$ID --rdzv_backend c10d --rdzv_endpoint=localhost:$PORT \
--m SFT.train.train"
-
-# Build training arguments
-training_args="$base_training_args \
---model_name_or_path $MODEL_PATH \
---output_dir $output_dir \
---data_dir $data_dir \
---percentage $percentage \
---data_seed $DATA_SEED \
---per_device_train_batch_size $batch_size \
---method $data_selection \
---subject $subject \
---n_val $n_val \
---n_eval $n_eval \
---analysis_dataset $task \
---learning_rate $lr \
---gradient_accumulation_steps $gradient_accumulation_steps \
---seed $seed \
---optim $optim \
---selection_frac $selection_frac \
---val_strategy $val_strategy \
---use_flash_attention $use_flash_attention"
-
-# Add train_dataset_names if specified
-if [[ -n "$train_dataset" ]]; then
-    training_args="$training_args --train_dataset_names $train_dataset"
-fi
-
-# Add val_batch_size if specified (defaults to train batch size if not specified)
-if [[ -n "$val_batch_size" ]]; then
-    training_args="$training_args --val_batch_size_for_selection $val_batch_size"
-fi
-
-# Add LoRA arguments if using LoRA
-if [ "$use_lora" = true ]; then
-    training_args="$training_args --lora True --lora_alpha $lora_alpha --lora_r $lora_r --lora_dropout $lora_dropout"
-    # Only add target_modules if explicitly specified (empty = PEFT auto-detects)
-    if [[ -n "$lora_target_modules" ]]; then
-        training_args="$training_args --lora_target_modules $lora_target_modules"
-    fi
-else
-    training_args="$training_args --lora False"
-fi
-
-# Add gradient compression arguments (compression implies MeSO optimizer)
-if [[ -n "$sparsification" ]]; then
-    training_args="$training_args --sparsification $sparsification"
-fi
-if [[ -n "$projection" ]]; then
-    training_args="$training_args --projection $projection"
-fi
-if [[ -n "$compression" ]]; then
-    training_args="$training_args --update_compressor_freq $update_compressor_freq"
-fi
-
-# Add score compression dimension for data selection methods without explicit compression
-if [[ "$data_selection" != "NA" ]] && [[ -z "$compression" ]]; then
-    training_args="$training_args --score_compression_dim $score_compression_dim"
-fi
-
-# Add use_second_order for data selection
-if [[ "$data_selection" != "NA" ]] && [ "$use_second_order" = true ]; then
-    training_args="$training_args --use_second_order True"
-fi
-
-training_args="$training_args 2>&1 | tee $output_dir/train.log"
-
-eval "$header" "$training_args"
-
-fi  # End of single/multi method mode
+echo "========================================================"
+echo "  All $TOTAL methods completed!"
+echo "========================================================"

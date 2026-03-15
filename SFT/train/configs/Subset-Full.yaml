@@ -1,0 +1,8 @@
+# Subset selection with full fine-tuning (exact scoring)
+# See configs/README.md for compression format details (LoGra, GraSS, etc.)
+method: Subset
+finetuning: Full
+
+score_grad_compression:
+  sparsifier: none
+  projector: none

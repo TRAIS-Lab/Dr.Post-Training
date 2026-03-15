@@ -1,0 +1,11 @@
+# Layerwise selection with LoRA (exact scoring, no compression)
+# For LoRA layers (small dims like r×hidden), compression adds overhead
+# without speedup. Full (exact) scoring is both faster and more accurate.
+method: Layerwise
+finetuning: LoRA
+lora_r: 16
+lora_alpha: 32
+
+score_grad_compression:
+  sparsifier: none
+  projector: none

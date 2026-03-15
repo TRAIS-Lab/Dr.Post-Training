@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 """
-Training script for RLHF with gradient streaming.
+Training script for RLHF with layer-wise data selection.
 """
 
 import logging
@@ -22,11 +22,11 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
 from RLHF.data.get_prompts import get_prompt_dataset, get_validation_prompt_dataset, collator
 from RLHF.train.model_arguments import ModelArguments, add_padding_to_tokenizer
 from RLHF.train.training_arguments import TrainingArguments
-from RLHF.train.trainer import StreamingPPOTrainer
+from RLHF.train.trainer import LayerwisePPOTrainer
 from RLHF.train.rewards import load_reward_model, RewardModelWrapper
 from RLHF.train.evaluator import create_evaluator
 
-from gradstream import GradientHook, setup_model_compressors, create_sample_inputs, MeSOAdamW, CompressionMode
+from drpt import GradientHook, setup_model_compressors, create_sample_inputs, MeSOAdamW, CompressionMode
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +205,7 @@ def main():
     )
 
     logger.info("=" * 60)
-    logger.info("RLHF Training with Gradient Streaming")
+    logger.info("RLHF Training with Dr. Post-Training")
     logger.info(f"  Task: {training_args.task}")
     logger.info(f"  Method: {training_args.method}")
     logger.info(f"  Model: {model_args.model_name_or_path}")
@@ -348,127 +348,85 @@ def main():
     # Create gradient hook only when needed (selection or compression enabled)
     grad_hook = None
 
-    # Determine compression mode:
-    # - NONE: No compression (baseline or selection-only without score compression)
-    # - SCORE_ONLY: Compress for scoring only (auto score compression, standard optimizer)
-    # - FULL: Full compression (explicit compression, MeSO optimizer)
-    has_score_compression = training_args.has_selection and training_args.score_compression_dim > 0
-    if training_args.has_compression:
-        compression_mode = CompressionMode.FULL
-    elif has_score_compression:
-        compression_mode = CompressionMode.SCORE_ONLY
-    else:
-        compression_mode = CompressionMode.NONE
+    # Determine compression needs independently
+    has_score_compression = (training_args.has_selection
+                             and training_args.score_compression is not None)
+    has_update_compression = training_args.has_compression
 
-    if training_args.has_selection or training_args.has_compression:
+    if training_args.has_selection or has_update_compression:
         grad_hook = GradientHook(
             model=model,
             layer_names=layer_names,
             device=device,
         )
-        logger.info(f"Gradient Hook created (selection={training_args.has_selection}, compression_mode={compression_mode.value})")
     else:
         logger.info(f"Training method: {training_args.method} - No gradient hooks needed")
 
-    # Set up gradient compression
-    # Two modes:
-    # 1. Explicit compression: MeSO optimizer, compressed updates
-    # 2. Auto score compression: Standard optimizer, compressed scores only
-    needs_compression_setup = training_args.has_compression or (
-        training_args.has_selection and training_args.score_compression_dim > 0
-    )
+    # Helper: parse sparsification string into kwargs
+    def _parse_sparsifier(spec_str):
+        method, dim_str = spec_str.split("-")
+        assert "*" in dim_str, f"Sparsification dimension must be factorized, got '{spec_str}'"
+        dim = int(dim_str.split("*")[0])
+        return {
+            "proj_dim": dim, "proj_max_batch_size": training_args.per_device_train_batch_size,
+            "proj_seed": training_args.seed, "device": device, "proj_type": method,
+        }, f"{method}-{dim}*{dim}"
 
-    if needs_compression_setup:
+    _identity_projector = {
+        "proj_dim": -1, "proj_max_batch_size": training_args.per_device_train_batch_size,
+        "proj_type": "identity", "device": device,
+    }
+
+    if has_score_compression or has_update_compression:
         logger.info("=== Gradient Compression Setup ===")
-        if training_args.has_compression:
-            logger.info("  Mode: Explicit compression (MeSO optimizer, compressed updates)")
-        else:
-            logger.info("  Mode: Auto score compression (standard optimizer, compressed scores only)")
 
-        # Parse sparsification
-        if training_args.sparsification is not None:
-            method, dim = training_args.sparsification.split("-")
-            assert "*" in dim, "Sparsification dimension must be factorized (e.g., '64*64')"
-            dim_parts = dim.split("*")
-            sparsification_dim = int(dim_parts[0])
-
-            sparsifier_kwargs = {
-                "proj_dim": sparsification_dim,
-                "proj_max_batch_size": training_args.per_device_train_batch_size,
-                "proj_seed": training_args.seed,
-                "device": device,
-                "proj_type": method,
-            }
-            logger.info(f"  Sparsification: {method} -> {sparsification_dim}*{sparsification_dim} dimension")
-        elif training_args.has_selection and training_args.score_compression_dim > 0:
-            # Auto score compression: use LoGra (normal projection) with score_compression_dim
-            sparsification_dim = training_args.score_compression_dim
-            sparsifier_kwargs = {
-                "proj_dim": sparsification_dim,
-                "proj_max_batch_size": training_args.per_device_train_batch_size,
-                "proj_seed": training_args.seed,
-                "device": device,
-                "proj_type": "normal",  # LoGra uses normal (Gaussian) projection
-            }
-            logger.info(f"  Sparsification (auto): normal -> {sparsification_dim}*{sparsification_dim} dimension")
-        else:
-            sparsifier_kwargs = {
-                "proj_dim": -1,
-                "proj_type": "identity",
-                "device": device,
-            }
-            logger.info("  Sparsification: Disabled")
-
-        # Parse projection
-        if training_args.projection is not None:
-            method, dim = training_args.projection.split("-")
-            proj_dim = int(dim)
-
-            projector_kwargs = {
-                "proj_dim": proj_dim,
-                "proj_max_batch_size": training_args.per_device_train_batch_size,
-                "proj_seed": training_args.seed,
-                "device": device,
-                "proj_type": method,
-            }
-            logger.info(f"  Projection: {method} -> {proj_dim} dimension")
-        else:
-            projector_kwargs = {
-                "proj_dim": -1,
-                "proj_max_batch_size": training_args.per_device_train_batch_size,
-                "proj_type": "identity",
-                "device": device,
-            }
-            logger.info("  Projection: Disabled")
-
-        # Create sample inputs for compressor initialization
         sample_inputs = create_sample_inputs(
             tokenizer=tokenizer,
             max_seq_length=training_args.max_new_tokens + 20,
             device=device,
         )
 
-        # Setup compressors
-        compressors = setup_model_compressors(
-            model=model,
-            layer_names=layer_names,
-            sparsifier_kwargs=sparsifier_kwargs,
-            projector_kwargs=projector_kwargs,
-            sample_inputs=sample_inputs,
-            device=device,
-            update_freq=training_args.update_compressor_freq,
-        )
+        # --- Update compressors (MeSO) ---
+        if has_update_compression:
+            update_sparsifier_kwargs, update_desc = _parse_sparsifier(training_args.sparsification)
+            logger.info(f"  Update compression (MeSO): sparsifier={update_desc}")
+            update_compressors = setup_model_compressors(
+                model=model, layer_names=layer_names,
+                sparsifier_kwargs=update_sparsifier_kwargs,
+                projector_kwargs=_identity_projector,
+                sample_inputs=sample_inputs, device=device,
+                update_freq=training_args.update_compressor_freq,
+            )
+            grad_hook.set_update_compressors(update_compressors)
+        else:
+            logger.info("  Update compression: none")
 
-        grad_hook.set_compressors(compressors)
-        grad_hook.compression_mode = compression_mode
-        logger.info(f"  Set {len(compressors)} unified compressors (refreshed every {training_args.update_compressor_freq} steps)")
-        logger.info(f"  Compression mode: {compression_mode.value}")
+        # --- Score compressors ---
+        if has_score_compression:
+            score_spec = training_args.score_compression
+            update_spec = training_args.sparsification
+            if has_update_compression and score_spec == update_spec:
+                logger.info(f"  Score compression: same as update ({score_spec}) → sharing compressors")
+                grad_hook.set_score_compressors(grad_hook.update_compressors)
+            else:
+                score_sparsifier_kwargs, score_desc = _parse_sparsifier(score_spec)
+                logger.info(f"  Score compression: sparsifier={score_desc}")
+                score_compressors = setup_model_compressors(
+                    model=model, layer_names=layer_names,
+                    sparsifier_kwargs=score_sparsifier_kwargs,
+                    projector_kwargs=_identity_projector,
+                    sample_inputs=sample_inputs, device=device,
+                    update_freq=training_args.update_compressor_freq,
+                )
+                grad_hook.set_score_compressors(score_compressors)
+        else:
+            logger.info("  Score compression: none (exact scoring)")
+
+        logger.info(f"  Compression mode: {grad_hook.compression_mode.value}")
         logger.info("Gradient compression setup completed!")
     else:
-        # No compression setup, but still configure compression mode on hook if it exists
         if grad_hook is not None:
-            grad_hook.compression_mode = compression_mode
-            logger.info(f"Compression mode: {compression_mode.value} (no compressors)")
+            logger.info(f"Compression mode: {grad_hook.compression_mode.value} (no compressors)")
 
     # Create optimizer - separate parameter groups for policy and value head
     # This allows using different learning rates for each
@@ -556,7 +514,7 @@ def main():
         logger.info("Evaluator ready")
 
     # Create trainer
-    trainer = StreamingPPOTrainer(
+    trainer = LayerwisePPOTrainer(
         model=model,
         ref_model=ref_model,  # None for PEFT, shared-layer ref model for non-PEFT
         reward_model=reward_model,

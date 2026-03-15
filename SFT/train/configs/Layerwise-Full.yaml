@@ -1,0 +1,8 @@
+# Layerwise selection with full fine-tuning
+# See configs/README.md for compression format details (LoGra, GraSS, etc.)
+method: Layerwise
+finetuning: Full
+
+score_grad_compression:
+  sparsifier: normal-64*64
+  projector: none

@@ -5,7 +5,7 @@ This script implements the full gradient-based selection pipeline:
 1. Generates fresh rollouts for validation prompts using current policy
 2. Computes rewards on validation responses
 3. Captures validation gradients for selection
-4. Applies Streaming or GREATS selection during training
+4. Applies Layerwise or Subset selection during training
 
 This matches the intended design from RLHF/train/trainer.py.
 
@@ -13,7 +13,7 @@ Usage:
     python main_ppo_online_selection.py \
         data.train_files=/path/to/train.parquet \
         selection.enable=True \
-        selection.method=Streaming \
+        selection.method=Layerwise \
         selection.frac=0.5 \
         selection.val_prompts_path=/path/to/val_prompts.parquet
 """
@@ -44,12 +44,12 @@ from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device
 from verl.utils.fs import copy_to_local
 
-from gradstream_verl.selection_trainer import (
+from drpt_verl.selection_trainer import (
     SelectionRayPPOTrainerWithOnlineVal,
     SelectionTrainerConfig,
 )
-from gradstream_verl.validation_manager import ValidationConfig
-from gradstream_verl.worker_selection import SelectionActorRolloutRefWorker
+from drpt_verl.validation_manager import ValidationConfig
+from drpt_verl.worker_selection import SelectionActorRolloutRefWorker
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples=-1):
@@ -190,7 +190,7 @@ class SelectionTaskRunner(BaseTaskRunner):
             # Build selection trainer config
             selection_trainer_config = SelectionTrainerConfig(
                 enable=True,
-                method=selection_cfg.get("method", "Streaming"),
+                method=selection_cfg.get("method", "Layerwise"),
                 frac=selection_cfg.get("frac", 0.5),
                 use_second_order=selection_cfg.get("use_second_order", False),
                 val_prompts_path=selection_cfg.get("val_prompts_path"),

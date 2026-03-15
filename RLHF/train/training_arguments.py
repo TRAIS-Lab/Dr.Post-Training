@@ -2,7 +2,7 @@
 Training arguments for RLHF experiments.
 
 Following SFT conventions:
-- `method`: Controls data selection (NA, Streaming, GREATS)
+- `method`: Controls data selection (NA, Layerwise, Subset)
 - `sparsification`/`projection`: Controls compression (implies MeSO optimizer)
 - PPO-specific arguments for RLHF
 """
@@ -16,7 +16,7 @@ from transformers import TrainingArguments as TA
 @dataclass
 class TrainingArguments(TA):
     """
-    Training arguments for RLHF with gradient streaming.
+    Training arguments for RLHF with layer-wise data selection.
 
     Inherits from transformers.TrainingArguments and adds:
     - Data selection arguments (method, filter_frac)
@@ -74,8 +74,8 @@ class TrainingArguments(TA):
                 "Training method: "
                 "'NA' (baseline, no selection), "
                 "'IIF' (pre-filter entire rollout before PPO epochs), "
-                "'Streaming' (per-layer selection, single-pass), "
-                "'GREATS' (global selection, two-pass)"
+                "'Layerwise' (per-layer selection, single-pass), "
+                "'Subset' (global selection, two-pass)"
             )
         },
     )
@@ -119,16 +119,6 @@ class TrainingArguments(TA):
             )
         },
     )
-    val_generation_interval: int = field(
-        default=0,
-        metadata={
-            "help": (
-                "Steps between regenerating validation completions. "
-                "0 = generate once at start and reuse throughout training. "
-                "N > 0 = regenerate every N steps (more compute but fresher validation)."
-            )
-        },
-    )
     val_loss_type: str = field(
         default="seqloss-lastadv",
         metadata={
@@ -136,7 +126,8 @@ class TrainingArguments(TA):
                 "Validation loss type for data selection gradient computation. "
                 "Options: "
                 "'seqloss-lastadv' (default) - sequence log prob * last-token GAE advantage, "
-                "'seqloss-reward' - sequence log prob * normalized raw reward. "
+                "'seqloss-reward' - sequence log prob * normalized raw reward, "
+                "'tokenpg' - token-level REINFORCE: -mean(sum_t(log_prob_t * A_t * mask_t)). "
                 "Matches LDA-ORL reference implementation options."
             )
         },
@@ -168,13 +159,14 @@ class TrainingArguments(TA):
         default=200,
         metadata={"help": "Steps between compressor refreshes"},
     )
-    score_compression_dim: int = field(
-        default=64,
+    score_compression: str = field(
+        default=None,
         metadata={
             "help": (
-                "Dimension for score-only compression (factorized, so actual dim is score_compression_dim^2). "
-                "Used when data selection is enabled but no explicit compression is specified. "
-                "Set to 0 to disable auto score compression. Default: 64 (i.e., 64*64)"
+                "Score-only compression for influence score computation. "
+                "Same format as sparsification: 'METHOD-DIM*DIM'. "
+                "Examples: 'normal-64*64' (Gaussian, 64x64 factorized). "
+                "Set to None to disable (use exact scoring). Default: None"
             )
         },
     )
@@ -392,7 +384,7 @@ class TrainingArguments(TA):
             raise ValueError(f"task must be one of {valid_tasks}, got {self.task}")
 
         # Validate method
-        valid_methods = ["NA", "IIF", "Streaming", "GREATS"]
+        valid_methods = ["NA", "IIF", "Layerwise", "Subset"]
         if self.method not in valid_methods:
             raise ValueError(f"method must be one of {valid_methods}, got {self.method}")
 

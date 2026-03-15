@@ -1,0 +1,12 @@
+# TEST: Subset with MeSO but exact scoring (no score compression)
+# Expected: full gradient scoring, MeSO compressed optimizer updates
+method: Subset
+finetuning: MeSO
+
+score_grad_compression:
+  sparsifier: none
+  projector: none
+
+opt_grad_compression:
+  sparsifier: normal-512*512
+  projector: none

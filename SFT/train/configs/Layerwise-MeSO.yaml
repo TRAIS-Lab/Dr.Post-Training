@@ -1,0 +1,13 @@
+# Layerwise selection with MeSO optimizer
+# Same sparsifier in both sections → compressor objects are shared (zero overhead)
+# See configs/README.md for compression format details (LoGra, GraSS, etc.)
+method: Layerwise
+finetuning: MeSO
+
+score_grad_compression:
+  sparsifier: normal-512*512
+  projector: none
+
+opt_grad_compression:
+  sparsifier: normal-512*512
+  projector: none
