@@ -1,24 +1,8 @@
 #!/bin/bash
 
-#SBATCH --job-name=RLHF-Eval
-#SBATCH --mem=64g
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --partition=gpuA40x4
-#SBATCH --account=bfwm-delta-gpu
-#SBATCH --time=12:00:00
-#SBATCH --constraint="scratch"
-#SBATCH --output=/u/%u/Project/Gradient-Streaming/RLHF/log/%x-%j.log
-
-### GPU options ###
-#SBATCH --gpus-per-node=1
-#SBATCH --gpu-bind=none
-#SBATCH --mail-user=pbb@illinois.edu
-#SBATCH --mail-type="END"
-
-SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
-CODE_DIR=/u/phu1/Project
+# Source cluster config
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found. See README.md for cluster setup."; exit 1; }
 
 cd $CODE_DIR/Gradient-Streaming
 
@@ -76,7 +60,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo ""
             echo "Options:"
-            echo "  --models_dir DIR       Models directory (default: /work/hdd/bfwm/phu1/Project/Gradient-Streaming/RLHF)"
+            echo "  --models_dir DIR       Models directory (default: \$SCRATCH_DIR/Gradient-Streaming/RLHF)"
             echo "  --task NAME            Filter by task (e.g., toxicity)"
             echo "  --n_samples N          Number of test samples (default: 400, -1 for all)"
             echo "  --batch_size N         Batch size for generation (default: 16)"

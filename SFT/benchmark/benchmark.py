@@ -219,15 +219,36 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             hm._store_compressed_grad(lidx, rg)
             rec.mark('select_wgrad')
             return None, None
-        rec.mark('select'); si = _do_selection(state, lidx, scores, sim); rec.mark('select')
-        rec.mark('wgrad')
+        # select: top-k + split + indexing + scale_factor
+        rec.mark('select')
+        si = _do_selection(state, lidx, scores, sim)
         if usv: tgo, ti = go, inp
         else:
             tgo, _ = split_train_val_batch(go, state.train_batch_size)
             ti, _ = split_train_val_batch(inp, state.train_batch_size)
-        result = _produce_gradient_update(hm, uc, state, lidx, tgo, ti, si, hb)
+        scale_factor = state._compute_scale_factor(si)
+        sel_go = tgo[si]
+        sel_inp = ti[si]
+        rec.mark('select')
+
+        # wgrad: pure matmul only
         rec.mark('wgrad')
-        return result
+        if uc is not None:
+            sel_inp_aug = augment_input_for_bias(sel_inp, hb)
+            uc_compressed = uc.forward((sel_go, sel_inp_aug))
+            reduced = uc_compressed.mean(dim=0, keepdim=True) * scale_factor
+            hm._store_compressed_grad(lidx, reduced)
+            rec.mark('wgrad')
+            return None, None
+        else:
+            if sel_go.dim() == 3:
+                gw = torch.einsum('kso,ksi->oi', sel_go, sel_inp) * scale_factor
+                gb = sel_go.sum(dim=(0,1)) * scale_factor if hb else None
+            else:
+                gw = torch.einsum('ko,ki->oi', sel_go, sel_inp) * scale_factor
+                gb = sel_go.sum(dim=0) * scale_factor if hb else None
+            rec.mark('wgrad')
+            return gw, gb
 
     _bwd.LayerwiseLinearBackward.backward = timed_backward
     _bwd.LayerwiseLinearBackward._backward_compressed = timed_compressed
@@ -280,8 +301,40 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
     phases = ["pass1_forward", "pass1_backward", "selection",
               "pass2_forward", "pass2_backward", "optimizer"]
     timer = CUDAEventTimer(phases, N)
-    rec = EventRecorder()
+    rec = EventRecorder()      # pass 1 component events
+    p2_rec = EventRecorder()   # pass 2 component events
     pad_token_id = tokenizer.pad_token_id or 0
+
+    # TimedLinear for pass 2 backward breakdown (act_grad vs w.grad)
+    class TimedLinearP2(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, input, weight, bias):
+            ctx.save_for_backward(input, weight, bias)
+            return F.linear(input, weight, bias)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            input, weight, bias = ctx.saved_tensors
+            if input.dtype != grad_output.dtype:
+                input = input.to(grad_output.dtype)
+            p2_rec.mark('p2_act_grad')
+            grad_input = grad_output @ weight.to(grad_output.dtype)
+            p2_rec.mark('p2_act_grad')
+            p2_rec.mark('p2_wgrad')
+            go_2d = grad_output.reshape(-1, grad_output.shape[-1])
+            in_2d = input.reshape(-1, input.shape[-1])
+            grad_weight = go_2d.T @ in_2d
+            grad_bias = go_2d.sum(dim=0) if bias is not None else None
+            p2_rec.mark('p2_wgrad')
+            return grad_input, grad_weight, grad_bias
+
+    # Pre-build patched forwards for pass 2
+    _p2_patches = []
+    for _, module in model.named_modules():
+        if isinstance(module, nn.Linear) and hasattr(module, '_original_forward'):
+            def _make(mod):
+                return lambda input: TimedLinearP2.apply(input, mod.weight, mod.bias)
+            _p2_patches.append((module, module._original_forward, _make(module)))
 
     # Save originals
     _orig_backward = _bwd.SubsetLinearBackward.backward
@@ -368,6 +421,9 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
         has_update = grad_hook.compression_mode.uses_compressed_updates
         if not has_update:
             grad_hook.disable_hooks()
+            # Apply TimedLinearP2 patches for pass 2 breakdown
+            for mod, orig, timed in _p2_patches:
+                mod._original_forward = timed
         optimizer.zero_grad()
         if i is not None: timer.mark("pass2_forward", i, True)
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -377,19 +433,40 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
         loss2.backward()
         if i is not None: timer.mark("pass2_backward", i, False)
         if not has_update:
+            # Restore original forwards
+            for mod, orig, timed in _p2_patches:
+                mod._original_forward = orig
             grad_hook.enable_hooks()
         if i is not None: timer.mark("optimizer", i, True)
         optimizer.step()
         if i is not None: timer.mark("optimizer", i, False)
 
-    comp = _warmup_and_measure(step, train_batches, val_batches, config, rec)
+    # Warmup + timed (need to handle both rec and p2_rec)
+    N = config.num_iterations
+    p1_accum = {}
+    p2_accum = {}
+
+    for i in range(config.num_warmup):
+        rec.reset(); p2_rec.reset()
+        step(train_batches[i % len(train_batches)],
+             val_batches[i % len(val_batches)])
+
+    for i in range(N):
+        rec.reset(); p2_rec.reset()
+        step(train_batches[(config.num_warmup + i) % len(train_batches)],
+             val_batches[(config.num_warmup + i) % len(val_batches)], i)
+        torch.cuda.synchronize()
+        rec.accumulate(p1_accum)
+        p2_rec.accumulate(p2_accum)
 
     _bwd.SubsetLinearBackward.backward = _orig_backward
     _bwd.SubsetLinearBackward._accumulate_compressed = _orig_accum
 
     result = timer.mean_elapsed()
-    for k, v in comp.items():
-        result[f"p1_{k}"] = v
+    for k, v in p1_accum.items():
+        result[f"p1_{k}"] = v / N
+    for k, v in p2_accum.items():
+        result[k] = v / N
     return result
 
 
@@ -492,8 +569,16 @@ def print_results(standard, layerwise, subset, config, peak_mem):
                 ("score (accumulate)", p1_score),
                 ("autograd overhead", sub_p1b - p1_measured)]
     _bkd("Subset pass 1 (scoring)", p1_items, sub_p1b)
+    p2_act = subset.get('p2_act_grad', 0)
+    p2_wg = subset.get('p2_wgrad', 0)
+    p2_measured = p2_act + p2_wg
+    p2_overhead = sub_p2b - p2_measured if p2_measured > 0.01 else 0
     print(f"  Subset pass 2 (w.grad on selected):")
     print(f"    {'forward':<33} {sub_p2f:>8.1f} ms")
+    if p2_act > 0.01:
+        print(f"    {'act_grad (chain rule)':<33} {p2_act:>8.1f} ms")
+        print(f"    {'w.grad':<33} {p2_wg:>8.1f} ms")
+        print(f"    {'autograd overhead':<33} {p2_overhead:>8.1f} ms")
     print(f"    {'backward':<33} {sub_p2b:>8.1f} ms")
 
     print("=" * W)

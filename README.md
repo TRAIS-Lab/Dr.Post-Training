@@ -60,6 +60,30 @@ pip install flash-attn --no-build-isolation --no-cache-dir
 
 Note that due to the complicated dependencies of VERL (which is included as a git submodule) and vLLM, we recommend using a separate conda environment for RLVR experiments and let the VERL installation handle all the dependencies.
 
+## Cluster Setup
+
+All shell scripts source a gitignored `cluster_env.sh` at the repo root for cluster-specific paths. Create it before running any scripts:
+
+```bash
+# cluster_env.sh
+export SCRATCH_DIR="/scratch/$USER/Project"   # where data/checkpoints live
+export CODE_DIR="$HOME/Project"               # where this repo is cloned
+activate_env() { conda activate drpt; }       # or: export PATH="...envs/drpt/bin:$PATH"
+```
+
+This file is gitignored so it never causes merge conflicts between machines.
+
+For SLURM clusters, you can optionally create a `submit.sh` wrapper (also gitignored) to pass cluster-specific SLURM flags:
+
+```bash
+# submit.sh
+source "$(dirname "$0")/cluster_env.sh"
+sbatch --account=my-acct --partition=gpuA40x4 --gpus-per-node=4 \
+       --mem=128g --time=12:00:00 "$@"
+```
+
+Then submit jobs with `./submit.sh SFT/train/train.sh --methods baseline`.
+
 ## Experiments
 
 | Experiment | Environment | Description                                                              | Documentation                    |

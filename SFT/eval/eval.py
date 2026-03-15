@@ -452,7 +452,7 @@ def main():
     # Model selection (batch is default)
     model_group = parser.add_mutually_exclusive_group()
     model_group.add_argument("--models_dir", type=str,
-        default="/work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT",
+        default=os.environ.get("SCRATCH_DIR", "/scratch") + "/Gradient-Streaming/SFT",
         help="Directory containing trained models (default)")
     model_group.add_argument("--model_path", type=str,
         help="Path to single model to evaluate")

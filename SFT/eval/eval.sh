@@ -1,30 +1,12 @@
 #!/bin/bash
 
-#SBATCH --job-name=SFT-Eval
-#SBATCH --mem=64g
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --partition=gpuA40x4
-#SBATCH --account=bfwm-delta-gpu
-#SBATCH --time=24:00:00
-#SBATCH --constraint="scratch"
-#SBATCH --output=/u/%u/Project/Gradient-Streaming/SFT/log/%x-%j.log
-
-### GPU options ###
-#SBATCH --gpus-per-node=1
-#SBATCH --gpu-bind=none
-#SBATCH --mail-user=pbb@illinois.edu
-#SBATCH --mail-type="END"
-
-SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
-CODE_DIR=/u/phu1/Project
+# Source cluster config
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found. See README.md for cluster setup."; exit 1; }
 
 cd $CODE_DIR/Gradient-Streaming
 
-# Activate conda environment
-export PATH="/u/phu1/.conda/envs/IF/bin:$PATH"
-
+# Set PYTHONPATH to include project root for imports
 export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
 
 set -e
@@ -93,8 +75,8 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo ""
             echo "Options:"
-            echo "  --models_dir DIR     Models directory (default: /work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT)"
-            echo "  --data_dir DIR       Data directory (default: /work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT/data)"
+            echo "  --models_dir DIR     Models directory (default: \$SCRATCH_DIR/Gradient-Streaming/SFT)"
+            echo "  --data_dir DIR       Data directory (default: \$SCRATCH_DIR/Gradient-Streaming/SFT/data)"
             echo "  --train NAME         Filter by training dataset (alpaca, less, tulu3, wizardlm)"
             echo "  --task NAME          Override task (samsum, tydiqa, mmlu, bbh, gsm8k, math500)"
             echo "  --subject NAME       MMLU subject or BBH task to evaluate on (default: all)"

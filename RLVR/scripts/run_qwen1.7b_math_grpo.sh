@@ -1,27 +1,10 @@
 #!/bin/bash
 
-#SBATCH --job-name=RLVR-MATH
-#SBATCH --mem=128g
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --partition=gpuH200x8
-#SBATCH --account=bfwm-delta-gpu
-#SBATCH --time=12:00:00
-#SBATCH --output=/u/%u/Project/Gradient-Streaming/RLVR/logs/%x-%j.log
-
-### GPU options ###
-#SBATCH --gpus-per-node=4
-#SBATCH --gpu-bind=none
-#SBATCH --mail-user=pbb@illinois.edu
-#SBATCH --mail-type="END"
-
 set -x
 
-# Custom configurations
-
-SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
-CODE_DIR=/u/phu1/Project
+# Source cluster config
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found. See README.md for cluster setup."; exit 1; }
 
 # ============================================================================
 # GPU Configuration

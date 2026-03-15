@@ -1,35 +1,15 @@
 #!/bin/bash
 
-#SBATCH --job-name=RLHF-Train
-#SBATCH --mem=128g
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --partition=gpuA40x4
-#SBATCH --account=bfwm-delta-gpu
-#SBATCH --time=12:00:00
-#SBATCH --constraint="scratch"
-#SBATCH --output=/u/%u/Project/Gradient-Streaming/RLHF/log/%x-%j.log
-
-### GPU options ###
-#SBATCH --gpus-per-node=1
-#SBATCH --gpu-bind=none
-#SBATCH --mail-user=pbb@illinois.edu
-#SBATCH --mail-type="END"
-
-SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
-CODE_DIR=/u/phu1/Project
+# Source cluster config
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found. See README.md for cluster setup."; exit 1; }
 
 cd $CODE_DIR/Gradient-Streaming
-
-# Activate conda environment (IF has trl for RLHF)
-export PATH="/u/phu1/.conda/envs/IF/bin:$PATH"
 
 export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Use absolute path for configs (BASH_SOURCE unreliable under sbatch)
-CONFIG_DIR="$CODE_DIR/Gradient-Streaming/RLHF/train/configs"
+CONFIG_DIR="$SCRIPT_DIR/configs"
 
 # =============================================================================
 # Common settings (shared across all methods, overridden via CLI)

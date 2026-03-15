@@ -56,6 +56,10 @@ dist
 **/output
 **/wandb
 
+# Cluster-specific config (never commit — each user has their own)
+cluster_env.sh
+submit.sh
+
 # debug
 *debug*
 

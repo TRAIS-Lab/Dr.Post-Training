@@ -15,10 +15,13 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Source cluster config
+source "$PROJECT_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found. See README.md for cluster setup."; exit 1; }
+
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 # Python interpreter (override with PYTHON env var if needed)
-PYTHON="${PYTHON:-$HOME/miniconda3/envs/GradStream/bin/python}"
+PYTHON="${PYTHON:-python}"
 
 echo ""
 echo "========================================================"
