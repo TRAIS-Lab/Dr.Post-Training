@@ -1,12 +1,12 @@
 # Method Configs
 
-Each YAML file defines a training method as `{SelectionMethod}-{FinetuningMethod}`.
+Each YAML file defines a training method as `{CurationMethod}-{FinetuningMethod}`.
 
 ## Fields
 
 | Field | Values | Description |
 |---|---|---|
-| `method` | Standard, Layerwise, Subset | Data selection method |
+| `method` | Standard, Layerwise, Subset | Data curation method |
 | `finetuning` | Full, LoRA, MeSO, MeSO-LoRA | Training approach |
 | `lora_r`, `lora_alpha`, `lora_dropout` | int, int, float | LoRA hyperparameters |
 
@@ -45,11 +45,11 @@ Examples:
 
 ### Design Rules
 
-- **score_grad_compression**: Used for influence score computation in Layerwise/Subset selection.
+- **score_grad_compression**: Used for influence score computation in Layerwise/Subset curation.
   Set `sparsifier: none` for exact scoring (higher accuracy, more memory).
 - **opt_grad_compression**: Used by MeSO optimizer for memory-efficient updates.
   When both sections use the same sparsifier value, compressor objects are shared (zero overhead).
-- **MeSO + selection**: If `opt_grad_compression` is set and `score_grad_compression` is not,
+- **MeSO + curation**: If `opt_grad_compression` is set and `score_grad_compression` is not,
   scoring uses full (uncompressed) gradients. To share MeSO compression for scoring,
   set `score_grad_compression.sparsifier` to the same value as `opt_grad_compression.sparsifier`.
 - **Identity fallback**: If the compression dimension exceeds the layer's actual feature dimension,

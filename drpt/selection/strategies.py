@@ -1,5 +1,5 @@
 """
-Selection strategies for gradient-based data selection in trainers.
+Curation strategies for gradient-based data curation in trainers.
 
 This module provides two families of strategies based on how validation
 gradients are obtained:
@@ -12,7 +12,7 @@ gradients are obtained:
 
 2. **SeparateBatch Strategies**:
    - Val gradients are pre-captured and cached before training
-   - Training uses cached val gradients for selection scoring
+   - Training uses cached val gradients for curation scoring
    - Factory: create_separate_batch_strategy()
    - Supports two caching modes via start_val_capture(use_factorized=...):
      * Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 class MergedBatchStrategy(ABC):
     """
-    Abstract strategy for merged-batch data selection.
+    Abstract strategy for merged-batch data curation.
 
     Used when train and val samples are merged into a single batch,
     and val gradients are computed during the same forward/backward pass.
@@ -64,14 +64,14 @@ class MergedBatchStrategy(ABC):
         record_selections: bool = False,
     ):
         """
-        Initialize selection strategy.
+        Initialize curation strategy.
 
         Args:
             grad_hook: GradientHook instance (can be None for NoSelection)
-            frac: Selection fraction / filter fraction
-            use_second_order: Use greedy selection with second-order
+            frac: Curation fraction / filter fraction
+            use_second_order: Use greedy curation with second-order
             selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
-            record_selections: If True, record selection data for case study analysis
+            record_selections: If True, record curation data for case study analysis
         """
         self.grad_hook = grad_hook
         self.frac = frac
@@ -92,7 +92,7 @@ class MergedBatchStrategy(ABC):
         return self.grad_hook.compression_mode.uses_compressed_updates
 
     def _extract_selection_records(self):
-        """Extract selection records from state before cleanup."""
+        """Extract curation records from state before cleanup."""
         if self.grad_hook is None or self.grad_hook.selection_state is None:
             self.last_selection_record = None
             return
@@ -112,7 +112,7 @@ class MergedBatchStrategy(ABC):
         **kwargs
     ) -> Tensor:
         """
-        Execute a complete training step with selection.
+        Execute a complete training step with curation.
 
         Args:
             model: The model to train
@@ -129,9 +129,9 @@ class MergedBatchStrategy(ABC):
 
 class MergedBatchNoSelectionStrategy(MergedBatchStrategy):
     """
-    Baseline strategy: no data selection, standard training.
+    Baseline strategy: no data curation, standard training.
 
-    Uses all training samples without selection.
+    Uses all training samples without curation.
     """
 
     def execute_training_step(
@@ -142,7 +142,7 @@ class MergedBatchNoSelectionStrategy(MergedBatchStrategy):
         compute_loss_fn: Callable[[nn.Module, Dict[str, Tensor]], Tensor],
         **kwargs
     ) -> Tensor:
-        """Standard training step without selection."""
+        """Standard training step without curation."""
         # Disable hooks if present (use standard gradient computation)
         if self.grad_hook is not None and not self.has_update_compression:
             self.grad_hook.disable_hooks()
@@ -163,9 +163,9 @@ class MergedBatchNoSelectionStrategy(MergedBatchStrategy):
 
 class MergedBatchLayerwiseStrategy(MergedBatchStrategy):
     """
-    Layer-wise strategy with merged batch: single-pass, per-layer selection.
+    Layer-wise strategy with merged batch: single-pass, per-layer curation.
 
-    Selection and gradient aggregation happen layer-by-layer
+    Curation and gradient aggregation happen layer-by-layer
     during the backward pass.
     """
 
@@ -177,7 +177,7 @@ class MergedBatchLayerwiseStrategy(MergedBatchStrategy):
         compute_loss_fn: Callable[[nn.Module, Dict[str, Tensor]], Tensor],
         **kwargs
     ) -> Tensor:
-        """Training step with per-layer selection."""
+        """Training step with per-layer curation."""
         lr = kwargs.get('lr', 1e-4)
 
         # Set up streaming state
@@ -189,9 +189,9 @@ class MergedBatchLayerwiseStrategy(MergedBatchStrategy):
 
         model.zero_grad()
         loss = compute_loss_fn(model, merged_batch)
-        loss.backward()  # Per-layer selection happens in backward hooks
+        loss.backward()  # Per-layer curation happens in backward hooks
 
-        # Extract selection records before cleanup
+        # Extract curation records before cleanup
         self._extract_selection_records()
 
         # Cleanup
@@ -225,9 +225,9 @@ class MergedBatchLayerwiseStrategy(MergedBatchStrategy):
 
 class MergedBatchSubsetStrategy(MergedBatchStrategy):
     """
-    Subset strategy with merged batch: two-pass, global selection.
+    Subset strategy with merged batch: two-pass, global curation.
 
-    Pass 1: Compute selection scores across all layers
+    Pass 1: Compute curation scores across all layers
     Pass 2: Forward/backward only on globally selected samples
     """
 
@@ -239,7 +239,7 @@ class MergedBatchSubsetStrategy(MergedBatchStrategy):
         compute_loss_fn: Callable[[nn.Module, Dict[str, Tensor]], Tensor],
         **kwargs
     ) -> Tensor:
-        """Training step with global selection."""
+        """Training step with global curation."""
         lr = kwargs.get('lr', 1e-4)
         batch_train = kwargs.get('batch_train')  # Original train batch for pass 2
 
@@ -260,12 +260,12 @@ class MergedBatchSubsetStrategy(MergedBatchStrategy):
         selected_indices = selected_indices.sort()[0]
         n_selected = len(selected_indices)
 
-        # Extract selection records before cleanup
+        # Extract curation records before cleanup
         self._extract_selection_records()
 
         self._cleanup()
 
-        # Handle empty selection: skip pass 2 and return zero loss
+        # Handle empty curation: skip pass 2 and return zero loss
         if n_selected == 0:
             # Re-enable hooks for next step
             if not self.has_update_compression:
@@ -288,7 +288,7 @@ class MergedBatchSubsetStrategy(MergedBatchStrategy):
             'labels': batch_train['labels'][selected_indices]
         }
 
-        # For pass 2, disable hooks if no compression (we want full gradients)
+        # For pass 2, disable hooks if no compression (we want full gradients for selected samples)
         if not self.has_update_compression:
             self.grad_hook.disable_hooks()
         else:
@@ -340,17 +340,17 @@ def create_merged_batch_strategy(
     record_selections: bool = False,
 ) -> MergedBatchStrategy:
     """
-    Factory function to create merged-batch selection strategy.
+    Factory function to create merged-batch curation strategy.
 
     Note: Has padding overhead when val/train have different sequence lengths.
 
     Args:
-        method: Selection method ("NA", "Layerwise", "Subset")
+        method: Curation method ("NA", "Layerwise", "Subset")
         grad_hook: GradientHook instance
-        frac: Selection/filter fraction
-        use_second_order: Use greedy selection with second-order
+        frac: Curation/filter fraction
+        use_second_order: Use greedy curation with second-order
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
-        record_selections: If True, record selection data for case study analysis
+        record_selections: If True, record curation data for case study analysis
 
     Returns:
         Appropriate MergedBatchStrategy instance
@@ -364,7 +364,7 @@ def create_merged_batch_strategy(
     if method == "Subset":
         return MergedBatchSubsetStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
 
-    raise ValueError(f"Unknown selection method: {method}")
+    raise ValueError(f"Unknown curation method: {method}")
 
 
 
@@ -377,7 +377,7 @@ def create_merged_batch_strategy(
 
 class SeparateBatchStrategy(ABC):
     """
-    Abstract strategy for separate-batch data selection.
+    Abstract strategy for separate-batch data curation.
 
     Used when val gradients are pre-captured and cached before training,
     rather than computed from a merged batch during the same forward pass.
@@ -398,16 +398,16 @@ class SeparateBatchStrategy(ABC):
         record_selections: bool = False,
     ):
         """
-        Initialize stored-val selection strategy.
+        Initialize stored-val curation strategy.
 
         Args:
             grad_hook: GradientHook instance (can be None for NoSelection)
             frac: Fraction parameter. Meaning depends on selection_mode:
                   - "topk": Fraction of samples to select (top frac by score)
                   - "filtering": Fraction of negative-influence samples to DROP
-            use_second_order: Use greedy selection with second-order
+            use_second_order: Use greedy curation with second-order
             selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
-            record_selections: If True, record selection data for case study analysis
+            record_selections: If True, record curation data for case study analysis
         """
         self.grad_hook = grad_hook
         self.frac = frac
@@ -428,7 +428,7 @@ class SeparateBatchStrategy(ABC):
         return self.grad_hook.compression_mode.uses_compressed_updates
 
     def _extract_selection_records(self):
-        """Extract selection records from state before cleanup."""
+        """Extract curation records from state before cleanup."""
         if self.grad_hook is None or self.grad_hook.selection_state is None:
             self.last_selection_record = None
             return
@@ -448,7 +448,7 @@ class SeparateBatchStrategy(ABC):
         **kwargs
     ) -> Tuple[Tensor, Dict]:
         """
-        Execute a complete training step with selection.
+        Execute a complete training step with curation.
 
         Args:
             model: The model to train
@@ -458,14 +458,14 @@ class SeparateBatchStrategy(ABC):
             **kwargs: Additional arguments (filter_batch_fn for Subset)
 
         Returns:
-            Tuple of (loss, stats_dict) where stats includes selection metrics
+            Tuple of (loss, stats_dict) where stats includes curation metrics
         """
         pass
 
 
 class SeparateBatchNoSelectionStrategy(SeparateBatchStrategy):
     """
-    Baseline strategy: no data selection, standard training.
+    Baseline strategy: no data curation, standard training.
     """
 
     def execute_training_step(
@@ -476,7 +476,7 @@ class SeparateBatchNoSelectionStrategy(SeparateBatchStrategy):
         lr: float,
         **kwargs
     ) -> Tuple[Tensor, Dict]:
-        """Standard training step without selection."""
+        """Standard training step without curation."""
         # Disable hooks for baseline (use standard gradient computation)
         if self.grad_hook is not None:
             self.grad_hook.disable_hooks()
@@ -494,9 +494,9 @@ class SeparateBatchNoSelectionStrategy(SeparateBatchStrategy):
 
 class SeparateBatchLayerwiseStrategy(SeparateBatchStrategy):
     """
-    Layer-wise strategy with cached val: per-layer selection.
+    Layer-wise strategy with cached val: per-layer curation.
 
-    Selection and gradient aggregation happen layer-by-layer during backward,
+    Curation and gradient aggregation happen layer-by-layer during backward,
     using pre-captured validation gradients.
     """
 
@@ -508,7 +508,7 @@ class SeparateBatchLayerwiseStrategy(SeparateBatchStrategy):
         lr: float,
         **kwargs
     ) -> Tuple[Tensor, Dict]:
-        """Training step with per-layer selection using stored val grads.
+        """Training step with per-layer curation using stored val grads.
 
         Args:
             model: The model to train
@@ -530,9 +530,9 @@ class SeparateBatchLayerwiseStrategy(SeparateBatchStrategy):
 
         model.zero_grad()
         loss, stats = compute_loss_fn()
-        loss.backward()  # Per-layer selection happens in backward hooks
+        loss.backward()  # Per-layer curation happens in backward hooks
 
-        # Add selection stats from streaming state
+        # Add curation stats from streaming state
         sel_state = self.grad_hook.selection_state
         if hasattr(sel_state, '_layer_selections') and sel_state._layer_selections:
             n_selected_list = [n for _, n in sel_state._layer_selections]
@@ -541,7 +541,7 @@ class SeparateBatchLayerwiseStrategy(SeparateBatchStrategy):
             # Use min for n_selected check - if any layer had 0, flag it
             stats["selection/n_selected"] = min(n_selected_list)
 
-        # Extract selection records before cleanup
+        # Extract curation records before cleanup
         self._extract_selection_records()
 
         # Cleanup
@@ -569,9 +569,9 @@ class SeparateBatchLayerwiseStrategy(SeparateBatchStrategy):
 
 class SeparateBatchSubsetStrategy(SeparateBatchStrategy):
     """
-    Subset strategy with cached val: global selection.
+    Subset strategy with cached val: global curation.
 
-    Pass 1: Compute selection scores across all layers
+    Pass 1: Compute curation scores across all layers
     Pass 2: Forward/backward only on globally selected samples
     """
 
@@ -583,7 +583,7 @@ class SeparateBatchSubsetStrategy(SeparateBatchStrategy):
         lr: float,
         **kwargs
     ) -> Tuple[Tensor, Dict]:
-        """Training step with global selection using stored val grads."""
+        """Training step with global curation using stored val grads."""
         # filter_batch_fn: Callable[[Tensor], Callable] that takes selected_indices
         # and returns a new compute_loss_fn for the filtered batch
         filter_batch_fn = kwargs.get('filter_batch_fn')
@@ -603,12 +603,12 @@ class SeparateBatchSubsetStrategy(SeparateBatchStrategy):
         selected_indices = selected_indices.sort()[0]
         n_selected = len(selected_indices)
 
-        # Extract selection records before cleanup
+        # Extract curation records before cleanup
         self._extract_selection_records()
 
         self._cleanup()
 
-        # Handle empty selection: skip pass 2 and return zero loss
+        # Handle empty curation: skip pass 2 and return zero loss
         if n_selected == 0:
             # Re-enable hooks for next step
             self.grad_hook.enable_hooks()
@@ -630,7 +630,7 @@ class SeparateBatchSubsetStrategy(SeparateBatchStrategy):
             return zero_loss, stats
 
         # === PASS 2: Gradient Computation on Selected ===
-        # Disable hooks only if no update compression (standard optimizer).
+        # Disable hooks only if no update compression (standard optimizer for selected samples).
         # With MeSO, keep hooks enabled so CompressedLinearBackward stores
         # compressed gradients for the optimizer.
         if not self.has_update_compression:
@@ -647,7 +647,7 @@ class SeparateBatchSubsetStrategy(SeparateBatchStrategy):
         if not self.has_update_compression:
             self.grad_hook.enable_hooks()
 
-        # Add selection stats
+        # Add curation stats
         stats["selection/n_selected"] = n_selected
 
         return loss.detach(), stats
@@ -679,19 +679,19 @@ def create_separate_batch_strategy(
     record_selections: bool = False,
 ) -> SeparateBatchStrategy:
     """
-    Factory function to create separate-batch selection strategy.
+    Factory function to create separate-batch curation strategy.
 
     Avoids padding overhead when val/train have different sequence lengths.
 
     Args:
-        method: Selection method ("NA", "Layerwise", "Subset")
+        method: Curation method ("NA", "Layerwise", "Subset")
         grad_hook: GradientHook instance
         frac: Fraction parameter. Meaning depends on selection_mode:
               - "topk": Fraction of samples to select (top frac by score)
               - "filtering": Fraction of negative-influence samples to DROP
-        use_second_order: Use greedy selection with second-order
+        use_second_order: Use greedy curation with second-order
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
-        record_selections: If True, record selection data for case study analysis
+        record_selections: If True, record curation data for case study analysis
 
     Returns:
         Appropriate SeparateBatchStrategy instance
@@ -705,6 +705,4 @@ def create_separate_batch_strategy(
     if method == "Subset":
         return SeparateBatchSubsetStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
 
-    raise ValueError(f"Unknown selection method: {method}")
-
-
+    raise ValueError(f"Unknown curation method: {method}")

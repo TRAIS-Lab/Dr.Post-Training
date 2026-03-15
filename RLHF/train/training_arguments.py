@@ -2,7 +2,7 @@
 Training arguments for RLHF experiments.
 
 Following SFT conventions:
-- `method`: Controls data selection (NA, Layerwise, Subset)
+- `method`: Controls data curation (NA, Layerwise, Subset)
 - `sparsification`/`projection`: Controls compression (implies MeSO optimizer)
 - PPO-specific arguments for RLHF
 """
@@ -16,10 +16,10 @@ from transformers import TrainingArguments as TA
 @dataclass
 class TrainingArguments(TA):
     """
-    Training arguments for RLHF with layer-wise data selection.
+    Training arguments for RLHF with layer-wise data curation.
 
     Inherits from transformers.TrainingArguments and adds:
-    - Data selection arguments (method, filter_frac)
+    - Data curation arguments (method, filter_frac)
     - Gradient compression arguments (sparsification, projection)
     - PPO-specific arguments
     """
@@ -65,17 +65,17 @@ class TrainingArguments(TA):
     )
 
     # ===================
-    # Data Selection (following SFT conventions)
+    # Data Curation (following SFT conventions)
     # ===================
     method: str = field(
         default="NA",
         metadata={
             "help": (
                 "Training method: "
-                "'NA' (baseline, no selection), "
+                "'NA' (baseline, no curation), "
                 "'IIF' (pre-filter entire rollout before PPO epochs), "
-                "'Layerwise' (per-layer selection, single-pass), "
-                "'Subset' (global selection, two-pass)"
+                "'Layerwise' (per-layer curation, single-pass), "
+                "'Subset' (global curation, two-pass)"
             )
         },
     )
@@ -93,7 +93,7 @@ class TrainingArguments(TA):
         default=False,
         metadata={
             "help": (
-                "Use second-order selection (greedy with similarity matrix). "
+                "Use second-order curation (greedy with similarity matrix). "
                 "Slower but more accurate."
             )
         },
@@ -102,7 +102,7 @@ class TrainingArguments(TA):
         default=8,
         metadata={
             "help": (
-                "Number of validation samples for data selection. "
+                "Number of validation samples for data curation. "
                 "Uses a fixed validation set (separate from training) for computing "
                 "validation gradients. Set to 0 to use self-referencing validation "
                 "(training buffer as validation set)."
@@ -123,7 +123,7 @@ class TrainingArguments(TA):
         default="seqloss-lastadv",
         metadata={
             "help": (
-                "Validation loss type for data selection gradient computation. "
+                "Validation loss type for data curation gradient computation. "
                 "Options: "
                 "'seqloss-lastadv' (default) - sequence log prob * last-token GAE advantage, "
                 "'seqloss-reward' - sequence log prob * normalized raw reward, "
@@ -406,7 +406,7 @@ class TrainingArguments(TA):
 
     @property
     def has_selection(self) -> bool:
-        """Whether data selection is enabled."""
+        """Whether data curation is enabled."""
         return self.method != "NA"
 
     @property

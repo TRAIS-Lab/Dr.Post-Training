@@ -12,18 +12,18 @@ This folder contains the training and evaluation code and method configurations 
 
 All methods use **LoRA training** (no MeSO compression). Each method has a YAML config in `RLHF/train/configs/`:
 
-| Config                | Selection | Description                                    |
+| Config                | Curation  | Description                                    |
 | --------------------- | --------- | ---------------------------------------------- |
-| `Standard-LoRA.yaml`    | NA        | Baseline PPO (no data selection)               |
+| `Standard-LoRA.yaml`    | NA        | Baseline PPO (no data curation)               |
 | `IIF-LoRA.yaml`         | IIF       | Pre-filter rollout before PPO epochs           |
-| `Layerwise-LoRA.yaml`   | Layerwise | Per-layer selection with projected scoring |
-| `Subset-LoRA.yaml`      | Subset    | Global selection with exact scoring        |
+| `Layerwise-LoRA.yaml`   | Layerwise | Per-layer curation with projected scoring |
+| `Subset-LoRA.yaml`      | Subset    | Global curation with exact scoring        |
 
-**Selection Methods:**
-- **NA**: No data selection (baseline)
+**Curation Methods:**
+- **NA**: No data curation (baseline)
 - **IIF**: Influence Function-based Filtering — pre-filter entire rollout *before* PPO epochs
-- **Layerwise**: Per-layer, per-mini-batch selection during PPO training
-- **Subset**: Global selection across all layers, per-mini-batch during PPO training
+- **Layerwise**: Per-layer, per-mini-batch curation during PPO training
+- **Subset**: Global curation across all layers, per-mini-batch during PPO training
 
 ### Training Commands
 
@@ -51,7 +51,7 @@ bash RLHF/train/train.sh --methods all --dry-run
 
 #### Parameters
 
-Method-specific settings (selection method, score compression) are in YAML config files.
+Method-specific settings (curation method, score compression) are in YAML config files.
 Common settings are CLI arguments:
 
 1. Task Arguments
@@ -75,7 +75,7 @@ Common settings are CLI arguments:
    - `--target <val>` — Target KL for adaptive controller (default: `70.0`)
    - `--target_kl <kl>` — Early stopping threshold (default: `0.3`)
    - `--max_new_tokens <n>` — Max new tokens (default: `30`)
-4. Validation (for data selection)
+4. Validation (for data curation)
    - `--n_val <n>` — Validation samples (default: `1024`, `0` = self-ref)
    - `--val_batch_size <n>` — Val batch size (default: `256`)
    - `--val_loss_type <type>` — `seqloss-reward` (default), `seqloss-lastadv`, or `tokenpg`

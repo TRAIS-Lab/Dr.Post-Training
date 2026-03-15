@@ -1,6 +1,6 @@
 # RLVR Experiment
 
-This directory contains the implementation for online gradient-based data selection during RLHF/GRPO training, built on top of [verl](https://github.com/volcengine/verl).
+This directory contains the implementation for online gradient-based data curation during RLHF/GRPO training, built on top of [verl](https://github.com/volcengine/verl).
 
 ## Quick Start
 
@@ -16,10 +16,10 @@ python data/prepare_data.py \
     --num_samples 1000 \
     --seed 42
 
-# 3. Run training with Layerwise selection (default)
+# 3. Run training with Layerwise curation (default)
 bash scripts/run_qwen1.7b_math_grpo.sh
 
-# 4. Or disable selection for baseline
+# 4. Or disable curation for baseline
 bash scripts/run_qwen1.7b_math_grpo.sh ++selection.enable=False
 ```
 
@@ -37,7 +37,7 @@ This creates:
 
 ### Step 2: Prepare Validation Prompts
 
-For gradient-based selection, we need validation prompts. There are two options:
+For gradient-based curation, we need validation prompts. There are two options:
 
 #### Option A: Validation from Test Set (Default)
 
@@ -119,13 +119,13 @@ VAL_PROMPTS_PATH=$DATA_DIR/math/val_from_train.parquet bash scripts/run_qwen1.7b
 **Important:** Always run scripts from the `RLVR/` directory to ensure all output folders are created in consistent locations.
 
 ```bash
-# With Layerwise selection (default)
+# With Layerwise curation (default)
 bash scripts/run_qwen1.7b_math_grpo.sh
 
-# Baseline (no selection)
+# Baseline (no curation)
 bash scripts/run_qwen1.7b_math_grpo.sh ++selection.enable=False
 
-# With Subset selection
+# With Subset curation
 SELECTION_METHOD=Subset bash scripts/run_qwen1.7b_math_grpo.sh
 ```
 
@@ -137,9 +137,9 @@ SELECTION_METHOD=Subset bash scripts/run_qwen1.7b_math_grpo.sh
 | ------------------- | --------- | ------------------------------------------ |
 | `N_GPUS`            | auto      | Number of GPUs                             |
 | `SEED`              | 42        | Random seed for reproducibility            |
-| `SELECTION_ENABLED` | True      | Enable/disable selection                   |
-| `SELECTION_METHOD`  | Layerwise | Selection method: `Layerwise` or `Subset`  |
-| `SELECTION_FRAC`    | 1.0       | Fraction of samples to select              |
+| `SELECTION_ENABLED` | True      | Enable/disable curation                   |
+| `SELECTION_METHOD`  | Layerwise | Curation method: `Layerwise` or `Subset`  |
+| `SELECTION_FRAC`    | 1.0       | Fraction of samples to curate              |
 | `VAL_POOL_SIZE`     | 500       | Number of validation prompts               |
 | `VAL_BATCH_SIZE`    | 32        | Batch size for validation gradient capture |
 | `REFRESH_FREQ`      | 1         | How often to refresh validation gradients  |
@@ -149,10 +149,10 @@ SELECTION_METHOD=Subset bash scripts/run_qwen1.7b_math_grpo.sh
 Pass additional config via command line:
 
 ```bash
-# Disable selection
+# Disable curation
 bash scripts/run_qwen1.7b_math_grpo.sh ++selection.enable=False
 
-# Change selection fraction
+# Change curation fraction
 bash scripts/run_qwen1.7b_math_grpo.sh ++selection.frac=0.5
 
 # Change model

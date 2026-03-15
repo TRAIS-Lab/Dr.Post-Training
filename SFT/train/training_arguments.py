@@ -79,13 +79,13 @@ class TrainingArguments(TA):
     )
 
 
-    # Data Selection Arguments
+    # Data Curation Arguments
     method: str = field(
         default="NA",
         metadata={
             "help": (
-                "Data selection method: 'NA' (no selection), "
-                "'Layerwise' (per-layer selection), or 'Subset' (global selection)"
+                "Data curation method: 'NA' (no curation), "
+                "'Layerwise' (per-layer curation), or 'Subset' (global curation)"
             )
         },
     )
@@ -99,7 +99,7 @@ class TrainingArguments(TA):
     )
     n_val: int = field(
         default=8,
-        metadata={"help": "Number of validation samples for data selection"},
+        metadata={"help": "Number of validation samples for data curation"},
     )
     n_eval: int = field(
         default=500,
@@ -109,9 +109,9 @@ class TrainingArguments(TA):
         default=1,
         metadata={
             "help": (
-                "Batch size for validation data used during training for data selection. "
+                "Batch size for validation data used during training for data curation. "
                 "If None, defaults to per_device_train_batch_size. "
-                "This allows independent control of batch size for data selection during training."
+                "This allows independent control of batch size for data curation during training."
             )
         },
     )
@@ -159,9 +159,9 @@ class TrainingArguments(TA):
         default=False,
         metadata={
             "help": (
-                "Whether to use second-order interactions for data selection. "
-                "If True, uses greedy selection considering sample similarities (O(k*n) complexity). "
-                "If False (default), uses simple top-k selection based on scores."
+                "Whether to use second-order interactions for data curation. "
+                "If True, uses greedy curation considering sample similarities (O(k*n) complexity). "
+                "If False (default), uses simple top-k curation based on scores."
             )
         },
     )
@@ -169,7 +169,7 @@ class TrainingArguments(TA):
         default="separate_batch_factorized",
         metadata={
             "help": (
-                "Validation gradient strategy for data selection: "
+                "Validation gradient strategy for data curation: "
                 "'separate_batch_factorized' (default): Separate val pass, store [V,S,O] and [V,S,I] factors. "
                 "'separate_batch': Separate val pass, store mean gradient [O,I] per layer. "
                 "'merged_batch': Merge train+val into single batch, compute val grad in same pass. "
@@ -178,13 +178,13 @@ class TrainingArguments(TA):
         },
     )
 
-    # Selection Recording (Case Study)
+    # Curation Recording (Case Study)
     record_selections: bool = field(
         default=False,
         metadata={
             "help": (
                 "Record selected sample indices and scores per step for case study analysis. "
-                "For Layerwise: records per-layer selections. For Subset: records global selection. "
+                "For Layerwise: records per-layer curation. For Subset: records global curation. "
                 "Saves to output_dir/selection_records.json."
             )
         },
@@ -193,7 +193,7 @@ class TrainingArguments(TA):
         default=1,
         metadata={
             "help": (
-                "Record selections every N steps. Default: 1 (every step). "
+                "Record curation decisions every N steps. Default: 1 (every step). "
                 "Increase to reduce file size for long training runs."
             )
         },

@@ -17,15 +17,19 @@
 #SBATCH --mail-user=pbb@illinois.edu
 #SBATCH --mail-type="END"
 
-SCRATCH_DIR=/scratch/pbb/Project
-CODE_DIR=/home/pbb/Project
+SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
+CODE_DIR=/u/phu1/Project
 
 cd $CODE_DIR/Gradient-Streaming
+
+# Activate conda environment (IF has trl for RLHF)
+export PATH="/u/phu1/.conda/envs/IF/bin:$PATH"
 
 export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$SCRIPT_DIR/configs"
+# Use absolute path for configs (BASH_SOURCE unreliable under sbatch)
+CONFIG_DIR="$CODE_DIR/Gradient-Streaming/RLHF/train/configs"
 
 # =============================================================================
 # Common settings (shared across all methods, overridden via CLI)
@@ -60,7 +64,7 @@ min_new_tokens=0
 max_steps=-1
 use_flash_attention=true
 
-# Data selection
+# Data curation
 filter_frac=1.0
 use_second_order=false
 n_val=1024
@@ -155,7 +159,7 @@ Usage: bash train.sh --methods <methods> [options]
 
 Run RLHF training with method configs from RLHF/train/configs/*.yaml.
 
-Method Selection:
+Method Curation:
   --methods <list>         Methods or categories (comma-separated)
   --list                   List available methods and exit
   --dry-run                Print commands without executing
@@ -192,7 +196,7 @@ PPO Settings:
   --early_stopping         Enable early stopping
   --max_new_tokens <n>     Max new tokens to generate (default: 30)
 
-Validation (for data selection):
+Validation (for data curation):
   --n_val <n>              Validation samples (default: 1024, 0=self-ref)
   --val_batch_size <n>     Val batch size (default: 256)
   --val_loss_type <type>   Val loss: seqloss-lastadv, seqloss-reward, tokenpg
@@ -266,7 +270,7 @@ read_yaml() {
         esac
     done < "$config_file"
 
-    # Map method name to internal selection name
+    # Map method name to internal curation name
     case "$cfg_method" in
         Standard) cfg_internal_method="NA" ;;
         *)        cfg_internal_method="$cfg_method" ;;
@@ -464,12 +468,12 @@ run_method() {
     # Score-only compression (score_grad_compression)
     [[ -n "$cfg_score_sparsifier" && "$cfg_score_sparsifier" != "none" ]] && training_args="$training_args --score_compression=$cfg_score_sparsifier"
 
-    # Second-order selection
+    # Second-order curation
     if [[ "$cfg_internal_method" != "NA" ]] && [ "$use_second_order" = true ]; then
         training_args="$training_args --use_second_order=True"
     fi
 
-    # Validation settings (for data selection)
+    # Validation settings (for data curation)
     training_args="$training_args --n_val=$n_val --val_batch_size=$val_batch_size --val_loss_type=$val_loss_type"
 
     # Evaluation settings

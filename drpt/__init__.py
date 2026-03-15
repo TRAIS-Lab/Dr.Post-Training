@@ -6,7 +6,7 @@ Architecture overview:
   GradientHook
     Monkey-patches Linear layers with custom autograd Functions.
     Maintains two independent compressor lists:
-      score_compressors  — for influence score computation (data selection)
+      score_compressors  — for influence score computation (data curation)
       update_compressors — for MeSO optimizer updates
     When both use the same config, they share objects (zero overhead).
 
@@ -19,9 +19,9 @@ Architecture overview:
     Memory-efficient optimizer maintaining states in compressed space.
     Reads compressed gradients from update_compressors via the hook.
 
-  Selection (selection/)
-    Layerwise: per-layer selection in a single backward pass.
-    Subset: global selection via two-pass (score accumulation → filtered update).
+  Curation (selection/)
+    Layerwise: per-layer curation in a single backward pass.
+    Subset: global curation via two-pass (score accumulation → filtered update).
     Both use score_compressors for influence scoring.
 
   CompressionMode (compression_mode.py)
@@ -43,7 +43,7 @@ from .compression_mode import CompressionMode
 # Validation gradient cache
 from .validation_cache import ValidationCache, ValidationStorageMode
 
-# Selection module exports (gradient-based)
+# Curation module exports (gradient-based)
 from .selection import (
     SelectionState,
     LayerwiseState,
@@ -73,7 +73,7 @@ __all__ = [
     # Validation cache
     "ValidationCache",
     "ValidationStorageMode",
-    # Selection state classes
+    # Curation state classes
     "SelectionState",
     "LayerwiseState",
     "SubsetState",

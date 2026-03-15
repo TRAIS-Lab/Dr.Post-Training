@@ -1,5 +1,5 @@
 """
-Selection module for gradient-based data selection (Dr. Post-Training).
+Curation module for gradient-based data curation (Dr. Post-Training).
 
 This module provides two families of strategies for computing validation gradients:
 
@@ -11,7 +11,7 @@ This module provides two families of strategies for computing validation gradien
 
 2. **SeparateBatch Strategies**:
    - Val gradients are pre-captured and cached before training
-   - Training uses cached val gradients for selection scoring
+   - Training uses cached val gradients for curation scoring
    - Factory: create_separate_batch_strategy()
    - Avoids padding overhead - val and train can have different seq lengths
    - Supports two caching modes via start_val_capture(use_factorized=...):

@@ -31,8 +31,8 @@
 #   - Creates detailed results in SFT/lr_sweep_results/
 # =============================================================================
 
-SCRATCH_DIR=/scratch/pbb/Project
-CODE_DIR=/home/pbb/Project
+SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
+CODE_DIR=/u/phu1/Project
 
 cd $CODE_DIR/Gradient-Streaming
 
@@ -76,8 +76,8 @@ task="mmlu"
 train_dataset=""
 subject="sociology"
 compression=""
-use_second_order=false  # If true, use greedy selection with second-order interactions
-selection_frac="0.5"  # Fraction of samples to select (for Layerwise/Subset)
+use_second_order=false  # If true, use greedy curation with second-order interactions
+selection_frac="0.5"  # Fraction of samples to curate (for Layerwise/Subset)
 val_strategy="merged_batch"  # Validation strategy: separate_batch_factorized, separate_batch, merged_batch
 use_lora=false
 use_flash_attention=true
@@ -424,7 +424,7 @@ resolve_methods() {
 # Extract evaluation loss from training output
 # ========================================
 # We use eval_loss (evaluation/test set) for LR selection, NOT val_loss (validation set).
-# This prevents overfitting to the validation set which is also used for data selection
+# This prevents overfitting to the validation set which is also used for data curation
 # during Layerwise/Subset training.
 extract_eval_loss() {
     local output_dir="$1"

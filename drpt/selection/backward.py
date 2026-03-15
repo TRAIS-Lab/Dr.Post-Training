@@ -1,9 +1,9 @@
 """
-Autograd functions for gradient-based data selection and compression.
+Autograd functions for gradient-based data curation and compression.
 
 This module provides three distinct autograd Functions:
-- CompressedLinearBackward: Pure gradient compression (no selection)
-- LayerwiseLinearBackward: Per-layer selection, single-pass
+- CompressedLinearBackward: Pure gradient compression (no curation)
+- LayerwiseLinearBackward: Per-layer curation, single-pass
 - SubsetLinearBackward: Score accumulation, two-pass
 
 Each function routes to specific handlers based on CompressionMode:
@@ -80,7 +80,7 @@ def _do_selection(
     scores: Tensor,
     similarity: Optional[Tensor],
 ) -> Tensor:
-    """Run per-layer selection: pick indices, record stats."""
+    """Run per-layer curation: pick indices, record stats."""
     selected_indices = state._select_indices(scores, similarity)
     selected_indices = selected_indices.sort()[0]
     state._last_selected_indices = selected_indices
@@ -107,7 +107,7 @@ def _produce_gradient_update(
     selected_indices: Tensor,
     has_bias: bool,
 ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
-    """After selection, produce the gradient update.
+    """After curation, produce the gradient update.
 
     If update_compressor exists: compress selected gradients → store for MeSO → return (None, None).
     Otherwise: compute full gradients for selected samples → return (grad_weight, grad_bias).
@@ -138,7 +138,7 @@ def _store_update_grad(
     has_bias: bool,
     score_compressed_reduced: Tensor,
 ) -> None:
-    """Store compressed gradient for MeSO when no selection is active.
+    """Store compressed gradient for MeSO when no curation is active.
 
     Reuses score-compressed grad if compressors are shared; otherwise re-compresses.
     """
@@ -157,9 +157,9 @@ def _store_update_grad(
 
 class CompressedLinearBackward(Function):
     """
-    Autograd Function for pure gradient compression (no data selection).
+    Autograd Function for pure gradient compression (no data curation).
 
-    Used when compression is enabled (MeSO optimizer) but no data selection is active.
+    Used when compression is enabled (MeSO optimizer) but no data curation is active.
     """
 
     @staticmethod
@@ -209,7 +209,7 @@ class CompressedLinearBackward(Function):
 
 class LayerwiseLinearBackward(Function):
     """
-    Autograd Function for layer-wise descent (per-layer selection).
+    Autograd Function for layer-wise descent (per-layer curation).
 
     Single-pass: At each layer, computes scores, selects samples,
     and aggregates gradients immediately.
@@ -236,7 +236,7 @@ class LayerwiseLinearBackward(Function):
         ctx,
         grad_output: Tensor
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], None, None]:
-        """Backward pass with per-layer selection."""
+        """Backward pass with per-layer curation."""
         input, weight, bias = ctx.saved_tensors
         layer_idx = ctx.layer_idx
 
@@ -311,7 +311,7 @@ class LayerwiseLinearBackward(Function):
                 val_cache._compressed[layer_idx] = val_cache._compressed[layer_idx] + total_grad
             return None, None
 
-        # --- No selection state: just store MeSO update if needed ---
+        # --- No curation state: just store MeSO update if needed ---
         if state is None:
             _store_update_grad(hook_manager, update_compressor, score_compressor,
                                layer_idx, grad_output, input_aug, has_bias,
@@ -405,7 +405,7 @@ class LayerwiseLinearBackward(Function):
             )
             return None, None
 
-        # --- No selection state: just store MeSO update if needed ---
+        # --- No curation state: just store MeSO update if needed ---
         if state is None:
             if update_compressor is not None:
                 input_aug = augment_input_for_bias(input, has_bias)
@@ -447,7 +447,7 @@ class LayerwiseLinearBackward(Function):
 
 class SubsetLinearBackward(Function):
     """
-    Autograd Function for Subset method (global selection).
+    Autograd Function for Subset method (global curation).
 
     Pass 1: Accumulates scores across all layers (no gradient output).
     Pass 2: Forward/backward on selected samples only.

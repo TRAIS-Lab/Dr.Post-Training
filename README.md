@@ -1,6 +1,6 @@
 # Dr. Post-Training
 
-This repository implements **Dr. Post-Training** for fine-grained data selection for modern model training.
+This repository implements **Dr. Post-Training** for fine-grained data curation for modern model training.
 
 The trainer of SFT and RLHF is implemented in plain PyTorch without advanced distributed training frameworks (e.g., DeepSpeed, FairScale, or Hugging Face Accelerator) to maximize clarity and ease of understanding. For large-scale training, we provide our implementation in the RLVR experiment with [VERL](https://github.com/volcengine/verl) (Ray-based distributed RL) with vLLM for fast generation.
 
@@ -64,19 +64,19 @@ Note that due to the complicated dependencies of VERL (which is included as a gi
 
 | Experiment | Environment | Description                                                              | Documentation                    |
 | ---------- | ----------- | ------------------------------------------------------------------------ | -------------------------------- |
-| **SFT**    | `drpt`      | Supervised Fine-Tuning with layerwise data selection                     | [SFT/README.md](SFT/README.md)   |
-| **RLHF**   | `drpt`      | Reinforcement Learning from Human Feedback with layerwise data selection | [RLHF/README.md](RLHF/README.md) |
+| **SFT**    | `drpt`      | Supervised Fine-Tuning with layerwise data curation                     | [SFT/README.md](SFT/README.md)   |
+| **RLHF**   | `drpt`      | Reinforcement Learning from Human Feedback with layerwise data curation | [RLHF/README.md](RLHF/README.md) |
 | **RLVR**   | `drpt_rlvr` | Reinforcement Learning with Verifiable Rewards (VERL + vLLM)             | [RLVR/README.md](RLVR/README.md) |
 
 ## Methods
 
 Generally speaking, we support the following:
 
-1. Selection Modes
-   - **NA**: No data selection
-   - **Baseline**: Data selection in the existing literature
-   - **Subset**: Global online selection
-   - **Layerwise**: Per-layer selection
+1. Curation Modes
+   - **NA**: No data curation
+   - **Baseline**: Data curation in the existing literature
+   - **Subset**: Global online curation
+   - **Layerwise**: Per-layer curation
 2. Compression Methods
    - **NA**: No compression - uses full gradients and standard AdamW optimizer
    - **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer

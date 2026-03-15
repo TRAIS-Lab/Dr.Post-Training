@@ -17,12 +17,14 @@
 #SBATCH --mail-user=pbb@illinois.edu
 #SBATCH --mail-type="END"
 
-SCRATCH_DIR=/scratch/pbb/Project
-CODE_DIR=/home/pbb/Project
+SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
+CODE_DIR=/u/phu1/Project
 
 cd $CODE_DIR/Gradient-Streaming
 
-# Set PYTHONPATH to include project root for imports
+# Activate conda environment
+export PATH="/u/phu1/.conda/envs/IF/bin:$PATH"
+
 export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
 
 set -e
@@ -91,8 +93,8 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo ""
             echo "Options:"
-            echo "  --models_dir DIR     Models directory (default: /scratch/pbb/Project/Gradient-Streaming/SFT)"
-            echo "  --data_dir DIR       Data directory (default: /scratch/pbb/Project/Gradient-Streaming/SFT/data)"
+            echo "  --models_dir DIR     Models directory (default: /work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT)"
+            echo "  --data_dir DIR       Data directory (default: /work/hdd/bfwm/phu1/Project/Gradient-Streaming/SFT/data)"
             echo "  --train NAME         Filter by training dataset (alpaca, less, tulu3, wizardlm)"
             echo "  --task NAME          Override task (samsum, tydiqa, mmlu, bbh, gsm8k, math500)"
             echo "  --subject NAME       MMLU subject or BBH task to evaluate on (default: all)"

@@ -1,9 +1,9 @@
 """
 Hook manager with monkey-patching and custom autograd Functions.
 
-The hook supports two distinct selection methods via the selection module:
-- Layerwise: Per-layer selection, single-pass (LayerwiseLinearBackward)
-- Subset: Global selection, two-pass (SubsetLinearBackward)
+The hook supports two distinct curation methods via the selection module:
+- Layerwise: Per-layer curation, single-pass (LayerwiseLinearBackward)
+- Subset: Global curation, two-pass (SubsetLinearBackward)
 
 Compression is configured independently for two purposes:
 - Score compression: compresses gradients for influence score computation
@@ -31,7 +31,7 @@ from .compression_mode import CompressionMode
 # Validation gradient cache
 from .validation_cache import ValidationCache
 
-# Selection module
+# Curation module
 from .selection.state import SelectionState, LayerwiseState, SubsetState
 from .selection.backward import (
     CompressedLinearBackward,
@@ -49,7 +49,7 @@ class GradientHook:
     This class manages:
     1. Monkey-patching Linear layers for custom backward passes
     2. Compression configuration (via CompressionMode)
-    3. Selection state management (Layerwise/Subset)
+    3. Curation state management (Layerwise/Subset)
     4. Validation gradient caching (for separate-batch strategies)
     5. Token count tracking for proper gradient scaling
     """
@@ -90,7 +90,7 @@ class GradientHook:
         self.hooks_registered: bool = False
         self.hooks_enabled: bool = True
 
-        # Selection state (set by trainer before forward/backward)
+        # Curation state (set by trainer before forward/backward)
         self.selection_state: Optional[SelectionState] = None
 
         # Validation gradient cache (consolidated from three separate buffers)
@@ -167,7 +167,7 @@ class GradientHook:
         Routing logic:
         1. If hooks disabled -> call original forward method
         2. If Subset state -> SubsetLinearBackward (score accumulation)
-        3. If Layerwise state -> LayerwiseLinearBackward (per-layer selection)
+        3. If Layerwise state -> LayerwiseLinearBackward (per-layer curation)
         4. If capture_val_mode -> LayerwiseLinearBackward (val gradient capture)
         5. If compressor present -> CompressedLinearBackward (compression only)
         6. Otherwise -> call original forward method
@@ -194,12 +194,12 @@ class GradientHook:
                 input, module.weight, module.bias, self, idx
             )
         elif self.update_compressors[idx] is not None:
-            # Update compression only, no data selection (MeSO without selection)
+            # Update compression only, no data curation (MeSO without curation)
             return CompressedLinearBackward.apply(
                 input, module.weight, module.bias, self, idx
             )
         else:
-            # No selection and no compression: use original forward
+            # No curation and no compression: use original forward
             return module._original_forward(input)
 
     def set_score_compressors(self, compressors: List[Optional[Compressor]]) -> None:
@@ -224,7 +224,7 @@ class GradientHook:
         self.hooks_enabled = False
 
     # =========================================================================
-    # Selection State Management
+    # Curation State Management
     # =========================================================================
 
     def setup_selection(
@@ -239,22 +239,22 @@ class GradientHook:
         scoring_method: str = "ghost",
     ) -> None:
         """
-        Set up selection state for gradient streaming.
+        Set up curation state for gradient streaming.
 
         Args:
             train_batch_size: Number of training samples
-            selection_method: Selection method ("Layerwise", "Subset", or "Regular")
-            frac: Selection fraction (topk) or filter fraction (filtering)
+            selection_method: Curation method ("Layerwise", "Subset", or "Regular")
+            frac: Curation fraction (topk) or filter fraction (filtering)
             lr: Learning rate for score scaling
             compute_scores_only: If True, only compute scores (Subset pass 1)
-            use_second_order: If True, use greedy selection with similarity matrix
+            use_second_order: If True, use greedy curation with similarity matrix
             selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
             scoring_method: For Subset: "ghost" (factored inner product) or "direct"
                            (explicit per-sample gradient materialization, Algorithm 4.4)
         """
         if selection_method == "Regular":
             self.selection_state = None
-            logger.debug("Set up baseline mode (no selection)")
+            logger.debug("Set up baseline mode (no curation)")
             return
 
         dtype = next(self.model.parameters()).dtype
@@ -296,7 +296,7 @@ class GradientHook:
         )
 
     def clear_selection(self) -> None:
-        """Clear selection state after forward/backward."""
+        """Clear curation state after forward/backward."""
         self.selection_state = None
 
     # =========================================================================
@@ -413,15 +413,15 @@ class GradientHook:
         scoring_method: str = "ghost",
     ) -> None:
         """
-        Set up selection state using pre-captured validation gradients.
+        Set up curation state using pre-captured validation gradients.
 
         Args:
             train_batch_size: Number of training samples
-            selection_method: Selection method ("Layerwise" or "Subset")
-            frac: Selection/filter fraction
+            selection_method: Curation method ("Layerwise" or "Subset")
+            frac: Curation/filter fraction
             lr: Learning rate for score scaling
             compute_scores_only: If True, only compute scores (Subset pass 1)
-            use_second_order: If True, use greedy selection
+            use_second_order: If True, use greedy curation
             selection_mode: "topk" or "filtering"
             record_selections: If True, record selected indices/scores for case study
             scoring_method: For Subset: "ghost" (factored inner product) or "direct"
@@ -472,7 +472,7 @@ class GradientHook:
         self.selection_state._use_stored_val = True
 
         logger.debug(
-            f"Set up selection with stored val gradients: {train_batch_size} train samples, "
+            f"Set up curation with stored val gradients: {train_batch_size} train samples, "
             f"{num_captured} layers with val gradients, selection_mode={selection_mode}, frac={frac}"
         )
 

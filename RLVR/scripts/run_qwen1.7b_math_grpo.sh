@@ -20,8 +20,8 @@ set -x
 
 # Custom configurations
 
-SCRATCH_DIR=/home/pbb/Project
-CODE_DIR=/home/pbb/Project
+SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
+CODE_DIR=/u/phu1/Project
 
 # ============================================================================
 # GPU Configuration

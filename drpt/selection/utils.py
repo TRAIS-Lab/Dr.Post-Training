@@ -1,5 +1,5 @@
 """
-Utility functions for gradient-based data selection.
+Utility functions for gradient-based data curation.
 
 This module provides low-level helper functions used by the backward autograd functions.
 """
@@ -263,7 +263,7 @@ def compute_selected_gradients(
         train_input: Training input [B, S, I] or [B, I]
         selected_indices: Indices of selected samples [K]
         has_bias: Whether to compute bias gradient
-        scale_factor: Scaling factor to normalize for selection (scalar Tensor)
+        scale_factor: Scaling factor to normalize for curation (scalar Tensor)
 
     Returns:
         (grad_weight, grad_bias) tuple where grad_bias is None if not has_bias

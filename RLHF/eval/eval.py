@@ -536,7 +536,7 @@ def main():
     model_group.add_argument(
         "--models_dir",
         type=str,
-        default="/scratch/pbb/Project/Gradient-Streaming/RLHF",
+        default="/work/hdd/bfwm/phu1/Project/Gradient-Streaming/RLHF",
         help="Directory containing trained models",
     )
     model_group.add_argument(

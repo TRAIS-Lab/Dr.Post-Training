@@ -17,15 +17,19 @@
 #SBATCH --mail-user=pbb@illinois.edu
 #SBATCH --mail-type="END"
 
-SCRATCH_DIR=/scratch/pbb/Project
-CODE_DIR=/home/pbb/Project
+SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
+CODE_DIR=/u/phu1/Project
 
 cd $CODE_DIR/Gradient-Streaming
+
+# Activate conda environment
+export PATH="/u/phu1/.conda/envs/IF/bin:$PATH"
 
 export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$SCRIPT_DIR/configs"
+# Use absolute path for configs (BASH_SOURCE unreliable under sbatch)
+CONFIG_DIR="$CODE_DIR/Gradient-Streaming/SFT/train/configs"
 
 # =============================================================================
 # Common settings (shared across all methods, overridden via CLI)
@@ -85,7 +89,7 @@ lora_dropout=0.1
 # Compressor update frequency (for compression methods)
 update_compressor_freq=200
 
-# Selection recording
+# Curation recording
 record_selections=false
 record_selections_freq=1
 
@@ -148,7 +152,7 @@ Usage: bash train.sh --methods <methods> [options]
 
 Run training with method configs from SFT/train/configs/*.yaml.
 
-Method Selection:
+Method Curation:
   --methods <list>         Methods or categories (comma-separated)
   --list                   List available methods and exit
   --dry-run                Print commands without executing
@@ -166,16 +170,16 @@ Experiment Settings:
   --train <dataset>        Training dataset (default: task-based)
   --subject <subject>      MMLU/BBH subject (default: sociology)
   --batch_size <n>         Batch size (default: 8)
-  --val_batch_size <n>     Val batch size for selection (default: 1)
+  --val_batch_size <n>     Val batch size for curation (default: 1)
   --lr <lr>                Learning rate override
   --lr_config <path>       LR config file (default: SFT/train/lr/config.json)
   --percentage <pct>       Data percentage (default: 0.05)
   --n_val <n>              Validation examples (default: 8)
   --n_eval <n>             Evaluation examples (default: 500)
   --seed <seed>            Random seed (default: 42)
-  --selection_frac <frac>  Selection fraction (default: 0.5)
+  --selection_frac <frac>  Curation fraction (default: 0.5)
   --val_strategy <strat>   Val strategy (default: merged_batch)
-  --use_second_order       Enable second-order selection
+  --use_second_order       Enable second-order curation
 HELP
             exit 0
             ;;
@@ -243,7 +247,7 @@ read_yaml() {
         esac
     done < "$config_file"
 
-    # Map method name to internal selection name
+    # Map method name to internal curation name
     case "$cfg_method" in
         Standard) cfg_internal_method="NA" ;;
         *)        cfg_internal_method="$cfg_method" ;;
@@ -370,7 +374,7 @@ run_method() {
     echo "Job: $JOB_NAME"
     echo "Model: $model | Task: $task | LR: $exp_lr"
     echo "Method: $cfg_method | Finetuning: $cfg_finetuning"
-    echo "Batch: $batch_size | Val: ${val_batch_size} | Selection: $selection_frac"
+    echo "Batch: $batch_size | Val: ${val_batch_size} | Curation: $selection_frac"
     echo "Output: $output_dir"
     echo "=============================================="
 
@@ -434,12 +438,12 @@ run_method() {
     # Score compression (score_grad_compression → --score_compression for influence scoring)
     [[ -n "$cfg_score_sparsifier" && "$cfg_score_sparsifier" != "none" ]] && training_args="$training_args --score_compression $cfg_score_sparsifier"
 
-    # Second-order selection
+    # Second-order curation
     if [[ "$cfg_internal_method" != "NA" ]] && [ "$use_second_order" = true ]; then
         training_args="$training_args --use_second_order True"
     fi
 
-    # Selection recording
+    # Curation recording
     if [ "$record_selections" = true ]; then
         training_args="$training_args --record_selections True --record_selections_freq $record_selections_freq"
     fi

@@ -1,9 +1,9 @@
 """
-Selection state classes for gradient-based data selection.
+Curation state classes for gradient-based data curation.
 
 This module provides two distinct state classes:
-- LayerwiseState: Per-layer selection (layer-wise descent), single-pass
-- SubsetState: Global selection (subset descent), two-pass score accumulation
+- LayerwiseState: Per-layer curation (layer-wise descent), single-pass
+- SubsetState: Global curation (subset descent), two-pass score accumulation
 """
 
 from __future__ import annotations
@@ -21,11 +21,11 @@ from ..utils import greedy_selection, topk_selection, negative_filtering
 
 class SelectionState(ABC):
     """
-    Abstract base class for selection state management during backward pass.
+    Abstract base class for curation state management during backward pass.
 
-    Subclasses implement different selection strategies:
-    - LayerwiseState: Per-layer selection (layer-wise descent), immediate gradient aggregation
-    - SubsetState: Score accumulation (subset descent), global selection after all layers
+    Subclasses implement different curation strategies:
+    - LayerwiseState: Per-layer curation (layer-wise descent), immediate gradient aggregation
+    - SubsetState: Score accumulation (subset descent), global curation after all layers
     """
 
     def __init__(
@@ -41,7 +41,7 @@ class SelectionState(ABC):
         record_selections: bool = False,
     ):
         """
-        Initialize selection state.
+        Initialize curation state.
 
         Args:
             train_batch_size: Number of training samples
@@ -52,7 +52,7 @@ class SelectionState(ABC):
             lr: Learning rate for score scaling
             device: Device for tensors
             dtype: Data type for tensors
-            use_second_order: If True, use greedy selection with second-order interactions
+            use_second_order: If True, use greedy curation with second-order interactions
             selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
             record_selections: If True, record selected indices and scores per layer for case study
         """
@@ -76,7 +76,7 @@ class SelectionState(ABC):
         # Stored as Tensor to avoid D2H memory copies during backward
         self.score_correction: Optional[Tensor] = None
 
-        # Selection recording for case study analysis
+        # Curation recording for case study analysis
         self._record_selections = record_selections
         self._selection_records: list = []
 
@@ -144,14 +144,14 @@ class SelectionState(ABC):
         Compute token-based gradient scale factor for selected samples.
 
         Returns train_total_tokens / selected_tokens to maintain proper gradient magnitude.
-        Returns 1.0 if no samples are selected (empty selection case).
+        Returns 1.0 if no samples are selected (empty curation case).
         """
         if self.tokens_per_sample is None or self.train_total_tokens_tensor is None:
             raise RuntimeError(
-                "Token counts not set. Call set_token_counts() before selection. "
+                "Token counts not set. Call set_token_counts() before curation. "
                 "For SeparateBatch strategies, pass 'labels' in kwargs to execute_training_step()."
             )
-        # Handle empty selection to avoid division by zero
+        # Handle empty curation to avoid division by zero
         if selected_indices.numel() == 0:
             return torch.tensor(1.0, device=self.device, dtype=self.dtype)
         selected_tokens = self.tokens_per_sample[selected_indices].sum()
@@ -188,7 +188,7 @@ class SelectionState(ABC):
         """
         Get final selected indices.
 
-        For Streaming: Raises NotImplementedError (selection is per-layer)
+        For Streaming: Raises NotImplementedError (curation is per-layer)
         For Subset: Returns globally selected indices after all layers
         """
         pass
@@ -196,7 +196,7 @@ class SelectionState(ABC):
 
 class LayerwiseState(SelectionState):
     """
-    State for layer-wise descent: per-layer selection, single-pass.
+    State for layer-wise descent: per-layer curation, single-pass.
 
     At each layer, immediately computes scores, selects samples,
     and aggregates gradients. No global accumulation needed.
@@ -207,7 +207,7 @@ class LayerwiseState(SelectionState):
         # Track last selected indices for stats
         self._last_selected_indices: Optional[Tensor] = None
 
-        # Track selection stats across all layers
+        # Track curation stats across all layers
         self._layer_selections: list = []  # (layer_idx, n_selected) tuples
 
     def process_layer_gradients(
@@ -249,10 +249,10 @@ class LayerwiseState(SelectionState):
         self._last_selected_indices = selected_indices
         num_selected = selected_indices.shape[0]
 
-        # Track selection for this layer
+        # Track curation for this layer
         self._layer_selections.append((layer_idx, num_selected))
 
-        # Record selection data for case study analysis
+        # Record curation data for case study analysis
         if self._record_selections:
             self._selection_records.append({
                 'layer_idx': layer_idx,
@@ -261,13 +261,13 @@ class LayerwiseState(SelectionState):
             })
 
         # Step 4: Aggregate selected gradients
-        # Note: empty selection (num_selected=0) naturally produces zero gradients
+        # Note: empty curation (num_selected=0) naturally produces zero gradients
         # since train_grads[empty_indices].sum() = zeros
         selected_grads = train_grads[selected_indices]
         reduced_grad = selected_grads.sum(dim=0, keepdim=True)
 
         # Step 5: Apply token-based gradient scaling
-        # _compute_scale_factor handles empty selection internally (returns 1.0)
+        # _compute_scale_factor handles empty curation internally (returns 1.0)
         scale_factor = self._compute_scale_factor(selected_indices)
         reduced_grad = reduced_grad * scale_factor
 
@@ -275,19 +275,19 @@ class LayerwiseState(SelectionState):
         return reduced_grad, num_selected
 
     def get_final_selection(self) -> Tensor:
-        """Layer-wise descent uses per-layer selection, not global."""
+        """Layer-wise descent uses per-layer curation, not global."""
         raise NotImplementedError(
-            "LayerwiseState uses per-layer selection. "
+            "LayerwiseState uses per-layer curation. "
             "Use process_layer_gradients() at each layer instead."
         )
 
 
 class SubsetState(SelectionState):
     """
-    State for Subset method: global selection, two-pass.
+    State for Subset method: global curation, two-pass.
 
     Pass 1: Accumulates scores across all layers
-    Pass 2: Uses global selection for gradient computation on selected samples
+    Pass 2: Uses global curation for gradient computation on selected samples
 
     Args (in addition to SelectionState):
         scoring_method: "ghost" for ghost/factored inner product (default),
@@ -322,7 +322,7 @@ class SubsetState(SelectionState):
         score_correction: Optional[Tensor] = None,
     ) -> None:
         """
-        Accumulate scores - no immediate selection.
+        Accumulate scores - no immediate curation.
 
         Args:
             train_grads: Per-sample gradients [train_batch_size, feature_dim]
@@ -382,7 +382,7 @@ class SubsetState(SelectionState):
 
     def get_final_selection(self) -> Tensor:
         """
-        Compute global selection after all layers processed.
+        Compute global curation after all layers processed.
 
         Returns:
             Tensor of selected indices
@@ -402,7 +402,7 @@ class SubsetState(SelectionState):
 
         self.num_selected = len(selected_indices)
 
-        # Record selection data for case study analysis
+        # Record curation data for case study analysis
         if self._record_selections:
             self._selection_records = [{
                 'selected_indices': selected_indices.tolist(),

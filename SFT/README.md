@@ -65,17 +65,17 @@ The following methods have been run and can be rerun with the commands below.
 
 We consider the following 9 methods for each of the training datasets above. Each method has a YAML config in `SFT/train/configs/`:
 
-| Config              | Selection | Description                               |
+| Config              | Curation  | Description                               |
 | ------------------- | --------- | ----------------------------------------- |
 | `Standard-Full`     | NA        | Baseline full fine-tuning                 |
 | `Standard-LoRA`     | NA        | Baseline LoRA fine-tuning                 |
 | `Standard-MeSO`     | NA        | Baseline MeSO fine-tuning                 |
-| `Layerwise-Full`    | Layerwise | Per-layer selection, full fine-tuning     |
-| `Layerwise-LoRA`    | Layerwise | Per-layer selection, LoRA fine-tuning     |
-| `Layerwise-MeSO`    | Layerwise | Per-layer selection + MeSO                |
-| `Subset-Full`       | Subset    | Global selection, full fine-tuning        |
-| `Subset-LoRA`       | Subset    | Global selection, LoRA fine-tuning        |
-| `Subset-MeSO`       | Subset    | Global selection + MeSO                   |
+| `Layerwise-Full`    | Layerwise | Per-layer curation, full fine-tuning     |
+| `Layerwise-LoRA`    | Layerwise | Per-layer curation, LoRA fine-tuning     |
+| `Layerwise-MeSO`    | Layerwise | Per-layer curation + MeSO                |
+| `Subset-Full`       | Subset    | Global curation, full fine-tuning        |
+| `Subset-LoRA`       | Subset    | Global curation, LoRA fine-tuning        |
+| `Subset-MeSO`       | Subset    | Global curation + MeSO                   |
 
 > Experiments follow the pattern: `{train}_{task}-{model}-{Method}-{FinetuningMethod}-p{pct}-lr{lr}-b{batch}-v{nval}-s{seed}`
 
@@ -117,7 +117,7 @@ bash SFT/train/train.sh --methods all --train less --task mmlu --subject sociolo
 
 #### Method Configs
 
-Each method is defined by a YAML config in `SFT/train/configs/`. Method-specific settings (selection method, compression, LoRA, score compression) live in the config file — no need to pass them via CLI.
+Each method is defined by a YAML config in `SFT/train/configs/`. Method-specific settings (curation method, compression, LoRA, score compression) live in the config file — no need to pass them via CLI.
 
 Example config (`Layerwise-Full.yaml`):
 ```yaml
@@ -181,13 +181,13 @@ These are experiment-level settings shared across methods (passed via CLI):
 | `--model` | `meta-llama/Llama-3.2-1B` | Model path |
 | `--lr` | from config.json | Learning rate override |
 | `--batch_size` | `8` | Training batch size |
-| `--val_batch_size` | `1` | Val batch size for selection |
+| `--val_batch_size` | `1` | Val batch size for curation |
 | `--percentage` | `0.05` | Data sampling fraction |
 | `--n_val` | `8` | Validation examples |
 | `--n_eval` | `500` | Evaluation examples |
 | `--seed` | `42` | Random seed |
-| `--selection_frac` | `0.5` | Selection fraction |
-| `--use_second_order` | disabled | Enable greedy selection |
+| `--selection_frac` | `0.5` | Curation fraction |
+| `--use_second_order` | disabled | Enable greedy curation |
 
 </details>
 

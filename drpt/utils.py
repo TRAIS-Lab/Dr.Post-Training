@@ -321,7 +321,7 @@ def create_sample_inputs(
 
 def topk_selection(scores, k: int):
     """
-    Select k data points with the highest scores using simple top-k.
+    Curate k data points with the highest scores using simple top-k.
 
     This is O(n + k log k) and much faster than greedy_selection.
     Use this when second-order interactions are not needed.
@@ -343,7 +343,7 @@ def negative_filtering(scores, filter_frac: float = 1.0):
     """
     Filter out negative-influence samples.
 
-    Note that it is possible to return empty selection when all samples have
+    Note that it is possible to return empty result when all samples have
     negative influence.
 
     Arguments:
@@ -395,11 +395,11 @@ def negative_filtering(scores, filter_frac: float = 1.0):
 
 def greedy_selection(scores, interaction_matrix, k: int):
     """
-    Select k data points based on the highest scores, dynamically updating scores
+    Curate k data points based on the highest scores, dynamically updating scores
     by subtracting interactions with previously selected data points.
 
     This is O(k*n) and accounts for second-order interactions between samples.
-    For faster selection without interactions, use topk_selection instead.
+    For faster curation without interactions, use topk_selection instead.
 
     Arguments:
     - scores: A tensor of initial scores for each data point.

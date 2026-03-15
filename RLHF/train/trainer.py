@@ -1,5 +1,5 @@
 """
-Layerwise PPO trainer with unified data selection and model update.
+Layerwise PPO trainer with unified data curation and model update.
 """
 
 import logging
@@ -151,7 +151,7 @@ def compute_gae(
 
 class LayerwisePPOTrainer:
     """
-    PPO Trainer supporting gradient-based data selection with optional compression.
+    PPO Trainer supporting gradient-based data curation with optional compression.
     """
 
     def __init__(
@@ -180,7 +180,7 @@ class LayerwisePPOTrainer:
             optimizer: Optimizer (created if None)
             lr_scheduler: LR scheduler (optional)
             evaluator: ToxicityEvaluator instance for evaluation during training (optional)
-            val_dataset: Fixed validation dataset for data selection (optional).
+            val_dataset: Fixed validation dataset for data curation (optional).
                          If provided and args.use_validation_set is True, uses this
                          instead of self-referencing validation.
         """
@@ -249,7 +249,7 @@ class LayerwisePPOTrainer:
         self.filter_frac = args.filter_frac
         self.use_second_order = args.use_second_order
 
-        # Create selection strategy for clean separation of selection methods
+        # Create curation strategy for clean separation of curation methods
         # RLHF uses filtering mode: keep positive + drop bottom frac of negative
         # Note: For IIF, we use NA strategy since IIF does pre-filtering at rollout level,
         # not per-step filtering during PPO epochs
@@ -276,7 +276,7 @@ class LayerwisePPOTrainer:
                 logger.info(f"  Validation: fixed dataset (n_val={n_val}, batch_size={val_batch_size}/step)")
             else:
                 logger.info(f"  Validation: self-reference (training buffer)")
-            logger.info(f"  Second-order selection: {self.use_second_order}")
+            logger.info(f"  Second-order curation: {self.use_second_order}")
         logger.info(f"  KL coefficient: {self.kl_ctl.value} ({'adaptive' if self.adap_kl_ctrl else 'fixed'})")
         logger.info(f"  KL estimator: {self.kl_estimator}")
         logger.info(f"  Clip range: {self.cliprange}")
@@ -1347,7 +1347,7 @@ class LayerwisePPOTrainer:
         rollout_data: Optional[Dict[str, Any]] = None,
     ) -> float:
         """
-        Capture validation gradients for data selection.
+        Capture validation gradients for data curation.
 
         This method supports two modes:
         1. Self-referencing (buffer): Pass query_ids, query_mask, and rollout_data
@@ -1548,7 +1548,7 @@ class LayerwisePPOTrainer:
         Implementation:
         - Uses Subset-style batched score computation (efficient)
         - Processes mini-batches to accumulate scores for all samples
-        - Applies global selection after all scores are computed
+        - Applies global curation after all scores are computed
         - No model update during score computation
 
         Args:
@@ -1597,7 +1597,7 @@ class LayerwisePPOTrainer:
             mb_state = SubsetState(
                 train_batch_size=mb_size,
                 num_layers=num_layers,
-                frac=self.filter_frac,  # Not used for selection here, just for state init
+                frac=self.filter_frac,  # Not used for curation here, just for state init
                 lr=lr,
                 device=str(self.device),
                 dtype=torch.float32,
@@ -1661,10 +1661,10 @@ class LayerwisePPOTrainer:
         scores_scaled = all_scores * lr
         selected_indices = negative_filtering(scores_scaled, self.filter_frac)
 
-        # Log selection stats
+        # Log curation stats
         n_selected = len(selected_indices)
         n_positive = (all_scores >= 0).sum().item()
-        logger.info(f"IIF pre-selection: {n_selected}/{batch_size} samples selected "
+        logger.info(f"IIF pre-curation: {n_selected}/{batch_size} samples selected "
                     f"({100*n_selected/batch_size:.1f}%), {n_positive} positive scores")
 
         # Restore original state and clean up
@@ -1828,12 +1828,12 @@ class LayerwisePPOTrainer:
         loss_scale: float = 1.0,
     ) -> Dict[str, float]:
         """
-        Perform one training step with optional selection.
+        Perform one training step with optional curation.
 
-        Uses the selection strategy pattern for clean separation of methods:
+        Uses the curation strategy pattern for clean separation of methods:
         - NA: Standard PPO update
-        - Layerwise: Per-layer selection during backward (uses stored val grads)
-        - Subset: Global selection (two-pass for training)
+        - Layerwise: Per-layer curation during backward (uses stored val grads)
+        - Subset: Global curation (two-pass for training)
 
         Args:
             query_ids, response_ids: Token IDs
@@ -1896,7 +1896,7 @@ class LayerwisePPOTrainer:
             torch.full_like(response_mask, -100),  # padding: -100
         )
 
-        # Execute selection strategy
+        # Execute curation strategy
         loss, stats = strategy.execute_training_step(
             model=self.model,
             batch_size=batch_size,
@@ -1906,7 +1906,7 @@ class LayerwisePPOTrainer:
             labels=labels,  # Pass labels for token-based gradient scaling
         )
 
-        # Record selection statistics (for logging via stats dict)
+        # Record curation statistics (for logging via stats dict)
         if self.method != "NA" and self.grad_hook is not None:
             sel_state = getattr(self.grad_hook, 'selection_state', None)
             if sel_state is not None:
@@ -1937,7 +1937,7 @@ class LayerwisePPOTrainer:
         return stats
 
     def _get_effective_strategy(self, batch_size: int):
-        """Get the selection strategy."""
+        """Get the curation strategy."""
         return self.selection_strategy
 
     def _prepare_batch(self, batch: Dict) -> Tuple[Tensor, Tensor]:
@@ -2335,7 +2335,7 @@ class LayerwisePPOTrainer:
                     self._update_history(history, initial_stats)
                     logged_initial_stats = True
 
-                # Capture validation gradients for selection methods
+                # Capture validation gradients for curation methods
                 if self.method != "NA":
                     if getattr(self.args, 'use_validation_set', False) and self.val_dataset is not None:
                         # Use fixed validation dataset (one batch per step)
@@ -2368,7 +2368,7 @@ class LayerwisePPOTrainer:
                         "response_texts": [rollout_data["response_texts"][i] for i in selected_indices.tolist()],
                     }
 
-                    # Track IIF selection stats
+                    # Track IIF curation stats
                     if "iif/n_selected" not in history:
                         history["iif/n_selected"] = []
                         history["iif/selection_rate"] = []
@@ -2496,7 +2496,7 @@ class LayerwisePPOTrainer:
         history["full_eval_toxicity_rate"].append(eval_results["toxicity_rate"])
         history["full_eval_steps"].append(global_step)
 
-        # Re-enable hooks after evaluation if selection method is active
+        # Re-enable hooks after evaluation if curation method is active
         if self.grad_hook is not None and self.method != "NA":
             self.grad_hook.enable_hooks()
 

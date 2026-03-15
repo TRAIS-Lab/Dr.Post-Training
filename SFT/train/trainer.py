@@ -1,5 +1,5 @@
 """
-Layer-wise SFT trainer with unified data selection and model update.
+Layer-wise SFT trainer with unified data curation and model update.
 """
 
 import json
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 class LayerwiseTrainer(Trainer):
     """
-    SFT Trainer supporting gradient-based data selection with optional compression.
+    SFT Trainer supporting gradient-based data curation with optional compression.
     """
 
     def __init__(self, grad_hook: GradientHook, val_dataset, *args, **kwargs):
@@ -34,9 +34,9 @@ class LayerwiseTrainer(Trainer):
 
         Args:
             grad_hook: GradientHook instance for gradient capture and compression.
-            val_dataset: Small validation set used for data selection during training.
+            val_dataset: Small validation set used for data curation during training.
                 Batches from this set are merged with training batches to compute
-                selection scores that guide which training samples to use.
+                curation scores that guide which training samples to use.
             *args, **kwargs: Same as transformers.Trainer.
                 Must include eval_dataset: Large held-out set for generalization testing.
                 This is separate from val_dataset and used only during evaluation.
@@ -54,8 +54,8 @@ class LayerwiseTrainer(Trainer):
         self.val_dataset = val_dataset
         self.eval_dataset_custom = eval_dataset
 
-        # Set selection_frac to 1.0 when no selection method is specified (consistency)
-        # This means we "select" all samples when not doing data selection
+        # Set selection_frac to 1.0 when no curation method is specified (consistency)
+        # This means we "select" all samples when not doing data curation
         if not hasattr(self.args, 'selection_frac') or self.args.selection_frac is None:
             if self.args.method == 'NA':
                 self.args.selection_frac = 1.0
@@ -71,7 +71,7 @@ class LayerwiseTrainer(Trainer):
             self.training_start_event = None
             self.training_start_time = time.time()  # Fallback for CPU
 
-        # Determine validation batch size for data selection
+        # Determine validation batch size for data curation
         # Use val_batch_size_for_selection if provided, otherwise default to per_device_train_batch_size
         self.val_batch_size_for_selection = (
             self.args.val_batch_size_for_selection
@@ -80,7 +80,7 @@ class LayerwiseTrainer(Trainer):
         )
 
         # Create validation dataloader iterator for efficient batch sampling during training
-        # Only needed if we're doing layer-wise data selection
+        # Only needed if we're doing layer-wise data curation
         if val_dataset is not None:
             self.val_dataloader_iter = iter(
                 self.get_val_dataloader(self.val_dataset, batch_size=self.val_batch_size_for_selection, shuffle=True)
@@ -94,12 +94,12 @@ class LayerwiseTrainer(Trainer):
             self.grad_hook.compression_mode.uses_compressed_updates
         )
 
-        # Selection recording for case study analysis
+        # Curation recording for case study analysis
         self._record_selections = getattr(self.args, 'record_selections', False)
         self._record_selections_freq = max(1, getattr(self.args, 'record_selections_freq', 1))
         self._selection_records = []
 
-        # Create selection strategy for clean separation of selection methods
+        # Create curation strategy for clean separation of curation methods
         # SFT uses topk mode: select top frac samples by alignment score
         # Strategy is determined by val_strategy argument:
         # - separate_batch_factorized: Separate val pass, store factorized components (default)
@@ -130,27 +130,27 @@ class LayerwiseTrainer(Trainer):
         logger.info("="*60)
         logger.info("Initialized LayerwiseTrainer")
         selection_frac = getattr(self.args, 'selection_frac', None)
-        logger.info(f"  Method: {self.args.method} (selection fraction: {selection_frac})")
+        logger.info(f"  Method: {self.args.method} (curation fraction: {selection_frac})")
         logger.info(f"  Validation strategy: {self.val_strategy}")
         logger.info(f"  Compression: {self.has_compression}")
         logger.info(f"  Validation set size: {len(val_dataset) if val_dataset is not None else 0}")
         logger.info(f"  Evaluation set size: {len(eval_dataset) if eval_dataset is not None else 0}")
         logger.info(f"  Training batch size: {self.args.per_device_train_batch_size}")
-        logger.info(f"  Validation batch size (for selection): {self.val_batch_size_for_selection}")
+        logger.info(f"  Validation batch size (for curation): {self.val_batch_size_for_selection}")
         if self._record_selections:
-            logger.info(f"  Selection recording: enabled (every {self._record_selections_freq} steps)")
+            logger.info(f"  Curation recording: enabled (every {self._record_selections_freq} steps)")
 
         # Log the training mode based on configuration
-        # Naming convention: {selection}-{compression}-{training_type}
+        # Naming convention: {curation}-{compression}-{training_type}
         if self.args.method in ('Layerwise', 'Subset'):
             if self.has_compression:
                 logger.info(f"  Mode: {self.args.method} with compression (MeSO optimizer)")
             else:
                 logger.info(f"  Mode: {self.args.method} without compression (standard optimizer)")
         elif self.has_compression:
-            logger.info(f"  Mode: MeSO only (compressed gradients, no selection)")
+            logger.info(f"  Mode: MeSO only (compressed gradients, no curation)")
         else:
-            logger.info(f"  Mode: Baseline (full gradients, no selection)")
+            logger.info(f"  Mode: Baseline (full gradients, no curation)")
 
         logger.info("="*60)
 
@@ -193,7 +193,7 @@ class LayerwiseTrainer(Trainer):
         return self.optimizer
 
     def get_val_dataloader(self, val_dataset, batch_size=4, shuffle=True):
-        """Create validation dataloader for data selection."""
+        """Create validation dataloader for data curation."""
         if shuffle:
             sampler = RandomSampler(val_dataset)
         else:
@@ -286,12 +286,12 @@ class LayerwiseTrainer(Trainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """
-        Training step using selection strategy pattern.
+        Training step using curation strategy pattern.
 
-        The selection strategy handles the difference between:
-        - Layerwise: Single-pass, per-layer selection
-        - Subset: Two-pass, global selection
-        - NA: Baseline (no selection)
+        The curation strategy handles the difference between:
+        - Layerwise: Single-pass, per-layer curation
+        - Subset: Two-pass, global curation
+        - NA: Baseline (no curation)
 
         With or without compression (MeSO).
         """
@@ -304,9 +304,9 @@ class LayerwiseTrainer(Trainer):
             if isinstance(unwrapped_optimizer, MeSOAdamW):
                 unwrapped_optimizer.refresh_compressors_if_needed()
 
-        # === DATA SELECTION MODE (Layerwise or Subset) ===
+        # === DATA CURATION MODE (Layerwise or Subset) ===
         if args.method in ('Layerwise', 'Subset'):
-            # Get validation batch for selection
+            # Get validation batch for curation
             try:
                 val_batch = next(self.val_dataloader_iter)
             except StopIteration:
@@ -353,7 +353,7 @@ class LayerwiseTrainer(Trainer):
                 val_loss.backward()
                 self.grad_hook.end_val_capture()
 
-                # PASS 2: Train with selection using stored val gradients
+                # PASS 2: Train with curation using stored val gradients
                 def compute_train_loss():
                     loss = self._compute_loss_for_selection(model, batch_train)
                     return loss, {}  # SeparateBatchStrategy expects (loss, stats) tuple
@@ -378,18 +378,18 @@ class LayerwiseTrainer(Trainer):
                 # Cleanup val buffer
                 self.grad_hook.clear_val_buffer()
 
-            # Record selection data for case study
+            # Record curation data for case study
             if self._record_selections and self.state.global_step % self._record_selections_freq == 0:
                 self._capture_selection_record(batch_train, batch_val)
 
             return loss
 
-        # === BASELINE MODE (no data selection) ===
+        # === BASELINE MODE (no data curation) ===
         else:
             return self._training_step_baseline(model, inputs)
 
     def _compute_loss_for_selection(self, model, batch):
-        """Compute loss for selection (handles multi-GPU and grad accumulation)."""
+        """Compute loss for curation (handles multi-GPU and grad accumulation)."""
         with self.compute_loss_context_manager():
             outputs = model(**batch)
             loss = outputs.loss
@@ -402,7 +402,7 @@ class LayerwiseTrainer(Trainer):
         return loss
 
     def _training_step_baseline(self, model, inputs):
-        """Baseline training step without selection."""
+        """Baseline training step without curation."""
         args = self.args
 
         model.zero_grad()
@@ -434,10 +434,10 @@ class LayerwiseTrainer(Trainer):
         batch_train: Dict[str, Tensor],
         batch_val: Dict[str, Tensor],
     ):
-        """Capture selection record from the last training step.
+        """Capture curation record from the last training step.
 
         Records decoded text for both training and validation samples,
-        along with per-layer (Layerwise) or global (Subset) selection data.
+        along with per-layer (Layerwise) or global (Subset) curation data.
         """
         record = getattr(self.selection_strategy, 'last_selection_record', None)
         if record is None:
@@ -457,13 +457,13 @@ class LayerwiseTrainer(Trainer):
         if self.args.method == 'Layerwise':
             step_record['layers'] = record
         else:
-            # Subset: single global selection
+            # Subset: single global curation
             step_record['selection'] = record[0] if record else {}
 
         self._selection_records.append(step_record)
 
     def _save_selection_records(self):
-        """Save accumulated selection records to JSON file."""
+        """Save accumulated curation records to JSON file."""
         if not self._selection_records:
             return
 
@@ -485,14 +485,14 @@ class LayerwiseTrainer(Trainer):
         with open(output_file, 'w') as f:
             json.dump(data, f)
 
-        logger.info(f"Saved {len(self._selection_records)} selection records to {output_file}")
+        logger.info(f"Saved {len(self._selection_records)} curation records to {output_file}")
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         """
         Override evaluate to compute both validation and evaluation perplexity.
 
         Computes:
-        - Validation perplexity: on the small validation set (used for data selection)
+        - Validation perplexity: on the small validation set (used for data curation)
         - Evaluation perplexity: on the large held-out evaluation set (for generalization)
 
         Args:
@@ -507,7 +507,7 @@ class LayerwiseTrainer(Trainer):
         if self.grad_hook is not None:
             self.grad_hook.disable_hooks()
 
-        # Evaluate on validation dataset (small set for data selection)
+        # Evaluate on validation dataset (small set for data curation)
         val_loss, val_perplexity = self._evaluate_on_dataset(
             self.val_dataset,
             description="Validation"
@@ -560,8 +560,8 @@ class LayerwiseTrainer(Trainer):
             f"wall_time={wall_time:.2f}s"
         )
 
-        # Re-enable hooks after evaluation if selection method is active OR compression is used
-        # Hooks are needed for both: (1) layer-wise data selection, (2) MeSO compressed gradients
+        # Re-enable hooks after evaluation if curation method is active OR compression is used
+        # Hooks are needed for both: (1) layer-wise data curation, (2) MeSO compressed gradients
         if self.grad_hook is not None and (self.args.method != "NA" or self.has_compression):
             self.grad_hook.enable_hooks()
 

@@ -17,8 +17,8 @@
 #SBATCH --mail-user=pbb@illinois.edu
 #SBATCH --mail-type="END"
 
-SCRATCH_DIR=/scratch/pbb/Project
-CODE_DIR=/home/pbb/Project
+SCRATCH_DIR=/work/hdd/bfwm/phu1/Project
+CODE_DIR=/u/phu1/Project
 
 cd $CODE_DIR/Gradient-Streaming
 
@@ -76,7 +76,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo ""
             echo "Options:"
-            echo "  --models_dir DIR       Models directory (default: /scratch/pbb/Project/Gradient-Streaming/RLHF)"
+            echo "  --models_dir DIR       Models directory (default: /work/hdd/bfwm/phu1/Project/Gradient-Streaming/RLHF)"
             echo "  --task NAME            Filter by task (e.g., toxicity)"
             echo "  --n_samples N          Number of test samples (default: 400, -1 for all)"
             echo "  --batch_size N         Batch size for generation (default: 16)"

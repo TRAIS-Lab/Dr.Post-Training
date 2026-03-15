@@ -2,7 +2,7 @@
 Validation dataset loading for RLHF experiments.
 
 This module provides utilities for loading validation datasets used
-for data selection during layer-wise descent.
+for data curation during layer-wise descent.
 """
 
 from typing import Optional
@@ -20,7 +20,7 @@ def get_validation_dataset(
     strategy: str = "random",
 ) -> Dataset:
     """
-    Load validation dataset for data selection.
+    Load validation dataset for data curation.
 
     The validation dataset represents "good" examples that we want
     the model to learn from. During layer-wise descent, we compute
@@ -34,7 +34,7 @@ def get_validation_dataset(
         input_min_length: Minimum prompt length
         input_max_length: Maximum prompt length
         seed: Random seed
-        strategy: Selection strategy ('random' or 'top')
+        strategy: Curation strategy ('random' or 'top')
             - 'random': Randomly sample from test set
             - 'top': Select samples with highest target metric (e.g., most toxic)
 
@@ -68,7 +68,7 @@ def _load_toxicity_validation(
 
     For detoxification, the validation set contains prompts where we want
     the model to generate non-toxic continuations. The gradients on these
-    examples guide the selection of beneficial training samples.
+    examples guide the curation of beneficial training samples.
 
     Args:
         tokenizer: Tokenizer for encoding
@@ -117,7 +117,7 @@ def _load_toxicity_validation(
         val_ds = test_ds.shuffle(seed=seed).select(range(min(n_val, len(test_ds))))
     elif strategy == "top":
         # Select most toxic prompts for validation
-        # This creates harder examples to guide selection
+        # This creates harder examples to guide curation
         test_ds = test_ds.map(lambda x: {"toxicity": x["prompt"]["toxicity"]})
         val_ds = test_ds.sort("toxicity", reverse=True).select(range(min(n_val, len(test_ds))))
     else:
