@@ -67,12 +67,18 @@ def tokenize(
         print(full_prompt)
         print("******** Example ends ********")
 
-    prompt_input_ids = torch.tensor(
-        tokenizer.encode(query, max_length=max_length))
-    full_input_ids = torch.tensor(
-        tokenizer.encode(full_prompt, max_length=max_length))
-    labels = torch.tensor(tokenizer.encode(full_prompt, max_length=max_length))
-    labels[:len(prompt_input_ids)] = -100
+    # Encode query without truncation to find the prompt/completion boundary
+    prompt_input_ids = tokenizer.encode(query)
+    # Encode full prompt and truncate to max_length
+    full_tokens = tokenizer.encode(full_prompt, max_length=max_length, truncation=True)
+
+    # Mask prompt tokens; cap at full sequence length so completion tokens
+    # (if any survive truncation) get real labels
+    prompt_len = min(len(prompt_input_ids), len(full_tokens))
+
+    full_input_ids = torch.tensor(full_tokens)
+    labels = torch.tensor(full_tokens)
+    labels[:prompt_len] = -100
     attention_mask = [1] * len(full_input_ids)
 
     return full_input_ids, labels, attention_mask

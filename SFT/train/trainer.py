@@ -71,6 +71,9 @@ class LayerwiseTrainer(Trainer):
             self.training_start_event = None
             self.training_start_time = time.time()  # Fallback for CPU
 
+        # Track cumulative evaluation time so it can be subtracted from wall time
+        self.cumulative_eval_time = 0.0
+
         # Determine validation batch size for data curation
         # Use val_batch_size_for_selection if provided, otherwise default to per_device_train_batch_size
         self.val_batch_size_for_selection = (
@@ -507,6 +510,13 @@ class LayerwiseTrainer(Trainer):
         if self.grad_hook is not None:
             self.grad_hook.disable_hooks()
 
+        # Record time before evaluation
+        if self.training_start_event is not None:
+            eval_start_event = torch.cuda.Event(enable_timing=True)
+            eval_start_event.record()
+        else:
+            eval_start_cpu = time.time()
+
         # Evaluate on validation dataset (small set for data curation)
         val_loss, val_perplexity = self._evaluate_on_dataset(
             self.val_dataset,
@@ -519,16 +529,20 @@ class LayerwiseTrainer(Trainer):
             description="Evaluation"
         )
 
-        # Calculate elapsed wall time
+        # Calculate elapsed wall time and subtract cumulative evaluation time
         if self.training_start_event is not None:
-            # Use CUDA event timing for accurate GPU time measurement
-            eval_event = torch.cuda.Event(enable_timing=True)
-            eval_event.record()
+            eval_end_event = torch.cuda.Event(enable_timing=True)
+            eval_end_event.record()
             torch.cuda.synchronize()
-            wall_time = self.training_start_event.elapsed_time(eval_event) / 1000.0  # Convert ms to seconds
+            wall_time = self.training_start_event.elapsed_time(eval_end_event) / 1000.0  # Convert ms to seconds
+            eval_duration = eval_start_event.elapsed_time(eval_end_event) / 1000.0
         else:
-            # Fallback to CPU timing
-            wall_time = time.time() - self.training_start_time
+            eval_end_cpu = time.time()
+            wall_time = eval_end_cpu - self.training_start_time
+            eval_duration = eval_end_cpu - eval_start_cpu
+
+        self.cumulative_eval_time += eval_duration
+        train_wall_time = wall_time - self.cumulative_eval_time
 
         # Create metrics dictionary
         eval_metrics = {
@@ -537,6 +551,7 @@ class LayerwiseTrainer(Trainer):
             "val_loss": val_loss,
             "val_perplexity": val_perplexity,
             "wall_time": wall_time,
+            "train_wall_time": train_wall_time,
         }
 
         # Save results
@@ -548,6 +563,7 @@ class LayerwiseTrainer(Trainer):
             "eval_loss": eval_loss,
             "eval_perplexity": eval_perplexity,
             "wall_time": wall_time,
+            "train_wall_time": train_wall_time,
         }
         self.evaluation_results.append(result_entry)
         self._save_evaluation_results()
@@ -557,7 +573,7 @@ class LayerwiseTrainer(Trainer):
             f"Step {self.state.global_step}: "
             f"val_perplexity={val_perplexity:.4f}, "
             f"eval_perplexity={eval_perplexity:.4f}, "
-            f"wall_time={wall_time:.2f}s"
+            f"train_wall_time={train_wall_time:.2f}s (eval_time={eval_duration:.2f}s)"
         )
 
         # Re-enable hooks after evaluation if curation method is active OR compression is used
@@ -606,28 +622,11 @@ class LayerwiseTrainer(Trainer):
                 outputs = model(**batch)
                 loss = outputs.loss
 
-                # Debug: Check for NaN in loss
+                # Skip NaN batches (e.g. all labels are -100 after truncation)
                 if torch.isnan(loss):
-                    logger.warning(f"{description}: NaN loss detected in batch {num_batches}!")
-                    logger.warning(f"  Batch size: {batch['input_ids'].shape[0]}")
-                    logger.warning(f"  Input shape: {batch['input_ids'].shape}")
-                    # Check labels
-                    if 'labels' in batch:
-                        labels = batch['labels']
-                        non_ignore_mask = (labels != -100)
-                        num_valid_tokens = non_ignore_mask.sum().item()
-                        logger.warning(f"  Labels shape: {labels.shape}")
-                        logger.warning(f"  Valid tokens (not -100): {num_valid_tokens}")
-                        logger.warning(f"  All labels ignored: {num_valid_tokens == 0}")
-                        if num_valid_tokens > 0:
-                            logger.warning(f"  Sample label values: {labels[non_ignore_mask][:10].tolist()}")
-                    # Check outputs
-                    logger.warning(f"  Model output loss: {loss}")
-                    if hasattr(outputs, 'logits'):
-                        logits = outputs.logits
-                        logger.warning(f"  Logits shape: {logits.shape}")
-                        logger.warning(f"  Logits contains NaN: {torch.isnan(logits).any().item()}")
-                        logger.warning(f"  Logits contains Inf: {torch.isinf(logits).any().item()}")
+                    logger.debug(f"{description}: Skipping NaN loss batch {num_batches} "
+                                 f"(likely all labels masked after truncation)")
+                    continue
 
                 # Accumulate loss
                 batch_size = batch["input_ids"].shape[0]

@@ -1,7 +1,19 @@
 #!/bin/bash
+#
+# Ablation study: Train on ~n_val validation samples (standard training only).
+#
+# Instead of tulu3->tydiqa or alpaca->samsum, we train on a small subset of the
+# task's validation split and evaluate on the test split. Uses percentage-based
+# sampling to select ~n_val samples. Optimization steps match the original experiment.
+#
+# Only Standard methods (no curation): Standard-Full, Standard-LoRA, Standard-MeSO.
+#
+# Usage:
+#   bash SFT/train/train_val_ablation.sh --task tydiqa --methods all --seed 42
+#   bash SFT/train/train_val_ablation.sh --task samsum --methods all --seed 42
+#   bash SFT/train/train_val_ablation.sh --task tydiqa --methods all --lr 5e-05 --dry-run
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# Source cluster config (skip if already set by submit.sh)
 if [[ -z "$CODE_DIR" ]]; then
     source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found."; exit 1; }
     activate_env
@@ -15,7 +27,7 @@ SCRIPT_DIR="$CODE_DIR/Gradient-Streaming/SFT/train"
 CONFIG_DIR="$SCRIPT_DIR/configs"
 
 # =============================================================================
-# Common settings (shared across all methods, overridden via CLI)
+# Base training args (same as train.sh, num_train_epochs removed — we use max_steps)
 # =============================================================================
 
 export base_training_args="--do_train=True \
@@ -26,10 +38,9 @@ export base_training_args="--do_train=True \
 --warmup_ratio=0.03 \
 --weight_decay=0.0 \
 --logging_steps=1 \
---eval_steps=50 \
+--eval_steps=400 \
 --eval_strategy=steps \
 --save_strategy=no \
---num_train_epochs=1 \
 --bf16=True \
 --tf32=False \
 --fp16=False \
@@ -38,22 +49,16 @@ export base_training_args="--do_train=True \
 
 model="meta-llama/Llama-3.2-1B"
 data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
-train_dataset=""
-percentage=0.05
-task="mmlu"
-subject="sociology"
+task=""
 seed=42
 
 optim="adamw_torch"
-batch_size=8
+batch_size=1
 gradient_accumulation_steps=1
 use_flash_attention=true
 
-selection_frac="0.5"
-use_second_order=false
-n_val=8
-val_batch_size="1"
-val_strategy="merged_batch"
+n_val=32
+n_eval=500
 
 # LR configuration
 lr_config_file="SFT/train/lr/config.json"
@@ -61,37 +66,39 @@ lr_override=""
 default_lr_full="5e-05"
 default_lr_lora="2e-04"
 
-# Evaluation
-n_eval=500
-
-# LoRA defaults (can be overridden per config)
+# LoRA defaults
 lora_r=32
 lora_alpha=1
 lora_dropout=0.1
 
-# Compressor update frequency (for compression methods)
+# Compressor update frequency
 update_compressor_freq=200
-
-# Curation recording
-record_selections=false
-record_selections_freq=1
 
 # Multi-method mode
 methods=""
 dry_run=false
+max_steps_override=""
+
+# Target optimization steps: match total sample-passes of main experiments
+# main_steps * main_batch_size / val_ablation_batch_size = main_steps * 8
+declare -A TARGET_STEPS=(
+    ["tydiqa"]=9392   # 1174 * 8 = 9392 sample-passes
+    ["samsum"]=20800  # 2600 * 8 = 20800 sample-passes
+)
+declare -A LR_CONFIG_KEYS=(
+    ["tydiqa"]="tulu3_tydiqa"
+    ["samsum"]="alpaca_samsum"
+)
 
 # =============================================================================
-# Category mappings (for --methods shorthand)
+# Category mappings (Standard methods only)
 # =============================================================================
 declare -A CATEGORY_METHODS=(
-    ["all"]="Standard-Full,Standard-LoRA,Standard-MeSO,Layerwise-Full,Layerwise-LoRA,Subset-Full,Subset-LoRA,Layerwise-MeSO,Subset-MeSO"
+    ["all"]="Standard-Full,Standard-LoRA,Standard-MeSO"
     ["baseline"]="Standard-Full,Standard-LoRA"
-    ["layerwise"]="Layerwise-Full,Layerwise-LoRA,Layerwise-MeSO"
-    ["subset"]="Subset-Full,Subset-LoRA,Subset-MeSO"
-    ["full"]="Standard-Full,Standard-MeSO,Layerwise-Full,Subset-Full,Layerwise-MeSO,Subset-MeSO"
-    ["lora"]="Standard-LoRA,Layerwise-LoRA,Subset-LoRA"
-    ["compression"]="Standard-MeSO,Layerwise-MeSO,Subset-MeSO"
-    ["no-compression"]="Standard-Full,Standard-LoRA,Layerwise-Full,Layerwise-LoRA,Subset-Full,Subset-LoRA"
+    ["full"]="Standard-Full"
+    ["lora"]="Standard-LoRA"
+    ["compression"]="Standard-MeSO"
 )
 
 # =============================================================================
@@ -99,70 +106,39 @@ declare -A CATEGORY_METHODS=(
 # =============================================================================
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --methods)        methods="$2"; shift 2 ;;
-        --model)          model="$2"; shift 2 ;;
         --task)           task="$2"; shift 2 ;;
-        --train)          train_dataset="$2"; shift 2 ;;
-        --subject)        subject="$2"; shift 2 ;;
+        --methods)        methods="$2"; shift 2 ;;
+        --max_steps)      max_steps_override="$2"; shift 2 ;;
+        --model)          model="$2"; shift 2 ;;
         --batch_size)     batch_size="$2"; shift 2 ;;
-        --val_batch_size) val_batch_size="$2"; shift 2 ;;
-        --percentage)     percentage="$2"; shift 2 ;;
         --n_val)          n_val="$2"; shift 2 ;;
         --n_eval)         n_eval="$2"; shift 2 ;;
         --lr)             lr_override="$2"; shift 2 ;;
         --lr_config)      lr_config_file="$2"; shift 2 ;;
         --seed)           seed="$2"; shift 2 ;;
-        --selection_frac) selection_frac="$2"; shift 2 ;;
-        --val_strategy)   val_strategy="$2"; shift 2 ;;
-        --use_second_order) use_second_order=true; shift 1 ;;
         --data_dir)       data_dir="$2"; shift 2 ;;
         --gradient_accumulation_steps) gradient_accumulation_steps="$2"; shift 2 ;;
-        --record_selections) record_selections=true; shift 1 ;;
-        --record_selections_freq) record_selections_freq="$2"; shift 2 ;;
         --dry-run)        dry_run=true; shift ;;
-        --list)
-            echo "Available methods (config files in $CONFIG_DIR):"
-            for f in "$CONFIG_DIR"/*.yaml; do
-                basename "$f" .yaml
-            done
-            echo ""
-            echo "Categories: ${!CATEGORY_METHODS[*]}"
-            exit 0
-            ;;
         --help|-h)
             cat <<'HELP'
-Usage: bash train.sh --methods <methods> [options]
+Usage: bash train_val_ablation.sh --task <task> --methods <methods> [options]
 
-Run training with method configs from SFT/train/configs/*.yaml.
+Ablation: Standard training on ~n_val validation samples.
+Matches optimization steps to the original tulu3->tydiqa / alpaca->samsum experiments.
 
-Method Curation:
-  --methods <list>         Methods or categories (comma-separated)
-  --list                   List available methods and exit
-  --dry-run                Print commands without executing
+Required:
+  --task <task>          Task: tydiqa or samsum
+  --methods <list>       Methods: all, baseline, full, lora, compression,
+                         or specific names (Standard-Full, Standard-LoRA, Standard-MeSO)
 
-  Categories: all, baseline, layerwise, subset, full, lora, compression, no-compression
-
-  Examples:
-    --methods all                              Run all methods
-    --methods baseline                         Run Standard-Full and Standard-LoRA
-    --methods "Layerwise-Full,Subset-Full"       Run specific methods
-
-Experiment Settings:
-  --model <path>           Model path (default: meta-llama/Llama-3.2-1B)
-  --task <task>            Task: mmlu, bbh, tydiqa, samsum, gsm8k
-  --train <dataset>        Training dataset (default: task-based)
-  --subject <subject>      MMLU/BBH subject (default: sociology)
-  --batch_size <n>         Batch size (default: 8)
-  --val_batch_size <n>     Val batch size for curation (default: 1)
-  --lr <lr>                Learning rate override
-  --lr_config <path>       LR config file (default: SFT/train/lr/config.json)
-  --percentage <pct>       Data percentage (default: 0.05)
-  --n_val <n>              Validation examples (default: 8)
-  --n_eval <n>             Evaluation examples (default: 500)
-  --seed <seed>            Random seed (default: 42)
-  --selection_frac <frac>  Curation fraction (default: 0.5)
-  --val_strategy <strat>   Val strategy (default: merged_batch)
-  --use_second_order       Enable second-order curation
+Optional:
+  --max_steps <n>        Override target optimization steps
+  --batch_size <n>       Batch size (default: 1)
+  --n_val <n>            Number of val samples to train on (default: 32)
+  --n_eval <n>           Evaluation examples (default: 500)
+  --lr <lr>              Learning rate override
+  --seed <seed>          Random seed (default: 42)
+  --dry-run              Print commands without executing
 HELP
             exit 0
             ;;
@@ -173,17 +149,55 @@ HELP
     esac
 done
 
+# =============================================================================
+# Validate inputs
+# =============================================================================
+if [[ -z "$task" ]]; then
+    echo "ERROR: --task is required (tydiqa or samsum)"
+    exit 1
+fi
+
+if [[ -z "$methods" ]]; then
+    echo "ERROR: --methods is required"
+    exit 1
+fi
+
+val_file="${data_dir}/eval/${task}/${task}_validation_data.jsonl"
+if [[ ! -f "$val_file" ]]; then
+    echo "ERROR: Validation file not found: $val_file"
+    exit 1
+fi
+
+# Determine max_steps
+if [[ -n "$max_steps_override" ]]; then
+    max_steps="$max_steps_override"
+elif [[ -n "${TARGET_STEPS[$task]}" ]]; then
+    max_steps="${TARGET_STEPS[$task]}"
+else
+    echo "ERROR: No target steps defined for task '$task'. Use --max_steps to specify."
+    exit 1
+fi
+
 model_name=$(basename "$model")
 
+# Compute percentage to get exactly n_val samples from the validation file
+# Use (n_val + 0.5) / n_lines to avoid int() truncation from float rounding
+n_file_lines=$(wc -l < "$val_file")
+percentage=$(python3 -c "print(($n_val + 0.5) / $n_file_lines)")
+n_actual=$(python3 -c "print(int($n_file_lines * $percentage))")
+
+steps_per_epoch=$((n_actual / batch_size))
+if [[ $((n_actual % batch_size)) -ne 0 ]]; then
+    steps_per_epoch=$((steps_per_epoch + 1))
+fi
+n_epochs=$(( (max_steps + steps_per_epoch - 1) / steps_per_epoch ))
+
 # =============================================================================
-# Helper: Read YAML config (lightweight, no pyyaml dependency)
+# Helper: Read YAML config (same as train.sh)
 # =============================================================================
 read_yaml() {
-    # Reads a config YAML and sets cfg_* variables.
-    # The config is the source of truth for method hyperparameters.
     local config_file="$1"
 
-    # Reset all config fields
     cfg_method="Standard"
     cfg_finetuning="Full"
     cfg_score_sparsifier=""
@@ -193,12 +207,7 @@ read_yaml() {
     cfg_lora_r=""
     cfg_lora_alpha=""
     cfg_lora_dropout=""
-    cfg_selection_frac=""
-    cfg_n_val=""
-    cfg_val_batch_size=""
-    cfg_val_strategy=""
 
-    # Parse YAML with one level of nesting support (section.key)
     local section=""
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -206,7 +215,6 @@ read_yaml() {
 
         local full_key="" val=""
         if [[ "$line" =~ ^[[:space:]] ]]; then
-            # Indented: child of current section
             val=$(echo "$line" | cut -d: -f2- | xargs | sed 's/^"//;s/"$//' | sed "s/^'//;s/'$//")
             full_key="${section}.$(echo "$line" | cut -d: -f1 | xargs)"
         else
@@ -227,24 +235,16 @@ read_yaml() {
             lora_r)                              cfg_lora_r="$val" ;;
             lora_alpha)                          cfg_lora_alpha="$val" ;;
             lora_dropout)                        cfg_lora_dropout="$val" ;;
-            score_grad_compression.sparsifier)   cfg_score_sparsifier="$val" ;;
-            score_grad_compression.projector)    cfg_score_projector="$val" ;;
             opt_grad_compression.sparsifier)     cfg_opt_sparsifier="$val" ;;
             opt_grad_compression.projector)      cfg_opt_projector="$val" ;;
-            selection_frac)                      cfg_selection_frac="$val" ;;
-            n_val)                               cfg_n_val="$val" ;;
-            val_batch_size)                      cfg_val_batch_size="$val" ;;
-            val_strategy)                        cfg_val_strategy="$val" ;;
         esac
     done < "$config_file"
 
-    # Map method name to internal curation name
     case "$cfg_method" in
         Standard) cfg_internal_method="NA" ;;
         *)        cfg_internal_method="$cfg_method" ;;
     esac
 
-    # Derive whether LoRA is enabled from finetuning type
     case "$cfg_finetuning" in
         LoRA|MeSO-LoRA) cfg_lora="true" ;;
         *)              cfg_lora="false" ;;
@@ -308,7 +308,6 @@ resolve_methods() {
             resolved="${resolved:+$resolved,}$item"
         else
             echo "ERROR: Unknown method or category: $item"
-            echo "Use --list to see available methods."
             exit 1
         fi
     done
@@ -317,7 +316,7 @@ resolve_methods() {
 }
 
 # =============================================================================
-# Run a single method from its config file
+# Run a single method
 # =============================================================================
 run_method() {
     local exp_name="$1"
@@ -328,54 +327,29 @@ run_method() {
         return 1
     fi
 
-    # Read method config
     read_yaml "$config_file"
 
-    # Resolve: config yaml > shell default (for method-specific params)
-    local eff_selection_frac="${cfg_selection_frac:-$selection_frac}"
-    local eff_n_val="${cfg_n_val:-$n_val}"
-    local eff_val_batch_size="${cfg_val_batch_size:-$val_batch_size}"
-    local eff_val_strategy="${cfg_val_strategy:-$val_strategy}"
-
-    # Look up LR
-    local train_str="${train_dataset:-default}"
-    local config_key
-    if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
-        config_key="${train_str}_${task}_${subject}"
-    else
-        config_key="${train_str}_${task}"
-    fi
+    # LR lookup: reuse LRs from the original experiment (tulu3_tydiqa / alpaca_samsum)
+    local config_key="${LR_CONFIG_KEYS[$task]}"
     local exp_lr=$(lookup_lr "$config_key" "$exp_name" "$cfg_lora")
 
-    # Build job name: use config name directly (e.g., Layerwise-Full)
-    local method_str="$exp_name"
-    if [[ "$cfg_internal_method" != "NA" ]] && [ "$use_second_order" = true ]; then
-        method_str="${method_str}-2nd"
-    fi
-
-    local JOB_NAME
-    if [[ "$task" == "mmlu" ]] || [[ "$task" == "bbh" ]]; then
-        JOB_NAME="${train_str}_${task}_${subject}-${model_name}-${method_str}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
-    else
-        JOB_NAME="${train_str}_${task}-${model_name}-${method_str}-p${percentage}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
-    fi
+    local JOB_NAME="${task}_val_${task}-${model_name}-${method_str:-$exp_name}-ms${max_steps}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
 
     local output_dir=$SCRATCH_DIR/Gradient-Streaming/SFT/${JOB_NAME}
     mkdir -p "$output_dir"
 
     echo ""
     echo "=============================================="
-    echo "  Running: $exp_name"
+    echo "  [Val Ablation] Running: $exp_name"
     echo "=============================================="
-    echo "Config: $config_file"
     echo "Job: $JOB_NAME"
     echo "Model: $model | Task: $task | LR: $exp_lr"
     echo "Method: $cfg_method | Finetuning: $cfg_finetuning"
-    echo "Batch: $batch_size | Val: ${eff_val_batch_size} | Curation: $eff_selection_frac"
+    echo "Train: ~${n_actual} val samples (pct=${percentage}) | Batch: $batch_size"
+    echo "Max steps: $max_steps (~${n_epochs} epochs)"
     echo "Output: $output_dir"
     echo "=============================================="
 
-    # Build training arguments
     local exp_base_training_args="$base_training_args"
 
     # Model-specific FSDP config
@@ -398,27 +372,23 @@ run_method() {
 --model_name_or_path $model \
 --output_dir $output_dir \
 --data_dir $data_dir \
+--train_files $val_file \
 --percentage $percentage \
+--max_steps $max_steps \
+--num_train_epochs 99999 \
 --data_seed $DATA_SEED \
 --per_device_train_batch_size $batch_size \
---method $cfg_internal_method \
---subject $subject \
---n_val $eff_n_val \
+--method NA \
+--n_val $n_val \
 --n_eval $n_eval \
 --analysis_dataset $task \
 --learning_rate $exp_lr \
 --gradient_accumulation_steps $gradient_accumulation_steps \
 --seed $seed \
 --optim $optim \
---selection_frac $eff_selection_frac \
---val_strategy $eff_val_strategy \
 --use_flash_attention $use_flash_attention"
 
-    # Optional: train dataset
-    [[ -n "$train_dataset" ]] && training_args="$training_args --train_dataset_names $train_dataset"
-    [[ -n "$eff_val_batch_size" ]] && training_args="$training_args --val_batch_size_for_selection $eff_val_batch_size"
-
-    # LoRA (from config, with shell defaults as fallback)
+    # LoRA
     if [ "$cfg_lora" = true ]; then
         local eff_lora_r="${cfg_lora_r:-$lora_r}"
         local eff_lora_alpha="${cfg_lora_alpha:-$lora_alpha}"
@@ -428,22 +398,9 @@ run_method() {
         training_args="$training_args --lora False"
     fi
 
-    # Update compression (opt_grad_compression → --sparsification for MeSO)
+    # Compression (for MeSO)
     [[ -n "$cfg_opt_sparsifier" && "$cfg_opt_sparsifier" != "none" ]] && training_args="$training_args --sparsification $cfg_opt_sparsifier --update_compressor_freq $update_compressor_freq"
     [[ -n "$cfg_opt_projector" && "$cfg_opt_projector" != "none" ]] && training_args="$training_args --projection $cfg_opt_projector"
-
-    # Score compression (score_grad_compression → --score_compression for influence scoring)
-    [[ -n "$cfg_score_sparsifier" && "$cfg_score_sparsifier" != "none" ]] && training_args="$training_args --score_compression $cfg_score_sparsifier"
-
-    # Second-order curation
-    if [[ "$cfg_internal_method" != "NA" ]] && [ "$use_second_order" = true ]; then
-        training_args="$training_args --use_second_order True"
-    fi
-
-    # Curation recording
-    if [ "$record_selections" = true ]; then
-        training_args="$training_args --record_selections True --record_selections_freq $record_selections_freq"
-    fi
 
     training_args="$training_args 2>&1 | tee $output_dir/train.log"
 
@@ -457,22 +414,19 @@ run_method() {
 # =============================================================================
 # Main
 # =============================================================================
-if [[ -z "$methods" ]]; then
-    echo "Usage: bash train.sh --methods <methods> [options]"
-    echo "       bash train.sh --help"
-    exit 1
-fi
-
 resolved_methods=$(resolve_methods "$methods")
 IFS=',' read -ra method_list <<< "$resolved_methods"
 TOTAL=${#method_list[@]}
 
 echo ""
 echo "========================================================"
-echo "  SFT Training"
+echo "  SFT Val-Ablation Training"
 echo "========================================================"
+echo "Task: $task | Train on ~${n_actual} val samples (pct=${percentage}, batch=$batch_size)"
+echo "Val file: $val_file ($n_file_lines total, sampling $n_val)"
 echo "Methods: $resolved_methods ($TOTAL total)"
-echo "Model: $model | Task: $task | Seed: $seed"
+echo "Max steps: $max_steps (~${n_epochs} epochs) matching original experiment"
+echo "Model: $model | Seed: $seed"
 echo "========================================================"
 
 current=0
