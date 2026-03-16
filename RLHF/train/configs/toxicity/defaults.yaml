@@ -1,0 +1,50 @@
+# Shared experiment defaults for toxicity reduction
+#
+# These values are inherited by all method configs in this directory.
+# Method configs can override any value.
+
+# Model
+model: EleutherAI/gpt-neo-2.7B
+reward_model: facebook/roberta-hate-speech-dynabench-r4-target
+task: toxicity
+
+# Training
+seed: 42
+batch_size: 256
+epochs: 1
+max_steps: -1
+use_flash_attention: true
+lr_scheduler_type: linear
+warmup_ratio: 0.03
+weight_decay: 0.0
+
+# LR (shared across all methods for this task)
+learning_rate: 1e-5
+lr_vhead: 5e-4
+init_kl_coef: 0.02
+
+# PPO
+ppo_epochs: 4
+mini_batch_size: 4
+kl_estimator: k1
+adap_kl_ctrl: true
+target: 70.0
+target_kl: 0.3
+early_stopping: true
+max_new_tokens: 30
+min_new_tokens: 0
+
+# LoRA (shared across all methods)
+lora_r: 16
+lora_alpha: 32
+
+# Curation defaults (used by IIF/Layerwise/Subset)
+filter_frac: 1.0
+n_val: 0
+val_batch_size: 256
+val_loss_type: seqloss-reward
+
+# Evaluation
+eval_interval: 1
+n_eval: 500
+eval_batch_size: 256

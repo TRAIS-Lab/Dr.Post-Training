@@ -1,0 +1,7 @@
+# IIF: offline pre-filtering of rollout before PPO epochs
+method: IIF
+finetuning: LoRA
+
+score_grad_compression:
+  sparsifier: none
+  projector: none

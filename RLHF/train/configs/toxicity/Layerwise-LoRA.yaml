@@ -1,0 +1,7 @@
+# Layerwise: per-layer, per-mini-batch curation during PPO
+method: Layerwise
+finetuning: LoRA
+
+score_grad_compression:
+  sparsifier: none
+  projector: none

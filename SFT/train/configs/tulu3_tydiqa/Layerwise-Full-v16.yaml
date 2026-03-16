@@ -1,0 +1,11 @@
+# Layerwise data curation with full fine-tuning (n_val=16)
+# Same as Layerwise-Full but with larger validation pool.
+method: Layerwise
+finetuning: Full
+learning_rate: 4.96e-05
+
+score_grad_compression:
+  sparsifier: normal-64*64
+  projector: none
+
+n_val: 16

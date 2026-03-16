@@ -1,0 +1,33 @@
+# Test defaults - minimal settings for quick validation of compression configs
+#
+# Usage: bash train.sh -c configs/test -m test-score-only --dry-run
+
+# Model
+model: meta-llama/Llama-3.2-1B
+
+# Dataset
+train_dataset: tulu3
+target_task: tydiqa
+percentage: 0.005
+
+# Training (small values for fast iteration)
+seed: 42
+batch_size: 4
+gradient_accumulation_steps: 1
+optim: adamw_torch
+max_seq_length: 512
+lr_scheduler_type: linear
+warmup_ratio: 0.03
+weight_decay: 0.0
+num_train_epochs: 1
+eval_steps: 10
+use_flash_attention: true
+
+# Evaluation
+n_eval: 50
+
+# Curation
+selection_frac: 0.5
+n_val: 4
+val_batch_size: 1
+val_strategy: merged_batch

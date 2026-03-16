@@ -1,0 +1,7 @@
+# Standard LoRA fine-tuning (no data curation)
+method: Standard
+finetuning: LoRA
+learning_rate: 0.00261
+lora_r: 32
+lora_alpha: 1
+lora_dropout: 0.1

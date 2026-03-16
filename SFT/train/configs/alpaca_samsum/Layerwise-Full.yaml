@@ -1,0 +1,8 @@
+# Layerwise data curation with full fine-tuning
+method: Layerwise
+finetuning: Full
+learning_rate: 7.74e-06
+
+score_grad_compression:
+  sparsifier: normal-64*64
+  projector: none

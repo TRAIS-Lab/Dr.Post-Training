@@ -65,17 +65,17 @@ The following methods have been run and can be rerun with the commands below.
 
 We consider the following 9 methods for each of the training datasets above. Each method has a YAML config in `SFT/train/configs/`:
 
-| Config              | Curation  | Description                               |
-| ------------------- | --------- | ----------------------------------------- |
-| `Standard-Full`     | NA        | Baseline full fine-tuning                 |
-| `Standard-LoRA`     | NA        | Baseline LoRA fine-tuning                 |
-| `Standard-MeSO`     | NA        | Baseline MeSO fine-tuning                 |
-| `Layerwise-Full`    | Layerwise | Per-layer curation, full fine-tuning     |
-| `Layerwise-LoRA`    | Layerwise | Per-layer curation, LoRA fine-tuning     |
-| `Layerwise-MeSO`    | Layerwise | Per-layer curation + MeSO                |
-| `Subset-Full`       | Subset    | Global curation, full fine-tuning        |
-| `Subset-LoRA`       | Subset    | Global curation, LoRA fine-tuning        |
-| `Subset-MeSO`       | Subset    | Global curation + MeSO                   |
+| Config           | Curation  | Description                          |
+| ---------------- | --------- | ------------------------------------ |
+| `Standard-Full`  | NA        | Baseline full fine-tuning            |
+| `Standard-LoRA`  | NA        | Baseline LoRA fine-tuning            |
+| `Standard-MeSO`  | NA        | Baseline MeSO fine-tuning            |
+| `Layerwise-Full` | Layerwise | Per-layer curation, full fine-tuning |
+| `Layerwise-LoRA` | Layerwise | Per-layer curation, LoRA fine-tuning |
+| `Layerwise-MeSO` | Layerwise | Per-layer curation + MeSO            |
+| `Subset-Full`    | Subset    | Global curation, full fine-tuning    |
+| `Subset-LoRA`    | Subset    | Global curation, LoRA fine-tuning    |
+| `Subset-MeSO`    | Subset    | Global curation + MeSO               |
 
 > Experiments follow the pattern: `{train}_{task}-{model}-{Method}-{FinetuningMethod}-p{pct}-lr{lr}-b{batch}-v{nval}-s{seed}`
 
@@ -98,96 +98,122 @@ You can also run grid search via `--mode grid`.
 
 ### Training Commands
 
-All methods are launched using the unified `train.sh` script. Training commands for each experiment (LRs loaded from lr_config.json):
+All methods are launched using `train.sh` with a config directory. Each config directory is self-contained: a `defaults.yaml` for shared experiment settings (model, dataset, batch size, LR scheduler, etc.) and one YAML per method (curation type, LR, compression).
 
 ```bash
-# Alpaca -> SamSUM
-bash SFT/train/train.sh --methods all --train alpaca --task samsum --batch_size 8 --n_val 32 --percentage 0.4 --seed 42
+# Alpaca -> SamSUM (all 9 methods)
+bash SFT/train/train.sh -c configs/alpaca_samsum -m all
 
-# Tulu3 -> TydiQA
-bash SFT/train/train.sh --methods all --train tulu3 --task tydiqa --batch_size 8 --n_val 32 --percentage 0.01 --seed 42
-
-# LESS -> MMLU/BBH
-bash SFT/train/train.sh --methods all --train less --task mmlu --subject sociology --batch_size 8 --n_val 32 --percentage 0.05 --seed 42 --lora_r 128
+# Tulu3 -> TydiQA (all 9 methods)
+bash SFT/train/train.sh -c configs/tulu3_tydiqa -m all
 ```
 
+#### Seed Sweeps and CLI Overrides
+
+The `--seed` and `--lr` flags override the corresponding config values, useful for sweeps:
+
+```bash
+# Run all methods with 3 different seeds
+for s in 42 123 456; do
+  bash SFT/train/train.sh -c configs/tulu3_tydiqa -m all --seed $s
+done
+
+# Quick LR test on a single method
+bash SFT/train/train.sh -c configs/tulu3_tydiqa -m Layerwise-Full --lr 1e-04
+```
+
+#### Running by Category
+
+```bash
+# Run by category
+bash SFT/train/train.sh -c configs/tulu3_tydiqa -m baseline    # Standard-Full, Standard-LoRA
+bash SFT/train/train.sh -c configs/tulu3_tydiqa -m layerwise   # All Layerwise-* variants
+bash SFT/train/train.sh -c configs/tulu3_tydiqa -m subset      # All Subset-* variants
+
+# Run specific methods
+bash SFT/train/train.sh -c configs/tulu3_tydiqa -m "Layerwise-Full,Subset-Full"
+
+# Dry run (print commands without executing)
+bash SFT/train/train.sh -c configs/tulu3_tydiqa -m all --dry-run
+
+# List available methods in a config directory
+bash SFT/train/train.sh -c configs/tulu3_tydiqa --list
+```
+
+| Category         | Matches                                        |
+| ---------------- | ---------------------------------------------- |
+| `all`            | All methods in the config directory             |
+| `baseline`       | `Standard-*`                                   |
+| `layerwise`      | `Layerwise-*`                                  |
+| `subset`         | `Subset-*`                                     |
+| `full`           | All non-LoRA methods                           |
+| `lora`           | `*-LoRA`                                       |
+| `compression`    | `*-MeSO`                                       |
+| `no-compression` | All non-MeSO methods                           |
 
 <details>
-  <summary>Detailed Training Script Configuration</summary>
+  <summary>Config Directory Structure</summary>
 
-#### Method Configs
+#### Layout
 
-Each method is defined by a YAML config in `SFT/train/configs/`. Method-specific settings (curation method, compression, LoRA, score compression) live in the config file — no need to pass them via CLI.
+Each config directory contains a `defaults.yaml` and one YAML per method:
 
-Example config (`Layerwise-Full.yaml`):
+```
+configs/tulu3_tydiqa/
+  defaults.yaml          # shared: model, dataset, training hyperparams
+  Standard-Full.yaml     # method + learning_rate
+  Layerwise-Full.yaml    # method + learning_rate + compression
+  ...
+```
+
+#### defaults.yaml (shared experiment settings)
+
+```yaml
+model: meta-llama/Llama-3.2-1B
+train_dataset: tulu3
+target_task: tydiqa
+percentage: 0.01
+seed: 42
+batch_size: 8
+gradient_accumulation_steps: 1
+optim: adamw_torch
+max_seq_length: 512
+lr_scheduler_type: linear
+warmup_ratio: 0.03
+weight_decay: 0.0
+num_train_epochs: 1
+eval_steps: 50
+use_flash_attention: true
+n_eval: 500
+selection_frac: 0.5
+n_val: 8
+val_batch_size: 1
+val_strategy: merged_batch
+```
+
+#### Method config (method-specific settings)
+
+Method configs only need to specify what differs from defaults. Example (`Layerwise-Full.yaml`):
+
 ```yaml
 method: Layerwise
 finetuning: Full
+learning_rate: 4.96e-05
 
 score_grad_compression:
   sparsifier: normal-64*64
   projector: none
-
-opt_grad_compression:
-  sparsifier: none
-  projector: none
 ```
 
-To customize a method, edit its config file directly.
+Values in the method config override `defaults.yaml`. The load order is: `reset_config()` defaults → `defaults.yaml` → method config → CLI overrides (`--seed`, `--lr`).
 
-#### Running Experiments
+#### Creating a New Experiment
 
-```bash
-# List available methods
-bash SFT/train/train.sh --list
+To set up a new dataset combination:
 
-# Run all methods
-bash SFT/train/train.sh --methods all --task mmlu --subject sociology
-
-# Run by category
-bash SFT/train/train.sh --methods baseline --task mmlu      # Standard-Full, Standard-LoRA
-bash SFT/train/train.sh --methods layerwise --task mmlu     # All Layerwise-* variants
-bash SFT/train/train.sh --methods subset --task mmlu        # All Subset-* variants
-
-# Run specific methods
-bash SFT/train/train.sh --methods "Standard-Full,Layerwise-MeSO" --task mmlu
-
-# Dry run
-bash SFT/train/train.sh --methods all --task mmlu --dry-run
-```
-
-Available Categories:
-
-| Category         | Experiments                                                |
-| ---------------- | ---------------------------------------------------------- |
-| `all`            | All 9 methods                                          |
-| `baseline`       | Standard-Full, Standard-LoRA                               |
-| `layerwise`      | Layerwise-Full, Layerwise-LoRA, Layerwise-MeSO             |
-| `subset`         | Subset-Full, Subset-LoRA, Subset-MeSO                      |
-| `full`           | All *-Full methods                                         |
-| `lora`           | All *-LoRA methods                                         |
-| `compression`    | All *-MeSO* methods                                        |
-| `no-compression` | All methods without compression                            |
-
-#### CLI Parameters
-
-These are experiment-level settings shared across methods (passed via CLI):
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--task` | `mmlu` | Eval task: mmlu, bbh, tydiqa, gsm8k, math500, samsum |
-| `--subject` | `sociology` | Subject for MMLU/BBH |
-| `--train` | task default | Training dataset |
-| `--model` | `meta-llama/Llama-3.2-1B` | Model path |
-| `--lr` | from config.json | Learning rate override |
-| `--batch_size` | `8` | Training batch size |
-| `--val_batch_size` | `1` | Val batch size for curation |
-| `--percentage` | `0.05` | Data sampling fraction |
-| `--n_val` | `8` | Validation examples |
-| `--n_eval` | `500` | Evaluation examples |
-| `--seed` | `42` | Random seed |
-| `--selection_frac` | `0.5` | Curation fraction |
-| `--use_second_order` | disabled | Enable greedy curation |
+1. Create a new folder under `configs/` (e.g., `configs/less_mmlu_sociology/`)
+2. Copy a `defaults.yaml` from an existing experiment and update dataset, percentage, subject, etc.
+3. Copy method configs and update learning rates (from LR sweep results)
 
 </details>
 

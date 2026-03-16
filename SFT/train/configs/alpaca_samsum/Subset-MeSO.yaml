@@ -1,0 +1,12 @@
+# Subset data curation with MeSO optimizer (exact scoring)
+method: Subset
+finetuning: MeSO
+learning_rate: 8.8e-07
+
+score_grad_compression:
+  sparsifier: none
+  projector: none
+
+opt_grad_compression:
+  sparsifier: normal-512*512
+  projector: none

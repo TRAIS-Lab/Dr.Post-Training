@@ -1,0 +1,8 @@
+# Standard MeSO fine-tuning (no data curation, compressed optimizer)
+method: Standard
+finetuning: MeSO
+learning_rate: 5e-05
+
+opt_grad_compression:
+  sparsifier: normal-512*512
+  projector: none

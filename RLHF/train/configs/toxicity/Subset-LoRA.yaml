@@ -1,0 +1,7 @@
+# Subset: global curation across all layers, per-mini-batch during PPO
+method: Subset
+finetuning: LoRA
+
+score_grad_compression:
+  sparsifier: none
+  projector: none

@@ -1,0 +1,11 @@
+# Layerwise data curation with LoRA fine-tuning
+method: Layerwise
+finetuning: LoRA
+learning_rate: 0.000129
+lora_r: 32
+lora_alpha: 1
+lora_dropout: 0.1
+
+score_grad_compression:
+  sparsifier: normal-64*64
+  projector: none

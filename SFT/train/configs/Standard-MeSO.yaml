@@ -1,9 +1,0 @@
-# Standard fine-tuning with MeSO optimizer (no data curation)
-# Note: curation params (n_val, selection_frac, val_strategy, val_batch_size) are ignored for Standard
-# See configs/README.md for compression format details (LoGra, GraSS, etc.)
-method: Standard
-finetuning: MeSO
-
-opt_grad_compression:
-  sparsifier: normal-512*512
-  projector: none

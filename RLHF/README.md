@@ -27,67 +27,105 @@ All methods use **LoRA training** (no MeSO compression). Each method has a YAML 
 
 ### Training Commands
 
+All methods are launched using `train.sh` with a config directory. Each config directory is self-contained: a `defaults.yaml` for shared experiment settings (model, reward model, PPO params, LR, etc.) and one YAML per method.
+
 ```bash
 # Run all 4 methods
-bash RLHF/train/train.sh --methods all --task toxicity
+bash RLHF/train/train.sh -c configs/toxicity -m all
 
 # Run by category
-bash RLHF/train/train.sh --methods baseline --task toxicity
-bash RLHF/train/train.sh --methods layerwise --task toxicity
-bash RLHF/train/train.sh --methods subset --task toxicity
+bash RLHF/train/train.sh -c configs/toxicity -m baseline
+bash RLHF/train/train.sh -c configs/toxicity -m layerwise
+bash RLHF/train/train.sh -c configs/toxicity -m subset
 
 # Run specific methods
-bash RLHF/train/train.sh --methods "Layerwise-LoRA,Subset-LoRA" --task toxicity
+bash RLHF/train/train.sh -c configs/toxicity -m "Layerwise-LoRA,Subset-LoRA"
 
-# List available methods
-bash RLHF/train/train.sh --list
-
-# Dry run
-bash RLHF/train/train.sh --methods all --dry-run
+# Dry run / list
+bash RLHF/train/train.sh -c configs/toxicity -m all --dry-run
+bash RLHF/train/train.sh -c configs/toxicity --list
 ```
 
+#### Seed Sweeps and CLI Overrides
+
+The `--seed`, `--lr`, `--lr_vhead`, and `--init_kl_coef` flags override config values:
+
+```bash
+# Run all methods with 3 different seeds
+for s in 42 123 456; do
+  bash RLHF/train/train.sh -c configs/toxicity -m all --seed $s
+done
+
+# Quick LR test
+bash RLHF/train/train.sh -c configs/toxicity -m Layerwise-LoRA --lr 5e-6
+```
+
+| Category    | Matches            |
+| ----------- | ------------------ |
+| `all`       | All methods        |
+| `baseline`  | `Standard-*`       |
+| `iif`       | `IIF-*`            |
+| `layerwise` | `Layerwise-*`      |
+| `subset`    | `Subset-*`         |
+| `lora`      | `*-LoRA`           |
+
 <details>
-  <summary>Detailed Training Script Configuration</summary>
+  <summary>Config Directory Structure</summary>
 
-#### Parameters
+#### Layout
 
-Method-specific settings (curation method, score compression) are in YAML config files.
-Common settings are CLI arguments:
+Each config directory contains a `defaults.yaml` and one YAML per method:
 
-1. Task Arguments
-   - `--task <task>` — Task: `toxicity` (default: `toxicity`)
-   - `--model <model>` — Policy model (default: `EleutherAI/gpt-neo-2.7B`)
-   - `--reward_model <model>` — Reward model (default: auto-selected per task)
-2. Training Arguments
-   - `--lr <lr>` — Learning rate override (default: from `config.json`)
-   - `--lr_vhead <lr>` — Value head LR override (default: from `config.json`)
-   - `--lr_config <path>` — Config file (default: `RLHF/train/config.json`)
-   - `--batch_size <size>` — Batch size (default: `256`)
-   - `--max_steps <steps>` — Max training steps (`-1` = use epochs, default)
-   - `--epochs <n>` — Training epochs (default: `1`)
-   - `--seed <seed>` — Random seed (default: `42`)
-   - `--filter_frac <frac>` — Fraction of negative samples to drop (default: `1.0`)
-3. PPO Arguments
-   - `--ppo_epochs <n>` — PPO epochs per batch (default: `4`)
-   - `--mini_batch_size <n>` — Mini-batch size (default: `4`)
-   - `--init_kl_coef <coef>` — Initial KL coefficient override (default: from `config.json`)
-   - `--kl_estimator <mode>` — KL estimator: `k1`, `k2`, `k3` (default: `k1`)
-   - `--target <val>` — Target KL for adaptive controller (default: `70.0`)
-   - `--target_kl <kl>` — Early stopping threshold (default: `0.3`)
-   - `--max_new_tokens <n>` — Max new tokens (default: `30`)
-4. Validation (for data curation)
-   - `--n_val <n>` — Validation samples (default: `1024`, `0` = self-ref)
-   - `--val_batch_size <n>` — Val batch size (default: `256`)
-   - `--val_loss_type <type>` — `seqloss-reward` (default), `seqloss-lastadv`, or `tokenpg`
-5. LoRA
-   - `--lora_r <r>` — LoRA rank (default: `16`)
-   - `--lora_alpha <alpha>` — LoRA alpha (default: `32`)
+```
+configs/toxicity/
+  defaults.yaml          # shared: model, reward_model, PPO params, LR, LoRA
+  Standard-LoRA.yaml     # method only (everything else from defaults)
+  IIF-LoRA.yaml          # method + compression
+  Layerwise-LoRA.yaml    # method + compression
+  Subset-LoRA.yaml       # method + compression
+```
 
-#### LR/KL Resolution
+#### defaults.yaml (shared experiment settings)
 
-1. If `--lr` / `--lr_vhead` / `--init_kl_coef` is specified, use that value
-2. Otherwise, look up from `config.json` based on task + method name
-3. If not found, use fallback defaults
+```yaml
+model: EleutherAI/gpt-neo-2.7B
+reward_model: facebook/roberta-hate-speech-dynabench-r4-target
+task: toxicity
+seed: 42
+batch_size: 256
+epochs: 1
+learning_rate: 1e-5
+lr_vhead: 5e-4
+init_kl_coef: 0.02
+ppo_epochs: 4
+mini_batch_size: 4
+lora_r: 16
+lora_alpha: 32
+# ... (see file for full list)
+```
+
+#### Method config (method-specific settings)
+
+Method configs only specify what differs from defaults. Example (`Layerwise-LoRA.yaml`):
+
+```yaml
+method: Layerwise
+finetuning: LoRA
+
+score_grad_compression:
+  sparsifier: none
+  projector: none
+```
+
+Values load in order: `reset_config()` defaults → `defaults.yaml` → method config → CLI overrides (`--seed`, `--lr`, etc.).
+
+#### Creating a New Experiment
+
+To set up a new task:
+
+1. Create a new folder under `configs/` (e.g., `configs/sentiment/`)
+2. Copy a `defaults.yaml` and update model, reward_model, task, LRs, etc.
+3. Copy method configs (usually unchanged for method-specific settings)
 
 </details>
 
