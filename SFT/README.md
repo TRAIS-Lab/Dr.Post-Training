@@ -126,7 +126,7 @@ bash SFT/train/train.sh -c configs/tulu3_tydiqa -m Layerwise-Full --lr 1e-04
 
 ```bash
 # Run by category
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m baseline    # Standard-Full, Standard-LoRA
+bash SFT/train/train.sh -c configs/tulu3_tydiqa -m standard    # All Standard-* variants
 bash SFT/train/train.sh -c configs/tulu3_tydiqa -m layerwise   # All Layerwise-* variants
 bash SFT/train/train.sh -c configs/tulu3_tydiqa -m subset      # All Subset-* variants
 
@@ -140,16 +140,15 @@ bash SFT/train/train.sh -c configs/tulu3_tydiqa -m all --dry-run
 bash SFT/train/train.sh -c configs/tulu3_tydiqa --list
 ```
 
-| Category         | Matches                                        |
-| ---------------- | ---------------------------------------------- |
-| `all`            | All methods in the config directory             |
-| `baseline`       | `Standard-*`                                   |
-| `layerwise`      | `Layerwise-*`                                  |
-| `subset`         | `Subset-*`                                     |
-| `full`           | All non-LoRA methods                           |
-| `lora`           | `*-LoRA`                                       |
-| `compression`    | `*-MeSO`                                       |
-| `no-compression` | All non-MeSO methods                           |
+| Category    | Matches                            |
+| ----------- | ---------------------------------- |
+| `all`       | All methods in the config directory|
+| `standard`  | `Standard-*`                       |
+| `layerwise` | `Layerwise-*`                      |
+| `subset`    | `Subset-*`                         |
+| `full`      | `*-Full`                           |
+| `lora`      | `*-LoRA`                           |
+| `meso`      | `*-MeSO`                           |
 
 <details>
   <summary>Config Directory Structure</summary>

@@ -167,13 +167,12 @@ read_sweep_config() {
 # Category mappings (same as train.sh)
 declare -A CATEGORY_METHODS=(
     ["all"]="Standard-Full,Standard-LoRA,Standard-MeSO,Standard-MeSO-LoRA,Layerwise-Full,Layerwise-LoRA,Subset-Full,Subset-LoRA,Layerwise-MeSO,Subset-MeSO"
-    ["baseline"]="Standard-Full,Standard-LoRA"
+    ["standard"]="Standard-Full,Standard-LoRA,Standard-MeSO,Standard-MeSO-LoRA"
     ["layerwise"]="Layerwise-Full,Layerwise-LoRA,Layerwise-MeSO"
     ["subset"]="Subset-Full,Subset-LoRA,Subset-MeSO"
-    ["full"]="Standard-Full,Standard-MeSO,Layerwise-Full,Subset-Full,Layerwise-MeSO,Subset-MeSO"
+    ["full"]="Standard-Full,Layerwise-Full,Subset-Full"
     ["lora"]="Standard-LoRA,Standard-MeSO-LoRA,Layerwise-LoRA,Subset-LoRA"
-    ["compression"]="Standard-MeSO,Standard-MeSO-LoRA,Layerwise-MeSO,Subset-MeSO"
-    ["no-compression"]="Standard-Full,Standard-LoRA,Layerwise-Full,Layerwise-LoRA,Subset-Full,Subset-LoRA"
+    ["meso"]="Standard-MeSO,Standard-MeSO-LoRA,Layerwise-MeSO,Subset-MeSO"
 )
 
 # Parse named arguments
@@ -349,7 +348,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --dry-run                              Print commands without executing"
             echo ""
             echo "  Experiment names: Standard-Full, Standard-LoRA, Layerwise-Full, etc."
-            echo "  Categories: all, baseline, layerwise, subset, Full, LoRA, compression"
+            echo "  Categories: all, standard, layerwise, subset, full, lora, meso"
             echo ""
             echo "Shared Options (same as train.sh):"
             echo "  --model <model>                        HuggingFace model path (default: meta-llama/Llama-3.2-1B)"
@@ -945,7 +944,7 @@ else:
 else
     echo "ERROR: Please specify methods with --methods"
     echo "Example: --methods all"
-    echo "         --methods baseline"
+    echo "         --methods standard"
     echo "         --methods Standard-Full,Layerwise-Full"
     exit 1
 fi

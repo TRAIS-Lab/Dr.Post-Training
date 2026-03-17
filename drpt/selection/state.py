@@ -98,6 +98,7 @@ class SelectionState(ABC):
         # Store for gradient scaling: train_total_tokens / selected_tokens
         self.tokens_per_sample = tokens_per_sample
         self.train_total_tokens_tensor = total_train_tokens.to(dtype=self.dtype)
+        self.batch_total_tokens_tensor = batch_total_tokens.to(dtype=self.dtype)
 
         # Precompute score correction for joint batch mode
         # All operations kept on device as Tensors to avoid D2H memcpy
@@ -158,6 +159,25 @@ class SelectionState(ABC):
         scale = self.train_total_tokens_tensor / selected_tokens
         return torch.where(selected_tokens == 0, torch.ones_like(scale), scale)
 
+    def _compute_scale_factor_with_val(self, selected_indices: Tensor) -> Tensor:
+        """
+        Compute token-based scale factor for selected train + all val samples.
+
+        Returns batch_total_tokens / (selected_train_tokens + val_tokens).
+        When selection_frac=1.0, this returns 1.0 (matching baseline).
+        """
+        if self.tokens_per_sample is None or self.batch_total_tokens_tensor is None:
+            raise RuntimeError(
+                "Token counts not set. Call set_token_counts() before curation."
+            )
+        if selected_indices.numel() == 0:
+            return torch.tensor(1.0, device=self.device, dtype=self.dtype)
+        selected_train_tokens = self.tokens_per_sample[selected_indices].sum()
+        val_tokens = self.batch_total_tokens_tensor - self.train_total_tokens_tensor
+        effective_tokens = selected_train_tokens + val_tokens
+        scale = self.batch_total_tokens_tensor / effective_tokens
+        return torch.where(effective_tokens == 0, torch.ones_like(scale), scale)
+
     @abstractmethod
     def process_layer_gradients(
         self,
@@ -202,13 +222,17 @@ class LayerwiseState(SelectionState):
     and aggregates gradients. No global accumulation needed.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, include_val_in_update: bool = False, **kwargs):
         super().__init__(**kwargs)
         # Track last selected indices for stats
         self._last_selected_indices: Optional[Tensor] = None
 
         # Track curation stats across all layers
         self._layer_selections: list = []  # (layer_idx, n_selected) tuples
+
+        # Whether to include validation gradient in the parameter update
+        # Used by LayerwiseWithVal to train on both selected train + val samples
+        self.include_val_in_update = include_val_in_update
 
     def process_layer_gradients(
         self,

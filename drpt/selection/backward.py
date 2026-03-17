@@ -34,6 +34,7 @@ from .utils import (
     compute_scores_and_similarity,
     compute_scores_direct_materialization,
     compute_selected_gradients,
+    compute_total_gradient,
 )
 
 
@@ -128,10 +129,45 @@ def _produce_gradient_update(
         return grad_weight, grad_bias
 
 
+def _produce_gradient_update_with_val(
+    state: "LayerwiseState",
+    selected_indices: Tensor,
+    train_grad_output: Tensor,
+    train_input: Tensor,
+    val_grad_output: Tensor,
+    val_input: Tensor,
+    has_bias: bool,
+) -> "Tuple[Tensor, Optional[Tensor]]":
+    """Compute gradient from selected train + val samples in a single einsum.
+
+    Concatenates selected train and val activations, then computes the gradient
+    with a unified scale factor: batch_total_tokens / (selected_train_tokens + val_tokens).
+    When selection_frac=1.0, scale=1.0 (matching baseline).
+    """
+    # Concatenate selected train + all val for unified gradient computation
+    all_go = torch.cat([train_grad_output[selected_indices], val_grad_output], dim=0)
+    all_inp = torch.cat([train_input[selected_indices], val_input], dim=0)
+
+    # Unified scale factor accounting for all contributing tokens
+    scale = state._compute_scale_factor_with_val(selected_indices)
+
+    # Single einsum over all contributing samples
+    grad_weight = compute_total_gradient(all_go, all_inp) * scale
+
+    grad_bias = None
+    if has_bias:
+        if all_go.dim() == 3:
+            grad_bias = all_go.sum(dim=(0, 1)) * scale
+        else:
+            grad_bias = all_go.sum(dim=0) * scale
+
+    return grad_weight, grad_bias
+
+
 def _store_update_grad(
     hook_manager: "GradientHook",
-    update_compressor: Optional["Compressor"],
-    score_compressor: Optional["Compressor"],
+    update_compressor: "Optional[Compressor]",
+    score_compressor: "Optional[Compressor]",
     layer_idx: int,
     grad_output: Tensor,
     input_aug: Tensor,
@@ -367,15 +403,22 @@ class LayerwiseLinearBackward(Function):
         if use_stored_val:
             train_grad_output, train_input = grad_output, input
         else:
-            train_grad_output, _ = split_train_val_batch(grad_output, state.train_batch_size)
-            train_input, _ = split_train_val_batch(input, state.train_batch_size)
+            train_grad_output, val_grad_output_raw = split_train_val_batch(grad_output, state.train_batch_size)
+            train_input, val_input_raw = split_train_val_batch(input, state.train_batch_size)
 
-        result = _produce_gradient_update(
+        # LayerwiseWithVal: unified gradient from selected train + val in one einsum
+        if (getattr(state, 'include_val_in_update', False)
+                and not use_stored_val):
+            return _produce_gradient_update_with_val(
+                state, selected_indices,
+                train_grad_output, train_input,
+                val_grad_output_raw, val_input_raw, has_bias,
+            )
+
+        return _produce_gradient_update(
             hook_manager, update_compressor, state, layer_idx,
             train_grad_output, train_input, selected_indices, has_bias
         )
-
-        return result
 
     @staticmethod
     def _backward_full(
@@ -438,6 +481,15 @@ class LayerwiseLinearBackward(Function):
 
         # --- Select, then produce gradient update ---
         selected_indices = _do_selection(state, layer_idx, scores, similarity)
+
+        # LayerwiseWithVal: unified gradient from selected train + val in one einsum
+        if (getattr(state, 'include_val_in_update', False)
+                and not use_stored_val):
+            return _produce_gradient_update_with_val(
+                state, selected_indices,
+                train_grad_output, train_input,
+                val_grad_output, val_input, has_bias,
+            )
 
         return _produce_gradient_update(
             hook_manager, update_compressor, state, layer_idx,

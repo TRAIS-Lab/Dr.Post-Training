@@ -58,7 +58,7 @@ while [[ $# -gt 0 ]]; do
                 [[ "$name" != "defaults" ]] && echo "  $name"
             done
             echo ""
-            echo "Categories: all, baseline, layerwise, subset, full, lora, compression, no-compression"
+            echo "Categories: all, standard, layerwise, subset, full, lora, meso"
             exit 0
             ;;
         --help|-h)
@@ -78,12 +78,12 @@ Optional:
   --dry-run               Print commands without executing
   --list                  List available methods and exit
 
-Categories: all, baseline, layerwise, subset, full, lora, compression, no-compression
+Categories: all, standard, layerwise, subset, full, lora, meso
 
 Examples:
   bash train.sh -c configs/tulu3_tydiqa -m all
   bash train.sh -c configs/tulu3_tydiqa -m "Layerwise-Full,Subset-Full" --seed 123
-  bash train.sh -c configs/tulu3_tydiqa -m baseline --dry-run
+  bash train.sh -c configs/tulu3_tydiqa -m standard --dry-run
 HELP
             exit 0
             ;;
@@ -120,6 +120,7 @@ reset_config() {
 
     # Curation
     cfg_selection_frac="0.5"
+    cfg_selection_mode="topk"
     cfg_n_val="8"
     cfg_val_batch_size="1"
     cfg_val_strategy="merged_batch"
@@ -191,6 +192,7 @@ parse_yaml() {
             opt_grad_compression.sparsifier)     cfg_opt_sparsifier="$val" ;;
             opt_grad_compression.projector)      cfg_opt_projector="$val" ;;
             selection_frac)                      cfg_selection_frac="$val" ;;
+            selection_mode)                      cfg_selection_mode="$val" ;;
             n_val)                               cfg_n_val="$val" ;;
             val_batch_size)                      cfg_val_batch_size="$val" ;;
             val_strategy)                        cfg_val_strategy="$val" ;;
@@ -244,13 +246,12 @@ resolve_methods() {
         item=$(echo "$item" | xargs)
         case "$item" in
             all)            for m in "${available[@]}"; do resolved="${resolved:+$resolved,}$m"; done ;;
-            baseline)       for m in "${available[@]}"; do [[ "$m" == Standard-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            standard)       for m in "${available[@]}"; do [[ "$m" == Standard-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             layerwise)      for m in "${available[@]}"; do [[ "$m" == Layerwise-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             subset)         for m in "${available[@]}"; do [[ "$m" == Subset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            full)           for m in "${available[@]}"; do [[ "$m" != *-LoRA ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            full)           for m in "${available[@]}"; do [[ "$m" == *-Full ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             lora)           for m in "${available[@]}"; do [[ "$m" == *-LoRA ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            compression)    for m in "${available[@]}"; do [[ "$m" == *-MeSO ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            no-compression) for m in "${available[@]}"; do [[ "$m" != *-MeSO ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            meso)           for m in "${available[@]}"; do [[ "$m" == *-MeSO ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             *)
                 if [[ -f "$config_dir/${item}.yaml" ]]; then
                     resolved="${resolved:+$resolved,}$item"
@@ -372,6 +373,7 @@ $fsdp_args \
 --seed $cfg_seed \
 --optim $cfg_optim \
 --selection_frac $cfg_selection_frac \
+--selection_mode $cfg_selection_mode \
 --val_strategy $cfg_val_strategy \
 --use_flash_attention $cfg_use_flash_attention"
 

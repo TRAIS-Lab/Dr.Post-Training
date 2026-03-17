@@ -223,6 +223,35 @@ class MergedBatchLayerwiseStrategy(MergedBatchStrategy):
         self.grad_hook.clear_token_counts()
 
 
+class MergedBatchLayerwiseWithValStrategy(MergedBatchLayerwiseStrategy):
+    """
+    Layer-wise strategy with merged batch that also trains on validation data.
+
+    Same as MergedBatchLayerwiseStrategy but includes validation gradients
+    in the parameter update, effectively training on both selected train
+    samples and validation samples.
+    """
+
+    def _setup_state(self, train_batch_size: int, lr: float) -> None:
+        """Set up LayerwiseState with include_val_in_update=True."""
+        dtype = next(self.grad_hook.model.parameters()).dtype
+
+        state = LayerwiseState(
+            train_batch_size=train_batch_size,
+            num_layers=len(self.grad_hook.layer_names),
+            frac=self.frac,
+            lr=lr,
+            device=self.grad_hook.device,
+            dtype=dtype,
+            use_second_order=self.use_second_order,
+            selection_mode=self.selection_mode,
+            record_selections=self.record_selections,
+            include_val_in_update=True,
+        )
+
+        self.grad_hook.selection_state = state
+
+
 class MergedBatchSubsetStrategy(MergedBatchStrategy):
     """
     Subset strategy with merged batch: two-pass, global curation.
@@ -360,6 +389,9 @@ def create_merged_batch_strategy(
 
     if method == "Layerwise":
         return MergedBatchLayerwiseStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
+
+    if method == "LayerwiseWithVal":
+        return MergedBatchLayerwiseWithValStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
 
     if method == "Subset":
         return MergedBatchSubsetStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)

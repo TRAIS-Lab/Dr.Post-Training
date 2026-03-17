@@ -93,6 +93,15 @@ class TrainingArguments(TA):
         default=0.5,
         metadata={"help": "Fraction of samples to select (0-1)"},
     )
+    selection_mode: str = field(
+        default="topk",
+        metadata={
+            "help": (
+                "Selection mode: 'topk' (select top frac samples by score) or "
+                "'filtering' (drop bottom frac of negative-score samples)."
+            )
+        },
+    )
     subject: str = field(
         default="sociology",
         metadata={"help": "Subject for MMLU/BBH evaluation"},

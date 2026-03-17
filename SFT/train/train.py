@@ -210,7 +210,7 @@ def main():
     # 1. Selection method is not NA (Layerwise or Subset)
     # 2. Compression enabled (implies MeSO optimizer)
     has_explicit_compression = (training_args.sparsification is not None or training_args.projection is not None)
-    needs_selection = training_args.method in ('Layerwise', 'Subset')
+    needs_selection = training_args.method in ('Layerwise', 'Subset', 'LayerwiseWithVal')
     needs_grad_hook = needs_selection or has_explicit_compression
 
     # Determine compression needs independently for score and update

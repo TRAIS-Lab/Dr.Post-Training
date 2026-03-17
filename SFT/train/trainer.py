@@ -109,13 +109,20 @@ class LayerwiseTrainer(Trainer):
         # - separate_batch: Separate val pass, store mean gradient
         # - merged_batch: Merge train+val into single batch
         val_strategy = getattr(self.args, 'val_strategy', 'separate_batch_factorized')
+        # LayerwiseWithVal requires merged_batch strategy
+        if self.args.method == 'LayerwiseWithVal' and val_strategy != 'merged_batch':
+            logger.warning(
+                f"LayerwiseWithVal requires merged_batch strategy, overriding "
+                f"val_strategy from '{val_strategy}' to 'merged_batch'"
+            )
+            val_strategy = 'merged_batch'
         if val_strategy == 'merged_batch':
             self.selection_strategy = create_merged_batch_strategy(
                 method=self.args.method,
                 grad_hook=self.grad_hook,
                 frac=getattr(self.args, 'selection_frac', 0.5),
                 use_second_order=getattr(self.args, 'use_second_order', False),
-                selection_mode="topk",
+                selection_mode=getattr(self.args, 'selection_mode', 'topk'),
                 record_selections=self._record_selections,
             )
         else:
@@ -125,7 +132,7 @@ class LayerwiseTrainer(Trainer):
                 grad_hook=self.grad_hook,
                 frac=getattr(self.args, 'selection_frac', 0.5),
                 use_second_order=getattr(self.args, 'use_second_order', False),
-                selection_mode="topk",
+                selection_mode=getattr(self.args, 'selection_mode', 'topk'),
                 record_selections=self._record_selections,
             )
         self.val_strategy = val_strategy
@@ -145,7 +152,7 @@ class LayerwiseTrainer(Trainer):
 
         # Log the training mode based on configuration
         # Naming convention: {curation}-{compression}-{training_type}
-        if self.args.method in ('Layerwise', 'Subset'):
+        if self.args.method in ('Layerwise', 'Subset', 'LayerwiseWithVal'):
             if self.has_compression:
                 logger.info(f"  Mode: {self.args.method} with compression (MeSO optimizer)")
             else:
@@ -308,7 +315,7 @@ class LayerwiseTrainer(Trainer):
                 unwrapped_optimizer.refresh_compressors_if_needed()
 
         # === DATA CURATION MODE (Layerwise or Subset) ===
-        if args.method in ('Layerwise', 'Subset'):
+        if args.method in ('Layerwise', 'Subset', 'LayerwiseWithVal'):
             # Get validation batch for curation
             try:
                 val_batch = next(self.val_dataloader_iter)
@@ -457,7 +464,7 @@ class LayerwiseTrainer(Trainer):
             'val_samples': val_texts,
         }
 
-        if self.args.method == 'Layerwise':
+        if self.args.method in ('Layerwise', 'LayerwiseWithVal'):
             step_record['layers'] = record
         else:
             # Subset: single global curation
