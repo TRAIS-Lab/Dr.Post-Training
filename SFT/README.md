@@ -56,10 +56,8 @@ The following methods have been run and can be rerun with the commands below.
 
 | Train Dataset | Eval Task | Percentage | Batch | Val Size | LoRA Rank |
 | ------------- | --------- | ---------- | ----- | -------- | --------- |
-| Alpaca        | SamSUM    | 0.4        | 8     | 32       | 32        |
-| Tulu3         | TydiQA    | 0.01       | 8     | 32       | 32        |
-| LESS          | MMLU      | 0.05       | 8     | 32       | 128       |
-| LESS          | BBH       | 0.05       | 8     | 32       | 128       |
+| Alpaca        | SamSUM    | 0.4        | 8     | 16       | 32        |
+| Tulu3         | TydiQA    | 0.01       | 8     | 16       | 32        |
 
 ### Experiment Configurations
 
@@ -79,22 +77,62 @@ We consider the following 9 methods for each of the training datasets above. Eac
 
 > Experiments follow the pattern: `{train}_{task}-{model}-{Method}-{FinetuningMethod}-p{pct}-lr{lr}-b{batch}-v{nval}-s{seed}`
 
-### LR Sweep Commands
+### LR Sweep
 
-The `SFT/train/lr/` folder contains tools for finding optimal learning rates, where learning rates are managed via `SFT/train/lr/config.json`. Run LR sweep before full training to find optimal learning rates:
+The `SFT/train/lr/` folder contains tools for finding optimal learning rates. Best LRs are written directly into each method's YAML config file (the `learning_rate:` field).
+
+#### Three-Way Data Split
+
+Evaluation data is split into three parts to prevent contamination:
+
+| Split | File | Purpose |
+|-------|------|---------|
+| `validation` | `{task}_validation_data.jsonl` | Data curation (during training) |
+| `lr` | `{task}_lr_data.jsonl` | LR sweep evaluation |
+| `test` | `{task}_test_data.jsonl` | Final evaluation only |
+
+Regenerate splits with: `python SFT/data/prepare_datasets.py --datasets tydiqa samsum`
+
+#### Parallel Sweep (Recommended)
+
+Uses SLURM to submit all LR trials as parallel 1-GPU jobs. Each job trains 1 epoch with the method's full config and evaluates on the `lr` split.
 
 ```bash
-# Alpaca -> SamSUM
-bash SFT/train/lr/lr_sweep.sh --mode binary --methods all --train alpaca --task samsum --batch_size 8 --n_val 8 --sweep_percentage 0.04 --seed 2
+# Step 1: Submit all trials (9 methods x 20 LRs = 180 jobs per config)
+bash SFT/train/lr/lr_sweep_submit.sh -c configs/tulu3_tydiqa -m all
+bash SFT/train/lr/lr_sweep_submit.sh -c configs/alpaca_samsum -m all
 
-# Tulu3 -> TydiQA
-bash SFT/train/lr/lr_sweep.sh --mode binary --methods all --train tulu3 --task tydiqa --batch_size 8 --n_val 8 --sweep_percentage 0.001 --seed 2
-
-# LESS -> MMLU/BBH
-bash SFT/train/lr/lr_sweep.sh --mode binary --methods all --train less --task mmlu --subject sociology --batch_size 8 --n_val 8 --sweep_percentage 0.005 --seed 2 --lora_r 128
+# Step 2: After all jobs complete, collect results and update YAML configs
+bash SFT/train/lr/lr_sweep_collect.sh -c configs/tulu3_tydiqa -m all
+bash SFT/train/lr/lr_sweep_collect.sh -c configs/alpaca_samsum -m all
 ```
 
-You can also run grid search via `--mode grid`.
+The grid uses 20 log-spaced LR values:
+- **Full/MeSO**: `1e-7` to `1e-3`
+- **LoRA**: `1e-5` to `1e-1`
+
+The collect script picks the smallest LR within 1% of the best eval_loss (stability margin), writes it back to the method YAML, and cleans up model weights.
+
+Options:
+```bash
+# Customize grid density
+bash SFT/train/lr/lr_sweep_submit.sh -c configs/tulu3_tydiqa -m all --n_lrs 10
+
+# Dry run (print commands without submitting)
+bash SFT/train/lr/lr_sweep_submit.sh -c configs/tulu3_tydiqa -m Standard-Full --dry-run
+
+# Adjust stability margin
+bash SFT/train/lr/lr_sweep_collect.sh -c configs/tulu3_tydiqa -m all --lr_margin 0.02
+```
+
+#### Sequential Sweep (Single GPU)
+
+For local/interactive use without SLURM. Runs trials sequentially on the current machine:
+
+```bash
+bash SFT/train/lr/lr_sweep.sh -c configs/tulu3_tydiqa -m all
+bash SFT/train/lr/lr_sweep.sh -c configs/tulu3_tydiqa -m Standard-Full --mode grid
+```
 
 ### Training Commands
 
@@ -185,7 +223,8 @@ eval_steps: 50
 use_flash_attention: true
 n_eval: 500
 selection_frac: 0.5
-n_val: 8
+selection_mode: topk
+n_val: 16
 val_batch_size: 1
 val_strategy: merged_batch
 ```
@@ -197,7 +236,7 @@ Method configs only need to specify what differs from defaults. Example (`Layerw
 ```yaml
 method: Layerwise
 finetuning: Full
-learning_rate: 4.96e-05
+learning_rate: 3.36e-05
 
 score_grad_compression:
   sparsifier: normal-64*64
@@ -212,7 +251,10 @@ To set up a new dataset combination:
 
 1. Create a new folder under `configs/` (e.g., `configs/less_mmlu_sociology/`)
 2. Copy a `defaults.yaml` from an existing experiment and update dataset, percentage, subject, etc.
-3. Copy method configs and update learning rates (from LR sweep results)
+3. Copy method configs (learning rates will be placeholder values)
+4. Prepare data splits: `python SFT/data/prepare_datasets.py --datasets <task>`
+5. Run LR sweep: `bash SFT/train/lr/lr_sweep_submit.sh -c configs/<new_config> -m all`
+6. Collect results: `bash SFT/train/lr/lr_sweep_collect.sh -c configs/<new_config> -m all`
 
 </details>
 
