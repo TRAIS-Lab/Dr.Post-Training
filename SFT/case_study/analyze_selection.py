@@ -464,7 +464,7 @@ def main():
         tokenizer=tokenizer,
         max_seq_length=data_args.max_seq_length,
         sample_percentage=data_args.percentage,
-        seed=data_args.sample_data_seed,
+        seed=training_args.data_seed if training_args.data_seed is not None else training_args.seed,
         train_files=data_args.train_files if data_args.train_files else None,
         train_dataset_names=training_args.train_dataset_names,
     )
