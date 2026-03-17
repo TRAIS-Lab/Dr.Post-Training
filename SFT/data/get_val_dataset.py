@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 from typing import List, Optional, Tuple
 
 import torch
@@ -87,28 +88,30 @@ def tokenize(
 def load_unified_jsonl(
         data_dir: str,
         task: str,
-        validation: bool,
+        split: str = "test",
         k: int = 5,
-        subject: str = None
+        subject: str = None,
+        seed: Optional[int] = None
     ) -> List[dict]:
     """
     Load examples from unified JSONL format.
 
     File naming convention:
     - Validation: {data_dir}/eval/{task}/{task}_validation_data.jsonl
+    - LR sweep: {data_dir}/eval/{task}/{task}_lr_data.jsonl
     - Test: {data_dir}/eval/{task}/{task}_test_data.jsonl
 
     Args:
         data_dir: Base data directory
         task: Task name (mmlu, bbh, tydiqa, gsm8k, math500, samsum)
-        validation: If True, load validation split; otherwise load test split
+        split: Which split to load ("validation", "test", or "lr")
         k: Number of examples to load
         subject: Optional subject filter (for MMLU and BBH with multiple subtasks)
+        seed: Optional seed for shuffling examples before selecting first k
 
     Returns:
         List of example dictionaries with 'messages' field
     """
-    split = "validation" if validation else "test"
     file_path = os.path.join(data_dir, "eval", task, f"{task}_{split}_data.jsonl")
 
     if not os.path.exists(file_path):
@@ -123,15 +126,17 @@ def load_unified_jsonl(
             example = json.loads(line.strip())
             # Filter by subject/task if specified (for BBH and MMLU)
             if subject is not None:
-                # Check 'task' field (BBH) or 'subject' field (MMLU)
                 example_subject = example.get('task') or example.get('subject')
                 if example_subject != subject:
                     continue
             examples.append(example)
-            if len(examples) >= k:
+            if seed is None and len(examples) >= k:
                 break
 
-    return examples
+    if seed is not None:
+        random.Random(seed).shuffle(examples)
+
+    return examples[:k]
 
 
 def get_bbh_dataset(
@@ -140,9 +145,10 @@ def get_bbh_dataset(
         max_length: int,
         use_chat_format: bool = True,
         chat_format: str = "tulu",
-        validation: bool = False,
+        split: str = "test",
         k: int = 5,
         subject: str = None,
+        seed: Optional[int] = None,
         max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
@@ -155,9 +161,10 @@ def get_bbh_dataset(
         max_length: The maximum length of the input sequence.
         use_chat_format: Whether to use chat format for the input.
         chat_format: The chat format to use ("tulu" or "llama2").
-        validation: If True, load validation split; otherwise load test split.
+        split: Which split to load ("validation", "test", or "lr").
         k: Number of examples to load.
         subject: Optional BBH task name to filter by (e.g., "boolean_expressions").
+        seed: Optional seed for shuffling examples before selection.
         max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
@@ -165,7 +172,7 @@ def get_bbh_dataset(
     """
     # Load more examples than needed if rejection sampling is enabled
     load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "bbh", validation, load_k, subject)
+    examples = load_unified_jsonl(data_dir, "bbh", split, load_k, subject, seed=seed)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
     rejected_count = 0
@@ -223,8 +230,9 @@ def get_tydiqa_dataset(
         max_length: int,
         use_chat_format: bool = True,
         chat_format: str = "tulu",
-        validation: bool = False,
+        split: str = "test",
         k: int = 5,
+        seed: Optional[int] = None,
         max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
@@ -237,8 +245,9 @@ def get_tydiqa_dataset(
         max_length: The maximum length of the input sequence.
         use_chat_format: Whether to use chat format for the input.
         chat_format: The chat format to use.
-        validation: If True, load validation split; otherwise load test split.
+        split: Which split to load ("validation", "test", or "lr").
         k: Number of examples to load.
+        seed: Optional seed for shuffling examples before selection.
         max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
@@ -246,7 +255,7 @@ def get_tydiqa_dataset(
     """
     # Load more examples than needed if rejection sampling is enabled
     load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "tydiqa", validation, load_k)
+    examples = load_unified_jsonl(data_dir, "tydiqa", split, load_k, seed=seed)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
     rejected_count = 0
@@ -302,8 +311,9 @@ def get_gsm8k_dataset(
         data_dir: str,
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
-        validation: bool = False,
+        split: str = "test",
         k: int = 5,
+        seed: Optional[int] = None,
         max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
@@ -314,8 +324,9 @@ def get_gsm8k_dataset(
         data_dir: The main data directory.
         tokenizer: The tokenizer used to tokenize the input text.
         max_length: The maximum length of the input sequence.
-        validation: If True, load validation split; otherwise load test split.
+        split: Which split to load ("validation", "test", or "lr").
         k: Number of examples to use.
+        seed: Optional seed for shuffling examples before selection.
         max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
@@ -323,7 +334,7 @@ def get_gsm8k_dataset(
     """
     # Load more examples than needed if rejection sampling is enabled
     load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "gsm8k", validation, load_k)
+    examples = load_unified_jsonl(data_dir, "gsm8k", split, load_k, seed=seed)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
     rejected_count = 0
@@ -371,8 +382,9 @@ def get_math500_dataset(
         data_dir: str,
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
-        validation: bool = False,
+        split: str = "test",
         k: int = 5,
+        seed: Optional[int] = None,
         max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
@@ -383,8 +395,9 @@ def get_math500_dataset(
         data_dir: The main data directory.
         tokenizer: The tokenizer used to tokenize the input text.
         max_length: The maximum length of the input sequence.
-        validation: If True, load validation split; otherwise load test split.
+        split: Which split to load ("validation", "test", or "lr").
         k: Number of examples to use.
+        seed: Optional seed for shuffling examples before selection.
         max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
@@ -392,7 +405,7 @@ def get_math500_dataset(
     """
     # Load more examples than needed if rejection sampling is enabled
     load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "math500", validation, load_k)
+    examples = load_unified_jsonl(data_dir, "math500", split, load_k, seed=seed)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
     rejected_count = 0
@@ -440,8 +453,9 @@ def get_samsum_dataset(
         data_dir: str,
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
-        validation: bool = False,
+        split: str = "test",
         k: int = 5,
+        seed: Optional[int] = None,
         max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
@@ -452,8 +466,9 @@ def get_samsum_dataset(
         data_dir: The main data directory.
         tokenizer: The tokenizer used to tokenize the input text.
         max_length: The maximum length of the input sequence.
-        validation: If True, load validation split; otherwise load test split.
+        split: Which split to load ("validation", "test", or "lr").
         k: Number of examples to use.
+        seed: Optional seed for shuffling examples before selection.
         max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
@@ -461,7 +476,7 @@ def get_samsum_dataset(
     """
     # Load more examples than needed if rejection sampling is enabled
     load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "samsum", validation, load_k)
+    examples = load_unified_jsonl(data_dir, "samsum", split, load_k, seed=seed)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
     rejected_count = 0
@@ -515,9 +530,10 @@ def get_mmlu_dataset(
         max_length: int,
         use_chat_format: bool = True,
         chat_format: str = "tulu",
-        validation: bool = False,
+        split: str = "test",
         k: int = 5,
         subject: str = None,
+        seed: Optional[int] = None,
         max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
@@ -530,9 +546,10 @@ def get_mmlu_dataset(
         max_length: The maximum length of the input sequence.
         use_chat_format: Whether to use chat format for the prompts.
         chat_format: The chat format to use.
-        validation: If True, load validation split; otherwise load test split.
+        split: Which split to load ("validation", "test", or "lr").
         k: Number of examples to load.
         subject: Optional MMLU subject to filter by (e.g., "sociology").
+        seed: Optional seed for shuffling examples before selection.
         max_seq_length_threshold: If provided, reject samples longer than this threshold.
 
     Returns:
@@ -540,7 +557,7 @@ def get_mmlu_dataset(
     """
     # Load more examples than needed if rejection sampling is enabled
     load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "mmlu", validation, load_k, subject)
+    examples = load_unified_jsonl(data_dir, "mmlu", split, load_k, subject, seed=seed)
 
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
     rejected_count = 0
@@ -607,8 +624,9 @@ def get_dataset(task: str, **kwargs) -> Dataset:
             - data_dir: Base data directory
             - tokenizer: Tokenizer for encoding
             - max_length: Maximum sequence length
-            - validation: If True, load validation split; else test split
+            - split: Which split to load ("validation", "test", or "lr")
             - k: Number of examples to load
+            - seed: Optional seed for shuffling examples before selection
             - max_seq_length_threshold: If provided, reject samples longer than
               this threshold (for rejection sampling based on train avg length)
 
@@ -655,5 +673,3 @@ def get_dataloader(dataset: Dataset, tokenizer: PreTrainedTokenizerBase, batch_s
     )
     print(f"There are {len(dataset)} examples in the dataset")
     return dataloader
-
-

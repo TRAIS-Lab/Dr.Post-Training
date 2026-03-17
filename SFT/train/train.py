@@ -340,9 +340,10 @@ def main():
         data_dir=data_args.data_dir,
         tokenizer=tokenizer,
         max_length=data_args.max_seq_length,
-        validation=True,
+        split="validation",
         k=training_args.n_val,
         subject=training_args.subject,
+        seed=training_args.seed,
         max_seq_length_threshold=val_seq_length_threshold
     )
 
@@ -352,7 +353,7 @@ def main():
         data_dir=data_args.data_dir,
         tokenizer=tokenizer,
         max_length=data_args.max_seq_length,
-        validation=False,
+        split=data_args.eval_split,
         k=training_args.n_eval,
         subject=training_args.subject
     )

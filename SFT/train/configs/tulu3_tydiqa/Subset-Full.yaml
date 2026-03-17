@@ -1,7 +1,7 @@
 # Subset data curation with full fine-tuning (exact scoring)
 method: Subset
 finetuning: Full
-learning_rate: 1.57e-05
+learning_rate: 2.00e-05
 
 score_grad_compression:
   sparsifier: none

@@ -1,7 +1,7 @@
 # Subset data curation with LoRA fine-tuning (exact scoring)
 method: Subset
 finetuning: LoRA
-learning_rate: 1.07e-05
+learning_rate: 2.98e-04
 lora_r: 32
 lora_alpha: 1
 lora_dropout: 0.1

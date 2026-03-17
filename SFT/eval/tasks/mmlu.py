@@ -16,7 +16,7 @@ from ..utils import get_next_word_predictions, create_prompt_with_tulu_chat_form
 CHOICES = ["A", "B", "C", "D"]
 
 
-def get_mmlu_dataset_df(data_dir: str, validation: bool = False, k: int = 5, subject: str = None):
+def get_mmlu_dataset_df(data_dir: str, split: str = "test", k: int = 5, subject: str = None):
     """
     Get MMLU dataset as a pandas DataFrame for evaluation.
 
@@ -25,14 +25,14 @@ def get_mmlu_dataset_df(data_dir: str, validation: bool = False, k: int = 5, sub
 
     Args:
         data_dir: The main data directory.
-        validation: If True, load validation split; otherwise load test split.
+        split: Which split to load ("validation", "test", or "lr").
         k: Number of examples to load.
         subject: Optional MMLU subject to filter by.
 
     Returns:
         pandas DataFrame with columns [question, A, B, C, D, answer]
     """
-    examples = load_unified_jsonl(data_dir, "mmlu", validation, k, subject)
+    examples = load_unified_jsonl(data_dir, "mmlu", split, k, subject)
 
     rows = []
     for example in examples:
@@ -202,7 +202,7 @@ def compute_accuracy(args, model, tokenizer, batch_size=1):
     # Load validation set for few-shot examples
     dev_df = get_mmlu_dataset_df(
         data_dir=data_dir,
-        validation=True,
+        split="validation",
         k=n_val,
         subject=subject
     )
@@ -210,7 +210,7 @@ def compute_accuracy(args, model, tokenizer, batch_size=1):
     # Load test set for evaluation
     eval_df = get_mmlu_dataset_df(
         data_dir=data_dir,
-        validation=False,
+        split="test",
         k=n_eval,
         subject=subject
     )

@@ -496,17 +496,18 @@ def prepare_bbh(output_dir):
 
 def prepare_tydiqa(output_dir):
     """
-    Prepare TyDiQA validation and test data in unified JSONL format.
+    Prepare TyDiQA validation, LR sweep, and test data in unified JSONL format.
 
-    Uses the HuggingFace validation split and divides into validation/test.
+    Uses the HuggingFace validation split and divides into validation/lr/test.
     Preserves the few-shot prompts file (tydiqa_fewshot.json) for downstream evaluation.
 
     Output files:
     - tydiqa_validation_data.jsonl: For data selection
-    - tydiqa_test_data.jsonl: For evaluation
+    - tydiqa_lr_data.jsonl: For LR sweep evaluation
+    - tydiqa_test_data.jsonl: For final evaluation
     - tydiqa_fewshot.json: One-shot prompts (preserved/renamed)
     """
-    print("Preparing TyDiQA validation and test data...")
+    print("Preparing TyDiQA validation, LR, and test data...")
 
     output_dir_tydiqa = os.path.join(output_dir, "eval", "tydiqa")
     ensure_dir(output_dir_tydiqa)
@@ -520,10 +521,12 @@ def prepare_tydiqa(output_dir):
     # Use validation split (TyDiQA doesn't have a test split in secondary_task)
     all_data = list(dataset["validation"])
 
-    # Split: first 100 for validation, rest for test
+    # Split: first 100 for validation, next 100 for LR sweep, rest for test
     val_size = 100
+    lr_size = 100
     val_data = all_data[:val_size]
-    test_data = all_data[val_size:]
+    lr_data = all_data[val_size:val_size + lr_size]
+    test_data = all_data[val_size + lr_size:]
 
     def format_qa(example):
         context = example.get('context', '')
@@ -544,6 +547,24 @@ def prepare_tydiqa(output_dir):
             data = {
                 "dataset": "tydiqa",
                 "id": f"tydiqa_val_{idx}",
+                "messages": [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": answer}
+                ],
+                "metadata": {
+                    "language": example.get('id', '').split('-')[0] if example.get('id') else 'unknown'
+                }
+            }
+            f.write(json.dumps(data, ensure_ascii=False) + '\n')
+
+    # Write LR sweep data
+    lr_file = os.path.join(output_dir_tydiqa, "tydiqa_lr_data.jsonl")
+    with open(lr_file, 'w', encoding='utf-8') as f:
+        for idx, example in enumerate(tqdm(lr_data, desc="LR")):
+            user_content, answer = format_qa(example)
+            data = {
+                "dataset": "tydiqa",
+                "id": f"tydiqa_lr_{idx}",
                 "messages": [
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": answer}
@@ -619,6 +640,7 @@ def prepare_tydiqa(output_dir):
 
     print(f"TyDiQA data saved:")
     print(f"  Validation: {val_file} ({len(val_data)} examples)")
+    print(f"  LR sweep: {lr_file} ({len(lr_data)} examples)")
     print(f"  Test: {test_file} ({len(test_data)} examples)")
     return val_file, test_file
 
@@ -805,17 +827,25 @@ def prepare_samsum(output_dir):
     Prepare SamSUM dialogue summarization dataset.
 
     Checks if data already exists in the expected format before downloading.
+
+    Output files:
+    - samsum_train_data.jsonl: Training data
+    - samsum_validation_data.jsonl: For data selection
+    - samsum_lr_data.jsonl: For LR sweep evaluation
+    - samsum_test_data.jsonl: For final evaluation
     """
     print("Preparing SamSUM data...")
 
     train_file = os.path.join(output_dir, "train", "samsum", "samsum_train_data.jsonl")
     val_file = os.path.join(output_dir, "eval", "samsum", "samsum_validation_data.jsonl")
+    lr_file = os.path.join(output_dir, "eval", "samsum", "samsum_lr_data.jsonl")
     test_file = os.path.join(output_dir, "eval", "samsum", "samsum_test_data.jsonl")
 
     # Check if data already exists
-    if os.path.exists(val_file) and os.path.exists(test_file):
+    if os.path.exists(val_file) and os.path.exists(lr_file) and os.path.exists(test_file):
         print(f"SamSUM evaluation data already exists:")
         print(f"  Validation: {val_file}")
+        print(f"  LR sweep: {lr_file}")
         print(f"  Test: {test_file}")
 
         # Check if train data exists
@@ -835,6 +865,12 @@ def prepare_samsum(output_dir):
     train_dataset = load_dataset("knkarthick/samsum", split="train")
     val_dataset = load_dataset("knkarthick/samsum", split="validation")
     test_dataset = load_dataset("knkarthick/samsum", split="test")
+
+    # Split test into LR sweep (first 100) and final test (rest)
+    test_list = list(test_dataset)
+    lr_size = 100
+    lr_examples = test_list[:lr_size]
+    test_examples = test_list[lr_size:]
 
     # Training data
     with open(train_file, 'w', encoding='utf-8') as f:
@@ -868,9 +904,25 @@ def prepare_samsum(output_dir):
             }
             f.write(json.dumps(data, ensure_ascii=False) + '\n')
 
+    # LR sweep data
+    with open(lr_file, 'w', encoding='utf-8') as f:
+        for idx, example in enumerate(tqdm(lr_examples, desc="LR")):
+            dialogue = example['dialogue']
+            summary = example['summary']
+
+            data = {
+                "dataset": "samsum",
+                "id": f"samsum_lr_{idx}",
+                "messages": [
+                    {"role": "user", "content": f"Summarize the following dialogue:\n\n{dialogue}"},
+                    {"role": "assistant", "content": summary}
+                ]
+            }
+            f.write(json.dumps(data, ensure_ascii=False) + '\n')
+
     # Test data
     with open(test_file, 'w', encoding='utf-8') as f:
-        for idx, example in enumerate(tqdm(test_dataset, desc="Test")):
+        for idx, example in enumerate(tqdm(test_examples, desc="Test")):
             dialogue = example['dialogue']
             summary = example['summary']
 
@@ -887,7 +939,8 @@ def prepare_samsum(output_dir):
     print(f"SamSUM data saved:")
     print(f"  Train: {train_file}")
     print(f"  Validation: {val_file}")
-    print(f"  Test: {test_file}")
+    print(f"  LR sweep: {lr_file} ({len(lr_examples)} examples)")
+    print(f"  Test: {test_file} ({len(test_examples)} examples)")
     return train_file
 
 

@@ -29,6 +29,6 @@ n_eval: 500
 
 # Curation defaults (used by Layerwise/Subset methods)
 selection_frac: 0.5
-n_val: 8
+n_val: 16
 val_batch_size: 1
 val_strategy: merged_batch

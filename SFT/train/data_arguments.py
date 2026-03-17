@@ -42,6 +42,10 @@ class DataArguments:
         default=0.05,
         metadata={"help": "Sampling percentage for each dataset"},
     )
+    eval_split: str = field(
+        default="test",
+        metadata={"help": "Split to use for evaluation: 'test' (default) or 'lr' (for LR sweep)."},
+    )
 
 
 def get_data_statistics(lm_datasets, return_avg_length: bool = False):

@@ -39,6 +39,7 @@ config_dir=""
 methods=""
 seed_override=""
 lr_override=""
+eval_split_override=""
 dry_run=false
 
 while [[ $# -gt 0 ]]; do
@@ -47,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --methods|-m)     methods="$2"; shift 2 ;;
         --seed)           seed_override="$2"; shift 2 ;;
         --lr)             lr_override="$2"; shift 2 ;;
+        --eval_split)     eval_split_override="$2"; shift 2 ;;
         --dry-run)        dry_run=true; shift ;;
         --list)
             dir="${config_dir:-configs}"
@@ -75,6 +77,7 @@ Required:
 Optional:
   --seed <seed>           Override seed from config
   --lr <lr>               Override learning rate from config
+  --eval_split <split>    Override eval split ("test" or "lr")
   --dry-run               Print commands without executing
   --list                  List available methods and exit
 
@@ -405,12 +408,14 @@ $fsdp_args \
     [[ "$cfg_record_selections" == "true" ]] && \
         cmd="$cmd --record_selections True --record_selections_freq $cfg_record_selections_freq"
 
-    cmd="$cmd 2>&1 | tee $output_dir/train.log"
+    # Eval split override
+    [[ -n "$eval_split_override" ]] && cmd="$cmd --eval_split $eval_split_override"
 
     if [[ "$dry_run" == "true" ]]; then
         echo "[DRY-RUN] $cmd"
     else
-        eval $cmd
+        eval $cmd 2>&1 | tee $output_dir/train.log
+        exit ${PIPESTATUS[0]}
     fi
 }
 

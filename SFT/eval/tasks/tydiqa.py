@@ -59,7 +59,7 @@ def format_oneshot_prompt(example: Dict, language: str) -> str:
 
 def get_tydiqa_dataset_df(
         data_dir: str,
-        validation: bool = False,
+        split: str = "test",
         use_chat_format: bool = True,
         chat_format: str = "tulu",
         k: int = 100,
@@ -73,7 +73,7 @@ def get_tydiqa_dataset_df(
 
     Args:
         data_dir: The main data directory.
-        validation: If True, load validation split; otherwise load test split.
+        split: Which split to load ("validation", "test", or "lr").
         use_chat_format: Whether to format prompts with chat template.
         chat_format: The chat format to use ("tulu" or "llama2").
         k: Number of examples to load.
@@ -82,7 +82,7 @@ def get_tydiqa_dataset_df(
     Returns:
         List of (formatted_prompt, answer, language) tuples
     """
-    examples = load_unified_jsonl(data_dir, "tydiqa", validation, k)
+    examples = load_unified_jsonl(data_dir, "tydiqa", split, k)
 
     results = []
     for example in examples:
@@ -150,7 +150,7 @@ def compute_accuracy(args, model, tokenizer):
     # where formatted_prompt already contains the full prompt with context and question
     test_dataset = get_tydiqa_dataset_df(
         data_dir=data_dir,
-        validation=False,
+        split="test",
         use_chat_format=True,  # This controls the format returned by get_tydiqa_dataset_df
         chat_format="tulu",
         k=n_test,

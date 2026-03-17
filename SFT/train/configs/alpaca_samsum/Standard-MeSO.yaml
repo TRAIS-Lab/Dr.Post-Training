@@ -1,7 +1,7 @@
 # Standard MeSO fine-tuning (no data curation, compressed optimizer)
 method: Standard
 finetuning: MeSO
-learning_rate: 5e-05
+learning_rate: 6.95e-07
 
 opt_grad_compression:
   sparsifier: normal-512*512
