@@ -1119,8 +1119,10 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                             entropy = verl_F.entropy_from_logits(logits)
 
                         # Compute loss scale factor (must be before loss computation)
+                        # Use original micro_batch_size, not selected count, to preserve
+                        # gradient magnitude (consistent with Layerwise and fixed-batch path)
                         if self.config.use_dynamic_bsz:
-                            loss_scale_factor = sel_response_mask.shape[0] / self.config.ppo_mini_batch_size
+                            loss_scale_factor = micro_batch_size / self.config.ppo_mini_batch_size
                         else:
                             loss_scale_factor = 1 / self.gradient_accumulation
 

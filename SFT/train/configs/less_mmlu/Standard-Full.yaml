@@ -1,0 +1,3 @@
+# Standard full fine-tuning (no data curation)
+method: Standard
+finetuning: Full
