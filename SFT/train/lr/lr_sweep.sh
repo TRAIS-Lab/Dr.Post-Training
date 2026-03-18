@@ -20,10 +20,10 @@ if [[ -z "$CODE_DIR" ]]; then
     activate_env
 fi
 
-cd $CODE_DIR/Gradient-Streaming
-export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
+cd $CODE_DIR/Dr.Post-Training
+export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
-SCRIPT_DIR="$CODE_DIR/Gradient-Streaming/SFT/train"
+SCRIPT_DIR="$CODE_DIR/Dr.Post-Training/SFT/train"
 
 # Fixed training args (same as train.sh)
 FIXED_ARGS="--do_train=True \
@@ -296,7 +296,7 @@ run_lr_trial() {
     local eff_percentage="${sweep_percentage:-$cfg_percentage}"
     local eff_n_eval="$sweep_n_eval"
 
-    local data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
+    local data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
     local DATA_SEED=$((cfg_seed + 1))
     local PORT=$((29400 + RANDOM % 10000))
 

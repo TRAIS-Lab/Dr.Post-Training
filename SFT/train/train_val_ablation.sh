@@ -19,11 +19,11 @@ if [[ -z "$CODE_DIR" ]]; then
     activate_env
 fi
 
-cd $CODE_DIR/Gradient-Streaming
+cd $CODE_DIR/Dr.Post-Training
 
-export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
+export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
-SCRIPT_DIR="$CODE_DIR/Gradient-Streaming/SFT/train"
+SCRIPT_DIR="$CODE_DIR/Dr.Post-Training/SFT/train"
 CONFIG_DIR="$SCRIPT_DIR/configs"
 
 # =============================================================================
@@ -48,7 +48,7 @@ export base_training_args="--do_train=True \
 --report_to=none"
 
 model="meta-llama/Llama-3.2-1B"
-data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
+data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
 task=""
 seed=42
 
@@ -335,7 +335,7 @@ run_method() {
 
     local JOB_NAME="${task}_val_${task}-${model_name}-${method_str:-$exp_name}-ms${max_steps}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
 
-    local output_dir=$SCRATCH_DIR/Gradient-Streaming/SFT/${JOB_NAME}
+    local output_dir=$SCRATCH_DIR/Dr.Post-Training/SFT/${JOB_NAME}
     mkdir -p "$output_dir"
 
     echo ""

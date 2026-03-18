@@ -7,15 +7,15 @@ if [[ -z "$CODE_DIR" ]]; then
     activate_env
 fi
 
-cd $CODE_DIR/Gradient-Streaming
+cd $CODE_DIR/Dr.Post-Training
 
-export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
+export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 set -e
 
 # Default values
-models_dir="$SCRATCH_DIR/Gradient-Streaming/SFT"
-data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
+models_dir="$SCRATCH_DIR/Dr.Post-Training/SFT"
+data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
 train=""
 task=""
 subject=""
@@ -77,8 +77,8 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo ""
             echo "Options:"
-            echo "  --models_dir DIR     Models directory (default: \$SCRATCH_DIR/Gradient-Streaming/SFT)"
-            echo "  --data_dir DIR       Data directory (default: \$SCRATCH_DIR/Gradient-Streaming/SFT/data)"
+            echo "  --models_dir DIR     Models directory (default: \$SCRATCH_DIR/Dr.Post-Training/SFT)"
+            echo "  --data_dir DIR       Data directory (default: \$SCRATCH_DIR/Dr.Post-Training/SFT/data)"
             echo "  --train NAME         Filter by training dataset (alpaca, less, tulu3, wizardlm)"
             echo "  --task NAME          Override task (samsum, tydiqa, mmlu, bbh, gsm8k, math500)"
             echo "  --subject NAME       MMLU subject or BBH task to evaluate on (default: all)"

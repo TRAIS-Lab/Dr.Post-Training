@@ -8,7 +8,7 @@ The trainer of SFT and RLHF is implemented in plain PyTorch without advanced dis
 
 ```bash
 # Clone with submodules
-git clone --recursive https://github.com/TRAIS-Lab/Gradient-Streaming.git
+git clone --recursive https://github.com/TRAIS-Lab/Dr.Post-Training.git
 
 # Or if already cloned, initialize submodules
 git submodule update --init --recursive
@@ -102,7 +102,7 @@ MEM="${MEM:-128g}"
 CPUS="${CPUS:-16}"
 TIME="${TIME:-12:00:00}"
 CONSTRAINT="${CONSTRAINT:-scratch}"
-LOG_DIR="${CODE_DIR}/Gradient-Streaming/log"
+LOG_DIR="${CODE_DIR}/Dr.Post-Training/log"
 mkdir -p "$LOG_DIR"
 
 sbatch --job-name="$JOB_NAME" --account="$SLURM_ACCOUNT" --partition="$SLURM_PARTITION" \

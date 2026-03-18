@@ -18,11 +18,11 @@ if [[ -z "$CODE_DIR" ]]; then
     activate_env
 fi
 
-cd $CODE_DIR/Gradient-Streaming
-export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
+cd $CODE_DIR/Dr.Post-Training
+export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
-SCRIPT_DIR="$CODE_DIR/Gradient-Streaming/SFT/train"
-SUBMIT_SCRIPT="$CODE_DIR/Gradient-Streaming/submit.sh"
+SCRIPT_DIR="$CODE_DIR/Dr.Post-Training/SFT/train"
+SUBMIT_SCRIPT="$CODE_DIR/Dr.Post-Training/submit.sh"
 
 # =============================================================================
 # CLI

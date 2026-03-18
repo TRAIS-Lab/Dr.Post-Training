@@ -7,9 +7,9 @@ if [[ -z "$CODE_DIR" ]]; then
     activate_env
 fi
 
-cd $CODE_DIR/Gradient-Streaming
+cd $CODE_DIR/Dr.Post-Training
 
-export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
+export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 # =============================================================================
 # Case study: Standard training with dual Layerwise + Subset scoring
@@ -17,7 +17,7 @@ export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
 
 # Defaults
 model="meta-llama/Llama-3.2-1B"
-data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
+data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
 task="tydiqa"
 train_dataset="tulu3"
 subject="sociology"
@@ -65,7 +65,7 @@ ID=$RANDOM
 PORT=$((29400 + RANDOM % 10000))
 
 JOB_NAME="case_study_${train_dataset}_${task}-${model_name}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
-output_dir=$SCRATCH_DIR/Gradient-Streaming/SFT/${JOB_NAME}
+output_dir=$SCRATCH_DIR/Dr.Post-Training/SFT/${JOB_NAME}
 mkdir -p "$output_dir"
 
 echo ""

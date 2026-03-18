@@ -14,8 +14,8 @@ if [[ -z "$CODE_DIR" ]]; then
     activate_env
 fi
 
-cd $CODE_DIR/Gradient-Streaming
-export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
+cd $CODE_DIR/Dr.Post-Training
+export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -326,7 +326,7 @@ run_method() {
 
     local JOB_NAME="${cfg_task}-${model_name}-${method_str}-${cfg_finetuning}-lr${cfg_learning_rate}-b${cfg_batch_size}-${val_str}-pe${cfg_ppo_epochs}-mb${cfg_mini_batch_size}-kl${cfg_init_kl_coef}-s${cfg_seed}"
 
-    local output_dir="$SCRATCH_DIR/Gradient-Streaming/RLHF/${JOB_NAME}"
+    local output_dir="$SCRATCH_DIR/Dr.Post-Training/RLHF/${JOB_NAME}"
     mkdir -p "$output_dir"
 
     echo ""

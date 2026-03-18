@@ -19,10 +19,10 @@ if [[ -z "$CODE_DIR" ]]; then
     activate_env
 fi
 
-cd $CODE_DIR/Gradient-Streaming
-export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
+cd $CODE_DIR/Dr.Post-Training
+export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
-SCRIPT_DIR="$CODE_DIR/Gradient-Streaming/SFT/train"
+SCRIPT_DIR="$CODE_DIR/Dr.Post-Training/SFT/train"
 
 # =============================================================================
 # CLI
@@ -279,11 +279,11 @@ for exp_name in "${method_list[@]}"; do
     [[ -n "$cfg_subject" ]] && pattern="${pattern}_${cfg_subject}"
     pattern="${pattern}-${model_name}-${exp_name}-p${cfg_percentage}-lr*-b${cfg_batch_size}-v${cfg_n_val}-s${cfg_seed}"
 
-    sweep_dirs=$(find "$SCRATCH_DIR/Gradient-Streaming/SFT/" -maxdepth 1 -type d -name "$pattern" 2>/dev/null | sort)
+    sweep_dirs=$(find "$SCRATCH_DIR/Dr.Post-Training/SFT/" -maxdepth 1 -type d -name "$pattern" 2>/dev/null | sort)
 
     if [[ -z "$sweep_dirs" ]]; then
         echo "  No sweep directories found matching: $pattern"
-        echo "  (looked in $SCRATCH_DIR/Gradient-Streaming/SFT/)"
+        echo "  (looked in $SCRATCH_DIR/Dr.Post-Training/SFT/)"
         continue
     fi
 

@@ -24,7 +24,7 @@ echo "Using N_GPUS=$N_GPUS"
 # ============================================================================
 # Data paths
 # ============================================================================
-DATA_DIR=$SCRATCH_DIR/Gradient-Streaming/RLVR/data
+DATA_DIR=$SCRATCH_DIR/Dr.Post-Training/RLVR/data
 math_train_path=$DATA_DIR/math/train.parquet
 math_test_path=$DATA_DIR/math/test.parquet
 math_test_cleaned_path=$DATA_DIR/math/test_cleaned.parquet
@@ -38,7 +38,7 @@ train_files=$math_train_path
 test_files=$math_test_cleaned_path
 
 # Output directory
-OUTPUT_BASE=$SCRATCH_DIR/Gradient-Streaming/RLVR/output
+OUTPUT_BASE=$SCRATCH_DIR/Dr.Post-Training/RLVR/output
 
 # ============================================================================
 # Experiment Configuration
@@ -115,7 +115,7 @@ echo "  refresh_freq=$REFRESH_FREQ"
 echo "  val_loss_type=$VAL_LOSS_TYPE"
 
 # Add project root to PYTHONPATH
-export PYTHONPATH=$CODE_DIR/Gradient-Streaming/RLVR:$CODE_DIR/Gradient-Streaming:${PYTHONPATH}
+export PYTHONPATH=$CODE_DIR/Dr.Post-Training/RLVR:$CODE_DIR/Dr.Post-Training:${PYTHONPATH}
 
 # Unset ROCR_VISIBLE_DEVICES to avoid conflict with CUDA_VISIBLE_DEVICES
 # (ROCR is for AMD ROCm, we're using NVIDIA GPUs)
@@ -131,7 +131,7 @@ if [ "$SELECTION_ENABLED" = "True" ]; then
     # Generate val_from_test and test_cleaned if needed
     if [ ! -f "$VAL_FROM_TEST_PATH" ]; then
         echo "Generating val_from_test.parquet and test_cleaned.parquet..."
-        python3 $CODE_DIR/Gradient-Streaming/RLVR/data/prepare_data.py \
+        python3 $CODE_DIR/Dr.Post-Training/RLVR/data/prepare_data.py \
             --test_data $math_test_path \
             --output $VAL_FROM_TEST_PATH \
             --output_test $math_test_cleaned_path \
@@ -142,7 +142,7 @@ if [ "$SELECTION_ENABLED" = "True" ]; then
     # Generate val_from_train if needed
     if [ ! -f "$VAL_FROM_TRAIN_PATH" ]; then
         echo "Generating val_from_train.parquet..."
-        python3 $CODE_DIR/Gradient-Streaming/RLVR/data/prepare_data.py \
+        python3 $CODE_DIR/Dr.Post-Training/RLVR/data/prepare_data.py \
             --train_data $math_train_path \
             --output $VAL_FROM_TRAIN_PATH \
             --num_samples $VAL_POOL_SIZE \
@@ -159,7 +159,7 @@ echo "Starting training with $N_GPUS GPUs..."
 
 # Note: MATH problems and solutions are typically longer than GSM8K
 # Increased max_response_length to 1024 to accommodate more detailed reasoning
-python3 $CODE_DIR/Gradient-Streaming/RLVR/main_ppo_online_selection.py \
+python3 $CODE_DIR/Dr.Post-Training/RLVR/main_ppo_online_selection.py \
     hydra.run.dir=$HYDRA_DIR \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \

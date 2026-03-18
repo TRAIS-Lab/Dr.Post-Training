@@ -239,7 +239,7 @@ class GradientHook:
         scoring_method: str = "ghost",
     ) -> None:
         """
-        Set up curation state for gradient streaming.
+        Set up curation state for Dr. Post-Training.
 
         Args:
             train_batch_size: Number of training samples

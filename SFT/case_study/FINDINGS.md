@@ -147,7 +147,7 @@ This is consistent with Subset being dominated by accumulated scores, where late
 
 ```bash
 # Run the case studies (standard training + dual scoring)
-cd $CODE_DIR/Gradient-Streaming
+cd $CODE_DIR/Dr.Post-Training
 
 # tulu3 → tydiqa
 bash SFT/case_study/run.sh --percentage 0.005

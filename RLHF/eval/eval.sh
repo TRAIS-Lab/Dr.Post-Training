@@ -7,15 +7,15 @@ if [[ -z "$CODE_DIR" ]]; then
     activate_env
 fi
 
-cd $CODE_DIR/Gradient-Streaming
+cd $CODE_DIR/Dr.Post-Training
 
 # Set PYTHONPATH to include project root for imports
-export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
+export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 set -e
 
 # Default values
-models_dir="$SCRATCH_DIR/Gradient-Streaming/RLHF"
+models_dir="$SCRATCH_DIR/Dr.Post-Training/RLHF"
 task=""
 n_samples=400
 batch_size=16
@@ -63,7 +63,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo ""
             echo "Options:"
-            echo "  --models_dir DIR       Models directory (default: \$SCRATCH_DIR/Gradient-Streaming/RLHF)"
+            echo "  --models_dir DIR       Models directory (default: \$SCRATCH_DIR/Dr.Post-Training/RLHF)"
             echo "  --task NAME            Filter by task (e.g., toxicity)"
             echo "  --n_samples N          Number of test samples (default: 400, -1 for all)"
             echo "  --batch_size N         Batch size for generation (default: 16)"

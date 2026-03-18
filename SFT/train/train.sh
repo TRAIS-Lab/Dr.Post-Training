@@ -14,10 +14,10 @@ if [[ -z "$CODE_DIR" ]]; then
     activate_env
 fi
 
-cd $CODE_DIR/Gradient-Streaming
-export PYTHONPATH="$CODE_DIR/Gradient-Streaming:$PYTHONPATH"
+cd $CODE_DIR/Dr.Post-Training
+export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
-SCRIPT_DIR="$CODE_DIR/Gradient-Streaming/SFT/train"
+SCRIPT_DIR="$CODE_DIR/Dr.Post-Training/SFT/train"
 
 # Fixed training args (infra-level, always the same)
 FIXED_ARGS="--do_train=True \
@@ -321,8 +321,8 @@ run_method() {
         JOB_NAME="${train_str}_${cfg_target_task}-${model_name}-${method_str}-p${cfg_percentage}-lr${cfg_learning_rate}-b${cfg_batch_size}-v${cfg_n_val}-s${cfg_seed}"
     fi
 
-    local data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
-    local output_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/${JOB_NAME}"
+    local data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
+    local output_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/${JOB_NAME}"
     mkdir -p "$output_dir"
 
     echo ""

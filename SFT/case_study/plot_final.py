@@ -212,7 +212,7 @@ def analyze(records_path, feature_fn):
 
 
 def main():
-    scratch = "/scratch/pbb/Project/Gradient-Streaming/SFT"
+    scratch = "/scratch/pbb/Project/Dr.Post-Training/SFT"
     datasets = [
         {
             'path': f"{scratch}/case_study_tulu3_tydiqa-Llama-3.2-1B-p0.005-lr3.61e-05-b16-v8-s42/selection_records.json",
