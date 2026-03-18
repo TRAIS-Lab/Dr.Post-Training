@@ -16,6 +16,7 @@ set -e
 # Default values
 models_dir="$SCRATCH_DIR/Gradient-Streaming/SFT"
 data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
+model_path=""
 train=""
 task=""
 subject=""
@@ -35,6 +36,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --data_dir)
             data_dir="$2"
+            shift 2
+            ;;
+        --model_path)
+            model_path="$2"
             shift 2
             ;;
         --train)
@@ -119,7 +124,11 @@ echo "========================================================"
 
 # Build command
 cmd="python -m SFT.eval.eval"
-cmd="$cmd --models_dir $models_dir"
+if [[ -n "$model_path" ]]; then
+    cmd="$cmd --model_path $model_path"
+else
+    cmd="$cmd --models_dir $models_dir"
+fi
 cmd="$cmd --data_dir $data_dir"
 cmd="$cmd --n_test $n_test"
 cmd="$cmd --batch_size $batch_size"
