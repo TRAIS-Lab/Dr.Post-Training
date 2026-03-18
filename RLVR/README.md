@@ -8,19 +8,17 @@ This directory contains the implementation for online gradient-based data curati
 # 1. Prepare data
 python verl/examples/data_preprocess/math_dataset.py --local_save_dir $DATA_DIR/math
 
-# 2. Split test set into validation + cleaned test
-python data/prepare_data.py \
-    --test_data $DATA_DIR/math/test.parquet \
-    --output $DATA_DIR/math/val_prompts.parquet \
-    --output_test $DATA_DIR/math/test_cleaned.parquet \
-    --num_samples 1000 \
-    --seed 42
+# 2. Run training with Layerwise curation
+bash train.sh -c configs/math -m Layerwise
 
-# 3. Run training with Layerwise curation (default)
-bash scripts/run_qwen1.7b_math_grpo.sh
+# 3. Or run baseline (no curation)
+bash train.sh -c configs/math -m Standard
 
-# 4. Or disable curation for baseline
-bash scripts/run_qwen1.7b_math_grpo.sh ++selection.enable=False
+# 4. Run all methods
+bash train.sh -c configs/math -m all
+
+# 5. Dry-run to verify commands
+bash train.sh -c configs/math -m Layerwise --dry-run
 ```
 
 ## Data Preparation
@@ -104,66 +102,67 @@ This creates 4 files:
 | `val_from_test.parquet` | test | Validation prompts (disjoint from test_cleaned) |
 | `val_from_train.parquet` | train | Validation prompts (can overlap with train) |
 
-To switch which validation set is used, set `VAL_PROMPTS_PATH` before running:
-
-```bash
-# Use validation from test (default)
-VAL_PROMPTS_PATH=$DATA_DIR/math/val_from_test.parquet bash scripts/run_qwen1.7b_math_grpo.sh
-
-# Use validation from train (ablation)
-VAL_PROMPTS_PATH=$DATA_DIR/math/val_from_train.parquet bash scripts/run_qwen1.7b_math_grpo.sh
-```
+To switch which validation set is used, set `val_source` in the config:
+- `from_train` (default): validation from training set
+- `from_test`: validation from test set
 
 ## Running Experiments
 
-**Important:** Always run scripts from the `RLVR/` directory to ensure all output folders are created in consistent locations.
-
 ```bash
-# With Layerwise curation (default)
-bash scripts/run_qwen1.7b_math_grpo.sh
+# Layerwise curation
+bash train.sh -c configs/math -m Layerwise
 
 # Baseline (no curation)
-bash scripts/run_qwen1.7b_math_grpo.sh ++selection.enable=False
+bash train.sh -c configs/math -m Standard
 
-# With Subset curation
-SELECTION_METHOD=Subset bash scripts/run_qwen1.7b_math_grpo.sh
+# Subset curation
+bash train.sh -c configs/math -m Subset
+
+# All methods
+bash train.sh -c configs/math -m all
+
+# Override seed or learning rate
+bash train.sh -c configs/math -m Layerwise --seed 123 --lr 5e-7
+
+# Dry-run to inspect generated commands
+bash train.sh -c configs/math -m all --dry-run
+
+# List available methods
+bash train.sh -c configs/math --list
 ```
 
 ## Configuration
 
-### Environment Variables
+Settings live in YAML config files under `configs/`. Each config directory has:
+- `defaults.yaml`: shared settings inherited by all methods
+- Per-method configs (e.g., `Standard.yaml`, `Layerwise.yaml`, `Subset.yaml`)
 
-| Variable            | Default   | Description                                |
-| ------------------- | --------- | ------------------------------------------ |
-| `N_GPUS`            | auto      | Number of GPUs                             |
-| `SEED`              | 42        | Random seed for reproducibility            |
-| `SELECTION_ENABLED` | True      | Enable/disable curation                   |
-| `SELECTION_METHOD`  | Layerwise | Curation method: `Layerwise` or `Subset`  |
-| `SELECTION_FRAC`    | 1.0       | Fraction of samples to curate              |
-| `VAL_POOL_SIZE`     | 500       | Number of validation prompts               |
-| `VAL_BATCH_SIZE`    | 32        | Batch size for validation gradient capture |
-| `REFRESH_FREQ`      | 1         | How often to refresh validation gradients  |
+### Config Options
 
-### Hydra Overrides
+| Option | Default | Description |
+| --- | --- | --- |
+| `model` | `Qwen/Qwen3-1.7B-Base` | Model path |
+| `seed` | `42` | Random seed |
+| `train_batch_size` | `128` | Training batch size |
+| `learning_rate` | `1e-6` | Learning rate |
+| `total_epochs` | `5` | Number of epochs |
+| `selection_frac` | `1.0` | Fraction of samples to curate |
+| `val_pool_size` | `512` | Number of validation prompts |
+| `val_batch_size` | `64` | Batch size for validation gradient capture |
+| `val_loss_type` | `reward` | Validation loss: `reward` or `train-loss` |
+| `val_source` | `from_train` | Validation source: `from_train` or `from_test` |
+| `refresh_freq` | `1` | How often to refresh validation gradients |
 
-Pass additional config via command line:
+### Validation Loss Types
 
-```bash
-# Disable curation
-bash scripts/run_qwen1.7b_math_grpo.sh ++selection.enable=False
+| Name | Formula | Description |
+| --- | --- | --- |
+| `reward` | `-E[normalized_reward * log_prob]` | Batch-normalized reward weighting |
+| `train-loss` | `-E[advantages * log_prob]` | GRPO-normalized, matches training objective |
 
-# Change curation fraction
-bash scripts/run_qwen1.7b_math_grpo.sh ++selection.frac=0.5
+### Legacy Script
 
-# Change model
-bash scripts/run_qwen1.7b_math_grpo.sh actor_rollout_ref.model.path=Qwen/Qwen3-4B
-
-# Set random seed for different runs
-bash scripts/run_qwen1.7b_math_grpo.sh seed=123
-
-# Multiple overrides
-bash scripts/run_qwen1.7b_math_grpo.sh ++selection.method=Subset ++selection.frac=0.8
-```
+The original `scripts/run_qwen1.7b_math_grpo.sh` is preserved for backward compatibility but delegates to `train.py`. For new experiments, use `train.sh` with config files.
 
 ## MATH Dataset Info
 

@@ -42,7 +42,7 @@ lora_alpha: 32
 filter_frac: 1.0
 n_val: 0
 val_batch_size: 256
-val_loss_type: seqloss-reward
+val_loss_type: reward
 
 # Evaluation
 eval_interval: 1

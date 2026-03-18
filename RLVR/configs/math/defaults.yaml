@@ -1,0 +1,32 @@
+# Shared experiment defaults for MATH GRPO training
+#
+# These values are inherited by all method configs in this directory.
+# Method configs can override any value.
+
+# Model
+model: Qwen/Qwen3-1.7B-Base
+
+# Training
+seed: 42
+train_batch_size: 128
+max_prompt_length: 1024
+max_response_length: 1024
+learning_rate: 1e-6
+total_epochs: 5
+ppo_mini_batch_size: 32
+ppo_micro_batch_size_per_gpu: 2
+kl_loss_coef: 0.001
+rollout_n: 8
+gpu_memory_utilization: 0.6
+
+# Evaluation & checkpointing
+test_freq: 3
+save_freq: 1000
+
+# Selection defaults
+selection_frac: 1.0
+val_pool_size: 512
+val_batch_size: 64
+val_loss_type: reward
+val_source: from_train
+refresh_freq: 1

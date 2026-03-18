@@ -159,7 +159,7 @@ reset_config() {
     cfg_use_second_order="false"
     cfg_n_val="0"
     cfg_val_batch_size="256"
-    cfg_val_loss_type="seqloss-reward"
+    cfg_val_loss_type="reward"
     cfg_update_compressor_freq="200"
 
     # Evaluation
@@ -316,10 +316,10 @@ run_method() {
     # Build job name
     local val_type_short
     case "$cfg_val_loss_type" in
-        seqloss-lastadv) val_type_short="adv" ;;
-        seqloss-reward)  val_type_short="rew" ;;
-        tokenpg)         val_type_short="tpg" ;;
-        *)               val_type_short="$cfg_val_loss_type" ;;
+        reward)      val_type_short="rew" ;;
+        token-pg)    val_type_short="tpg" ;;
+        train-loss)  val_type_short="tloss" ;;
+        *)           val_type_short="$cfg_val_loss_type" ;;
     esac
     local val_str="v${cfg_n_val}-${val_type_short}"
     [[ "$cfg_n_val" -gt 0 ]] && val_str="${val_str}-b${cfg_val_batch_size}"

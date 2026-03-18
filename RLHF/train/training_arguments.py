@@ -120,15 +120,14 @@ class TrainingArguments(TA):
         },
     )
     val_loss_type: str = field(
-        default="seqloss-lastadv",
+        default="reward",
         metadata={
             "help": (
                 "Validation loss type for data curation gradient computation. "
                 "Options: "
-                "'seqloss-lastadv' (default) - sequence log prob * last-token GAE advantage, "
-                "'seqloss-reward' - sequence log prob * normalized raw reward, "
-                "'tokenpg' - token-level REINFORCE: -mean(sum_t(log_prob_t * A_t * mask_t)). "
-                "Matches LDA-ORL reference implementation options."
+                "'reward' (default) - -E[normalized_reward * log_prob], "
+                "'token-pg' - token-level REINFORCE: -mean(sum_t(log_prob_t * A_t * mask_t)), "
+                "'train-loss' - actual training objective (clipped surrogate + value loss)."
             )
         },
     )

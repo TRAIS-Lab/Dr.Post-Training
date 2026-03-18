@@ -1358,10 +1358,11 @@ class LayerwisePPOTrainer:
            - Computes fresh rewards and advantages
 
         The validation loss formula depends on val_loss_type:
-        - 'seqloss-lastadv': L_val = -E[log π_θ(y|x) * Â_{-1}(x,y)]
-          Uses last-token GAE advantage (matches LDA-ORL reference)
-        - 'seqloss-reward': L_val = -E[log π_θ(y|x) * normalize(R(x,y))]
-          Uses normalized raw reward (for ablation studies)
+        - 'reward': L_val = -E[log π_θ(y|x) * normalize(R(x,y))]
+          Uses normalized raw reward
+        - 'token-pg': L_val = -mean(sum_t(log_prob_t * A_t * mask_t))
+          Token-level REINFORCE with per-token GAE advantages
+        - 'train-loss': Actual PPO loss (clipped surrogate + value loss)
 
         Where:
         - y ~ π^ref: Responses generated from reference policy (frozen)
@@ -1383,7 +1384,7 @@ class LayerwisePPOTrainer:
         """
         # Determine mode based on arguments
         use_buffer = rollout_data is not None
-        val_loss_type = getattr(self.args, 'val_loss_type', 'seqloss-lastadv')
+        val_loss_type = getattr(self.args, 'val_loss_type', 'reward')
 
         if use_buffer:
             # Mode 1: Self-referencing - reuse training rollout data
@@ -1470,30 +1471,23 @@ class LayerwisePPOTrainer:
         batch_size = query_ids.shape[0]
 
         # Compute sequence-level scores based on val_loss_type
-        if val_loss_type == 'seqloss-lastadv':
-            # Extract advantage at the LAST token (Â_{-1}) - matches LDA-ORL reference
-            last_token_indices = response_mask.sum(dim=1) - 1
-            seq_scores = advantages[
-                torch.arange(batch_size, device=self.device),
-                last_token_indices.long()
-            ]
-        elif val_loss_type == 'seqloss-reward':
-            # Use normalized raw reward - for ablation studies
+        if val_loss_type == 'reward':
+            # Use normalized raw reward
             if batch_size > 1:
                 seq_scores = (raw_rewards - raw_rewards.mean()) / (raw_rewards.std() + 1e-8)
             else:
                 seq_scores = raw_rewards - raw_rewards.mean()
-        elif val_loss_type == 'tokenpg':
+        elif val_loss_type == 'token-pg':
             # Token-level REINFORCE: uses per-token GAE advantages
             # Will be handled separately below
             seq_scores = None
-        elif val_loss_type == 'ppo':
+        elif val_loss_type == 'train-loss':
             # Actual PPO loss (clipped surrogate + value loss)
             # Will be handled separately below
             seq_scores = None
         else:
             raise ValueError(f"Unknown val_loss_type: {val_loss_type}. "
-                           f"Supported: 'seqloss-lastadv', 'seqloss-reward', 'tokenpg', 'ppo'")
+                           f"Supported: 'reward', 'token-pg', 'train-loss'")
 
         # Start validation capture mode
         self.grad_hook.start_val_capture(use_factorized=False)
@@ -1501,13 +1495,13 @@ class LayerwisePPOTrainer:
         self.model.train()
 
         # Capture gradients
-        if val_loss_type == 'ppo':
+        if val_loss_type == 'train-loss':
             # Actual PPO loss: clipped surrogate policy gradient + value loss
             total_val_loss = self._capture_ppo_validation_gradients(
                 full_ids, full_mask, response_ids, response_mask,
                 rollout_data, query_len, self.mini_batch_size,
             )
-        elif val_loss_type == 'tokenpg':
+        elif val_loss_type == 'token-pg':
             # Token-level policy gradient: L = -mean(sum_t(log_prob_t * A_t * mask_t))
             total_val_loss = self._capture_tokenpg_validation_gradients(
                 full_ids, full_mask, response_ids, response_mask,

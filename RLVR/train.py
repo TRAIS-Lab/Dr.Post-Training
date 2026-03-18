@@ -10,7 +10,7 @@ This script implements the full gradient-based selection pipeline:
 This matches the intended design from RLHF/train/trainer.py.
 
 Usage:
-    python main_ppo_online_selection.py \
+    python train.py \
         data.train_files=/path/to/train.parquet \
         selection.enable=True \
         selection.method=Layerwise \
@@ -200,7 +200,7 @@ class SelectionTaskRunner(BaseTaskRunner):
                 val_max_response_length=selection_cfg.get("val_max_response_length", 1024),
                 val_seed=selection_cfg.get("val_seed"),
                 refresh_freq=selection_cfg.get("refresh_freq", 1),
-                val_loss_type=selection_cfg.get("val_loss_type", "seqloss-reward"),
+                val_loss_type=selection_cfg.get("val_loss_type", "reward"),
             )
 
             trainer = SelectionRayPPOTrainerWithOnlineVal(
@@ -290,7 +290,7 @@ def main(config):
                 "val_max_response_length": 1024,
                 "val_seed": None,
                 "refresh_freq": 1,
-                "val_loss_type": "seqloss-reward",
+                "val_loss_type": "reward",
             }
 
         if config.selection.get("enable", False):

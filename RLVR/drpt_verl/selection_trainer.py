@@ -91,13 +91,13 @@ class SelectionTrainerConfig:
     refresh_freq: int = 1
 
     # Validation loss type:
-    # - "seqloss-reward": L = -E[normalized_reward * log_prob]
+    # - "reward": L = -E[normalized_reward * log_prob]
     #     Uses batch-level reward normalization: (reward - mean) / std
-    # - "grpo-loss": L = -E[advantages * log_prob] using GRPO-normalized advantages
+    # - "train-loss": L = -E[advantages * log_prob] using GRPO-normalized advantages
     #     Matches training loss formulation exactly (PPO with ratio=1).
     #     Uses per-prompt-group GRPO normalization (same as training).
     #     Recommended for best alignment between validation and training gradients.
-    val_loss_type: str = "seqloss-reward"
+    val_loss_type: str = "reward"
 
 
 class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
@@ -110,7 +110,7 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
     Key differences from base RayPPOTrainer:
     1. Maintains a validation data manager with prompt pool
     2. Generates validation rollouts before each training step
-    3. Computes validation gradients using seqloss-reward objective
+    3. Computes validation gradients using reward objective
     4. Applies selection during _update_actor
 
     Flow:

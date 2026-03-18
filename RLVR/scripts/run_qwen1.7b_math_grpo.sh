@@ -52,9 +52,9 @@ VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-64}
 REFRESH_FREQ=${REFRESH_FREQ:-1}
 RESUME_MODE=${RESUME_MODE:-disable}
 # Validation loss type options:
-# - seqloss-reward: L = -E[normalized_reward * log_prob] (batch normalization)
-# - grpo-loss: L = -E[advantages * log_prob] (GRPO normalization, matches training)
-VAL_LOSS_TYPE=${VAL_LOSS_TYPE:-grpo-loss}
+# - reward: L = -E[normalized_reward * log_prob] (batch normalization)
+# - train-loss: L = -E[advantages * log_prob] (GRPO normalization, matches training)
+VAL_LOSS_TYPE=${VAL_LOSS_TYPE:-train-loss}
 
 # Parse Hydra overrides from command line args
 for arg in "$@"; do
@@ -115,7 +115,7 @@ echo "  refresh_freq=$REFRESH_FREQ"
 echo "  val_loss_type=$VAL_LOSS_TYPE"
 
 # Add project root to PYTHONPATH
-export PYTHONPATH=$CODE_DIR/Dr.Post-Training/RLVR:$CODE_DIR/Dr.Post-Training:${PYTHONPATH}
+export PYTHONPATH=$REPO_ROOT/RLVR:$REPO_ROOT:${PYTHONPATH}
 
 # Unset ROCR_VISIBLE_DEVICES to avoid conflict with CUDA_VISIBLE_DEVICES
 # (ROCR is for AMD ROCm, we're using NVIDIA GPUs)
@@ -131,7 +131,7 @@ if [ "$SELECTION_ENABLED" = "True" ]; then
     # Generate val_from_test and test_cleaned if needed
     if [ ! -f "$VAL_FROM_TEST_PATH" ]; then
         echo "Generating val_from_test.parquet and test_cleaned.parquet..."
-        python3 $CODE_DIR/Dr.Post-Training/RLVR/data/prepare_data.py \
+        python3 $REPO_ROOT/RLVR/data/prepare_data.py \
             --test_data $math_test_path \
             --output $VAL_FROM_TEST_PATH \
             --output_test $math_test_cleaned_path \
@@ -142,7 +142,7 @@ if [ "$SELECTION_ENABLED" = "True" ]; then
     # Generate val_from_train if needed
     if [ ! -f "$VAL_FROM_TRAIN_PATH" ]; then
         echo "Generating val_from_train.parquet..."
-        python3 $CODE_DIR/Dr.Post-Training/RLVR/data/prepare_data.py \
+        python3 $REPO_ROOT/RLVR/data/prepare_data.py \
             --train_data $math_train_path \
             --output $VAL_FROM_TRAIN_PATH \
             --num_samples $VAL_POOL_SIZE \
@@ -159,7 +159,7 @@ echo "Starting training with $N_GPUS GPUs..."
 
 # Note: MATH problems and solutions are typically longer than GSM8K
 # Increased max_response_length to 1024 to accommodate more detailed reasoning
-python3 $CODE_DIR/Dr.Post-Training/RLVR/main_ppo_online_selection.py \
+python3 $REPO_ROOT/RLVR/train.py \
     hydra.run.dir=$HYDRA_DIR \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \

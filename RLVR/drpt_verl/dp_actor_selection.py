@@ -18,7 +18,7 @@ This extends DataParallelPPOActor to support gradient-based selection:
 - Layerwise: Per-layer selection during backward using gradient similarity
 - Subset: Two-pass global selection using accumulated gradient similarity
 
-The validation gradients are captured from a fixed validation set (seqloss-reward)
+The validation gradients are captured from a fixed validation set (reward objective)
 and used to compute gradient similarity scores for training sample selection.
 """
 
@@ -82,7 +82,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
     Inherits from DataParallelPPOActor and adds:
     1. GradientHook for gradient-based selection
-    2. External validation gradient capture (seqloss-reward)
+    2. External validation gradient capture (reward/train-loss)
     3. Layerwise: Per-layer selection during backward
     4. Subset: Two-pass global selection per mini-batch
 
@@ -169,15 +169,15 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         temperature: float = 1.0,
         n_responses: int = 1,
         norm_adv_by_std: bool = True,
-        val_loss_type: str = "seqloss-reward",
+        val_loss_type: str = "reward",
     ) -> Dict[str, Any]:
         """
         Capture validation gradients from external validation data.
 
         Supports two validation loss types:
-            - "seqloss-reward": L = -E[normalized_reward * log_prob]
+            - "reward": L = -E[normalized_reward * log_prob]
                 Uses batch-level reward normalization: (reward - mean) / std
-            - "grpo-loss": L = -E[advantages * log_prob] using GRPO-normalized advantages
+            - "train-loss": L = -E[advantages * log_prob] using GRPO-normalized advantages
                 Matches training loss formulation exactly (PPO with ratio=1).
                 Uses per-prompt-group GRPO normalization (same as training).
                 Recommended for best alignment between validation and training gradients.
@@ -209,12 +209,12 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         # Compute seq_scores based on val_loss_type
         norm_stats = {'val_loss_type': val_loss_type}
 
-        if val_loss_type == "seqloss-reward":
+        if val_loss_type == "reward":
             # Batch-normalized reward weighting: L = -E[normalized_reward * log_prob]
             from .validation import normalize_rewards_for_validation
             seq_scores, reward_norm_stats = normalize_rewards_for_validation(
                 rewards=val_rewards,
-                norm_type="batch",  # Always use batch normalization for seqloss-reward
+                norm_type="batch",  # Always use batch normalization for reward
                 n_responses=n_responses,
                 norm_adv_by_std=norm_adv_by_std,
                 device=val_input_ids.device,
@@ -222,21 +222,21 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             norm_stats.update(reward_norm_stats)
             norm_stats['num_samples_used'] = batch_size
 
-        elif val_loss_type == "grpo-loss":
+        elif val_loss_type == "train-loss":
             # Training-style loss: L = -E[advantages * log_prob]
             # Uses GRPO per-prompt-group normalization (matches training exactly)
             seq_scores = None  # Signal to use advantages instead
             norm_stats['used_fallback'] = False
             norm_stats['num_samples_used'] = batch_size
             logger.info(
-                f"[Val Grad] Using grpo-loss (training-style loss with GRPO advantages) "
+                f"[Val Grad] Using train-loss (training-style loss with GRPO advantages) "
                 f"on {batch_size} samples, n_responses={n_responses}"
             )
 
         else:
             raise ValueError(
                 f"Unknown val_loss_type: {val_loss_type}. "
-                f"Supported: seqloss-reward, grpo-loss"
+                f"Supported: reward, train-loss"
             )
 
         # Start validation gradient capture
@@ -270,9 +270,9 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         else:
             total_response_tokens_tensor = local_response_tokens
 
-        # For grpo-loss: Pre-compute GRPO advantages for the full batch
+        # For train-loss: Pre-compute GRPO advantages for the full batch
         # This matches training's advantage computation exactly
-        use_grpo_loss = (val_loss_type == "grpo-loss")
+        use_grpo_loss = (val_loss_type == "train-loss")
         full_batch_advantages = None
         if use_grpo_loss:
             from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
@@ -376,7 +376,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
                 # Compute per-token loss based on loss type
                 if use_grpo_loss:
-                    # grpo-loss: L = -advantages (matches training exactly)
+                    # train-loss: L = -advantages (matches training exactly)
                     # This is equivalent to PPO loss with ratio=1 (no old policy)
                     # The gradient is: d(-adv)/dW = -adv * d(log_prob)/dW
                     # We need to include log_prob in the computation graph for gradients
@@ -452,7 +452,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             'val/num_micro_batches': num_micro_batches,
             'val/rank': rank,
             'val/world_size': world_size,
-            'val/loss_type': norm_stats.get('val_loss_type', 'seqloss-reward'),
+            'val/loss_type': norm_stats.get('val_loss_type', 'reward'),
         }
         # Add loss-type specific stats
         if 'num_correct' in norm_stats:

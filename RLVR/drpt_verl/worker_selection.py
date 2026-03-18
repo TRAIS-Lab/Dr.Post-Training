@@ -154,7 +154,7 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
         # Get GRPO normalization parameters from meta_info (matching training)
         n_responses = val_batch.meta_info.get('n_responses', 1)
         norm_adv_by_std = val_batch.meta_info.get('norm_adv_by_std', True)
-        val_loss_type = val_batch.meta_info.get('val_loss_type', 'seqloss-reward')
+        val_loss_type = val_batch.meta_info.get('val_loss_type', 'reward')
 
         # Call actor's validation gradient capture
         stats = self.actor.capture_validation_gradients_external(
@@ -176,7 +176,7 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
             'val/num_samples': stats.get('val/num_samples', 0),
             'val/num_layers_captured': stats.get('val/num_layers_captured', 0),
             'val/world_size': stats.get('val/world_size', 1),
-            'val/loss_type': stats.get('val/loss_type', 'seqloss-reward'),
+            'val/loss_type': stats.get('val/loss_type', 'reward'),
             'val/num_correct': stats.get('val/num_correct', -1),
             'val/num_samples_used': stats.get('val/num_samples_used', 0),
         })
