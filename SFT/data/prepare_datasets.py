@@ -245,23 +245,48 @@ def prepare_mmlu(output_dir):
             print(f"  Warning: Failed to load subject '{subject}': {e}")
             continue
 
-    # Write validation data
+    # Write validation data (from HF validation split, used for data curation)
     val_file = os.path.join(output_dir_mmlu, "mmlu_validation_data.jsonl")
     with open(val_file, 'w', encoding='utf-8') as f:
         for example in val_examples:
             f.write(json.dumps(example, ensure_ascii=False) + '\n')
 
+    # Three-way split of test data (per subject):
+    #   - LR sweep: first 40 per subject
+    #   - Test: next 100 per subject
+    lr_size_per_subject = 40
+    test_size_per_subject = 100
+
+    # Group test examples by subject
+    test_by_subject = {}
+    for example in test_examples:
+        subj = example.get("subject", "unknown")
+        test_by_subject.setdefault(subj, []).append(example)
+
+    lr_examples = []
+    final_test_examples = []
+    for subj, examples in test_by_subject.items():
+        lr_examples.extend(examples[:lr_size_per_subject])
+        final_test_examples.extend(examples[lr_size_per_subject:lr_size_per_subject + test_size_per_subject])
+
+    # Write LR sweep data
+    lr_file = os.path.join(output_dir_mmlu, "mmlu_lr_data.jsonl")
+    with open(lr_file, 'w', encoding='utf-8') as f:
+        for example in lr_examples:
+            f.write(json.dumps(example, ensure_ascii=False) + '\n')
+
     # Write test data
     test_file = os.path.join(output_dir_mmlu, "mmlu_test_data.jsonl")
     with open(test_file, 'w', encoding='utf-8') as f:
-        for example in test_examples:
+        for example in final_test_examples:
             f.write(json.dumps(example, ensure_ascii=False) + '\n')
 
     print(f"MMLU data saved:")
-    print(f"  Validation: {val_file} ({len(val_examples)} examples)")
-    print(f"  Test: {test_file} ({len(test_examples)} examples)")
+    print(f"  Validation: {val_file} ({len(val_examples)} examples, for data curation)")
+    print(f"  LR sweep: {lr_file} ({len(lr_examples)} examples, {lr_size_per_subject}/subject)")
+    print(f"  Test: {test_file} ({len(final_test_examples)} examples, {test_size_per_subject}/subject)")
     print(f"  Subjects: {len(subjects)}")
-    return val_file, test_file
+    return val_file, lr_file, test_file
 
 
 def prepare_math500(output_dir):
@@ -1151,8 +1176,9 @@ Available Datasets:
 
     # Evaluation datasets (with validation/test split)
     if 'mmlu' in datasets_to_prepare:
-        val_file, test_file = prepare_mmlu(args.output_dir)
+        val_file, lr_file, test_file = prepare_mmlu(args.output_dir)
         results['mmlu_validation'] = val_file
+        results['mmlu_lr'] = lr_file
         results['mmlu_test'] = test_file
 
     if 'gsm8k' in datasets_to_prepare:

@@ -1,0 +1,11 @@
+# Subset data curation with MeSO fine-tuning
+method: Subset
+finetuning: MeSO
+
+opt_grad_compression:
+  sparsifier: normal-512*512
+  projector: none
+
+score_grad_compression:
+  sparsifier: normal-64*64
+  projector: none
