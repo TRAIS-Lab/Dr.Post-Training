@@ -383,7 +383,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     # So loss = -advantages * log_prob (gradient flows through log_prob)
                     per_token_loss = -mb_advantages * token_log_probs
                 else:
-                    # seqloss variants: L = -seq_score * log_prob
+                    # reward objective: L = -seq_score * log_prob
                     # seq_scores is [mb_batch_size], broadcast to [mb_batch_size, response_length]
                     per_token_loss = -(mb_seq_scores.unsqueeze(1) * token_log_probs)
 
@@ -952,7 +952,17 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         return metrics
 
     def _update_policy_subset(self, data: DataProto):
-        """Update policy with Subset selection (two-pass per micro-batch)."""
+        """
+        Update policy with Subset selection (two-phase per mini-batch).
+
+        Phase 1 (Scoring): Score ALL micro-batches to determine selected indices.
+                           Uses zero_grad freely — no gradient accumulation needed.
+        Phase 2 (Training): Train on selected samples with standard gradient accumulation.
+                           No hooks, no interference.
+
+        This separation avoids the scoring pass's zero_grad from destroying
+        accumulated training gradients across micro-batches.
+        """
         from verl.trainer.ppo import core_algos
         from verl.utils.py_functional import append_to_dict
         import verl.utils.torch_functional as verl_F
@@ -1002,14 +1012,15 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     )
                     micro_batches_list = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-                self.actor_optimizer.zero_grad()
-
+                # ==============================================================
+                # Phase 1: Score ALL micro-batches to get selected indices.
+                # This phase freely uses zero_grad — no accumulation needed.
+                # ==============================================================
+                scored_micro_batches = []
                 for micro_batch in micro_batches_list:
-                    # Move to device and extract data (verl pattern)
                     micro_batch = micro_batch.to(get_device_id())
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
 
-                    # Extract data
                     input_ids = model_inputs['input_ids']
                     attention_mask = model_inputs['attention_mask']
                     position_ids = model_inputs['position_ids']
@@ -1018,10 +1029,9 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     advantages = model_inputs['advantages']
                     response_mask = model_inputs['response_mask']
 
-                    response_length = responses.size(1)
                     micro_batch_size = responses.size(0)
 
-                    # Pass 1: Subset scoring to get selected indices
+                    # Scoring pass (zero_grad happens inside, safe here)
                     selected_indices = self._select_training_batch_subset(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -1044,6 +1054,25 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     else:
                         use_zero_weight = False
 
+                    scored_micro_batches.append((model_inputs, selected_indices, micro_batch_size, use_zero_weight))
+
+                # ==============================================================
+                # Phase 2: Train on selected samples with standard gradient
+                # accumulation. No hooks, no zero_grad interference.
+                # ==============================================================
+                self.actor_optimizer.zero_grad()
+
+                for model_inputs, selected_indices, micro_batch_size, use_zero_weight in scored_micro_batches:
+                    input_ids = model_inputs['input_ids']
+                    attention_mask = model_inputs['attention_mask']
+                    position_ids = model_inputs['position_ids']
+                    responses = model_inputs['responses']
+                    old_log_probs = model_inputs['old_log_probs']
+                    advantages = model_inputs['advantages']
+                    response_mask = model_inputs['response_mask']
+
+                    response_length = responses.size(1)
+
                     # Filter to selected samples
                     sel_input_ids = input_ids[selected_indices]
                     sel_attention_mask = attention_mask[selected_indices]
@@ -1053,7 +1082,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     sel_advantages = advantages[selected_indices]
                     sel_response_mask = response_mask[selected_indices]
 
-                    # Pass 2: Actual training on selected samples
+                    # Training forward/backward on selected samples
                     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                         if self.use_remove_padding and unpad_input is not None:
                             # Pack sequences
@@ -1175,7 +1204,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                         # (metrics like pg_clipfrac, ppo_kl are valid even for dummy backward)
                         append_to_dict(metrics, micro_batch_metrics)
 
-                # Optimizer step
+                # Optimizer step after accumulating gradients from ALL micro-batches
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
 

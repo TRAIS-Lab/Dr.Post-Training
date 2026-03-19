@@ -67,7 +67,7 @@ while [[ $# -gt 0 ]]; do
                 [[ "$name" != "defaults" ]] && echo "  $name"
             done
             echo ""
-            echo "Categories: all, standard, layerwise, subset"
+            echo "Categories: all, standard, layerwise, subset, full"
             exit 0
             ;;
         --help|-h)
@@ -76,6 +76,7 @@ Usage: bash train.sh -c <config_dir> -m <methods> [options]
 
 All experiment settings live in config files.
 Each config directory has a defaults.yaml for shared settings, plus per-method configs.
+Config naming convention: Method-Finetuning.yaml (e.g., Layerwise-Full.yaml)
 
 Required:
   -c, --config_dir <dir>  Config directory (relative to RLVR/ or absolute)
@@ -87,12 +88,13 @@ Optional:
   --dry-run               Print commands without executing
   --list                  List available methods and exit
 
-Categories: all, standard, layerwise, subset
+Categories: all, standard, layerwise, subset, full
 
 Examples:
   bash train.sh -c configs/math -m all
-  bash train.sh -c configs/math -m Layerwise --seed 123
-  bash train.sh -c configs/math -m "Standard,Layerwise" --dry-run
+  bash train.sh -c configs/math -m Layerwise-Full --seed 123
+  bash train.sh -c configs/math -m "Standard-Full,Layerwise-Full" --dry-run
+  bash train.sh -c configs/math -m layerwise --dry-run
 HELP
             exit 0
             ;;
@@ -121,6 +123,7 @@ fi
 reset_config() {
     # Method
     cfg_method="Standard"
+    cfg_finetuning="Full"
 
     # Model
     cfg_model="Qwen/Qwen3-1.7B-Base"
@@ -129,9 +132,9 @@ reset_config() {
     cfg_seed="42"
     cfg_train_batch_size="128"
     cfg_max_prompt_length="1024"
-    cfg_max_response_length="1024"
+    cfg_max_response_length="2048"
     cfg_learning_rate="1e-6"
-    cfg_total_epochs="5"
+    cfg_total_epochs="3"
     cfg_ppo_mini_batch_size="32"
     cfg_ppo_micro_batch_size_per_gpu="2"
     cfg_kl_loss_coef="0.001"
@@ -176,6 +179,7 @@ parse_yaml() {
 
         case "$key" in
             method)                          cfg_method="$val" ;;
+            finetuning)                      cfg_finetuning="$val" ;;
             model)                           cfg_model="$val" ;;
             seed)                            cfg_seed="$val" ;;
             train_batch_size)                cfg_train_batch_size="$val" ;;
@@ -220,9 +224,10 @@ resolve_methods() {
         item=$(echo "$item" | xargs)
         case "$item" in
             all)       for m in "${available[@]}"; do resolved="${resolved:+$resolved,}$m"; done ;;
-            standard)  for m in "${available[@]}"; do [[ "$m" == "Standard" ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            layerwise) for m in "${available[@]}"; do [[ "$m" == "Layerwise" ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            subset)    for m in "${available[@]}"; do [[ "$m" == "Subset" ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            standard)  for m in "${available[@]}"; do [[ "$m" == Standard-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            layerwise) for m in "${available[@]}"; do [[ "$m" == Layerwise-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            subset)    for m in "${available[@]}"; do [[ "$m" == Subset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            full)      for m in "${available[@]}"; do [[ "$m" == *-Full ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             *)
                 if [[ -f "$config_dir/${item}.yaml" ]]; then
                     resolved="${resolved:+$resolved,}$item"
@@ -277,11 +282,12 @@ run_method() {
     local val_from_test_path=$DATA_DIR/math/val_from_test.parquet
     local val_from_train_path=$DATA_DIR/math/val_from_train.parquet
 
-    # Build experiment name
-    local model_name=$(basename "$cfg_model")
+    # Build experiment name: Qwen3-1.7B_{method}_s{seed}_{val_loss_type}
+    # Strip "-Base"/"-Instruct" suffix from model name for cleaner wandb names
+    local model_name=$(basename "$cfg_model" | sed 's/-Base$//' | sed 's/-Instruct$//')
     local EXP_NAME
     if [[ "$selection_enabled" == "True" ]]; then
-        EXP_NAME="${model_name}_${cfg_method}_s${cfg_seed}"
+        EXP_NAME="${model_name}_${cfg_method}_s${cfg_seed}_${cfg_val_loss_type}"
     else
         EXP_NAME="${model_name}_s${cfg_seed}"
     fi
@@ -293,7 +299,7 @@ run_method() {
     echo "  Running: $exp_name"
     echo "=============================================="
     echo "Model: $cfg_model"
-    echo "Method: $cfg_method (selection=$selection_enabled)"
+    echo "Method: $cfg_method | Finetuning: $cfg_finetuning (selection=$selection_enabled)"
     echo "LR: $cfg_learning_rate | Seed: $cfg_seed"
     echo "Batch: $cfg_train_batch_size | Epochs: $cfg_total_epochs"
     echo "Val loss type: $cfg_val_loss_type | Val source: $cfg_val_source"

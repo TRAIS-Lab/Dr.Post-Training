@@ -54,7 +54,7 @@ RESUME_MODE=${RESUME_MODE:-disable}
 # Validation loss type options:
 # - reward: L = -E[normalized_reward * log_prob] (batch normalization)
 # - train-loss: L = -E[advantages * log_prob] (GRPO normalization, matches training)
-VAL_LOSS_TYPE=${VAL_LOSS_TYPE:-train-loss}
+VAL_LOSS_TYPE=${VAL_LOSS_TYPE:-reward}
 
 # Parse Hydra overrides from command line args
 for arg in "$@"; do
@@ -92,9 +92,9 @@ for arg in "$@"; do
     esac
 done
 
-# Build experiment name
+# Build experiment name: Qwen3-1.7B_{method}_s{seed}_{val_loss_type}
 if [ "$SELECTION_ENABLED" = "True" ]; then
-    EXP_NAME="Qwen3-1.7B_${SELECTION_METHOD}_s${SEED}"
+    EXP_NAME="Qwen3-1.7B_${SELECTION_METHOD}_s${SEED}_${VAL_LOSS_TYPE}"
 else
     EXP_NAME="Qwen3-1.7B_s${SEED}"
 fi

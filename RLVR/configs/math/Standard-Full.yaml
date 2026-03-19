@@ -1,0 +1,3 @@
+# Standard GRPO training (no data curation), full parameter fine-tuning
+method: Standard
+finetuning: Full

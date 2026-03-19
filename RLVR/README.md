@@ -8,17 +8,17 @@ This directory contains the implementation for online gradient-based data curati
 # 1. Prepare data
 python verl/examples/data_preprocess/math_dataset.py --local_save_dir $DATA_DIR/math
 
-# 2. Run training with Layerwise curation
-bash train.sh -c configs/math -m Layerwise
+# 2. Run training with Layerwise curation (full fine-tuning)
+bash train.sh -c configs/math -m Layerwise-Full
 
 # 3. Or run baseline (no curation)
-bash train.sh -c configs/math -m Standard
+bash train.sh -c configs/math -m Standard-Full
 
 # 4. Run all methods
 bash train.sh -c configs/math -m all
 
 # 5. Dry-run to verify commands
-bash train.sh -c configs/math -m Layerwise --dry-run
+bash train.sh -c configs/math -m Layerwise-Full --dry-run
 ```
 
 ## Data Preparation
@@ -109,20 +109,24 @@ To switch which validation set is used, set `val_source` in the config:
 ## Running Experiments
 
 ```bash
-# Layerwise curation
-bash train.sh -c configs/math -m Layerwise
+# Layerwise curation (full fine-tuning)
+bash train.sh -c configs/math -m Layerwise-Full
 
 # Baseline (no curation)
-bash train.sh -c configs/math -m Standard
+bash train.sh -c configs/math -m Standard-Full
 
 # Subset curation
-bash train.sh -c configs/math -m Subset
+bash train.sh -c configs/math -m Subset-Full
 
 # All methods
 bash train.sh -c configs/math -m all
 
+# By category (runs all matching configs)
+bash train.sh -c configs/math -m layerwise    # all Layerwise-* configs
+bash train.sh -c configs/math -m full         # all *-Full configs
+
 # Override seed or learning rate
-bash train.sh -c configs/math -m Layerwise --seed 123 --lr 5e-7
+bash train.sh -c configs/math -m Layerwise-Full --seed 123 --lr 5e-7
 
 # Dry-run to inspect generated commands
 bash train.sh -c configs/math -m all --dry-run
@@ -135,7 +139,7 @@ bash train.sh -c configs/math --list
 
 Settings live in YAML config files under `configs/`. Each config directory has:
 - `defaults.yaml`: shared settings inherited by all methods
-- Per-method configs (e.g., `Standard.yaml`, `Layerwise.yaml`, `Subset.yaml`)
+- Per-method configs named `Method-Finetuning.yaml` (e.g., `Standard-Full.yaml`, `Layerwise-Full.yaml`)
 
 ### Config Options
 
@@ -146,7 +150,7 @@ Settings live in YAML config files under `configs/`. Each config directory has:
 | `train_batch_size` | `128` | Training batch size |
 | `learning_rate` | `1e-6` | Learning rate |
 | `total_epochs` | `5` | Number of epochs |
-| `selection_frac` | `1.0` | Fraction of samples to curate |
+| `selection_frac` | `1.0` | Negative filtering: 1.0=drop all negatives, 0.0=keep all |
 | `val_pool_size` | `512` | Number of validation prompts |
 | `val_batch_size` | `64` | Batch size for validation gradient capture |
 | `val_loss_type` | `reward` | Validation loss: `reward` or `train-loss` |

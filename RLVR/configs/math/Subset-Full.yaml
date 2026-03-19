@@ -1,0 +1,8 @@
+# Subset data curation with full parameter fine-tuning
+# Global curation across all layers, per-mini-batch during GRPO training
+method: Subset
+finetuning: Full
+
+# Curation: drop all negative-influence samples globally
+selection_frac: 1.0
+val_loss_type: reward
