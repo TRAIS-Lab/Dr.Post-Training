@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rlvr-subset
+#SBATCH --job-name=rlvr-layerwise
 #SBATCH --partition=general,overflow
 #SBATCH --qos=high
 #SBATCH --nodes=1
@@ -11,7 +11,7 @@
 #SBATCH --output=logs/slurm-%j.out
 #SBATCH --error=logs/slurm-%j.err
 #
-# Submit: sbatch RLVR/scripts/slurm_subset.sh
+# Submit: sbatch RLVR/scripts/slurm_layerwise.sh
 
 set -x
 
@@ -28,4 +28,4 @@ export TMPDIR="$SCRATCH_DIR/.cache/tmp"
 mkdir -p "$TIKTOKEN_CACHE_DIR" "$TMPDIR"
 
 SEED="${1:-42}"
-exec bash RLVR/train.sh -c configs/math -m Subset-Full --seed "$SEED"
+exec bash RLVR/train.sh -c configs/math -m Layerwise-Full --seed "$SEED"
