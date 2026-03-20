@@ -147,7 +147,7 @@ reset_config() {
 
     # Selection
     cfg_selection_frac="1.0"
-    cfg_val_pool_size="512"
+    cfg_val_pool_size="-1"
     cfg_val_batch_size="64"
     cfg_val_loss_type="reward"
     cfg_val_source="from_train"
@@ -308,13 +308,19 @@ run_method() {
 
     # Auto-prepare data if missing (only for selection methods)
     if [[ "$selection_enabled" == "True" ]]; then
+        # val_pool_size=-1 means "use all samples"; pass large number to prepare_data.py
+        local prep_num_samples="$cfg_val_pool_size"
+        if [[ "$cfg_val_pool_size" == "-1" ]]; then
+            prep_num_samples=999999
+        fi
+
         if [ ! -f "$val_from_test_path" ]; then
             echo "Generating val_from_test.parquet and test_cleaned.parquet..."
             python3 $REPO_ROOT/RLVR/data/prepare_data.py \
                 --test_data "$math_test_path" \
                 --output "$val_from_test_path" \
                 --output_test "$math_test_cleaned_path" \
-                --num_samples "$cfg_val_pool_size" \
+                --num_samples "$prep_num_samples" \
                 --seed "$cfg_seed"
         fi
         if [ ! -f "$val_from_train_path" ]; then
@@ -322,7 +328,7 @@ run_method() {
             python3 $REPO_ROOT/RLVR/data/prepare_data.py \
                 --train_data "$math_train_path" \
                 --output "$val_from_train_path" \
-                --num_samples "$cfg_val_pool_size" \
+                --num_samples "$prep_num_samples" \
                 --seed "$cfg_seed"
         fi
     fi

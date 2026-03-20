@@ -29,7 +29,7 @@ save_freq: 1000
 #   frac=0.5 → drop 50% of negative-influence samples
 #   frac=0.0 → keep all samples (no filtering)
 selection_frac: 1.0
-val_pool_size: 512
+val_pool_size: -1
 val_batch_size: 64
 val_loss_type: reward
 val_source: from_train

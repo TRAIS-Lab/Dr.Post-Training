@@ -128,6 +128,14 @@ VAL_FROM_TEST_PATH=$DATA_DIR/math/val_from_test.parquet
 VAL_FROM_TRAIN_PATH=$DATA_DIR/math/val_from_train.parquet
 
 if [ "$SELECTION_ENABLED" = "True" ]; then
+    # For prepare_data.py: val_pool_size=-1 means "use all samples"
+    # Pass a very large number so min(num_samples, total) takes all
+    if [ "$VAL_POOL_SIZE" = "-1" ]; then
+        PREP_NUM_SAMPLES=999999
+    else
+        PREP_NUM_SAMPLES=$VAL_POOL_SIZE
+    fi
+
     # Generate val_from_test and test_cleaned if needed
     if [ ! -f "$VAL_FROM_TEST_PATH" ]; then
         echo "Generating val_from_test.parquet and test_cleaned.parquet..."
@@ -135,7 +143,7 @@ if [ "$SELECTION_ENABLED" = "True" ]; then
             --test_data $math_test_path \
             --output $VAL_FROM_TEST_PATH \
             --output_test $math_test_cleaned_path \
-            --num_samples $VAL_POOL_SIZE \
+            --num_samples $PREP_NUM_SAMPLES \
             --seed $SEED
     fi
 
@@ -145,7 +153,7 @@ if [ "$SELECTION_ENABLED" = "True" ]; then
         python3 $REPO_ROOT/RLVR/data/prepare_data.py \
             --train_data $math_train_path \
             --output $VAL_FROM_TRAIN_PATH \
-            --num_samples $VAL_POOL_SIZE \
+            --num_samples $PREP_NUM_SAMPLES \
             --seed $SEED
     fi
 
