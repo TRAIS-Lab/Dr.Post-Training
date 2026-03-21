@@ -163,6 +163,7 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
             val_position_ids=val_batch.batch['position_ids'],
             val_responses=val_batch.batch['responses'],
             val_rewards=val_batch.batch['rewards'],
+            val_response_mask=val_batch.batch.get('response_mask', None),
             temperature=temperature,
             n_responses=n_responses,
             norm_adv_by_std=norm_adv_by_std,

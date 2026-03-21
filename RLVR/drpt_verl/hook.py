@@ -272,7 +272,7 @@ class GradientHookVerl:
                 packed_tokens = train_tokens
 
             self.selection_state.set_token_counts(
-                train_tokens, total_train_tokens, self.total_tokens, packed_tokens
+                train_tokens, total_train_tokens, packed_tokens
             )
 
     def clear_token_counts(self) -> None:
@@ -579,6 +579,6 @@ class SubsetLinearBackwardVerl(Function):
                 )
 
             # Accumulate scores
-            state.accumulate_precomputed_scores(scores, similarity, None)
+            state.accumulate_precomputed_scores(scores, similarity)
 
         return grad_input, None, None, None, None

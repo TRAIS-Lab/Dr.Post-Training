@@ -166,6 +166,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         val_position_ids: torch.Tensor,
         val_responses: torch.Tensor,
         val_rewards: torch.Tensor,
+        val_response_mask: torch.Tensor = None,
         temperature: float = 1.0,
         n_responses: int = 1,
         norm_adv_by_std: bool = True,
@@ -258,7 +259,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
         # Pre-compute total response tokens for token-mean normalization
         # This ensures validation gradient uses the same normalization as training (loss_agg_mode="token-mean")
-        full_response_mask = val_attention_mask[:, -response_length:]
+        full_response_mask = val_response_mask if val_response_mask is not None else val_attention_mask[:, -response_length:]
         local_response_tokens = full_response_mask.sum().to(dtype=torch.float32)
 
         # For distributed training, sync token counts to get GLOBAL total
@@ -322,7 +323,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                 mb_seq_scores = seq_scores[start_idx:end_idx]
 
             mb_batch_size, mb_seqlen = mb_input_ids.shape
-            mb_response_mask = mb_attention_mask[:, -response_length:]
+            mb_response_mask = full_response_mask[start_idx:end_idx]
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 if self.use_remove_padding and unpad_input is not None:
