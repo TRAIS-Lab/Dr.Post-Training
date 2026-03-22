@@ -1,7 +1,0 @@
-# Layerwise data curation with full fine-tuning
-method: Layerwise
-finetuning: Full
-
-score_grad_compression:
-  sparsifier: normal-64*64
-  projector: none
