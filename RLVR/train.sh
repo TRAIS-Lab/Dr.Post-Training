@@ -385,7 +385,11 @@ run_method() {
     trainer.balance_batch=True \
     trainer.log_val_generations=5 \
     +selection.enable=$selection_enabled \
-    +selection.method=$cfg_method \
+    +selection.method=$cfg_method"
+
+    # Only pass val-related selection params when selection is enabled
+    if [[ "$selection_enabled" == "True" ]]; then
+        cmd+=" \
     +selection.frac=$cfg_selection_frac \
     +selection.use_second_order=False \
     +selection.val_prompts_path=$val_prompts_path \
@@ -396,6 +400,7 @@ run_method() {
     +selection.val_seed=$cfg_seed \
     +selection.refresh_freq=$cfg_refresh_freq \
     +selection.val_loss_type=$cfg_val_loss_type"
+    fi
 
     echo ""
     echo "Running command:"
