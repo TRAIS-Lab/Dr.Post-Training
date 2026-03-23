@@ -137,20 +137,3 @@ GPUS=1 TIME=1:00:00 MEM=64g ./submit.sh SFT/eval/eval.sh --task samsum
 | **SFT**    | `drpt`      | Supervised Fine-Tuning with layerwise data curation                     | [SFT/README.md](SFT/README.md)   |
 | **RLHF**   | `drpt`      | Reinforcement Learning from Human Feedback with layerwise data curation | [RLHF/README.md](RLHF/README.md) |
 | **RLVR**   | `drpt_rlvr` | Reinforcement Learning with Verifiable Rewards (VERL + vLLM)             | [RLVR/README.md](RLVR/README.md) |
-
-## Methods
-
-Generally speaking, we support the following:
-
-1. Curation Modes
-   - **NA**: No data curation
-   - **Baseline**: Data curation in the existing literature
-   - **Subset**: Global online curation
-   - **Layerwise**: Per-layer curation
-2. Compression Methods
-   - **NA**: No compression - uses full gradients and standard AdamW optimizer
-   - **LoGra**: Low-rank Gradient compression (Gaussian projection) - uses MeSO optimizer
-   - **GraSS**: Gradient Sparsification with Sketching (available but not used in default methods)
-3. Training Types
-   - **Full**: Full fine-tuning of all model parameters
-   - **LoRA**: LoRA fine-tuning of low-rank adapters only
