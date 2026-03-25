@@ -219,9 +219,13 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             hm._store_compressed_grad(lidx, rg)
             rec.mark('select_wgrad')
             return None, None
-        # select: top-k + split + indexing + scale_factor
+        # select: top-k only (apple-to-apple with Subset selection)
         rec.mark('select')
         si = _do_selection(state, lidx, scores, sim)
+        rec.mark('select')
+
+        # wgrad: split + indexing + matmul
+        rec.mark('wgrad')
         if usv: tgo, ti = go, inp
         else:
             tgo, _ = split_train_val_batch(go, state.train_batch_size)
@@ -229,10 +233,6 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
         scale_factor = state._compute_scale_factor(si)
         sel_go = tgo[si]
         sel_inp = ti[si]
-        rec.mark('select')
-
-        # wgrad: pure matmul only
-        rec.mark('wgrad')
         if uc is not None:
             sel_inp_aug = augment_input_for_bias(sel_inp, hb)
             uc_compressed = uc.forward((sel_go, sel_inp_aug))
