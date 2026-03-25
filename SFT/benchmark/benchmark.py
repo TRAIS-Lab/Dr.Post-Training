@@ -339,6 +339,7 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
     # Save originals
     _orig_backward = _bwd.SubsetLinearBackward.backward
     _orig_accum = _bwd.SubsetLinearBackward._accumulate_compressed
+    _orig_accum_full = _bwd.SubsetLinearBackward._accumulate_full
 
     # Patched backward: times act_grad
     @staticmethod
@@ -380,8 +381,20 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
             state.process_layer_gradients(tg, vg, lidx, scorr)
         rec.mark('score')
 
+    # Patched _accumulate_full: times score (no compression step)
+    @staticmethod
+    def timed_accum_full(hm, state, lidx, inp, go, usv):
+        rec.mark('score')
+        _orig_accum_full(hm, state, lidx, inp, go, usv)
+        rec.mark('score')
+
     _bwd.SubsetLinearBackward.backward = timed_backward
     _bwd.SubsetLinearBackward._accumulate_compressed = timed_accum
+    _bwd.SubsetLinearBackward._accumulate_full = timed_accum_full
+
+    # Disable score compressors for Subset — Subset uses exact (uncompressed) scoring by default
+    saved_score_compressors = grad_hook.score_compressors
+    grad_hook.score_compressors = [None] * len(saved_score_compressors)
 
     def step(batch, val_batch, i=None):
         train_bs = batch['input_ids'].shape[0]
@@ -461,6 +474,8 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
 
     _bwd.SubsetLinearBackward.backward = _orig_backward
     _bwd.SubsetLinearBackward._accumulate_compressed = _orig_accum
+    _bwd.SubsetLinearBackward._accumulate_full = _orig_accum_full
+    grad_hook.score_compressors = saved_score_compressors
 
     result = timer.mean_elapsed()
     for k, v in p1_accum.items():
@@ -507,8 +522,7 @@ def print_results(standard, layerwise, subset, config, peak_mem):
     sub_total = sub_p1f + sub_p1b + sub_sel + sub_p2f + sub_p2b + sub_opt
 
     _row("Forward", s_fwd, l_fwd, sub_p1f)
-    _row("Backward", s_bwd, l_bwd, sub_p1b)
-    _row("Selection", 0, 0, sub_sel)
+    _row("Backward + Selection", s_bwd, l_bwd, sub_p1b + sub_sel)
     _row("Pass-2 Forward", 0, 0, sub_p2f)
     _row("Pass-2 Backward", 0, 0, sub_p2b)
     _row("Optimizer", s_opt, l_opt, sub_opt)
@@ -564,11 +578,13 @@ def print_results(standard, layerwise, subset, config, peak_mem):
     p1_comp = subset.get('p1_compress', 0)
     p1_score = subset.get('p1_score', 0)
     p1_measured = p1_act + p1_comp + p1_score
+    p1_total = sub_p1b + sub_sel  # Include selection cost in P1
     p1_items = [("act_grad (chain rule)", p1_act),
                 ("compress (sparsifier.forward)", p1_comp),
                 ("score (accumulate)", p1_score),
+                ("selection (top-k)", sub_sel),
                 ("autograd overhead", sub_p1b - p1_measured)]
-    _bkd("Subset pass 1 (scoring)", p1_items, sub_p1b)
+    _bkd("Subset pass 1 (scoring)", p1_items, p1_total)
     p2_act = subset.get('p2_act_grad', 0)
     p2_wg = subset.get('p2_wgrad', 0)
     p2_measured = p2_act + p2_wg

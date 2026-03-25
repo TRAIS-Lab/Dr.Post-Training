@@ -38,132 +38,135 @@ bash benchmark.sh --output results/breakdown.json
 
 ## Results
 
-All benchmarks: Llama-3.2-1B | bfloat16 | A40 GPU | score compression: normal-64×64 | 10 warmup + 10 timed iters.
+All benchmarks: Llama-3.2-1B | bfloat16 | A40 GPU | Layerwise score compression: normal-64×64 | Subset: exact (no compression) | 10 warmup + 20 timed iters.
 All numbers directly measured with CUDA events via monkey-patched autograd Functions. No residuals. See `benchmark.py`.
 
 ### tulu3 → tydiqa | batch=8 | seq=512 (matches `train.sh` defaults)
 
-Total: Standard **525 ms**, Layerwise **565 ms** (+7.6%), Subset **762 ms** (+45.0%) | Peak: 19.7 / 21.3 / 21.3 GB
+Total: Standard **523 ms**, Layerwise **564 ms** (+7.9%), Subset **822 ms** (+57.3%) | Peak: 19.7 / 21.3 / 21.3 GB
 
 | Component     |  Standard | Layerwise | Subset P1 | Subset P2 |
 | ------------- | --------: | --------: | --------: | --------: |
-| **Forward**   | **152.1** | **164.9** | **183.7** |  **83.4** |
-| act_grad      |      83.7 |      88.1 |      88.6 |      43.8 |
-| compress      |         — |      19.3 |      22.1 |         — |
-| score         |         — |       1.7 |       8.3 |         — |
-| select        |         — |      17.9 |         — |         — |
-| w.grad        |      81.5 |      51.1 |         — |      42.7 |
-| autograd      |     117.3 |     131.5 |     136.1 |      62.3 |
-| **Backward**  | **282.5** | **309.6** | **255.0** | **148.8** |
+| **Forward**   | **151.7** | **166.2** | **165.6** |  **85.2** |
+| act_grad      |      83.1 |      87.5 |      89.3 |      43.6 |
+| compress      |         — |      19.1 |         — |         — |
+| score         |         — |       1.7 |     118.1 |         — |
+| select        |         — |      17.8 |       0.0 |         — |
+| w.grad        |      81.2 |      50.9 |         — |      42.2 |
+| autograd      |     116.1 |     130.0 |     126.3 |      61.2 |
+| **Backward**  | **280.5** | **307.1** | **333.8** | **147.0** |
 | **Optimizer** |  **90.7** |  **90.7** |           |  **90.7** |
 
 ### tulu3 → tydiqa | batch=16 | seq=512
 
-Total: Standard **946 ms**, Layerwise **975 ms** (+3.1%), Subset **1309 ms** (+38.3%) | Peak: 32.3 / 33.9 / 33.9 GB
+Total: Standard **944 ms**, Layerwise **1016 ms** (+7.7%), Subset **1518 ms** (+60.9%) | Peak: 32.3 / 33.9 / 33.9 GB
 
 | Component     |  Standard | Layerwise | Subset P1 | Subset P2 |
 | ------------- | --------: | --------: | --------: | --------: |
-| **Forward**   | **294.3** | **309.1** | **309.4** | **156.1** |
-| act_grad      |     168.4 |     171.5 |     171.7 |      86.2 |
-| compress      |         — |      31.9 |      32.4 |         — |
-| score         |         — |       1.8 |       8.3 |         — |
-| select        |         — |      31.5 |         — |         — |
-| w.grad        |     161.0 |      92.4 |         — |      83.9 |
-| autograd      |     231.6 |     246.3 |     250.0 |     119.8 |
-| **Backward**  | **561.0** | **575.4** | **462.4** | **290.0** |
-| **Optimizer** |  **90.7** |  **90.7** |           |  **90.6** |
+| **Forward**   | **294.4** | **309.2** | **309.7** | **156.8** |
+| act_grad      |     167.6 |     171.4 |     174.2 |      86.0 |
+| compress      |         — |      74.9 |         — |         — |
+| score         |         — |       1.7 |     258.4 |         — |
+| select        |         — |      31.3 |       0.0 |         — |
+| w.grad        |     161.2 |      92.3 |         — |      83.7 |
+| autograd      |     230.0 |     244.5 |     240.8 |     118.2 |
+| **Backward**  | **558.8** | **616.2** | **673.4** | **287.9** |
+| **Optimizer** |  **90.7** |  **90.6** |           |  **90.7** |
 
 ### tulu3 → tydiqa | batch=32 | seq=256
 
-Total: Standard **959 ms**, Layerwise **972 ms** (+1.3%), Subset **1310 ms** (+36.5%) | Peak: 32.5 / 33.3 / 33.3 GB
+Total: Standard **968 ms**, Layerwise **978 ms** (+1.1%), Subset **1491 ms** (+54.0%) | Peak: 32.5 / 33.3 / 33.3 GB
 
 | Component     |  Standard | Layerwise | Subset P1 | Subset P2 |
 | ------------- | --------: | --------: | --------: | --------: |
-| **Forward**   | **298.4** | **307.6** | **307.9** | **157.1** |
-| act_grad      |     169.0 |     170.9 |     171.4 |      86.6 |
-| compress      |         — |      30.7 |      31.1 |         — |
-| score         |         — |       1.8 |       8.2 |         — |
-| select        |         — |      31.6 |         — |         — |
-| w.grad        |     163.6 |      93.1 |         — |      84.5 |
-| autograd      |     237.7 |     245.7 |     249.3 |     122.8 |
-| **Backward**  | **570.3** | **573.9** | **460.0** | **293.8** |
+| **Forward**   | **301.7** | **310.2** | **311.3** | **159.8** |
+| act_grad      |     172.0 |     173.3 |     175.1 |      88.3 |
+| compress      |         — |      30.7 |         — |         — |
+| score         |         — |       1.8 |     214.3 |         — |
+| select        |         — |      31.8 |       0.0 |         — |
+| w.grad        |     165.8 |      94.2 |         — |      86.1 |
+| autograd      |     237.9 |     245.7 |     242.0 |     123.0 |
+| **Backward**  | **575.7** | **577.5** | **631.4** | **297.4** |
 | **Optimizer** |  **90.7** |  **90.7** |           |  **90.7** |
 
 ### alpaca → samsum | batch=8 | seq=512
 
-Total: Standard **313 ms**, Layerwise **361 ms** (+15.5%), Subset **465 ms** (+48.6%) | Peak: 19.5 / 21.0 / 21.0 GB
+Total: Standard **285 ms**, Layerwise **367 ms** (+28.6%), Subset **484 ms** (+69.6%) | Peak: 19.4 / 21.0 / 21.0 GB
 
 | Component     |  Standard | Layerwise | Subset P1 | Subset P2 |
 | ------------- | --------: | --------: | --------: | --------: |
-| **Forward**   |  **80.2** |  **91.8** |  **91.6** |  **48.1** |
-| act_grad      |      43.2 |      49.0 |      49.7 |      22.3 |
-| compress      |         — |      11.9 |      19.6 |         — |
-| score         |         — |       2.0 |       8.9 |         — |
-| select        |         — |      12.7 |         — |         — |
-| w.grad        |      40.3 |      33.2 |         — |      22.4 |
-| autograd      |      58.3 |      70.0 |      79.2 |      32.3 |
-| **Backward**  | **141.8** | **178.7** | **157.4** |  **77.0** |
+| **Forward**   |  **72.6** |  **94.6** |  **95.6** |  **46.4** |
+| act_grad      |      36.4 |      49.9 |      50.2 |      20.0 |
+| compress      |         — |      12.1 |         — |         — |
+| score         |         — |       2.1 |      64.1 |         — |
+| select        |         — |      12.9 |       0.0 |         — |
+| w.grad        |      35.0 |      33.7 |         — |      20.1 |
+| autograd      |      50.8 |      71.1 |      66.3 |      30.4 |
+| **Backward**  | **122.1** | **181.8** | **180.7** |  **70.6** |
 | **Optimizer** |  **90.7** |  **90.7** |           |  **90.7** |
 
 ### alpaca → samsum | batch=16 | seq=512
 
-Total: Standard **492 ms**, Layerwise **588 ms** (+19.5%), Subset **740 ms** (+50.4%) | Peak: 31.7 / 33.3 / 33.2 GB
+Total: Standard **492 ms**, Layerwise **577 ms** (+17.2%), Subset **818 ms** (+66.3%) | Peak: 31.7 / 33.3 / 33.3 GB
 
 | Component     |  Standard | Layerwise | Subset P1 | Subset P2 |
 | ------------- | --------: | --------: | --------: | --------: |
-| **Forward**   | **141.1** | **185.6** | **166.4** |  **78.5** |
-| act_grad      |      76.9 |      91.2 |      91.8 |      40.6 |
-| compress      |         — |      18.4 |      22.0 |         — |
-| score         |         — |       1.7 |       8.3 |         — |
-| select        |         — |      18.7 |         — |         — |
-| w.grad        |      76.0 |      53.5 |         — |      39.9 |
-| autograd      |     107.4 |     128.1 |     134.3 |      57.5 |
-| **Backward**  | **260.3** | **311.7** | **256.4** | **138.0** |
-| **Optimizer** |  **90.7** |  **90.7** |           | **101.0** |
+| **Forward**   | **142.1** | **169.8** | **170.6** |  **80.8** |
+| act_grad      |      76.6 |      92.8 |      94.6 |      41.0 |
+| compress      |         — |      18.4 |         — |         — |
+| score         |         — |       1.7 |     117.4 |         — |
+| select        |         — |      19.0 |       0.0 |         — |
+| w.grad        |      75.9 |      54.3 |         — |      39.8 |
+| autograd      |     106.9 |     130.2 |     126.4 |      57.1 |
+| **Backward**  | **259.4** | **316.4** | **338.5** | **137.9** |
+| **Optimizer** |  **90.7** |  **90.7** |           |  **90.7** |
 
 ### alpaca → samsum | batch=32 | seq=256
 
-Total: Standard **859 ms**, Layerwise **895 ms** (+4.2%), Subset **1195 ms** (+39.1%) | Peak: 31.9 / 32.7 / 32.7 GB
+Total: Standard **849 ms**, Layerwise **906 ms** (+6.7%), Subset **1355 ms** (+59.7%) | Peak: 31.9 / 32.7 / 32.7 GB
 
 | Component     |  Standard | Layerwise | Subset P1 | Subset P2 |
 | ------------- | --------: | --------: | --------: | --------: |
-| **Forward**   | **265.4** | **280.5** | **281.0** | **142.4** |
-| act_grad      |     150.3 |     157.9 |     158.5 |      78.5 |
-| compress      |         — |      28.8 |      29.4 |         — |
-| score         |         — |       1.8 |       7.9 |         — |
-| select        |         — |      29.7 |         — |         — |
-| w.grad        |     146.6 |      86.8 |         — |      76.2 |
-| autograd      |     206.3 |     219.1 |     223.8 |     106.8 |
-| **Backward**  | **503.2** | **524.1** | **419.7** | **261.5** |
+| **Forward**   | **262.3** | **286.2** | **286.6** | **142.6** |
+| act_grad      |     148.9 |     159.7 |     162.5 |      77.1 |
+| compress      |         — |      29.0 |         — |         — |
+| score         |         — |       1.8 |     198.3 |         — |
+| select        |         — |      29.9 |       0.0 |         — |
+| w.grad        |     144.6 |      87.8 |         — |      75.7 |
+| autograd      |     202.2 |     220.6 |     216.8 |     104.9 |
+| **Backward**  | **495.6** | **528.8** | **577.7** | **257.6** |
 | **Optimizer** |  **90.7** |  **90.7** |           |  **90.7** |
 
 ### Summary
 
 | Config                   | Standard | Layerwise | Overhead |  Subset | Overhead |
 | ------------------------ | -------: | --------: | -------: | ------: | -------: |
-| tulu3→tydiqa b=8 s=512   |   525 ms |    565 ms |    +7.6% |  762 ms |   +45.0% |
-| tulu3→tydiqa b=16 s=512  |   946 ms |    975 ms |    +3.1% | 1309 ms |   +38.3% |
-| tulu3→tydiqa b=32 s=256  |   959 ms |    972 ms |    +1.3% | 1310 ms |   +36.5% |
-| alpaca→samsum b=8 s=512  |   313 ms |    361 ms |   +15.5% |  465 ms |   +48.6% |
-| alpaca→samsum b=16 s=512 |   492 ms |    588 ms |   +19.5% |  740 ms |   +50.4% |
-| alpaca→samsum b=32 s=256 |   859 ms |    895 ms |    +4.2% | 1195 ms |   +39.1% |
+| tulu3→tydiqa b=8 s=512   |   523 ms |    564 ms |    +7.9% |  822 ms |   +57.3% |
+| tulu3→tydiqa b=16 s=512  |   944 ms |   1016 ms |    +7.7% | 1518 ms |   +60.9% |
+| tulu3→tydiqa b=32 s=256  |   968 ms |    978 ms |    +1.1% | 1491 ms |   +54.0% |
+| alpaca→samsum b=8 s=512  |   285 ms |    367 ms |   +28.6% |  484 ms |   +69.6% |
+| alpaca→samsum b=16 s=512 |   492 ms |    577 ms |   +17.2% |  818 ms |   +66.3% |
+| alpaca→samsum b=32 s=256 |   849 ms |    906 ms |    +6.7% | 1355 ms |   +59.7% |
 
 **Methods:**
 - **Standard**: Baseline full fine-tuning with AdamW.
-- **Layerwise**: Per-layer selection via merged batch. Single-pass — scoring and w.grad happen inline during backward.
-- **Subset**: Global selection with ghost inner product scoring. Two-pass — scoring pass (P1) then gradient pass on selected subset (P2).
+- **Layerwise**: Per-layer selection via merged batch. Single-pass — scoring and w.grad happen inline during backward. Uses score compression (normal-64×64).
+- **Subset**: Global selection with exact (uncompressed) scoring. Two-pass — scoring pass (P1, including selection) then gradient pass on selected subset (P2).
 
 **Component definitions:**
+- **compress** (Layerwise only): random projection for score compression
+- **score**: influence score computation — compressed matmul for Layerwise (~2 ms), exact factored scoring for Subset (64–258 ms depending on batch/seq)
 - **select** (Layerwise): includes top-k selection, batch splitting, sample indexing, and scale factor computation
 - **w.grad**: purely the gradient matmul (einsum for Layerwise, native GEMM for Standard/Subset P2)
 
 **Key takeaways:**
-- **Layerwise overhead vs Standard**: 1–8% at batch≥16 (tulu3), scaling favorably with batch size. Higher overhead (15–20%) on shorter datasets (alpaca) where fixed costs dominate.
+- **Layerwise overhead vs Standard**: 1–8% at batch≥16 (tulu3), scaling favorably with batch size. Higher overhead (17–29%) on shorter datasets (alpaca) where fixed costs dominate.
 - **w.grad savings**: Layerwise w.grad is 40–45% cheaper than Standard (e.g., 92 vs 161 ms at tulu3 b=16). Subset P2 w.grad is ~52% of Standard (e.g., 84 vs 161 ms). Both select ~50% of samples.
 - **select overhead**: 18–32 ms for Layerwise (batch splitting + per-layer indexing into non-contiguous tensors). This is the main per-layer cost beyond scoring.
-- **Score compression is cheap**: compress takes 12–32 ms. The actual score matmul is negligible (1.7–2.0 ms).
+- **Score compression is cheap** (Layerwise): compress takes 12–75 ms. The actual score matmul is negligible (1.7–2.1 ms).
+- **Subset exact scoring cost**: Without compression, the factored score accumulation takes 64–258 ms (scales with batch × seq). This is the dominant P1 backward cost.
 - **Autograd overhead**: ~14 ms extra for Layerwise vs Standard from custom Function dispatch.
-- **Subset overhead**: 36–50%. The P2 forward+backward on selected samples is the main cost.
+- **Subset overhead**: 54–70%. The two-pass cost (P1 scoring + P2 forward+backward on selected samples) is the main overhead.
 - **Peak memory**: Selection methods add 0.8–1.6 GB over Standard (merged batch + compressor state).
 
 ## Methodology
@@ -174,9 +177,9 @@ Each method runs in a **separate Python process** to ensure clean GPU memory mea
 | --------- | ------------------------------------------------------------------------------------------------------------------ |
 | Forward   | CUDA events around `model(**batch)`                                                                                |
 | act_grad  | CUDA events around `grad_output @ weight` inside monkey-patched Linear `backward()`                                |
-| compress  | CUDA events around `score_compressor.forward()` inside monkey-patched `_backward_compressed()`                     |
-| score     | CUDA events around matmul + score accumulation                                                                     |
-| select    | CUDA events around `_do_selection()` (top-k)                                                                       |
+| compress  | CUDA events around `score_compressor.forward()` inside monkey-patched `_backward_compressed()` (Layerwise only)    |
+| score     | CUDA events around matmul + score accumulation (compressed for Layerwise, exact for Subset)                        |
+| select    | CUDA events around `_do_selection()` (top-k, Layerwise) or `get_final_selection()` (Subset)                        |
 | w.grad    | CUDA events around `compute_selected_gradients()` (Layerwise) or monkey-patched `grad_output.T @ input` (Standard) |
 | autograd  | Remainder: total backward - (act_grad + compress + score + select + w.grad)                                        |
 | Optimizer | CUDA events around `optimizer.step()`                                                                              |
