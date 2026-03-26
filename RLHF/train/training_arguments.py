@@ -170,6 +170,27 @@ class TrainingArguments(TA):
         },
     )
 
+    scoring_method: str = field(
+        default="ghost",
+        metadata={
+            "help": (
+                "Scoring method for influence score computation: "
+                "'ghost' (default), 'ghost_greats', 'direct', 'compress'."
+            )
+        },
+    )
+    subset_mode: str = field(
+        default="two_pass",
+        metadata={
+            "help": (
+                "Subset descent mode: "
+                "'one_pass' (Algorithm 4.2, single backward + post-hoc assembly) or "
+                "'two_pass' (Algorithm 4.3, scoring pass + gradient pass on selected subset). "
+                "Default: two_pass for RLHF."
+            )
+        },
+    )
+
     # ===================
     # PPO-specific Arguments
     # ===================

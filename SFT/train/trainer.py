@@ -116,6 +116,8 @@ class LayerwiseTrainer(Trainer):
                 f"val_strategy from '{val_strategy}' to 'merged_batch'"
             )
             val_strategy = 'merged_batch'
+        scoring_method = getattr(self.args, 'scoring_method', 'ghost')
+        subset_mode = getattr(self.args, 'subset_mode', 'one_pass')
         if val_strategy == 'merged_batch':
             self.selection_strategy = create_merged_batch_strategy(
                 method=self.args.method,
@@ -124,6 +126,8 @@ class LayerwiseTrainer(Trainer):
                 use_second_order=getattr(self.args, 'use_second_order', False),
                 selection_mode=getattr(self.args, 'selection_mode', 'topk'),
                 record_selections=self._record_selections,
+                scoring_method=scoring_method,
+                subset_mode=subset_mode,
             )
         else:
             # separate_batch_factorized or separate_batch
@@ -134,6 +138,8 @@ class LayerwiseTrainer(Trainer):
                 use_second_order=getattr(self.args, 'use_second_order', False),
                 selection_mode=getattr(self.args, 'selection_mode', 'topk'),
                 record_selections=self._record_selections,
+                scoring_method=scoring_method,
+                subset_mode=subset_mode,
             )
         self.val_strategy = val_strategy
 
@@ -357,7 +363,10 @@ class LayerwiseTrainer(Trainer):
                 use_factorized = (self.val_strategy == 'separate_batch_factorized')
 
                 # PASS 1: Capture validation gradients
-                self.grad_hook.start_val_capture(use_factorized=use_factorized)
+                self.grad_hook.start_val_capture(
+                    use_factorized=use_factorized,
+                    scoring_method=getattr(self.args, 'scoring_method', 'ghost'),
+                )
                 model.zero_grad()
                 val_loss = self._compute_loss_for_selection(model, batch_val)
                 val_loss.backward()

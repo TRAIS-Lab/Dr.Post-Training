@@ -1,5 +1,6 @@
 # Layerwise data curation with full fine-tuning
 method: Layerwise
+scoring_method: compress
 finetuning: Full
 learning_rate: 1.27e-05
 

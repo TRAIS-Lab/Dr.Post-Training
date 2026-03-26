@@ -260,6 +260,8 @@ class LayerwisePPOTrainer:
             frac=self.filter_frac,
             use_second_order=self.use_second_order,
             selection_mode="filtering",
+            scoring_method=getattr(self.args, 'scoring_method', 'ghost'),
+            subset_mode=getattr(self.args, 'subset_mode', 'two_pass'),
         )
 
         # Log configuration

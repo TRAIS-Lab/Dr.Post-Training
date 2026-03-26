@@ -222,8 +222,9 @@ class LayerwiseState(SelectionState):
     and aggregates gradients. No global accumulation needed.
     """
 
-    def __init__(self, include_val_in_update: bool = False, **kwargs):
+    def __init__(self, include_val_in_update: bool = False, scoring_method: str = "ghost", **kwargs):
         super().__init__(**kwargs)
+        self.scoring_method = scoring_method
         # Track last selected indices for stats
         self._last_selected_indices: Optional[Tensor] = None
 
@@ -319,9 +320,10 @@ class SubsetState(SelectionState):
                         (Algorithm 4.4 in the paper).
     """
 
-    def __init__(self, scoring_method: str = "ghost", **kwargs):
+    def __init__(self, scoring_method: str = "ghost", one_pass: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.scoring_method = scoring_method
+        self.one_pass = one_pass
 
         # Accumulators for global scoring
         self.grad_dot_scores = torch.zeros(
@@ -364,15 +366,18 @@ class SubsetState(SelectionState):
             val_grad = val_grad.to(self.dtype)
 
         # Accumulate first-order scores: train_grads @ val_grad
-        # Apply score_correction via the alpha parameter (convert to scalar for addmv)
-        alpha = score_correction.item() if score_correction is not None else 1.0
-        torch.addmv(self.grad_dot_scores, train_grads, val_grad, alpha=alpha, out=self.grad_dot_scores)
+        # Use tensor ops to avoid D2H sync from .item()
+        layer_scores = torch.mv(train_grads, val_grad)
+        if score_correction is not None:
+            layer_scores = layer_scores * score_correction
+        self.grad_dot_scores.add_(layer_scores)
 
         # Accumulate similarity matrix if second-order
         if self.similarity_matrix is not None:
-            # Scale similarity by score_correction² to be consistent with scores
-            alpha_sq = alpha ** 2
-            torch.addmm(self.similarity_matrix, train_grads, train_grads.t(), alpha=alpha_sq, out=self.similarity_matrix)
+            layer_sim = torch.mm(train_grads, train_grads.t())
+            if score_correction is not None:
+                layer_sim = layer_sim * (score_correction ** 2)
+            self.similarity_matrix.add_(layer_sim)
 
         return None
 
@@ -434,6 +439,28 @@ class SubsetState(SelectionState):
             }]
 
         return selected_indices
+
+    def _compute_scale_factor_for_assembly(self, selected_indices: Tensor) -> Tensor:
+        """
+        Compute scale factor for one-pass gradient assembly (exact parity with two-pass).
+
+        Uses batch_total_tokens (not train_total_tokens) to correct for merged-batch
+        normalization. In two-pass mode, pass 2 computes loss on selected samples only,
+        giving grad = (1/selected_tokens) * raw_grad. In one-pass, grad_output is scaled
+        by 1/batch_total_tokens, so we need scale = batch_total_tokens / selected_tokens.
+
+        For SeparateBatch, batch_total_tokens == train_total_tokens, so this is equivalent
+        to the standard scale factor.
+        """
+        if self.tokens_per_sample is None or self.batch_total_tokens_tensor is None:
+            raise RuntimeError(
+                "Token counts not set. Call set_token_counts() before curation."
+            )
+        if selected_indices.numel() == 0:
+            return torch.tensor(1.0, device=self.device, dtype=self.dtype)
+        selected_tokens = self.tokens_per_sample[selected_indices].sum()
+        scale = self.batch_total_tokens_tensor / selected_tokens
+        return torch.where(selected_tokens == 0, torch.ones_like(scale), scale)
 
     def reset_accumulators(self) -> None:
         """Reset accumulators for next batch."""

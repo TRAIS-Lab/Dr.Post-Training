@@ -1,7 +1,9 @@
-# Subset data curation with full fine-tuning (exact scoring)
+# Two-pass subset with ghost_greats scoring
 method: Subset
 finetuning: Full
 learning_rate: 2.00e-05
+subset_mode: two_pass
+scoring_method: ghost_greats
 
 score_grad_compression:
   sparsifier: none

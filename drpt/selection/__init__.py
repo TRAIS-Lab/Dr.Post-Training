@@ -34,12 +34,14 @@ from .strategies import (
     MergedBatchNoSelectionStrategy,
     MergedBatchLayerwiseStrategy,
     MergedBatchSubsetStrategy,
+    MergedBatchSubsetOnePassStrategy,
     create_merged_batch_strategy,
     # SeparateBatch strategies
     SeparateBatchStrategy,
     SeparateBatchNoSelectionStrategy,
     SeparateBatchLayerwiseStrategy,
     SeparateBatchSubsetStrategy,
+    SeparateBatchSubsetOnePassStrategy,
     create_separate_batch_strategy,
 )
 
@@ -57,11 +59,13 @@ __all__ = [
     "MergedBatchNoSelectionStrategy",
     "MergedBatchLayerwiseStrategy",
     "MergedBatchSubsetStrategy",
+    "MergedBatchSubsetOnePassStrategy",
     "create_merged_batch_strategy",
     # SeparateBatch strategies
     "SeparateBatchStrategy",
     "SeparateBatchNoSelectionStrategy",
     "SeparateBatchLayerwiseStrategy",
     "SeparateBatchSubsetStrategy",
+    "SeparateBatchSubsetOnePassStrategy",
     "create_separate_batch_strategy",
 ]

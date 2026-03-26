@@ -1,5 +1,6 @@
 # Subset data curation with MeSO optimizer (exact scoring)
 method: Subset
+scoring_method: compress
 finetuning: MeSO
 learning_rate: 9.00e-07
 

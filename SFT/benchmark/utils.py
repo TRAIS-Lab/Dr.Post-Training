@@ -105,6 +105,7 @@ class BenchmarkConfig:
     use_second_order: bool = False  # If True, use greedy selection with O(k*n) complexity
     val_strategy: str = 'merged'  # 'separate' or 'merged' - how to handle validation gradients
     score_compression: str = "normal-64*64"  # Score-only compression for influence scoring (e.g., "normal-64*64")
+    scoring_method: str = 'ghost'  # Scoring method: 'ghost' (default), 'ghost_greats', 'direct', 'compress'
     val_dataset: str = 'tydiqa'  # Validation dataset for selection. Options: 'samsum', 'gsm8k', 'bbh', etc. If None, uses same as training dataset
     data_dir: str = 'data'  # Data directory for validation datasets (used when val_dataset is set)
 
@@ -198,7 +199,7 @@ class DummyDataset(Dataset):
         self.seq_length = seq_length
         self.size = size
         # Pre-tokenize a dummy sentence
-        self.dummy_text = "This is a test sentence for memory and performance benchmarking." * 128
+        self.dummy_text = "This is a test sentence for memory and performance benchmarking. " * 512
 
     def __len__(self):
         return self.size
@@ -895,10 +896,15 @@ def create_dataloaders(
         shuffle=True, collate_fn=train_collator,
     )
 
-    val_dataset = ValidationDataset(
-        config.val_dataset, tokenizer, config.seq_length, size=1000,
-    )
-    val_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding="longest")
+    if config.dataset == 'dummy':
+        # Use dummy dataset for val too — guarantees full-length sequences
+        val_dataset = DummyDataset(tokenizer, config.seq_length, size=1000)
+        val_collator = get_data_collator(tokenizer, config)
+    else:
+        val_dataset = ValidationDataset(
+            config.val_dataset, tokenizer, config.seq_length, size=1000,
+        )
+        val_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding="longest")
     val_loader = DataLoader(
         val_dataset, batch_size=config.val_batch_size,
         shuffle=True, collate_fn=val_collator,

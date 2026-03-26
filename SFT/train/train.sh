@@ -128,6 +128,8 @@ reset_config() {
     cfg_val_batch_size="1"
     cfg_val_strategy="merged_batch"
     cfg_use_second_order="false"
+    cfg_scoring_method="ghost"
+    cfg_subset_mode="one_pass"
 
     # LoRA
     cfg_lora_r="32"
@@ -200,6 +202,8 @@ parse_yaml() {
             val_batch_size)                      cfg_val_batch_size="$val" ;;
             val_strategy)                        cfg_val_strategy="$val" ;;
             use_second_order)                    cfg_use_second_order="$val" ;;
+            scoring_method)                      cfg_scoring_method="$val" ;;
+            subset_mode)                         cfg_subset_mode="$val" ;;
             lora_r)                              cfg_lora_r="$val" ;;
             lora_alpha)                          cfg_lora_alpha="$val" ;;
             lora_dropout)                        cfg_lora_dropout="$val" ;;
@@ -378,6 +382,8 @@ $fsdp_args \
 --selection_frac $cfg_selection_frac \
 --selection_mode $cfg_selection_mode \
 --val_strategy $cfg_val_strategy \
+--scoring_method $cfg_scoring_method \
+--subset_mode $cfg_subset_mode \
 --use_flash_attention $cfg_use_flash_attention"
 
     # Optional args

@@ -31,3 +31,5 @@ selection_frac: 0.5
 n_val: 4
 val_batch_size: 1
 val_strategy: merged_batch
+scoring_method: ghost
+subset_mode: one_pass

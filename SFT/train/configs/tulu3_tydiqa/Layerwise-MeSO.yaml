@@ -1,5 +1,6 @@
 # Layerwise data curation with MeSO optimizer
 method: Layerwise
+scoring_method: compress
 finetuning: MeSO
 learning_rate: 3.36e-05
 

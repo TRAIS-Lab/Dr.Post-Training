@@ -32,6 +32,7 @@ from .utils import (
     augment_input_for_bias,
     split_train_val_batch,
     compute_scores_and_similarity,
+    compute_scores_ghost_greats,
     compute_scores_direct_materialization,
     compute_selected_gradients,
     compute_total_gradient,
@@ -74,6 +75,33 @@ def _compute_scale_factor(state: LayerwiseState, selected_indices: Tensor) -> Te
 # =============================================================================
 # Shared helpers for Layerwise backward paths
 # =============================================================================
+
+def _dispatch_scoring(
+    scoring_method: str,
+    train_grad_output: "Tensor",
+    train_input: "Tensor",
+    val_grad_output: "Optional[Tensor]",
+    val_input: "Optional[Tensor]",
+    val_grad_total: "Optional[Tensor]",
+    use_second_order: bool,
+) -> "Tuple[Tensor, Optional[Tensor]]":
+    """Dispatch to the appropriate scoring function based on scoring_method."""
+    if scoring_method == "direct":
+        return compute_scores_direct_materialization(
+            train_grad_output, train_input, val_grad_output, val_input,
+            val_grad_total, use_second_order
+        )
+    elif scoring_method == "ghost_greats":
+        return compute_scores_ghost_greats(
+            train_grad_output, train_input, val_grad_output, val_input,
+            val_grad_total, use_second_order
+        )
+    else:  # "ghost" (default)
+        return compute_scores_and_similarity(
+            train_grad_output, train_input, val_grad_output, val_input,
+            val_grad_total, use_second_order
+        )
+
 
 def _do_selection(
     state: "LayerwiseState",
@@ -294,8 +322,18 @@ class LayerwiseLinearBackward(Function):
             getattr(state, '_use_stored_val', False)
         )
 
+        # Determine scoring path: use compressed only when scoring_method="compress"
+        # (or during val capture when val cache is in compressed mode)
+        use_compressed_scoring = False
+        if score_compressor is not None:
+            if capture_val_mode:
+                # Val capture: use compression only if val cache is in compressed mode
+                use_compressed_scoring = hook_manager._val_cache.is_compressed
+            elif state is not None:
+                use_compressed_scoring = getattr(state, 'scoring_method', 'ghost') == 'compress'
+
         with torch.no_grad():
-            if score_compressor is not None:
+            if use_compressed_scoring:
                 grad_weight, grad_bias = LayerwiseLinearBackward._backward_compressed(
                     hook_manager, score_compressor, update_compressor, state, layer_idx,
                     input, grad_output, bias, capture_val_mode, use_stored_val
@@ -469,8 +507,10 @@ class LayerwiseLinearBackward(Function):
             val_grad_total = None
             score_correction = state.score_correction
 
-        scores, similarity = compute_scores_and_similarity(
-            train_grad_output, train_input, val_grad_output, val_input, val_grad_total,
+        scoring_method = getattr(state, 'scoring_method', 'ghost')
+        scores, similarity = _dispatch_scoring(
+            scoring_method, train_grad_output, train_input,
+            val_grad_output, val_input, val_grad_total,
             state.use_second_order
         )
 
@@ -550,8 +590,14 @@ class SubsetLinearBackward(Function):
 
         use_stored_val = getattr(state, '_use_stored_val', False)
 
+        # Use compressed scoring only when scoring_method="compress"
+        use_compressed_scoring = (
+            score_compressor is not None
+            and getattr(state, 'scoring_method', 'ghost') == 'compress'
+        )
+
         with torch.no_grad():
-            if score_compressor is not None:
+            if use_compressed_scoring:
                 SubsetLinearBackward._accumulate_compressed(
                     hook_manager, score_compressor, state, layer_idx,
                     input, grad_output, bias, use_stored_val
@@ -561,6 +607,17 @@ class SubsetLinearBackward(Function):
                     hook_manager, state, layer_idx,
                     input, grad_output, use_stored_val
                 )
+
+            # One-pass mode: retain (grad_output, input) for post-hoc gradient assembly
+            if state.one_pass:
+                if use_stored_val:
+                    # SeparateBatch: entire batch is train
+                    hook_manager.retain_layer_data(layer_idx, grad_output, input)
+                else:
+                    # MergedBatch: extract train portion only
+                    train_go, _ = split_train_val_batch(grad_output, state.train_batch_size)
+                    train_inp, _ = split_train_val_batch(input, state.train_batch_size)
+                    hook_manager.retain_layer_data(layer_idx, train_go, train_inp)
 
         return grad_input, None, None, None, None
 
@@ -619,18 +676,10 @@ class SubsetLinearBackward(Function):
             score_correction = state.score_correction  # Tensor
 
         # Route to scoring method based on state configuration
-        if state.scoring_method == "direct":
-            # Algorithm 4.4: Explicitly materialize per-sample gradients g_i ∈ R^{O×I}
-            scores, similarity = compute_scores_direct_materialization(
-                train_grad_output, train_input, val_go, val_inp, val_grad_total,
-                state.use_second_order
-            )
-        else:
-            # Default: factored scoring (avoids materializing [B, O, I])
-            scores, similarity = compute_scores_and_similarity(
-                train_grad_output, train_input, val_go, val_inp, val_grad_total,
-                state.use_second_order
-            )
+        scores, similarity = _dispatch_scoring(
+            state.scoring_method, train_grad_output, train_input,
+            val_go, val_inp, val_grad_total, state.use_second_order
+        )
 
         # Accumulate scores using the state method (handles correction internally)
         state.accumulate_precomputed_scores(scores, similarity, score_correction)
