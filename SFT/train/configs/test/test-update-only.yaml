@@ -3,10 +3,5 @@
 method: Subset
 finetuning: MeSO
 
-score_grad_compression:
-  sparsifier: none
-  projector: none
-
-opt_grad_compression:
-  sparsifier: normal-512*512
-  projector: none
+optimizer:
+  compression: normal-512*512

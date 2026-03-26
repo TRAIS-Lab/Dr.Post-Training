@@ -329,14 +329,18 @@ def main():
         else:
             logger.info("Gradient compression disabled (no selection and no MeSO)")
 
-    # Auto-detect scoring_method from compression config:
-    # If score compressors are configured and scoring_method is still default "ghost",
-    # auto-switch to "compress" so the compressed path is actually used.
-    if (grad_hook is not None
-            and has_score_compression
-            and training_args.scoring_method == "ghost"):
-        logger.info("Auto-setting scoring_method='compress' (score compressors configured)")
-        training_args.scoring_method = "compress"
+    # Validate scoring_method vs compression config (strict — no auto-detection)
+    if has_score_compression and training_args.scoring_method != "compress":
+        raise ValueError(
+            f"scoring.compression is set ({training_args.score_compression}) but "
+            f"scoring.method='{training_args.scoring_method}'. "
+            f"Set scoring.method to 'compress' or remove scoring.compression."
+        )
+    if training_args.scoring_method == "compress" and not has_score_compression:
+        raise ValueError(
+            "scoring.method='compress' requires scoring.compression to be set. "
+            "Add 'compression: normal-64*64' under the scoring section."
+        )
 
     # Prepare validation dataset (used for data selection in layer-wise descent)
     # Use rejection sampling to filter out validation samples that are significantly

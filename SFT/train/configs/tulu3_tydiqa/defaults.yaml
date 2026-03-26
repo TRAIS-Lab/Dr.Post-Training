@@ -33,5 +33,6 @@ selection_mode: topk
 n_val: 16
 val_batch_size: 1
 val_strategy: merged_batch
-scoring_method: ghost
+scoring:
+  method: ghost
 subset_mode: one_pass

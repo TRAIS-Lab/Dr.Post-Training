@@ -3,10 +3,6 @@
 method: Layerwise
 finetuning: Full
 
-score_grad_compression:
-  sparsifier: normal-64*64
-  projector: none
-
-opt_grad_compression:
-  sparsifier: none
-  projector: none
+scoring:
+  method: compress
+  compression: normal-64*64

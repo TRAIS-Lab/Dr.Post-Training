@@ -3,10 +3,3 @@
 method: Subset
 finetuning: Full
 
-score_grad_compression:
-  sparsifier: none
-  projector: none
-
-opt_grad_compression:
-  sparsifier: none
-  projector: none

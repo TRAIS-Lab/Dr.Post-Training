@@ -4,8 +4,4 @@ method: Subset
 finetuning: Full
 learning_rate: 2.00e-05
 subset_mode: one_pass
-scoring_method: ghost_greats
 
-score_grad_compression:
-  sparsifier: none
-  projector: none

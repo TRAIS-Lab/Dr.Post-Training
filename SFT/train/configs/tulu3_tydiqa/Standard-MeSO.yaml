@@ -3,6 +3,5 @@ method: Standard
 finetuning: MeSO
 learning_rate: 5.00e-05
 
-opt_grad_compression:
-  sparsifier: normal-512*512
-  projector: none
+optimizer:
+  compression: normal-512*512

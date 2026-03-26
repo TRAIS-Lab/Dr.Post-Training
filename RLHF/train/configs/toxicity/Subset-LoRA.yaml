@@ -2,6 +2,3 @@
 method: Subset
 finetuning: LoRA
 
-score_grad_compression:
-  sparsifier: none
-  projector: none

@@ -1,13 +1,10 @@
 # Layerwise data curation with MeSO optimizer
 method: Layerwise
-scoring_method: compress
 finetuning: MeSO
 learning_rate: 3.36e-05
 
-score_grad_compression:
-  sparsifier: normal-512*512
-  projector: none
-
-opt_grad_compression:
-  sparsifier: normal-512*512
-  projector: none
+scoring:
+  method: compress
+  compression: normal-512*512
+optimizer:
+  compression: normal-512*512
