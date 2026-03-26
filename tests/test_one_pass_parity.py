@@ -295,7 +295,7 @@ def test_one_pass_vs_two_pass_separate_batch():
         )
 
         # Capture val gradients
-        hook.start_val_capture(use_factorized=True)
+        hook.start_val_capture(scoring_method="ghost")
         model.zero_grad()
         val_out = model(**val_batch)
         val_out.loss.backward()
@@ -496,8 +496,8 @@ def test_scoring_methods_in_pipeline():
             selection_mode="topk", scoring_method=scoring_method,
         )
 
-        # Val capture
-        hook.start_val_capture(use_factorized=True)
+        # Val capture — mode derived from scoring_method
+        hook.start_val_capture(scoring_method=scoring_method)
         model.zero_grad()
         val_out = model(**val_batch)
         val_out.loss.backward()

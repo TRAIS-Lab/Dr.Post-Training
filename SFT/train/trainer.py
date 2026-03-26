@@ -358,13 +358,12 @@ class LayerwiseTrainer(Trainer):
                 )
             else:
                 # === SEPARATE BATCH MODE: Separate val pass, then train with stored grads ===
-                # separate_batch_factorized: store [V,S,O] and [V,S,I] factors
-                # separate_batch: store mean gradient [O,I] per layer
-                use_factorized = (self.val_strategy == 'separate_batch_factorized')
-
+                # Storage mode (factorized/full/compressed) is derived from scoring_method:
+                #   ghost_greats → factorized [V,S,O] + [V,S,I] (for pairwise scoring)
+                #   ghost/direct → full [O,I] (summed gradient, cheaper)
+                #   compress     → compressed [k]
                 # PASS 1: Capture validation gradients
                 self.grad_hook.start_val_capture(
-                    use_factorized=use_factorized,
                     scoring_method=getattr(self.args, 'scoring_method', 'ghost'),
                 )
                 model.zero_grad()

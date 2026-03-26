@@ -125,7 +125,7 @@ def run_with_m(model_orig, train_batch, val_batch, scoring_method, subset_mode="
         hook.set_score_compressors(setup_compressors(model, layer_names))
 
     # Val capture
-    hook.start_val_capture(use_factorized=True, scoring_method=scoring_method)
+    hook.start_val_capture(scoring_method=scoring_method)
     model.zero_grad()
     model(**val_batch).loss.backward()
     hook.end_val_capture()

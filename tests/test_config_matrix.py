@@ -142,7 +142,7 @@ def run_config(method, scoring_method, use_meso, subset_mode, val_strategy):
             )
         else:
             # Separate batch
-            hook.start_val_capture(use_factorized=True, scoring_method=scoring_method)
+            hook.start_val_capture(scoring_method=scoring_method)
             model.zero_grad()
             val_out = model(**val_data)
             val_out.loss.backward()

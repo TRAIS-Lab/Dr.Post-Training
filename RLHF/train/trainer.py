@@ -1493,7 +1493,7 @@ class LayerwisePPOTrainer:
 
         # Start validation capture mode
         scoring_method = getattr(self.args, 'scoring_method', 'ghost')
-        self.grad_hook.start_val_capture(use_factorized=False, scoring_method=scoring_method)
+        self.grad_hook.start_val_capture(scoring_method=scoring_method)
         self.grad_hook.enable_hooks()
         self.model.train()
 

@@ -14,10 +14,10 @@ gradients are obtained:
    - Val gradients are pre-captured and cached before training
    - Training uses cached val gradients for curation scoring
    - Factory: create_separate_batch_strategy()
-   - Supports two caching modes via start_val_capture(use_factorized=...):
-     * Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
+   - Val storage mode is derived from scoring_method in start_val_capture():
+       * ghost/direct: Stores total gradient [O, I] per layer.
        Better when validation batch is large (e.g., self-reference validation in RLHF).
-     * Cached factors mode (use_factorized=True): Stores [V, S, O] and [V, S, I] components.
+       * ghost_greats: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
        More memory-efficient during training as it avoids materializing [B_train, O, I].
        Better when validation batch is small (e.g., external validation set in SFT).
 """
@@ -514,10 +514,10 @@ class SeparateBatchStrategy(ABC):
     Used when val gradients are pre-captured and cached before training,
     rather than computed from a merged batch during the same forward pass.
 
-    Supports two caching modes via start_val_capture(use_factorized=...):
-    - Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
+    Val storage mode is derived from scoring_method in start_val_capture():
+    - ghost/direct: Stores total gradient [O, I] per layer.
       Better when validation batch is large (e.g., self-reference validation in RLHF).
-    - Cached factors mode (use_factorized=True): Stores [V, S, O] and [V, S, I] components.
+    - ghost_greats: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
       More memory-efficient during training. Better when validation batch is small.
     """
 

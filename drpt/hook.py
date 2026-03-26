@@ -383,24 +383,30 @@ class GradientHook:
         """Get total tokens in validation batch."""
         return self._val_cache.total_tokens
 
-    def start_val_capture(self, use_factorized: bool = True, scoring_method: str = "ghost") -> None:
+    def start_val_capture(self, scoring_method: str = "ghost") -> None:
         """
         Start capturing validation gradients.
 
-        Args:
-            use_factorized: If True, store (grad_output, input) components.
-                           If False, store total gradient [O, I] per layer.
-            scoring_method: Scoring method for upcoming training. When "compress",
-                           val gradients are stored compressed to match scoring path.
-        """
-        mode = "factorized" if use_factorized else "full"
+        The storage mode is derived from the scoring method:
+        - compress      → compressed storage [k] per layer
+        - ghost_greats  → factorized storage (val_go, val_inp) per layer
+                          (needed for pairwise dot products across val samples)
+        - ghost/direct  → full storage G_val [O, I] per layer
+                          (only the summed gradient is needed)
 
-        # Use compressed storage only when scoring_method="compress" AND compressors exist
+        Args:
+            scoring_method: Scoring method for upcoming training.
+        """
         if scoring_method == "compress" and self.compression_mode.uses_compressed_scoring:
             mode = "compressed"
+        elif scoring_method == "ghost_greats":
+            mode = "factorized"
+        else:
+            # ghost, direct: only need the summed val gradient
+            mode = "full"
 
         self._val_cache.start_capture(mode=mode)
-        logger.debug(f"Started validation gradient capture mode (mode={mode})")
+        logger.debug(f"Started validation gradient capture mode (mode={mode}, scoring={scoring_method})")
 
     def end_val_capture(self, val_total_tokens: Optional[int] = None) -> None:
         """
