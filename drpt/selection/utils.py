@@ -237,7 +237,9 @@ def compute_scores_ghost_greats(
             scores = (go_dot * inp_dot).sum(dim=(2, 3)).sum(dim=1)  # [B]
             del go_dot, inp_dot
         elif val_grad_total is not None:
-            # Fall back to our ghost approach with precomputed total
+            # Fall back to ghost's collapse approach — pairwise not possible
+            # without factorized val components. This happens in SeparateBatch
+            # mode with use_factorized=False (e.g., RLHF with large val batch).
             temp = train_input @ val_grad_total.T  # [B, S, O]
             scores = (train_grad_output * temp).sum(dim=(1, 2))  # [B]
         else:

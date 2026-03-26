@@ -1492,7 +1492,8 @@ class LayerwisePPOTrainer:
                            f"Supported: 'reward', 'token-pg', 'train-loss'")
 
         # Start validation capture mode
-        self.grad_hook.start_val_capture(use_factorized=False)
+        scoring_method = getattr(self.args, 'scoring_method', 'ghost')
+        self.grad_hook.start_val_capture(use_factorized=False, scoring_method=scoring_method)
         self.grad_hook.enable_hooks()
         self.model.train()
 
