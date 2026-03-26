@@ -1,4 +1,8 @@
 # Layerwise: per-layer, per-mini-batch curation during PPO
+#
+# scoring.method: ghost, ghost_greats, direct, compress
+#
 method: Layerwise
 finetuning: LoRA
-
+scoring:
+  method: ghost
