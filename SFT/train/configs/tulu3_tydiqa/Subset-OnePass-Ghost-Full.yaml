@@ -3,4 +3,5 @@ method: Subset
 finetuning: Full
 learning_rate: 2.00e-05
 subset_mode: one_pass
-
+scoring:
+  method: ghost

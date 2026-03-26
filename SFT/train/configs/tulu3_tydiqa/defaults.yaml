@@ -35,4 +35,3 @@ val_batch_size: 1
 val_strategy: merged_batch
 scoring:
   method: ghost
-subset_mode: one_pass

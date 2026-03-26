@@ -1,7 +1,7 @@
-# One-pass subset data curation with full fine-tuning
-# Uses ghost_greats scoring (pairwise dot products, fastest for m=1)
+# One-pass subset with ghost_greats (pairwise dot products) scoring
 method: Subset
 finetuning: Full
 learning_rate: 2.00e-05
 subset_mode: one_pass
-
+scoring:
+  method: ghost_greats
