@@ -1,7 +1,0 @@
-# Two-pass subset with ghost (collapse-first) scoring
-method: Subset
-finetuning: Full
-learning_rate: 2.00e-05
-subset_mode: two_pass
-scoring:
-  method: ghost

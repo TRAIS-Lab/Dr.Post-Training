@@ -1,0 +1,18 @@
+# Subset data curation with full fine-tuning
+#
+# subset_mode options:
+#   one_pass  - Algorithm 4.2: single backward + post-hoc assembly (faster, ~20-30% less wall time)
+#   two_pass  - Algorithm 4.3: scoring pass + gradient pass on selected subset (original GREATS)
+#
+# scoring.method options:
+#   ghost         - Collapse-first ghost IP. Best when m >= 4 or T >= 1024.
+#   ghost_greats  - Pairwise ghost IP. Best when m = 1 and T <= 512.
+#   direct        - Batch materialization via bmm. Fast but high memory, OOMs at large n.
+#   compress      - Compressed gradients (requires scoring.compression). Fastest, approximate.
+#
+method: Subset
+finetuning: Full
+learning_rate: 2.00e-05
+subset_mode: two_pass
+scoring:
+  method: ghost
