@@ -29,8 +29,9 @@ import subprocess
 import sys
 import tempfile
 
-BENCHMARK_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark.py")
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(BENCHMARK_SCRIPT), "..", ".."))
+BENCHMARK_DIR = os.path.dirname(os.path.abspath(__file__))
+BENCHMARK_SH = os.path.join(BENCHMARK_DIR, "benchmark.sh")
+PROJECT_ROOT = os.path.abspath(os.path.join(BENCHMARK_DIR, "..", ".."))
 
 # Default configs covering both sides of the ghost/ghost_greats crossover.
 # All use dummy dataset for guaranteed full-length sequences.
@@ -66,16 +67,17 @@ COMBOS = [
 # =============================================================================
 
 def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterations, model=None):
-    """Run a single benchmark configuration via subprocess."""
+    """Run a single benchmark via bash (clean process, no CUDA context leak)."""
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT + ":" + env.get("PYTHONPATH", "")
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    if gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
 
     tmp = tempfile.mktemp(suffix='.json')
-    cmd = [sys.executable, BENCHMARK_SCRIPT, "--method", method, "--dataset", "dummy"]
+    args = ["--method", method, "--dataset", "dummy"]
     if model:
-        cmd += ["--model", model]
-    cmd += [
+        args += ["--model", model]
+    args += [
         "--batch-size", str(config["batch_size"]),
         "--seq-length", str(config["seq_length"]),
         "--val-batch-size", str(config["val_batch_size"]),
@@ -85,6 +87,7 @@ def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterati
         "--num-iterations", str(num_iterations),
         "--output", tmp,
     ]
+    cmd = ["bash", BENCHMARK_SH] + args
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if proc.returncode != 0:
         stderr_tail = proc.stderr.strip().split('\n')[-3:]
@@ -293,7 +296,7 @@ Examples:
   # Save results
   python benchmark_run.py --gpu 2 --output results/llama.json
         """)
-    parser.add_argument("--gpu", type=int, default=0, help="GPU index")
+    parser.add_argument("--gpu", type=int, default=None, help="GPU index (default: use CUDA_VISIBLE_DEVICES from env)")
     parser.add_argument("--model", type=str, default=None, help="Model name (default: Llama-3.2-1B)")
     parser.add_argument("--config", type=int, default=None, help="Run only this config index (0-4)")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size (custom config)")

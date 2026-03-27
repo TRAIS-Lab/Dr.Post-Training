@@ -427,7 +427,7 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
                     hm, sc, state, layer_idx, input, grad_output, bias, usv)
             else:
                 _bwd.SubsetLinearBackward._accumulate_full(
-                    hm, state, layer_idx, input, grad_output, usv)
+                    hm, state, layer_idx, input, grad_output, bias, usv)
         return grad_input, None, None, None, None
 
     # Patched _accumulate_compressed: times compress, score
@@ -447,9 +447,9 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
 
     # Patched _accumulate_full: times score (no compression step)
     @staticmethod
-    def timed_accum_full(hm, state, lidx, inp, go, usv):
+    def timed_accum_full(hm, state, lidx, inp, go, bias, usv):
         rec.mark('score')
-        _orig_accum_full(hm, state, lidx, inp, go, usv)
+        _orig_accum_full(hm, state, lidx, inp, go, bias, usv)
         rec.mark('score')
 
     _bwd.SubsetLinearBackward.backward = timed_backward
@@ -596,7 +596,7 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
                     hm, sc, state, layer_idx, input, grad_output, bias, usv)
             else:
                 _bwd.SubsetLinearBackward._accumulate_full(
-                    hm, state, layer_idx, input, grad_output, usv)
+                    hm, state, layer_idx, input, grad_output, bias, usv)
             # One-pass: retain data
             if state.one_pass:
                 rec.mark('retain')
@@ -611,9 +611,9 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
 
     # Patched _accumulate_full: times score
     @staticmethod
-    def timed_accum_full(hm, state, lidx, inp, go, usv):
+    def timed_accum_full(hm, state, lidx, inp, go, bias, usv):
         rec.mark('score')
-        _orig_accum_full(hm, state, lidx, inp, go, usv)
+        _orig_accum_full(hm, state, lidx, inp, go, bias, usv)
         rec.mark('score')
 
     # Patched _accumulate_compressed: times compress + score
