@@ -81,6 +81,7 @@ class ValidationCache:
         # Storage buffers (only one set is used depending on mode)
         self._factorized: List[Optional[Tuple[Tensor, Tensor]]] = [None] * self.num_layers
         self._full: List[Optional[Tensor]] = [None] * self.num_layers
+        self._bias_grad: List[Optional[Tensor]] = [None] * self.num_layers
         self._compressed: List[Optional[Tensor]] = [None] * self.num_layers
 
     def start_capture(self, mode: str = "factorized") -> None:
@@ -113,6 +114,7 @@ class ValidationCache:
         # Clear all buffers
         self._factorized = [None] * self.num_layers
         self._full = [None] * self.num_layers
+        self._bias_grad = [None] * self.num_layers
         self._compressed = [None] * self.num_layers
 
     def store_layer(
@@ -158,6 +160,16 @@ class ValidationCache:
                 self._full[layer_idx] = val_grad_total
             else:
                 self._full[layer_idx] = self._full[layer_idx] + val_grad_total
+
+            # Store bias gradient: Σ_v Σ_s grad_output[v,s,o] → [O]
+            if grad_output.dim() == 3:
+                bias_grad = grad_output.detach().sum(dim=(0, 1))
+            else:
+                bias_grad = grad_output.detach().sum(dim=0)
+            if self._bias_grad[layer_idx] is None:
+                self._bias_grad[layer_idx] = bias_grad
+            else:
+                self._bias_grad[layer_idx] = self._bias_grad[layer_idx] + bias_grad
 
         elif self.storage_mode == ValidationStorageMode.COMPRESSED:
             if compressor is None:
@@ -246,6 +258,7 @@ class ValidationCache:
         """Clear all cached validation gradients."""
         self._factorized = [None] * self.num_layers
         self._full = [None] * self.num_layers
+        self._bias_grad = [None] * self.num_layers
         self._compressed = [None] * self.num_layers
         self.total_tokens = None
         self.capturing = False
@@ -279,6 +292,10 @@ class ValidationCache:
     def get_full(self, layer_idx: int) -> Optional[Tensor]:
         """Get full gradient for a layer."""
         return self._full[layer_idx]
+
+    def get_bias_grad(self, layer_idx: int) -> Optional[Tensor]:
+        """Get cached bias gradient [O] for a layer (FULL mode only)."""
+        return self._bias_grad[layer_idx]
 
     def get_compressed(self, layer_idx: int) -> Optional[Tensor]:
         """Get compressed gradient for a layer."""
