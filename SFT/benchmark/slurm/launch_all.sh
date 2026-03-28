@@ -20,32 +20,41 @@ DRY_RUN=false
 
 echo "========================================"
 echo "  Dr.Post-Training H200 Benchmark Suite"
-echo "  3 models x 9 configs x 13 combos = 351 runs"
+echo "  3 models x 3 configs x 13 combos = 117 runs"
+echo "  Configs chosen to show ghost/ghost_greats crossover"
 echo "========================================"
 echo ""
 
 # ── Write config files ───────────────────────────────────────────────────────
+# Configs are designed so m={1,2,4} straddles the ghost/ghost_greats crossover V*.
+#   V* = sum(O*I) / (S * sum(O+I))  across all linear layers.
+#
+#   Qwen3-0.6B (h=1024, i=3072, 28L):  V* = 698/S  → T=512  gives V*=1.36
+#   Qwen3-1.7B (h=2048, i=6144, 28L):  V* = 1294/S → T=512  gives V*=2.53
+#   Qwen3-4B   (h=2560, i=9728,  36L): V* = 1760/S → T=512  gives V*=3.44
+#
+# At each config, m=1 is below V* (ghost_greats wins), m=4 is above (ghost wins).
 cat > "$CONFIGS_DIR/qwen3-0.6b.json" << 'EOF'
 [
-  {"n":32,"T":512,"m":1}, {"n":32,"T":512,"m":2}, {"n":32,"T":512,"m":4},
-  {"n":16,"T":1024,"m":1},{"n":16,"T":1024,"m":2},{"n":16,"T":1024,"m":4},
-  {"n":8,"T":2048,"m":1}, {"n":8,"T":2048,"m":2}, {"n":8,"T":2048,"m":4}
+  {"n":32, "T":512, "m":1},
+  {"n":32, "T":512, "m":2},
+  {"n":32, "T":512, "m":4}
 ]
 EOF
 
 cat > "$CONFIGS_DIR/qwen3-1.7b.json" << 'EOF'
 [
-  {"n":16,"T":512,"m":1}, {"n":16,"T":512,"m":2}, {"n":16,"T":512,"m":4},
-  {"n":8,"T":1024,"m":1}, {"n":8,"T":1024,"m":2}, {"n":8,"T":1024,"m":4},
-  {"n":4,"T":2048,"m":1}, {"n":4,"T":2048,"m":2}, {"n":4,"T":2048,"m":4}
+  {"n":16, "T":512, "m":1},
+  {"n":16, "T":512, "m":2},
+  {"n":16, "T":512, "m":4}
 ]
 EOF
 
-cat > "$CONFIGS_DIR/qwen3-8b.json" << 'EOF'
+cat > "$CONFIGS_DIR/qwen3-4b.json" << 'EOF'
 [
-  {"n":16,"T":512,"m":1}, {"n":16,"T":512,"m":2}, {"n":16,"T":512,"m":4},
-  {"n":8,"T":1024,"m":1}, {"n":8,"T":1024,"m":2}, {"n":8,"T":1024,"m":4},
-  {"n":4,"T":2048,"m":1}, {"n":4,"T":2048,"m":2}, {"n":4,"T":2048,"m":4}
+  {"n":8, "T":512, "m":1},
+  {"n":8, "T":512, "m":2},
+  {"n":8, "T":512, "m":4}
 ]
 EOF
 
@@ -141,20 +150,20 @@ python $REPO_ROOT/$RESULTS_DIR/run_benchmark.py
 }
 
 # ── Submit all 3 jobs ────────────────────────────────────────────────────────
-echo "--- Qwen3-0.6B (small) ---"
-submit_job "Qwen/Qwen3-0.6B"  "qwen3-0.6b"  "128G"  "3:00:00"
+echo "--- Qwen3-0.6B (small, T=512, V*=1.36) ---"
+submit_job "Qwen/Qwen3-0.6B"  "qwen3-0.6b"  "128G"  "1:30:00"
 
-echo "--- Qwen3-1.7B (medium) ---"
-submit_job "Qwen/Qwen3-1.7B"  "qwen3-1.7b"  "128G"  "4:00:00"
+echo "--- Qwen3-1.7B (medium, T=512, V*=2.53) ---"
+submit_job "Qwen/Qwen3-1.7B"  "qwen3-1.7b"  "128G"  "2:00:00"
 
-echo "--- Qwen3-8B (large) ---"
-submit_job "Qwen/Qwen3-8B"    "qwen3-8b"    "256G"  "6:00:00"
+echo "--- Qwen3-4B (large, T=512, V*=3.44) ---"
+submit_job "Qwen/Qwen3-4B"    "qwen3-4b"    "128G"  "3:00:00"
 
 echo "========================================"
 if [[ "$DRY_RUN" == "true" ]]; then
     echo "  Dry run complete. No jobs submitted."
 else
-    echo "  Submitted 3 jobs (1 GPU each, running in parallel)"
+    echo "  Submitted 3 jobs (1 GPU each, 117 total runs)"
 fi
 echo "  Results dir: $RESULTS_DIR/"
 echo "  Monitor:     squeue -u \$(whoami)"
