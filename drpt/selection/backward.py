@@ -32,6 +32,7 @@ from .utils import (
     augment_input_for_bias,
     split_train_val_batch,
     compute_scores_and_similarity,
+    compute_scores_ghost_greats,
     compute_scores_direct_materialization,
     compute_selected_gradients,
     compute_total_gradient,
@@ -45,25 +46,26 @@ from .utils import (
 def _get_val_components(
     hook_manager: GradientHook,
     layer_idx: int
-) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     """
     Get validation gradient components from hook manager.
 
     Returns:
-        (val_grad_output, val_input, val_grad_total) tuple.
-        Either (val_grad_output, val_input, None) for factorized mode,
-        or (None, None, val_grad_total) for full gradient mode.
+        (val_grad_output, val_input, val_grad_total, val_bias_grad) tuple.
+        Either (val_grad_output, val_input, None, None) for factorized mode,
+        or (None, None, val_grad_total, val_bias_grad) for full gradient mode.
     """
     val_cache = hook_manager._val_cache
 
     # Try factorized mode first
     val_grad_output, val_input = val_cache.get_factorized(layer_idx)
     if val_grad_output is not None and val_input is not None:
-        return val_grad_output, val_input, None
+        return val_grad_output, val_input, None, None
 
     # Fall back to full gradient mode
     val_grad_total = val_cache.get_full(layer_idx)
-    return None, None, val_grad_total
+    val_bias_grad = val_cache.get_bias_grad(layer_idx)
+    return None, None, val_grad_total, val_bias_grad
 
 
 def _compute_scale_factor(state: LayerwiseState, selected_indices: Tensor) -> Tensor:
@@ -74,6 +76,88 @@ def _compute_scale_factor(state: LayerwiseState, selected_indices: Tensor) -> Te
 # =============================================================================
 # Shared helpers for Layerwise backward paths
 # =============================================================================
+
+def _dispatch_scoring(
+    scoring_method: str,
+    train_grad_output: "Tensor",
+    train_input: "Tensor",
+    val_grad_output: "Optional[Tensor]",
+    val_input: "Optional[Tensor]",
+    val_grad_total: "Optional[Tensor]",
+    use_second_order: bool,
+) -> "Tuple[Tensor, Optional[Tensor]]":
+    """Dispatch to the appropriate scoring function based on scoring_method."""
+    if scoring_method == "direct":
+        return compute_scores_direct_materialization(
+            train_grad_output, train_input, val_grad_output, val_input,
+            val_grad_total, use_second_order
+        )
+    elif scoring_method == "ghost_greats":
+        return compute_scores_ghost_greats(
+            train_grad_output, train_input, val_grad_output, val_input,
+            val_grad_total, use_second_order
+        )
+    else:  # "ghost" (default)
+        return compute_scores_and_similarity(
+            train_grad_output, train_input, val_grad_output, val_input,
+            val_grad_total, use_second_order
+        )
+
+
+def _add_bias_scores(
+    scores: "Tensor",
+    similarity: "Optional[Tensor]",
+    train_grad_output: "Tensor",
+    val_grad_output: "Optional[Tensor]",
+    val_bias_grad: "Optional[Tensor]",
+    has_bias: bool,
+) -> "Tuple[Tensor, Optional[Tensor]]":
+    """
+    Add bias gradient contribution to influence scores and similarity.
+
+    The standard scoring functions compute scores from weight gradients only
+    (go ⊗ inp). This adds the bias gradient term: go_i · val_go.
+
+    Args:
+        scores: Weight-only influence scores [B]
+        similarity: Weight-only similarity matrix [B, B] or None
+        train_grad_output: Training grad_output [B, S, O] or [B, O]
+        val_grad_output: Validation grad_output [V, S, O] or None
+        val_bias_grad: Precomputed validation bias gradient [O] or None
+        has_bias: Whether the layer has bias
+
+    Returns:
+        (scores, similarity) with bias contribution added
+    """
+    if not has_bias:
+        return scores, similarity
+
+    # Compute train bias gradients: sum over sequence dim
+    if train_grad_output.dim() == 3:
+        train_bias = train_grad_output.sum(dim=1)  # [B, O]
+    else:
+        train_bias = train_grad_output  # [B, O]
+
+    # Compute val bias gradient from factorized components or cache
+    if val_grad_output is not None:
+        if val_grad_output.dim() == 3:
+            val_bias = val_grad_output.sum(dim=(0, 1))  # [O]
+        else:
+            val_bias = val_grad_output.sum(dim=0)  # [O]
+    elif val_bias_grad is not None:
+        val_bias = val_bias_grad  # [O] from cache
+    else:
+        return scores, similarity
+
+    # Add bias score: train_bias_i · val_bias
+    scores = scores + train_bias @ val_bias.to(train_bias.dtype)
+
+    # Add bias similarity: train_bias_i · train_bias_j
+    if similarity is not None:
+        similarity = similarity + train_bias @ train_bias.T
+
+    return scores, similarity
+
 
 def _do_selection(
     state: "LayerwiseState",
@@ -294,8 +378,18 @@ class LayerwiseLinearBackward(Function):
             getattr(state, '_use_stored_val', False)
         )
 
+        # Determine scoring path: use compressed only when scoring_method="compress"
+        # (or during val capture when val cache is in compressed mode)
+        use_compressed_scoring = False
+        if score_compressor is not None:
+            if capture_val_mode:
+                # Val capture: use compression only if val cache is in compressed mode
+                use_compressed_scoring = hook_manager._val_cache.is_compressed
+            elif state is not None:
+                use_compressed_scoring = getattr(state, 'scoring_method', 'ghost') == 'compress'
+
         with torch.no_grad():
-            if score_compressor is not None:
+            if use_compressed_scoring:
                 grad_weight, grad_bias = LayerwiseLinearBackward._backward_compressed(
                     hook_manager, score_compressor, update_compressor, state, layer_idx,
                     input, grad_output, bias, capture_val_mode, use_stored_val
@@ -459,7 +553,7 @@ class LayerwiseLinearBackward(Function):
         # --- Compute scores from full gradients ---
         if use_stored_val:
             train_grad_output, train_input = grad_output, input
-            val_grad_output, val_input, val_grad_total = _get_val_components(hook_manager, layer_idx)
+            val_grad_output, val_input, val_grad_total, val_bias_grad = _get_val_components(hook_manager, layer_idx)
             if val_grad_output is None and val_grad_total is None:
                 return None, None
             score_correction = None
@@ -467,11 +561,20 @@ class LayerwiseLinearBackward(Function):
             train_grad_output, val_grad_output = split_train_val_batch(grad_output, state.train_batch_size)
             train_input, val_input = split_train_val_batch(input, state.train_batch_size)
             val_grad_total = None
+            val_bias_grad = None
             score_correction = state.score_correction
 
-        scores, similarity = compute_scores_and_similarity(
-            train_grad_output, train_input, val_grad_output, val_input, val_grad_total,
+        scoring_method = getattr(state, 'scoring_method', 'ghost')
+        scores, similarity = _dispatch_scoring(
+            scoring_method, train_grad_output, train_input,
+            val_grad_output, val_input, val_grad_total,
             state.use_second_order
+        )
+
+        # Add bias gradient contribution to scores
+        scores, similarity = _add_bias_scores(
+            scores, similarity, train_grad_output,
+            val_grad_output, val_bias_grad, has_bias
         )
 
         if score_correction is not None:
@@ -550,8 +653,14 @@ class SubsetLinearBackward(Function):
 
         use_stored_val = getattr(state, '_use_stored_val', False)
 
+        # Use compressed scoring only when scoring_method="compress"
+        use_compressed_scoring = (
+            score_compressor is not None
+            and getattr(state, 'scoring_method', 'ghost') == 'compress'
+        )
+
         with torch.no_grad():
-            if score_compressor is not None:
+            if use_compressed_scoring:
                 SubsetLinearBackward._accumulate_compressed(
                     hook_manager, score_compressor, state, layer_idx,
                     input, grad_output, bias, use_stored_val
@@ -559,8 +668,19 @@ class SubsetLinearBackward(Function):
             else:
                 SubsetLinearBackward._accumulate_full(
                     hook_manager, state, layer_idx,
-                    input, grad_output, use_stored_val
+                    input, grad_output, bias is not None, use_stored_val
                 )
+
+            # One-pass mode: retain (grad_output, input) for post-hoc gradient assembly
+            if state.one_pass:
+                if use_stored_val:
+                    # SeparateBatch: entire batch is train
+                    hook_manager.retain_layer_data(layer_idx, grad_output, input)
+                else:
+                    # MergedBatch: extract train portion only
+                    train_go, _ = split_train_val_batch(grad_output, state.train_batch_size)
+                    train_inp, _ = split_train_val_batch(input, state.train_batch_size)
+                    hook_manager.retain_layer_data(layer_idx, train_go, train_inp)
 
         return grad_input, None, None, None, None
 
@@ -600,12 +720,13 @@ class SubsetLinearBackward(Function):
         layer_idx: int,
         input: Tensor,
         grad_output: Tensor,
+        has_bias: bool,
         use_stored_val: bool
     ) -> None:
         """Accumulate scores from full gradients."""
         if use_stored_val:
             train_grad_output, train_input = grad_output, input
-            val_go, val_inp, val_grad_total = _get_val_components(hook_manager, layer_idx)
+            val_go, val_inp, val_grad_total, val_bias_grad = _get_val_components(hook_manager, layer_idx)
             if val_go is None and val_grad_total is None:
                 return
             # Cached mode: gradients already correctly scaled, no correction needed
@@ -615,22 +736,21 @@ class SubsetLinearBackward(Function):
             train_grad_output, val_go = split_train_val_batch(grad_output, state.train_batch_size)
             train_input, val_inp = split_train_val_batch(input, state.train_batch_size)
             val_grad_total = None
+            val_bias_grad = None
             # Joint batch needs correction: T_total²/(T_train × T_val)
             score_correction = state.score_correction  # Tensor
 
         # Route to scoring method based on state configuration
-        if state.scoring_method == "direct":
-            # Algorithm 4.4: Explicitly materialize per-sample gradients g_i ∈ R^{O×I}
-            scores, similarity = compute_scores_direct_materialization(
-                train_grad_output, train_input, val_go, val_inp, val_grad_total,
-                state.use_second_order
-            )
-        else:
-            # Default: factored scoring (avoids materializing [B, O, I])
-            scores, similarity = compute_scores_and_similarity(
-                train_grad_output, train_input, val_go, val_inp, val_grad_total,
-                state.use_second_order
-            )
+        scores, similarity = _dispatch_scoring(
+            state.scoring_method, train_grad_output, train_input,
+            val_go, val_inp, val_grad_total, state.use_second_order
+        )
+
+        # Add bias gradient contribution to scores
+        scores, similarity = _add_bias_scores(
+            scores, similarity, train_grad_output,
+            val_go, val_bias_grad, has_bias
+        )
 
         # Accumulate scores using the state method (handles correction internally)
         state.accumulate_precomputed_scores(scores, similarity, score_correction)

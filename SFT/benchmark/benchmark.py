@@ -36,7 +36,7 @@ from SFT.benchmark.utils import (
 )
 from drpt import GradientHook
 
-METHODS = ["standard", "layerwise", "subset"]
+METHODS = ["standard", "layerwise", "subset", "subset_one_pass"]
 
 
 # =============================================================================
@@ -214,14 +214,25 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             if scorr is not None: sim = sim * (scorr ** 2)
         rec.mark('score')
         if uc is not None and uc is sc:
-            rec.mark('select_wgrad')
-            rg, _ = state.process_layer_gradients(tg2, vg, lidx, scorr)
+            # Unfuse process_layer_gradients for fair timing: select, then reduce
+            rec.mark('select')
+            si = _do_selection(state, lidx, scores, sim)
+            rec.mark('select')
+            rec.mark('wgrad')
+            selected_grads = tg2[si]
+            scale_factor = state._compute_scale_factor(si)
+            rg = selected_grads.sum(dim=0, keepdim=True) * scale_factor
             hm._store_compressed_grad(lidx, rg)
-            rec.mark('select_wgrad')
+            state.num_selected = si.shape[0]
+            rec.mark('wgrad')
             return None, None
-        # select: top-k + split + indexing + scale_factor
+        # select: top-k only (apple-to-apple with Subset selection)
         rec.mark('select')
         si = _do_selection(state, lidx, scores, sim)
+        rec.mark('select')
+
+        # wgrad: split + indexing + matmul
+        rec.mark('wgrad')
         if usv: tgo, ti = go, inp
         else:
             tgo, _ = split_train_val_batch(go, state.train_batch_size)
@@ -229,10 +240,6 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
         scale_factor = state._compute_scale_factor(si)
         sel_go = tgo[si]
         sel_inp = ti[si]
-        rec.mark('select')
-
-        # wgrad: pure matmul only
-        rec.mark('wgrad')
         if uc is not None:
             sel_inp_aug = augment_input_for_bias(sel_inp, hb)
             uc_compressed = uc.forward((sel_go, sel_inp_aug))
@@ -250,8 +257,63 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             rec.mark('wgrad')
             return gw, gb
 
+    # Patched _backward_full: times score, select, wgrad (no compression step)
+    _orig_full = _bwd.LayerwiseLinearBackward._backward_full
+
+    @staticmethod
+    def timed_full(hm, uc, state, lidx, inp, bias, go, cvm, usv):
+        from drpt.selection.backward import (
+            _get_val_components, _dispatch_scoring, _do_selection as _do_sel,
+            _produce_gradient_update as _produce_gu,
+            _produce_gradient_update_with_val as _produce_gu_val,
+        )
+        hb = bias is not None
+        if cvm:
+            hm.val_cache.store_layer(layer_idx=lidx, grad_output=go.detach(),
+                                     input=inp.detach(), compressor=None)
+            return None, None
+        if state is None:
+            if uc is not None:
+                ia = augment_input_for_bias(inp, hb)
+                uc_c = uc.forward((go, ia))
+                hm._store_compressed_grad(lidx, uc_c.sum(dim=0, keepdim=True))
+            return None, None
+        # Score
+        rec.mark('score')
+        if usv:
+            tgo, ti = go, inp
+            vgo, vinp, vgt = _get_val_components(hm, lidx)
+            if vgo is None and vgt is None:
+                rec.mark('score')
+                return None, None
+            scorr = None
+        else:
+            tgo, vgo = split_train_val_batch(go, state.train_batch_size)
+            ti, vinp = split_train_val_batch(inp, state.train_batch_size)
+            vgt = None
+            scorr = state.score_correction
+        sm = getattr(state, 'scoring_method', 'ghost')
+        scores, sim = _dispatch_scoring(sm, tgo, ti, vgo, vinp, vgt, state.use_second_order)
+        if scorr is not None:
+            scores = scores * scorr
+            if sim is not None: sim = sim * (scorr ** 2)
+        rec.mark('score')
+        # Select
+        rec.mark('select')
+        si = _do_sel(state, lidx, scores, sim)
+        rec.mark('select')
+        # Wgrad
+        rec.mark('wgrad')
+        if (getattr(state, 'include_val_in_update', False) and not usv):
+            gw, gb = _produce_gu_val(state, si, tgo, ti, vgo, vinp, hb)
+        else:
+            gw, gb = _produce_gu(hm, uc, state, lidx, tgo, ti, si, hb)
+        rec.mark('wgrad')
+        return gw, gb
+
     _bwd.LayerwiseLinearBackward.backward = timed_backward
     _bwd.LayerwiseLinearBackward._backward_compressed = timed_compressed
+    _bwd.LayerwiseLinearBackward._backward_full = timed_full
 
     def step(batch, val_batch, i=None):
         train_bs = batch['input_ids'].shape[0]
@@ -260,6 +322,7 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             train_batch_size=train_bs, selection_method="Layerwise",
             frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
             selection_mode="topk", use_second_order=config.use_second_order,
+            scoring_method=getattr(config, 'scoring_method', 'ghost'),
         )
         if 'labels' in merged:
             grad_hook.set_token_counts(merged['labels'], train_bs)
@@ -281,6 +344,7 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
 
     _bwd.LayerwiseLinearBackward.backward = _orig_backward
     _bwd.LayerwiseLinearBackward._backward_compressed = _orig_compressed
+    _bwd.LayerwiseLinearBackward._backward_full = _orig_full
 
     result = timer.mean_elapsed()
     result.update(comp)
@@ -339,6 +403,7 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
     # Save originals
     _orig_backward = _bwd.SubsetLinearBackward.backward
     _orig_accum = _bwd.SubsetLinearBackward._accumulate_compressed
+    _orig_accum_full = _bwd.SubsetLinearBackward._accumulate_full
 
     # Patched backward: times act_grad
     @staticmethod
@@ -362,7 +427,7 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
                     hm, sc, state, layer_idx, input, grad_output, bias, usv)
             else:
                 _bwd.SubsetLinearBackward._accumulate_full(
-                    hm, state, layer_idx, input, grad_output, usv)
+                    hm, state, layer_idx, input, grad_output, bias, usv)
         return grad_input, None, None, None, None
 
     # Patched _accumulate_compressed: times compress, score
@@ -380,8 +445,22 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
             state.process_layer_gradients(tg, vg, lidx, scorr)
         rec.mark('score')
 
+    # Patched _accumulate_full: times score (no compression step)
+    @staticmethod
+    def timed_accum_full(hm, state, lidx, inp, go, bias, usv):
+        rec.mark('score')
+        _orig_accum_full(hm, state, lidx, inp, go, bias, usv)
+        rec.mark('score')
+
     _bwd.SubsetLinearBackward.backward = timed_backward
     _bwd.SubsetLinearBackward._accumulate_compressed = timed_accum
+    _bwd.SubsetLinearBackward._accumulate_full = timed_accum_full
+
+    # Disable score compressors unless scoring_method is "compress"
+    scoring_method = getattr(config, 'scoring_method', 'ghost')
+    saved_score_compressors = grad_hook.score_compressors
+    if scoring_method != "compress":
+        grad_hook.score_compressors = [None] * len(saved_score_compressors)
 
     def step(batch, val_batch, i=None):
         train_bs = batch['input_ids'].shape[0]
@@ -392,7 +471,7 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
             train_batch_size=train_bs, selection_method="Subset",
             frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
             selection_mode="topk", use_second_order=config.use_second_order,
-            scoring_method="ghost",
+            scoring_method=scoring_method,
         )
         if 'labels' in merged:
             grad_hook.set_token_counts(merged['labels'], train_bs)
@@ -461,6 +540,8 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
 
     _bwd.SubsetLinearBackward.backward = _orig_backward
     _bwd.SubsetLinearBackward._accumulate_compressed = _orig_accum
+    _bwd.SubsetLinearBackward._accumulate_full = _orig_accum_full
+    grad_hook.score_compressors = saved_score_compressors
 
     result = timer.mean_elapsed()
     for k, v in p1_accum.items():
@@ -471,27 +552,193 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
 
 
 # =============================================================================
+# Measurement: Subset One-Pass
+# =============================================================================
+
+def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batches, config, tokenizer):
+    """Measure one-pass Subset (Algorithm 4.2): score + retain during backward, post-hoc assembly."""
+    import drpt.selection.backward as _bwd
+    from drpt.selection.backward import augment_input_for_bias, split_train_val_batch
+    from drpt.selection.state import SubsetState
+
+    N = config.num_iterations
+    phases = ["forward", "backward", "selection", "wgrad", "optimizer"]
+    timer = CUDAEventTimer(phases, N)
+    rec = EventRecorder()
+    pad_token_id = tokenizer.pad_token_id or 0
+
+    scoring_method = getattr(config, 'scoring_method', 'ghost')
+
+    # Save originals
+    _orig_backward = _bwd.SubsetLinearBackward.backward
+    _orig_accum_full = _bwd.SubsetLinearBackward._accumulate_full
+    _orig_accum_compressed = _bwd.SubsetLinearBackward._accumulate_compressed
+
+    # Patched backward: times act_grad + retain
+    @staticmethod
+    def timed_backward(ctx, grad_output):
+        input, weight, bias = ctx.saved_tensors
+        layer_idx = ctx.layer_idx
+        hm = ctx.hook_manager_ref()
+        if input.dtype != grad_output.dtype:
+            input = input.to(grad_output.dtype)
+        rec.mark('act_grad')
+        grad_input = grad_output @ weight.to(grad_output.dtype)
+        rec.mark('act_grad')
+        sc = hm.score_compressors[layer_idx]
+        state = hm.selection_state
+        if state is None:
+            return grad_input, None, None, None, None
+        usv = getattr(state, '_use_stored_val', False)
+        with torch.no_grad():
+            if sc is not None:
+                _bwd.SubsetLinearBackward._accumulate_compressed(
+                    hm, sc, state, layer_idx, input, grad_output, bias, usv)
+            else:
+                _bwd.SubsetLinearBackward._accumulate_full(
+                    hm, state, layer_idx, input, grad_output, bias, usv)
+            # One-pass: retain data
+            if state.one_pass:
+                rec.mark('retain')
+                if usv:
+                    hm.retain_layer_data(layer_idx, grad_output, input)
+                else:
+                    tgo, _ = split_train_val_batch(grad_output, state.train_batch_size)
+                    tinp, _ = split_train_val_batch(input, state.train_batch_size)
+                    hm.retain_layer_data(layer_idx, tgo, tinp)
+                rec.mark('retain')
+        return grad_input, None, None, None, None
+
+    # Patched _accumulate_full: times score
+    @staticmethod
+    def timed_accum_full(hm, state, lidx, inp, go, bias, usv):
+        rec.mark('score')
+        _orig_accum_full(hm, state, lidx, inp, go, bias, usv)
+        rec.mark('score')
+
+    # Patched _accumulate_compressed: times compress + score
+    @staticmethod
+    def timed_accum_compressed(hm, compressor, state, lidx, inp, go, bias, usv):
+        ia = augment_input_for_bias(inp, bias is not None)
+        rec.mark('compress'); cg = compressor.forward((go, ia)); rec.mark('compress')
+        rec.mark('score')
+        if usv:
+            tg, vg, scorr = cg, hm._val_cache.get_compressed(lidx), None
+        else:
+            tg, vgs = split_train_val_batch(cg, state.train_batch_size)
+            vg = vgs.sum(dim=0); scorr = state.score_correction
+        if vg is not None:
+            state.process_layer_gradients(tg, vg, lidx, scorr)
+        rec.mark('score')
+
+    _bwd.SubsetLinearBackward.backward = timed_backward
+    _bwd.SubsetLinearBackward._accumulate_full = timed_accum_full
+    _bwd.SubsetLinearBackward._accumulate_compressed = timed_accum_compressed
+
+    # Disable score compressors for one-pass — use exact scoring
+    saved_score_compressors = grad_hook.score_compressors
+    if scoring_method != "compress":
+        grad_hook.score_compressors = [None] * len(saved_score_compressors)
+
+    def step(batch, val_batch, i=None):
+        train_bs = batch['input_ids'].shape[0]
+        merged = pad_and_merge_batches(batch, val_batch, pad_token_id=pad_token_id)
+
+        grad_hook.setup_selection(
+            train_batch_size=train_bs, selection_method="Subset",
+            frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
+            selection_mode="topk", use_second_order=config.use_second_order,
+            scoring_method=scoring_method,
+            one_pass=True,
+        )
+        if 'labels' in merged:
+            grad_hook.set_token_counts(merged['labels'], train_bs)
+
+        optimizer.zero_grad()
+        if i is not None: timer.mark("forward", i, True)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            loss = model(**merged).loss
+        if i is not None: timer.mark("forward", i, False)
+
+        if i is not None: timer.mark("backward", i, True)
+        loss.backward()
+        if i is not None: timer.mark("backward", i, False)
+
+        if i is not None: timer.mark("selection", i, True)
+        state = grad_hook.selection_state
+        selected = state.get_final_selection().sort()[0]
+        if i is not None: timer.mark("selection", i, False)
+
+        if i is not None: timer.mark("wgrad", i, True)
+        if len(selected) > 0:
+            scale_factor = state._compute_scale_factor_for_assembly(selected)
+            # model.zero_grad() clears non-hooked grads; hooked layers got None from backward
+            model.zero_grad()
+            grad_hook.assemble_gradients_from_retained(selected, scale_factor)
+        else:
+            grad_hook.clear_retained_data()
+        if i is not None: timer.mark("wgrad", i, False)
+
+        grad_hook.clear_selection()
+        grad_hook.clear_token_counts()
+
+        if i is not None: timer.mark("optimizer", i, True)
+        optimizer.step()
+        if i is not None: timer.mark("optimizer", i, False)
+
+    # Warmup + timed
+    comp_accum = {}
+    for j in range(config.num_warmup):
+        rec.reset()
+        step(train_batches[j % len(train_batches)],
+             val_batches[j % len(val_batches)])
+
+    for j in range(N):
+        rec.reset()
+        step(train_batches[(config.num_warmup + j) % len(train_batches)],
+             val_batches[(config.num_warmup + j) % len(val_batches)], j)
+        torch.cuda.synchronize()
+        rec.accumulate(comp_accum)
+
+    _bwd.SubsetLinearBackward.backward = _orig_backward
+    _bwd.SubsetLinearBackward._accumulate_full = _orig_accum_full
+    _bwd.SubsetLinearBackward._accumulate_compressed = _orig_accum_compressed
+    grad_hook.score_compressors = saved_score_compressors
+
+    result = timer.mean_elapsed()
+    for k, v in comp_accum.items():
+        result[k] = v / N
+    return result
+
+
+# =============================================================================
 # Display
 # =============================================================================
 
-def print_results(standard, layerwise, subset, config, peak_mem):
-    W = 110
+def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass=None):
+    has_op = subset_one_pass is not None
+    W = 130 if has_op else 110
     print()
     print("=" * W)
     print(f"BENCHMARK RESULTS (ms per step, averaged over {config.num_iterations} iterations)")
     print(f"Model: {config.model_name} | Batch: {config.batch_size} | "
           f"Seq: {config.seq_length} | Dtype: {config.dtype}")
+    scoring = getattr(config, 'scoring_method', 'ghost')
     print(f"Dataset: {config.dataset} → {config.val_dataset} | "
-          f"Score compression: {config.score_compression}")
+          f"Score compression: {config.score_compression} | Scoring: {scoring}")
     print("=" * W)
 
     def _v(v):
         return "—" if v < 0.01 else f"{v:.1f}"
 
-    def _row(label, s, l, sub):
-        print(f"  {label:<30} {_v(s):>12} {_v(l):>12} {_v(sub):>12}")
-
-    print(f"  {'Component':<30} {'Standard':>12} {'Layerwise':>12} {'Subset':>12}")
+    if has_op:
+        def _row(label, s, l, sub, op):
+            print(f"  {label:<30} {_v(s):>12} {_v(l):>12} {_v(sub):>12} {_v(op):>12}")
+        print(f"  {'Component':<30} {'Standard':>12} {'Layerwise':>12} {'Subset 2P':>12} {'Subset 1P':>12}")
+    else:
+        def _row(label, s, l, sub, op=0):
+            print(f"  {label:<30} {_v(s):>12} {_v(l):>12} {_v(sub):>12}")
+        print(f"  {'Component':<30} {'Standard':>12} {'Layerwise':>12} {'Subset':>12}")
     print("-" * W)
 
     s_fwd, s_bwd, s_opt = standard['forward'], standard['backward'], standard['optimizer']
@@ -506,19 +753,39 @@ def print_results(standard, layerwise, subset, config, peak_mem):
     l_total = l_fwd + l_bwd + l_opt
     sub_total = sub_p1f + sub_p1b + sub_sel + sub_p2f + sub_p2b + sub_opt
 
-    _row("Forward", s_fwd, l_fwd, sub_p1f)
-    _row("Backward", s_bwd, l_bwd, sub_p1b)
-    _row("Selection", 0, 0, sub_sel)
-    _row("Pass-2 Forward", 0, 0, sub_p2f)
-    _row("Pass-2 Backward", 0, 0, sub_p2b)
-    _row("Optimizer", s_opt, l_opt, sub_opt)
+    if has_op:
+        op_fwd = subset_one_pass['forward']
+        op_bwd = subset_one_pass['backward']
+        op_sel = subset_one_pass['selection']
+        op_asm = subset_one_pass['wgrad']
+        op_opt = subset_one_pass['optimizer']
+        op_total = op_fwd + op_bwd + op_sel + op_asm + op_opt
+    else:
+        op_fwd = op_bwd = op_sel = op_asm = op_opt = op_total = 0
+
+    _row("Forward", s_fwd, l_fwd, sub_p1f, op_fwd)
+    _row("Backward (score+retain)", s_bwd, l_bwd, sub_p1b + sub_sel, op_bwd + op_sel)
+    _row("Pass-2 Fwd+Bwd / Assembly", 0, 0, sub_p2f + sub_p2b, op_asm)
+    _row("Optimizer", s_opt, l_opt, sub_opt, op_opt)
     print("-" * W)
-    print(f"  {'TOTAL':<30} {s_total:>11.1f}  {l_total:>11.1f}  {sub_total:>11.1f}")
-    print(f"  {'Peak Memory':<30} {peak_mem.get('standard',0):>10.2f} GB"
-          f" {peak_mem.get('layerwise',0):>10.2f} GB"
-          f" {peak_mem.get('subset',0):>10.2f} GB")
-    print(f"  {'Overhead vs Standard':<30} {'':>12}"
-          f" {(l_total/s_total-1)*100:>10.1f}%  {(sub_total/s_total-1)*100:>10.1f}%")
+
+    totals = f"  {'TOTAL':<30} {s_total:>11.1f}  {l_total:>11.1f}  {sub_total:>11.1f}"
+    if has_op: totals += f"  {op_total:>11.1f}"
+    print(totals)
+
+    mem_line = (f"  {'Peak Memory':<30} {peak_mem.get('standard',0):>10.2f} GB"
+                f" {peak_mem.get('layerwise',0):>10.2f} GB"
+                f" {peak_mem.get('subset',0):>10.2f} GB")
+    if has_op: mem_line += f" {peak_mem.get('subset_one_pass',0):>10.2f} GB"
+    print(mem_line)
+
+    ovh = f"  {'Overhead vs Standard':<30} {'':>12} {(l_total/s_total-1)*100:>10.1f}%  {(sub_total/s_total-1)*100:>10.1f}%"
+    if has_op: ovh += f"  {(op_total/s_total-1)*100:>10.1f}%"
+    print(ovh)
+
+    if has_op:
+        savings = (1 - op_total/sub_total) * 100 if sub_total > 0 else 0
+        print(f"  {'1P savings vs 2P':<30} {'':>38} {savings:>10.1f}%")
 
     # Detailed breakdowns
     print()
@@ -559,27 +826,46 @@ def print_results(standard, layerwise, subset, config, peak_mem):
     l_items.append(("autograd overhead", l_bwd - l_measured))
     _bkd("Layerwise", l_items, l_bwd)
 
-    # Subset
+    # Subset two-pass
     p1_act = subset.get('p1_act_grad', 0)
     p1_comp = subset.get('p1_compress', 0)
     p1_score = subset.get('p1_score', 0)
     p1_measured = p1_act + p1_comp + p1_score
+    p1_total = sub_p1b + sub_sel
     p1_items = [("act_grad (chain rule)", p1_act),
                 ("compress (sparsifier.forward)", p1_comp),
                 ("score (accumulate)", p1_score),
+                ("selection (top-k)", sub_sel),
                 ("autograd overhead", sub_p1b - p1_measured)]
-    _bkd("Subset pass 1 (scoring)", p1_items, sub_p1b)
+    _bkd("Subset two-pass: pass 1 (scoring)", p1_items, p1_total)
     p2_act = subset.get('p2_act_grad', 0)
     p2_wg = subset.get('p2_wgrad', 0)
     p2_measured = p2_act + p2_wg
     p2_overhead = sub_p2b - p2_measured if p2_measured > 0.01 else 0
-    print(f"  Subset pass 2 (w.grad on selected):")
+    print(f"  Subset two-pass: pass 2 (w.grad on selected):")
     print(f"    {'forward':<33} {sub_p2f:>8.1f} ms")
     if p2_act > 0.01:
         print(f"    {'act_grad (chain rule)':<33} {p2_act:>8.1f} ms")
         print(f"    {'w.grad':<33} {p2_wg:>8.1f} ms")
         print(f"    {'autograd overhead':<33} {p2_overhead:>8.1f} ms")
     print(f"    {'backward':<33} {sub_p2b:>8.1f} ms")
+
+    # Subset one-pass
+    if has_op:
+        op_act = subset_one_pass.get('act_grad', 0)
+        op_comp = subset_one_pass.get('compress', 0)
+        op_score = subset_one_pass.get('score', 0)
+        op_retain = subset_one_pass.get('retain', 0)
+        op_measured = op_act + op_comp + op_score + op_retain
+        op_items = [("act_grad (chain rule)", op_act),
+                    ("compress (sparsifier.forward)", op_comp),
+                    ("score (accumulate)", op_score),
+                    ("retain (save per-layer data)", op_retain),
+                    ("selection (top-k)", op_sel),
+                    ("assembly (w.grad from retained)", op_asm),
+                    ("autograd overhead", op_bwd - op_measured)]
+        _bkd("Subset one-pass (score+retain+assemble)", op_items,
+             op_bwd + op_sel + op_asm)
 
     print("=" * W)
 
@@ -610,6 +896,9 @@ def run_method(method, config):
     elif method == "subset":
         result = measure_subset(model, optimizer, grad_hook,
                                 train_batches, val_batches, config, tokenizer)
+    elif method == "subset_one_pass":
+        result = measure_subset_one_pass(model, optimizer, grad_hook,
+                                         train_batches, val_batches, config, tokenizer)
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -623,7 +912,8 @@ def _build_config(args):
                       ('seq_length','seq_length'), ('val_batch_size','val_batch_size'),
                       ('dataset','dataset'), ('val_dataset','val_dataset'),
                       ('num_warmup','num_warmup'), ('num_iterations','num_iterations'),
-                      ('seed','seed'), ('score_compression','score_compression')]:
+                      ('seed','seed'), ('score_compression','score_compression'),
+                      ('scoring_method','scoring_method')]:
         val = getattr(args, arg, None)
         if val is not None:
             kwargs[attr] = val
@@ -647,6 +937,8 @@ def main():
     parser.add_argument('--val-dataset', type=str, default=None,
                         choices=['samsum', 'gsm8k', 'tydiqa', 'mmlu', 'bbh', 'math500'])
     parser.add_argument('--score-compression', type=str, default=None)
+    parser.add_argument('--scoring-method', type=str, default=None,
+                        choices=['ghost', 'ghost_greats', 'direct', 'compress'])
     parser.add_argument('--num-warmup', type=int, default=None)
     parser.add_argument('--num-iterations', type=int, default=None)
     parser.add_argument('--use-second-order', action='store_true')
@@ -679,7 +971,8 @@ def main():
     for attr, flag in [('model_name','--model'), ('dtype','--dtype'), ('batch_size','--batch-size'),
                        ('seq_length','--seq-length'), ('val_batch_size','--val-batch-size'),
                        ('dataset','--dataset'), ('val_dataset','--val-dataset'),
-                       ('score_compression','--score-compression'), ('num_warmup','--num-warmup'),
+                       ('score_compression','--score-compression'), ('scoring_method','--scoring-method'),
+                       ('num_warmup','--num-warmup'),
                        ('num_iterations','--num-iterations'), ('seed','--seed')]:
         val = getattr(config, attr)
         if val != getattr(d, attr):
@@ -707,9 +1000,13 @@ def main():
         peak_mem[method] = result.get("peak_memory_gb", 0)
         print(f"  Done. Peak memory: {peak_mem[method]:.2f} GB")
 
-    if all(m in all_results for m in METHODS):
-        print_results(all_results["standard"], all_results["layerwise"],
-                      all_results["subset"], config, peak_mem)
+    required = ["standard", "layerwise", "subset"]
+    if all(m in all_results for m in required):
+        print_results(
+            all_results["standard"], all_results["layerwise"],
+            all_results["subset"], config, peak_mem,
+            subset_one_pass=all_results.get("subset_one_pass"),
+        )
         if args.output:
             with open(args.output, 'w') as f:
                 json.dump({"config": asdict(config), "results": all_results}, f, indent=2)

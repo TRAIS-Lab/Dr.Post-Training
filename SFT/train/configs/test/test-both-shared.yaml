@@ -3,10 +3,8 @@
 method: Layerwise
 finetuning: MeSO
 
-score_grad_compression:
-  sparsifier: normal-512*512
-  projector: none
-
-opt_grad_compression:
-  sparsifier: normal-512*512
-  projector: none
+scoring:
+  method: compress
+  compression: normal-512*512
+optimizer:
+  compression: normal-512*512

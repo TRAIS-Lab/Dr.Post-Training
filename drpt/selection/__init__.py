@@ -14,10 +14,10 @@ This module provides two families of strategies for computing validation gradien
    - Training uses cached val gradients for curation scoring
    - Factory: create_separate_batch_strategy()
    - Avoids padding overhead - val and train can have different seq lengths
-   - Supports two caching modes via start_val_capture(use_factorized=...):
-     * Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
+   - Val storage mode is derived from scoring_method in start_val_capture():
+       * ghost/direct: Stores total gradient [O, I] per layer.
        Better when validation batch is large (e.g., self-reference validation in RLHF).
-     * Cached factors mode (use_factorized=True): Stores [V, S, O] and [V, S, I] components.
+       * ghost_greats: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
        More memory-efficient during training as it avoids materializing [B_train, O, I].
        Better when validation batch is small (e.g., external validation set in SFT).
 """
@@ -34,12 +34,14 @@ from .strategies import (
     MergedBatchNoSelectionStrategy,
     MergedBatchLayerwiseStrategy,
     MergedBatchSubsetStrategy,
+    MergedBatchSubsetOnePassStrategy,
     create_merged_batch_strategy,
     # SeparateBatch strategies
     SeparateBatchStrategy,
     SeparateBatchNoSelectionStrategy,
     SeparateBatchLayerwiseStrategy,
     SeparateBatchSubsetStrategy,
+    SeparateBatchSubsetOnePassStrategy,
     create_separate_batch_strategy,
 )
 
@@ -57,11 +59,13 @@ __all__ = [
     "MergedBatchNoSelectionStrategy",
     "MergedBatchLayerwiseStrategy",
     "MergedBatchSubsetStrategy",
+    "MergedBatchSubsetOnePassStrategy",
     "create_merged_batch_strategy",
     # SeparateBatch strategies
     "SeparateBatchStrategy",
     "SeparateBatchNoSelectionStrategy",
     "SeparateBatchLayerwiseStrategy",
     "SeparateBatchSubsetStrategy",
+    "SeparateBatchSubsetOnePassStrategy",
     "create_separate_batch_strategy",
 ]

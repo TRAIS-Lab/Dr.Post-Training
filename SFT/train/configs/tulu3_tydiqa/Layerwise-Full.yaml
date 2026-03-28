@@ -3,6 +3,6 @@ method: Layerwise
 finetuning: Full
 learning_rate: 3.36e-05
 
-score_grad_compression:
-  sparsifier: normal-64*64
-  projector: none
+scoring:
+  method: compress
+  compression: normal-64*64

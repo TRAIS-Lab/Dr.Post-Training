@@ -14,10 +14,10 @@ gradients are obtained:
    - Val gradients are pre-captured and cached before training
    - Training uses cached val gradients for curation scoring
    - Factory: create_separate_batch_strategy()
-   - Supports two caching modes via start_val_capture(use_factorized=...):
-     * Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
+   - Val storage mode is derived from scoring_method in start_val_capture():
+       * ghost/direct: Stores total gradient [O, I] per layer.
        Better when validation batch is large (e.g., self-reference validation in RLHF).
-     * Cached factors mode (use_factorized=True): Stores [V, S, O] and [V, S, I] components.
+       * ghost_greats: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
        More memory-efficient during training as it avoids materializing [B_train, O, I].
        Better when validation batch is small (e.g., external validation set in SFT).
 """
@@ -62,6 +62,7 @@ class MergedBatchStrategy(ABC):
         use_second_order: bool = False,
         selection_mode: str = "topk",
         record_selections: bool = False,
+        scoring_method: str = "ghost",
     ):
         """
         Initialize curation strategy.
@@ -72,12 +73,14 @@ class MergedBatchStrategy(ABC):
             use_second_order: Use greedy curation with second-order
             selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
             record_selections: If True, record curation data for case study analysis
+            scoring_method: Scoring method for influence scores ("ghost", "ghost_greats", "direct")
         """
         self.grad_hook = grad_hook
         self.frac = frac
         self.use_second_order = use_second_order
         self.selection_mode = selection_mode
         self.record_selections = record_selections
+        self.scoring_method = scoring_method
         self.last_selection_record = None
 
     @property
@@ -213,6 +216,7 @@ class MergedBatchLayerwiseStrategy(MergedBatchStrategy):
             use_second_order=self.use_second_order,
             selection_mode=self.selection_mode,
             record_selections=self.record_selections,
+            scoring_method=self.scoring_method,
         )
 
         self.grad_hook.selection_state = state
@@ -246,6 +250,7 @@ class MergedBatchLayerwiseWithValStrategy(MergedBatchLayerwiseStrategy):
             use_second_order=self.use_second_order,
             selection_mode=self.selection_mode,
             record_selections=self.record_selections,
+            scoring_method=self.scoring_method,
             include_val_in_update=True,
         )
 
@@ -350,6 +355,7 @@ class MergedBatchSubsetStrategy(MergedBatchStrategy):
             use_second_order=self.use_second_order,
             selection_mode=self.selection_mode,
             record_selections=self.record_selections,
+            scoring_method=self.scoring_method,
         )
 
         self.grad_hook.selection_state = state
@@ -360,6 +366,89 @@ class MergedBatchSubsetStrategy(MergedBatchStrategy):
         self.grad_hook.clear_token_counts()
 
 
+class MergedBatchSubsetOnePassStrategy(MergedBatchStrategy):
+    """
+    One-pass subset strategy with merged batch (Algorithm 4.2).
+
+    Single forward+backward pass: scoring and data retention happen during backward,
+    then post-hoc gradient assembly from retained (grad_output, input) per layer.
+    Saves the second forward+backward at the cost of higher peak memory.
+    """
+
+    def execute_training_step(
+        self,
+        model: nn.Module,
+        merged_batch: Dict[str, Tensor],
+        train_batch_size: int,
+        compute_loss_fn: Callable[[nn.Module, Dict[str, Tensor]], Tensor],
+        **kwargs
+    ) -> Tensor:
+        """Training step with one-pass global curation."""
+        lr = kwargs.get('lr', 1e-4)
+
+        # Set up SubsetState with one_pass=True
+        self._setup_state(train_batch_size, lr)
+
+        if 'labels' in merged_batch:
+            self.grad_hook.set_token_counts(merged_batch['labels'], train_batch_size)
+
+        model.zero_grad()
+        loss = compute_loss_fn(model, merged_batch)
+        loss.backward()
+        # After backward: scores accumulated in state, layer data retained in hook
+
+        # Get globally selected indices
+        state: SubsetState = self.grad_hook.selection_state
+        selected_indices = state.get_final_selection()
+        selected_indices = selected_indices.sort()[0]
+        n_selected = len(selected_indices)
+
+        # Extract curation records before cleanup
+        self._extract_selection_records()
+
+        if n_selected == 0:
+            self.grad_hook.clear_retained_data()
+            self._cleanup()
+            import torch
+            return torch.tensor(0.0, device=next(model.parameters()).device)
+
+        # Compute scale factor for exact parity with two-pass
+        scale_factor = state._compute_scale_factor_for_assembly(selected_indices)
+
+        # Post-hoc gradient assembly from retained data
+        model.zero_grad()
+        self.grad_hook.assemble_gradients_from_retained(selected_indices, scale_factor)
+
+        self._cleanup()
+        return loss.detach()
+
+    def _setup_state(self, train_batch_size: int, lr: float) -> None:
+        """Set up SubsetState with one_pass=True."""
+        dtype = next(self.grad_hook.model.parameters()).dtype
+
+        state = SubsetState(
+            train_batch_size=train_batch_size,
+            num_layers=len(self.grad_hook.layer_names),
+            frac=self.frac,
+            lr=lr,
+            device=self.grad_hook.device,
+            dtype=dtype,
+            use_second_order=self.use_second_order,
+            selection_mode=self.selection_mode,
+            record_selections=self.record_selections,
+            scoring_method=self.scoring_method,
+            one_pass=True,
+        )
+
+        self.grad_hook.selection_state = state
+
+    def _cleanup(self) -> None:
+        """Clean up after training step."""
+        self.grad_hook.clear_selection()
+        self.grad_hook.clear_token_counts()
+        self.grad_hook.clear_retained_data()  # Safety net
+
+
 def create_merged_batch_strategy(
     method: str,
     grad_hook: Optional[GradientHook],
@@ -367,6 +456,8 @@ def create_merged_batch_strategy(
     use_second_order: bool = False,
     selection_mode: str = "topk",
     record_selections: bool = False,
+    scoring_method: str = "ghost",
+    subset_mode: str = "one_pass",
 ) -> MergedBatchStrategy:
     """
     Factory function to create merged-batch curation strategy.
@@ -380,21 +471,30 @@ def create_merged_batch_strategy(
         use_second_order: Use greedy curation with second-order
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
         record_selections: If True, record curation data for case study analysis
+        scoring_method: Scoring method ("ghost", "ghost_greats", "direct", "compress")
+        subset_mode: For Subset method: "one_pass" (Algorithm 4.2) or "two_pass" (Algorithm 4.3)
 
     Returns:
         Appropriate MergedBatchStrategy instance
     """
+    kwargs = dict(grad_hook=grad_hook, frac=frac, use_second_order=use_second_order,
+                  selection_mode=selection_mode, record_selections=record_selections,
+                  scoring_method=scoring_method)
+
     if method == "NA":
-        return MergedBatchNoSelectionStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
+        return MergedBatchNoSelectionStrategy(**kwargs)
 
     if method == "Layerwise":
-        return MergedBatchLayerwiseStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
+        return MergedBatchLayerwiseStrategy(**kwargs)
 
     if method == "LayerwiseWithVal":
-        return MergedBatchLayerwiseWithValStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
+        return MergedBatchLayerwiseWithValStrategy(**kwargs)
 
     if method == "Subset":
-        return MergedBatchSubsetStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
+        if subset_mode == "one_pass":
+            return MergedBatchSubsetOnePassStrategy(**kwargs)
+        else:
+            return MergedBatchSubsetStrategy(**kwargs)
 
     raise ValueError(f"Unknown curation method: {method}")
 
@@ -414,10 +514,10 @@ class SeparateBatchStrategy(ABC):
     Used when val gradients are pre-captured and cached before training,
     rather than computed from a merged batch during the same forward pass.
 
-    Supports two caching modes via start_val_capture(use_factorized=...):
-    - Cached grad mode (use_factorized=False): Stores total gradient [O, I] per layer.
+    Val storage mode is derived from scoring_method in start_val_capture():
+    - ghost/direct: Stores total gradient [O, I] per layer.
       Better when validation batch is large (e.g., self-reference validation in RLHF).
-    - Cached factors mode (use_factorized=True): Stores [V, S, O] and [V, S, I] components.
+    - ghost_greats: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
       More memory-efficient during training. Better when validation batch is small.
     """
 
@@ -428,6 +528,7 @@ class SeparateBatchStrategy(ABC):
         use_second_order: bool = False,
         selection_mode: str = "topk",
         record_selections: bool = False,
+        scoring_method: str = "ghost",
     ):
         """
         Initialize stored-val curation strategy.
@@ -440,12 +541,14 @@ class SeparateBatchStrategy(ABC):
             use_second_order: Use greedy curation with second-order
             selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
             record_selections: If True, record curation data for case study analysis
+            scoring_method: Scoring method ("ghost", "ghost_greats", "direct", "compress")
         """
         self.grad_hook = grad_hook
         self.frac = frac
         self.use_second_order = use_second_order
         self.selection_mode = selection_mode
         self.record_selections = record_selections
+        self.scoring_method = scoring_method
         self.last_selection_record = None
 
     @property
@@ -592,6 +695,7 @@ class SeparateBatchLayerwiseStrategy(SeparateBatchStrategy):
             use_second_order=self.use_second_order,
             selection_mode=self.selection_mode,
             record_selections=self.record_selections,
+            scoring_method=self.scoring_method,
         )
 
     def _cleanup(self) -> None:
@@ -695,11 +799,91 @@ class SeparateBatchSubsetStrategy(SeparateBatchStrategy):
             use_second_order=self.use_second_order,
             selection_mode=self.selection_mode,
             record_selections=self.record_selections,
+            scoring_method=self.scoring_method,
         )
 
     def _cleanup(self) -> None:
         """Clean up after training step."""
         self.grad_hook.clear_selection()
+
+
+class SeparateBatchSubsetOnePassStrategy(SeparateBatchStrategy):
+    """
+    One-pass subset strategy with separate val batch (Algorithm 4.2).
+
+    Recommended one-pass mode: exact scale factor parity with two-pass since
+    batch_total_tokens == train_total_tokens in separate batch mode.
+    """
+
+    def execute_training_step(
+        self,
+        model: nn.Module,
+        batch_size: int,
+        compute_loss_fn: Callable[[], Tuple[Tensor, Dict]],
+        lr: float,
+        **kwargs
+    ) -> Tuple[Tensor, Dict]:
+        """Training step with one-pass global curation using stored val grads."""
+        labels = kwargs.get('labels')
+
+        # Set up SubsetState with one_pass=True and stored val
+        self._setup_state(batch_size, lr)
+
+        if labels is not None:
+            self.grad_hook.set_token_counts(labels, batch_size)
+
+        model.zero_grad()
+        loss, stats = compute_loss_fn()
+        loss.backward()
+        # After backward: scores accumulated, layer data retained
+
+        # Get globally selected indices
+        selected_indices = self.grad_hook.selection_state.get_final_selection()
+        selected_indices = selected_indices.sort()[0]
+        n_selected = len(selected_indices)
+
+        # Extract curation records before cleanup
+        self._extract_selection_records()
+
+        if n_selected == 0:
+            self.grad_hook.clear_retained_data()
+            self._cleanup()
+            import torch
+            zero_loss = torch.tensor(0.0, device=next(model.parameters()).device)
+            stats["selection/n_selected"] = 0
+            return zero_loss, stats
+
+        # Compute scale factor for exact parity with two-pass
+        state = self.grad_hook.selection_state
+        scale_factor = state._compute_scale_factor_for_assembly(selected_indices)
+
+        # Post-hoc gradient assembly
+        model.zero_grad()
+        self.grad_hook.assemble_gradients_from_retained(selected_indices, scale_factor)
+
+        stats["selection/n_selected"] = n_selected
+        self._cleanup()
+        return loss.detach(), stats
+
+    def _setup_state(self, batch_size: int, lr: float) -> None:
+        """Set up SubsetState with one_pass=True and stored val gradients."""
+        self.grad_hook.setup_selection_with_stored_val(
+            train_batch_size=batch_size,
+            selection_method="Subset",
+            frac=self.frac,
+            lr=lr,
+            compute_scores_only=True,
+            use_second_order=self.use_second_order,
+            selection_mode=self.selection_mode,
+            record_selections=self.record_selections,
+            scoring_method=self.scoring_method,
+            one_pass=True,
+        )
+
+    def _cleanup(self) -> None:
+        """Clean up after training step."""
+        self.grad_hook.clear_selection()
+        self.grad_hook.clear_retained_data()  # Safety net
 
 
 def create_separate_batch_strategy(
@@ -709,6 +893,8 @@ def create_separate_batch_strategy(
     use_second_order: bool = False,
     selection_mode: str = "topk",
     record_selections: bool = False,
+    scoring_method: str = "ghost",
+    subset_mode: str = "one_pass",
 ) -> SeparateBatchStrategy:
     """
     Factory function to create separate-batch curation strategy.
@@ -724,17 +910,26 @@ def create_separate_batch_strategy(
         use_second_order: Use greedy curation with second-order
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
         record_selections: If True, record curation data for case study analysis
+        scoring_method: Scoring method ("ghost", "ghost_greats", "direct", "compress")
+        subset_mode: For Subset method: "one_pass" (Algorithm 4.2) or "two_pass" (Algorithm 4.3)
 
     Returns:
         Appropriate SeparateBatchStrategy instance
     """
+    kwargs = dict(grad_hook=grad_hook, frac=frac, use_second_order=use_second_order,
+                  selection_mode=selection_mode, record_selections=record_selections,
+                  scoring_method=scoring_method)
+
     if method == "NA":
-        return SeparateBatchNoSelectionStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
+        return SeparateBatchNoSelectionStrategy(**kwargs)
 
     if method == "Layerwise":
-        return SeparateBatchLayerwiseStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
+        return SeparateBatchLayerwiseStrategy(**kwargs)
 
     if method == "Subset":
-        return SeparateBatchSubsetStrategy(grad_hook, frac, use_second_order, selection_mode, record_selections)
+        if subset_mode == "one_pass":
+            return SeparateBatchSubsetOnePassStrategy(**kwargs)
+        else:
+            return SeparateBatchSubsetStrategy(**kwargs)
 
     raise ValueError(f"Unknown curation method: {method}")

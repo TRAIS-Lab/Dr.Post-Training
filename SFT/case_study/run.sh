@@ -17,16 +17,16 @@ export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 # Defaults
 model="meta-llama/Llama-3.2-1B"
-data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
+data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
 task="tydiqa"
 train_dataset="tulu3"
 subject="sociology"
-percentage=0.005
+percentage=0.01
 seed=42
 batch_size=8
-n_val=8
+n_val=16
 n_eval=500
-lr="3.61e-05"  # Standard-Full LR for tulu3_tydiqa
+lr="4.96e-05"  # Standard-Full LR for tulu3_tydiqa
 selection_frac="0.5"
 val_batch_size="1"
 val_strategy="separate_batch_factorized"

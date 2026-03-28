@@ -113,10 +113,14 @@ reset_config() {
     # Method
     cfg_method="Standard"
     cfg_finetuning="LoRA"
-    cfg_score_sparsifier=""
-    cfg_score_projector=""
-    cfg_opt_sparsifier=""
-    cfg_opt_projector=""
+
+    # Scoring
+    cfg_scoring_method="ghost"
+    cfg_score_compression=""
+    cfg_subset_mode="two_pass"
+
+    # Optimizer compression
+    cfg_opt_compression=""
 
     # Model
     cfg_model="EleutherAI/gpt-neo-2.7B"
@@ -194,10 +198,18 @@ parse_yaml() {
         case "$key" in
             method)                              cfg_method="$val" ;;
             finetuning)                          cfg_finetuning="$val" ;;
-            score_grad_compression.sparsifier)   cfg_score_sparsifier="$val" ;;
-            score_grad_compression.projector)    cfg_score_projector="$val" ;;
-            opt_grad_compression.sparsifier)     cfg_opt_sparsifier="$val" ;;
-            opt_grad_compression.projector)      cfg_opt_projector="$val" ;;
+            # New nested structure
+            scoring.method)                      cfg_scoring_method="$val" ;;
+            scoring.compression)                 cfg_score_compression="$val" ;;
+            optimizer.compression)               cfg_opt_compression="$val" ;;
+            optimizer.refresh_freq)              cfg_update_compressor_freq="$val" ;;
+            scoring_method)                      cfg_scoring_method="$val" ;;
+            subset_mode)                         cfg_subset_mode="$val" ;;
+            # Legacy keys (backward compat)
+            score_grad_compression.sparsifier)   cfg_score_compression="$val" ;;
+            score_grad_compression.projector)    ;; # Ignored
+            opt_grad_compression.sparsifier)     cfg_opt_compression="$val" ;;
+            opt_grad_compression.projector)      ;; # Ignored
             model)                               cfg_model="$val" ;;
             reward_model)                        cfg_reward_model="$val" ;;
             task)                                cfg_task="$val" ;;
@@ -385,13 +397,23 @@ $FIXED_ARGS \
     # Flash attention
     cmd="$cmd --use_flash_attention=$([[ "$cfg_use_flash_attention" == "true" ]] && echo True || echo False)"
 
-    # Compression
-    [[ -n "$cfg_opt_sparsifier" && "$cfg_opt_sparsifier" != "none" ]] && \
-        cmd="$cmd --sparsification=$cfg_opt_sparsifier --update_compressor_freq=$cfg_update_compressor_freq"
-    [[ -n "$cfg_opt_projector" && "$cfg_opt_projector" != "none" ]] && \
-        cmd="$cmd --projection=$cfg_opt_projector"
-    [[ -n "$cfg_score_sparsifier" && "$cfg_score_sparsifier" != "none" ]] && \
-        cmd="$cmd --score_compression=$cfg_score_sparsifier"
+    # Scoring method
+    cmd="$cmd --scoring_method=$cfg_scoring_method --subset_mode=$cfg_subset_mode"
+
+    # Scoring compression: parse "SPARSIFIER" or "SPARSIFIER/PROJECTOR" format
+    if [[ -n "$cfg_score_compression" && "$cfg_score_compression" != "none" ]]; then
+        cmd="$cmd --score_compression=${cfg_score_compression%%/*}"
+    fi
+
+    # Optimizer compression: parse "SPARSIFIER" or "SPARSIFIER/PROJECTOR" format
+    if [[ -n "$cfg_opt_compression" && "$cfg_opt_compression" != "none" ]]; then
+        local opt_sparsifier="${cfg_opt_compression%%/*}"
+        cmd="$cmd --sparsification=$opt_sparsifier --update_compressor_freq=$cfg_update_compressor_freq"
+        if [[ "$cfg_opt_compression" == */* ]]; then
+            local opt_projector="${cfg_opt_compression##*/}"
+            [[ "$opt_projector" != "none" ]] && cmd="$cmd --projection=$opt_projector"
+        fi
+    fi
 
     # Second-order
     [[ "$internal_method" != "NA" && "$cfg_use_second_order" == "true" ]] && \

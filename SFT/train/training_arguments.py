@@ -164,6 +164,29 @@ class TrainingArguments(TA):
             )
         },
     )
+    scoring_method: str = field(
+        default="ghost",
+        metadata={
+            "help": (
+                "Scoring method for influence score computation: "
+                "'ghost' (default, our ghost inner product, never materializes per-sample grads), "
+                "'ghost_greats' (GREATS-style ghost IP, materializes for 3D but true ghost for 2D), "
+                "'direct' (explicit per-sample gradient materialization), "
+                "'compress' (compressed per-sample gradients, requires score_compression to be set)."
+            )
+        },
+    )
+    subset_mode: str = field(
+        default="one_pass",
+        metadata={
+            "help": (
+                "Subset descent mode (only used when method='Subset'): "
+                "'one_pass' (default, Algorithm 4.2): Single forward+backward pass, "
+                "retains activations for post-hoc gradient assembly. "
+                "'two_pass' (Algorithm 4.3): First pass for scoring, second pass on selected subset."
+            )
+        },
+    )
     use_second_order: bool = field(
         default=False,
         metadata={

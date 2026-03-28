@@ -101,6 +101,11 @@ class GradientHook:
         self.total_tokens: Optional[Tensor] = None
         self.tokens_per_sample: Optional[Tensor] = None
 
+        # Retained layer data for one-pass subset descent (Algorithm 4.2)
+        # During backward, SubsetLinearBackward stores (grad_output, input) per layer
+        # so we can assemble gradients post-hoc after global selection
+        self._retained_data: Dict[int, Tuple[Tensor, Tensor]] = {}
+
         # Register hooks
         self._register_hooks()
 
@@ -237,6 +242,7 @@ class GradientHook:
         use_second_order: bool = False,
         selection_mode: str = "topk",
         scoring_method: str = "ghost",
+        one_pass: bool = False,
     ) -> None:
         """
         Set up curation state for Dr. Post-Training.
@@ -257,6 +263,20 @@ class GradientHook:
             logger.debug("Set up baseline mode (no curation)")
             return
 
+        # Validate scoring_method vs compressor state
+        has_score_comp = any(c is not None for c in self.score_compressors)
+        if scoring_method == "compress" and not has_score_comp:
+            raise ValueError(
+                "scoring_method='compress' requires score compressors to be configured. "
+                "Set score_compression in your config or call set_score_compressors()."
+            )
+        if has_score_comp and scoring_method != "compress":
+            logger.warning(
+                f"Score compressors are configured but scoring_method='{scoring_method}'. "
+                f"Compressors will be ignored for scoring. "
+                f"Set scoring_method='compress' to use compressed scoring."
+            )
+
         dtype = next(self.model.parameters()).dtype
         num_layers = len(self.layer_names)
 
@@ -271,6 +291,7 @@ class GradientHook:
                 use_second_order=use_second_order,
                 selection_mode=selection_mode,
                 scoring_method=scoring_method,
+                one_pass=one_pass,
             )
         elif selection_method == "Layerwise":
             self.selection_state = LayerwiseState(
@@ -281,7 +302,8 @@ class GradientHook:
                 device=self.device,
                 dtype=dtype,
                 use_second_order=use_second_order,
-                selection_mode=selection_mode
+                selection_mode=selection_mode,
+                scoring_method=scoring_method,
             )
         else:
             raise ValueError(
@@ -361,22 +383,30 @@ class GradientHook:
         """Get total tokens in validation batch."""
         return self._val_cache.total_tokens
 
-    def start_val_capture(self, use_factorized: bool = True) -> None:
+    def start_val_capture(self, scoring_method: str = "ghost") -> None:
         """
         Start capturing validation gradients.
 
-        Args:
-            use_factorized: If True, store (grad_output, input) components.
-                           If False, store total gradient [O, I] per layer.
-        """
-        mode = "factorized" if use_factorized else "full"
+        The storage mode is derived from the scoring method:
+        - compress      → compressed storage [k] per layer
+        - ghost_greats  → factorized storage (val_go, val_inp) per layer
+                          (needed for pairwise dot products across val samples)
+        - ghost/direct  → full storage G_val [O, I] per layer
+                          (only the summed gradient is needed)
 
-        # Use compressed storage if score compressors are available
-        if self.compression_mode.uses_compressed_scoring:
+        Args:
+            scoring_method: Scoring method for upcoming training.
+        """
+        if scoring_method == "compress" and self.compression_mode.uses_compressed_scoring:
             mode = "compressed"
+        elif scoring_method == "ghost_greats":
+            mode = "factorized"
+        else:
+            # ghost, direct: only need the summed val gradient
+            mode = "full"
 
         self._val_cache.start_capture(mode=mode)
-        logger.debug(f"Started validation gradient capture mode (mode={mode})")
+        logger.debug(f"Started validation gradient capture mode (mode={mode}, scoring={scoring_method})")
 
     def end_val_capture(self, val_total_tokens: Optional[int] = None) -> None:
         """
@@ -411,6 +441,7 @@ class GradientHook:
         selection_mode: str = "topk",
         record_selections: bool = False,
         scoring_method: str = "ghost",
+        one_pass: bool = False,
     ) -> None:
         """
         Set up curation state using pre-captured validation gradients.
@@ -424,14 +455,26 @@ class GradientHook:
             use_second_order: If True, use greedy curation
             selection_mode: "topk" or "filtering"
             record_selections: If True, record selected indices/scores for case study
-            scoring_method: For Subset: "ghost" (factored inner product) or "direct"
-                           (explicit per-sample gradient materialization, Algorithm 4.4)
+            scoring_method: Scoring method ("ghost", "ghost_greats", "direct", "compress")
+            one_pass: If True, enable one-pass subset mode (retain layer data for post-hoc assembly)
         """
         num_captured = self._val_cache.get_num_captured()
         if num_captured == 0:
             raise RuntimeError(
                 "No validation gradients captured. Call start_val_capture(), "
                 "run forward/backward on validation data, then end_val_capture() first."
+            )
+
+        # Validate scoring_method vs compressor state
+        has_score_comp = any(c is not None for c in self.score_compressors)
+        if scoring_method == "compress" and not has_score_comp:
+            raise ValueError(
+                "scoring_method='compress' requires score compressors to be configured."
+            )
+        if has_score_comp and scoring_method != "compress":
+            logger.warning(
+                f"Score compressors are configured but scoring_method='{scoring_method}'. "
+                f"Compressors will be ignored for scoring."
             )
 
         dtype = next(self.model.parameters()).dtype
@@ -449,6 +492,7 @@ class GradientHook:
                 selection_mode=selection_mode,
                 record_selections=record_selections,
                 scoring_method=scoring_method,
+                one_pass=one_pass,
             )
         elif selection_method == "Layerwise":
             self.selection_state = LayerwiseState(
@@ -461,6 +505,7 @@ class GradientHook:
                 use_second_order=use_second_order,
                 selection_mode=selection_mode,
                 record_selections=record_selections,
+                scoring_method=scoring_method,
             )
         else:
             raise ValueError(
@@ -513,6 +558,79 @@ class GradientHook:
     def get_compressed_grads(self) -> List[Optional[Tensor]]:
         """Get all captured compressed gradients."""
         return [self._get_compressed_grad(idx) for idx in range(len(self.layer_names))]
+
+    # =========================================================================
+    # Retained Layer Data (One-Pass Subset Descent)
+    # =========================================================================
+
+    def retain_layer_data(self, layer_idx: int, grad_output: Tensor, input: Tensor) -> None:
+        """Store grad_output and input for post-hoc gradient assembly (one-pass subset)."""
+        self._retained_data[layer_idx] = (grad_output.detach(), input.detach())
+
+    def clear_retained_data(self) -> None:
+        """Release all retained layer data."""
+        self._retained_data.clear()
+
+    def has_retained_data(self) -> bool:
+        """Check if any retained data is stored."""
+        return len(self._retained_data) > 0
+
+    def assemble_gradients_from_retained(
+        self,
+        selected_indices: Tensor,
+        scale_factor: Tensor,
+    ) -> None:
+        """
+        Assemble weight gradients for selected samples using retained layer data.
+
+        This is the post-hoc gradient assembly step in one-pass subset descent
+        (Algorithm 4.2). For each layer, computes:
+            g_l = scale_factor * Σ_{i∈S} grad_output_i ⊗ input_i
+        and assigns to param.grad.
+
+        For MeSO (update compression), compresses selected gradients instead.
+
+        Args:
+            selected_indices: Globally selected sample indices [K]
+            scale_factor: Scaling factor (batch_total_tokens / selected_tokens)
+        """
+        import torch
+        from .selection.utils import compute_selected_gradients, augment_input_for_bias
+
+        for layer_idx in range(len(self.layer_names)):
+            retained = self._retained_data.get(layer_idx)
+            if retained is None:
+                continue
+            grad_output, input_tensor = retained
+            module = self._get_module_from_idx(layer_idx)
+            has_bias = module.bias is not None
+
+            update_compressor = self.update_compressors[layer_idx]
+            if update_compressor is not None:
+                # MeSO mode: compress selected gradients and store for optimizer
+                sel_go = grad_output[selected_indices]
+                sel_inp = augment_input_for_bias(input_tensor[selected_indices], has_bias)
+                compressed = update_compressor.forward((sel_go, sel_inp))
+                reduced = compressed.mean(dim=0, keepdim=True) * scale_factor
+                self._store_compressed_grad(layer_idx, reduced)
+            else:
+                # Standard mode: compute full weight gradient
+                grad_weight, grad_bias = compute_selected_gradients(
+                    grad_output, input_tensor,
+                    selected_indices, has_bias, scale_factor
+                )
+                if grad_weight is not None:
+                    if module.weight.grad is None:
+                        module.weight.grad = grad_weight
+                    else:
+                        module.weight.grad.add_(grad_weight)
+                if grad_bias is not None and module.bias is not None:
+                    if module.bias.grad is None:
+                        module.bias.grad = grad_bias
+                    else:
+                        module.bias.grad.add_(grad_bias)
+
+        self.clear_retained_data()
 
     # =========================================================================
     # Compressor Management

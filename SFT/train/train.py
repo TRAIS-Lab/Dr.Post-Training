@@ -329,6 +329,19 @@ def main():
         else:
             logger.info("Gradient compression disabled (no selection and no MeSO)")
 
+    # Validate scoring_method vs compression config (strict — no auto-detection)
+    if has_score_compression and training_args.scoring_method != "compress":
+        raise ValueError(
+            f"scoring.compression is set ({training_args.score_compression}) but "
+            f"scoring.method='{training_args.scoring_method}'. "
+            f"Set scoring.method to 'compress' or remove scoring.compression."
+        )
+    if training_args.scoring_method == "compress" and not has_score_compression:
+        raise ValueError(
+            "scoring.method='compress' requires scoring.compression to be set. "
+            "Add 'compression: normal-64*64' under the scoring section."
+        )
+
     # Prepare validation dataset (used for data selection in layer-wise descent)
     # Use rejection sampling to filter out validation samples that are significantly
     # longer than the average training sequence length

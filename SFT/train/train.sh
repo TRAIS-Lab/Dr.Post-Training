@@ -116,10 +116,13 @@ reset_config() {
     # Method
     cfg_method="Standard"
     cfg_finetuning="Full"
-    cfg_score_sparsifier=""
-    cfg_score_projector=""
-    cfg_opt_sparsifier=""
-    cfg_opt_projector=""
+
+    # Scoring (nested under scoring: in YAML)
+    cfg_scoring_method="ghost"
+    cfg_score_compression=""     # Single string: "normal-64*64" or "normal-64*64/sjlt-512"
+
+    # Optimizer compression (nested under optimizer: in YAML)
+    cfg_opt_compression=""       # Single string: "normal-512*512" or "normal-512*512/sjlt-256"
 
     # Curation
     cfg_selection_frac="0.5"
@@ -128,6 +131,7 @@ reset_config() {
     cfg_val_batch_size="1"
     cfg_val_strategy="merged_batch"
     cfg_use_second_order="false"
+    cfg_subset_mode="one_pass"
 
     # LoRA
     cfg_lora_r="32"
@@ -190,16 +194,26 @@ parse_yaml() {
         case "$key" in
             method)                              cfg_method="$val" ;;
             finetuning)                          cfg_finetuning="$val" ;;
-            score_grad_compression.sparsifier)   cfg_score_sparsifier="$val" ;;
-            score_grad_compression.projector)    cfg_score_projector="$val" ;;
-            opt_grad_compression.sparsifier)     cfg_opt_sparsifier="$val" ;;
-            opt_grad_compression.projector)      cfg_opt_projector="$val" ;;
+            # New nested structure: scoring.method, scoring.compression
+            scoring.method)                      cfg_scoring_method="$val" ;;
+            scoring.compression)                 cfg_score_compression="$val" ;;
+            # New nested structure: optimizer.compression, optimizer.refresh_freq
+            optimizer.compression)               cfg_opt_compression="$val" ;;
+            optimizer.refresh_freq)              cfg_update_compressor_freq="$val" ;;
+            # Legacy keys (backward compatibility)
+            scoring_method)                      cfg_scoring_method="$val" ;;
+            score_grad_compression.sparsifier)   cfg_score_compression="$val" ;;
+            score_grad_compression.projector)    ;; # Ignored in new format
+            opt_grad_compression.sparsifier)     cfg_opt_compression="$val" ;;
+            opt_grad_compression.projector)      ;; # Ignored in new format
+            # Curation
             selection_frac)                      cfg_selection_frac="$val" ;;
             selection_mode)                      cfg_selection_mode="$val" ;;
             n_val)                               cfg_n_val="$val" ;;
             val_batch_size)                      cfg_val_batch_size="$val" ;;
             val_strategy)                        cfg_val_strategy="$val" ;;
             use_second_order)                    cfg_use_second_order="$val" ;;
+            subset_mode)                         cfg_subset_mode="$val" ;;
             lora_r)                              cfg_lora_r="$val" ;;
             lora_alpha)                          cfg_lora_alpha="$val" ;;
             lora_dropout)                        cfg_lora_dropout="$val" ;;
@@ -378,6 +392,8 @@ $fsdp_args \
 --selection_frac $cfg_selection_frac \
 --selection_mode $cfg_selection_mode \
 --val_strategy $cfg_val_strategy \
+--scoring_method $cfg_scoring_method \
+--subset_mode $cfg_subset_mode \
 --use_flash_attention $cfg_use_flash_attention"
 
     # Optional args
@@ -392,13 +408,20 @@ $fsdp_args \
         cmd="$cmd --lora False"
     fi
 
-    # Compression
-    [[ -n "$cfg_opt_sparsifier" && "$cfg_opt_sparsifier" != "none" ]] && \
-        cmd="$cmd --sparsification $cfg_opt_sparsifier --update_compressor_freq $cfg_update_compressor_freq"
-    [[ -n "$cfg_opt_projector" && "$cfg_opt_projector" != "none" ]] && \
-        cmd="$cmd --projection $cfg_opt_projector"
-    [[ -n "$cfg_score_sparsifier" && "$cfg_score_sparsifier" != "none" ]] && \
-        cmd="$cmd --score_compression $cfg_score_sparsifier"
+    # Scoring compression: parse "SPARSIFIER" or "SPARSIFIER/PROJECTOR" format
+    if [[ -n "$cfg_score_compression" && "$cfg_score_compression" != "none" ]]; then
+        cmd="$cmd --score_compression ${cfg_score_compression%%/*}"
+    fi
+
+    # Optimizer compression: parse "SPARSIFIER" or "SPARSIFIER/PROJECTOR" format
+    if [[ -n "$cfg_opt_compression" && "$cfg_opt_compression" != "none" ]]; then
+        local opt_sparsifier="${cfg_opt_compression%%/*}"
+        cmd="$cmd --sparsification $opt_sparsifier --update_compressor_freq $cfg_update_compressor_freq"
+        if [[ "$cfg_opt_compression" == */* ]]; then
+            local opt_projector="${cfg_opt_compression##*/}"
+            [[ "$opt_projector" != "none" ]] && cmd="$cmd --projection $opt_projector"
+        fi
+    fi
 
     # Second-order
     [[ "$internal_method" != "NA" && "$cfg_use_second_order" == "true" ]] && \

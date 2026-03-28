@@ -1,11 +1,11 @@
 # Subset data curation with LoRA fine-tuning (exact scoring)
 method: Subset
+subset_mode: two_pass
+scoring:
+  method: ghost
 finetuning: LoRA
 learning_rate: 2.98e-04
 lora_r: 32
 lora_alpha: 1
 lora_dropout: 0.1
 
-score_grad_compression:
-  sparsifier: none
-  projector: none

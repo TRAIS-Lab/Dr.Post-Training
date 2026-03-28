@@ -21,8 +21,11 @@ Architecture overview:
 
   Curation (selection/)
     Layerwise: per-layer curation in a single backward pass.
-    Subset: global curation via two-pass (score accumulation → filtered update).
-    Both use score_compressors for influence scoring.
+    Subset: global curation. Two modes:
+      one_pass (Algorithm 4.2): score + retain during backward, post-hoc gradient assembly.
+      two_pass (Algorithm 4.3): scoring pass, then gradient pass on selected subset.
+    Scoring methods: ghost (default), ghost_greats, direct, compress.
+    Both use score_compressors for influence scoring when configured.
 
   CompressionMode (compression_mode.py)
     Derived from which compressor lists are populated:
@@ -53,12 +56,14 @@ from .selection import (
     MergedBatchNoSelectionStrategy,
     MergedBatchLayerwiseStrategy,
     MergedBatchSubsetStrategy,
+    MergedBatchSubsetOnePassStrategy,
     create_merged_batch_strategy,
     # SeparateBatch strategies
     SeparateBatchStrategy,
     SeparateBatchNoSelectionStrategy,
     SeparateBatchLayerwiseStrategy,
     SeparateBatchSubsetStrategy,
+    SeparateBatchSubsetOnePassStrategy,
     create_separate_batch_strategy,
 )
 
@@ -82,11 +87,13 @@ __all__ = [
     "MergedBatchNoSelectionStrategy",
     "MergedBatchLayerwiseStrategy",
     "MergedBatchSubsetStrategy",
+    "MergedBatchSubsetOnePassStrategy",
     "create_merged_batch_strategy",
     # SeparateBatch strategy classes
     "SeparateBatchStrategy",
     "SeparateBatchNoSelectionStrategy",
     "SeparateBatchLayerwiseStrategy",
     "SeparateBatchSubsetStrategy",
+    "SeparateBatchSubsetOnePassStrategy",
     "create_separate_batch_strategy",
 ]
