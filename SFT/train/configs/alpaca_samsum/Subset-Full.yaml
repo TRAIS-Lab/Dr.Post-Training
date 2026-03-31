@@ -2,7 +2,7 @@
 method: Subset
 subset_mode: two_pass
 scoring:
-  method: ghost
+  method: reduced_ghost
 finetuning: Full
 learning_rate: 1.27e-05
 

@@ -2,7 +2,7 @@
 method: Subset
 subset_mode: two_pass
 scoring:
-  method: ghost
+  method: reduced_ghost
 finetuning: MeSO
 learning_rate: 9.00e-07
 

@@ -109,7 +109,7 @@ def compute_scores_and_similarity(
     Never materializes per-sample gradients [B, O, I].
 
     Scales well with V (val batch size) since G_val precomputation amortizes
-    over all train samples. For small V (m=1-2), ghost_greats may be faster
+    over all train samples. For small V (m=1-2), full_ghost may be faster
     due to its O(B × V × S² × (O+I)) complexity when S < min(O, I).
 
     Args:
@@ -166,7 +166,7 @@ def compute_scores_and_similarity(
     return scores, similarity
 
 
-def compute_scores_ghost_greats(
+def compute_scores_full_ghost(
     train_grad_output: Tensor,
     train_input: Tensor,
     val_grad_output: Optional[Tensor],
@@ -282,19 +282,18 @@ def compute_scores_direct_materialization(
     val_input: Optional[Tensor],
     val_grad_total: Optional[Tensor],
     use_second_order: bool,
+    batch_size: int = 0,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """
     Score computation via batch materialization of per-sample gradients.
 
-    Materializes all per-sample weight gradients at once via batched matmul:
+    Materializes per-sample weight gradients and computes scores:
       G_train[i] = bmm(go_i^T, inp_i) → [O, I], flattened to [O*I]
+      s = G_train @ G_val.flatten()
 
-    Then scores via a single matmul: s = G_train @ G_val.T
-
-    Memory: O(B × O × I) for the materialized gradient tensor. This is the
-    fastest materialization approach (fully batched, no Python loop) but uses
-    the most memory. Equivalent to the active branch in GREATS's
-    grad_dotprod_sequential().
+    When batch_size > 0, processes samples in chunks to reduce peak memory
+    from O(B × O × I) to O(batch_size × O × I). This enables direct scoring
+    at long sequence lengths where the full materialization would OOM.
 
     Args:
         train_grad_output: Training grad_output [B, S, O] or [B, O]
@@ -303,6 +302,7 @@ def compute_scores_direct_materialization(
         val_input: Validation input [V, S, I] or None
         val_grad_total: Total validation gradient [O, I] or None
         use_second_order: Whether to compute similarity matrix
+        batch_size: Chunk size for batched processing. 0 = all at once.
 
     Returns:
         (scores, similarity) tuple where similarity is None if not use_second_order
@@ -325,26 +325,51 @@ def compute_scores_direct_materialization(
         else:
             raise ValueError("Must provide either (val_grad_output, val_input) or val_grad_total")
 
-    # Step 2: Batch materialize per-sample gradients
-    if train_grad_output.dim() == 3:
-        # G[i] = Σ_s go_i[s]^T @ inp_i[s] = bmm(go^T, inp) → [B, O, I]
-        G_train = torch.bmm(
-            train_grad_output.permute(0, 2, 1),  # [B, O, S]
-            train_input                            # [B, S, I]
-        ).flatten(start_dim=1)                     # [B, O*I]
+    B = train_grad_output.shape[0]
+    val_flat = val_grad_total.flatten()  # [O*I]
+
+    if batch_size <= 0 or batch_size >= B:
+        # Full materialization: all B samples at once
+        G_train = _materialize_gradients(train_grad_output, train_input)
+        scores = torch.matmul(G_train, val_flat)
+        similarity = torch.matmul(G_train, G_train.T) if use_second_order else None
     else:
-        # 2D: G[i] = go_i ⊗ inp_i → [B, O*I]
-        G_train = (train_grad_output.unsqueeze(2) * train_input.unsqueeze(1)).flatten(start_dim=1)
-
-    # Step 3: Scores = G_train @ val_grad_total.flatten()
-    scores = torch.matmul(G_train, val_grad_total.flatten())  # [B]
-
-    # Step 4: Similarity from materialized gradients
-    similarity = None
-    if use_second_order:
-        similarity = torch.matmul(G_train, G_train.T)  # [B, B]
+        # Chunked: materialize batch_size samples at a time
+        scores = torch.empty(B, device=train_grad_output.device, dtype=target_dtype)
+        if use_second_order:
+            # Need full G_train for similarity — fall back to sequential accumulation
+            chunks = []
+            for start in range(0, B, batch_size):
+                end = min(start + batch_size, B)
+                G_chunk = _materialize_gradients(
+                    train_grad_output[start:end], train_input[start:end]
+                )
+                scores[start:end] = torch.matmul(G_chunk, val_flat)
+                chunks.append(G_chunk)
+            G_train = torch.cat(chunks, dim=0)
+            similarity = torch.matmul(G_train, G_train.T)
+        else:
+            similarity = None
+            for start in range(0, B, batch_size):
+                end = min(start + batch_size, B)
+                G_chunk = _materialize_gradients(
+                    train_grad_output[start:end], train_input[start:end]
+                )
+                scores[start:end] = torch.matmul(G_chunk, val_flat)
+                # G_chunk is freed here — peak memory is batch_size × O × I
 
     return scores, similarity
+
+
+def _materialize_gradients(grad_output: Tensor, inp: Tensor) -> Tensor:
+    """Materialize per-sample weight gradients: G[i] = go_i^T @ inp_i → [B, O*I]."""
+    if grad_output.dim() == 3:
+        return torch.bmm(
+            grad_output.permute(0, 2, 1),  # [B, O, S]
+            inp                             # [B, S, I]
+        ).flatten(start_dim=1)              # [B, O*I]
+    else:
+        return (grad_output.unsqueeze(2) * inp.unsqueeze(1)).flatten(start_dim=1)
 
 
 def compute_selected_gradients(

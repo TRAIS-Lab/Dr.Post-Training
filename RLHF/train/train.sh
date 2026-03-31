@@ -115,7 +115,7 @@ reset_config() {
     cfg_finetuning="LoRA"
 
     # Scoring
-    cfg_scoring_method="ghost"
+    cfg_scoring_method="reduced_ghost"
     cfg_score_compression=""
     cfg_subset_mode="two_pass"
 

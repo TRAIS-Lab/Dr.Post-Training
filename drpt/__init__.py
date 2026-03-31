@@ -24,7 +24,7 @@ Architecture overview:
     Subset: global curation. Two modes:
       one_pass (Algorithm 4.2): score + retain during backward, post-hoc gradient assembly.
       two_pass (Algorithm 4.3): scoring pass, then gradient pass on selected subset.
-    Scoring methods: ghost (default), ghost_greats, direct, compress.
+    Scoring methods: reduced_ghost (default), full_ghost, direct, compress.
     Both use score_compressors for influence scoring when configured.
 
   CompressionMode (compression_mode.py)

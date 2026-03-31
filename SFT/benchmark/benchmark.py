@@ -292,7 +292,7 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             ti, vinp = split_train_val_batch(inp, state.train_batch_size)
             vgt = None
             scorr = state.score_correction
-        sm = getattr(state, 'scoring_method', 'ghost')
+        sm = getattr(state, 'scoring_method', 'reduced_ghost')
         scores, sim = _dispatch_scoring(sm, tgo, ti, vgo, vinp, vgt, state.use_second_order)
         if scorr is not None:
             scores = scores * scorr
@@ -322,7 +322,8 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             train_batch_size=train_bs, selection_method="Layerwise",
             frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
             selection_mode="topk", use_second_order=config.use_second_order,
-            scoring_method=getattr(config, 'scoring_method', 'ghost'),
+            scoring_method=getattr(config, 'scoring_method', 'reduced_ghost'),
+            direct_batch_size=getattr(config, 'direct_batch_size', 0),
         )
         if 'labels' in merged:
             grad_hook.set_token_counts(merged['labels'], train_bs)
@@ -457,7 +458,7 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
     _bwd.SubsetLinearBackward._accumulate_full = timed_accum_full
 
     # Disable score compressors unless scoring_method is "compress"
-    scoring_method = getattr(config, 'scoring_method', 'ghost')
+    scoring_method = getattr(config, 'scoring_method', 'reduced_ghost')
     saved_score_compressors = grad_hook.score_compressors
     if scoring_method != "compress":
         grad_hook.score_compressors = [None] * len(saved_score_compressors)
@@ -472,6 +473,7 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
             frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
             selection_mode="topk", use_second_order=config.use_second_order,
             scoring_method=scoring_method,
+            direct_batch_size=getattr(config, 'direct_batch_size', 0),
         )
         if 'labels' in merged:
             grad_hook.set_token_counts(merged['labels'], train_bs)
@@ -567,7 +569,7 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
     rec = EventRecorder()
     pad_token_id = tokenizer.pad_token_id or 0
 
-    scoring_method = getattr(config, 'scoring_method', 'ghost')
+    scoring_method = getattr(config, 'scoring_method', 'reduced_ghost')
 
     # Save originals
     _orig_backward = _bwd.SubsetLinearBackward.backward
@@ -650,6 +652,7 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
             selection_mode="topk", use_second_order=config.use_second_order,
             scoring_method=scoring_method,
             one_pass=True,
+            direct_batch_size=getattr(config, 'direct_batch_size', 0),
         )
         if 'labels' in merged:
             grad_hook.set_token_counts(merged['labels'], train_bs)
@@ -723,7 +726,7 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
     print(f"BENCHMARK RESULTS (ms per step, averaged over {config.num_iterations} iterations)")
     print(f"Model: {config.model_name} | Batch: {config.batch_size} | "
           f"Seq: {config.seq_length} | Dtype: {config.dtype}")
-    scoring = getattr(config, 'scoring_method', 'ghost')
+    scoring = getattr(config, 'scoring_method', 'reduced_ghost')
     print(f"Dataset: {config.dataset} → {config.val_dataset} | "
           f"Score compression: {config.score_compression} | Scoring: {scoring}")
     print("=" * W)
@@ -913,7 +916,8 @@ def _build_config(args):
                       ('dataset','dataset'), ('val_dataset','val_dataset'),
                       ('num_warmup','num_warmup'), ('num_iterations','num_iterations'),
                       ('seed','seed'), ('score_compression','score_compression'),
-                      ('scoring_method','scoring_method')]:
+                      ('scoring_method','scoring_method'),
+                      ('direct_batch_size','direct_batch_size')]:
         val = getattr(args, arg, None)
         if val is not None:
             kwargs[attr] = val
@@ -938,7 +942,9 @@ def main():
                         choices=['samsum', 'gsm8k', 'tydiqa', 'mmlu', 'bbh', 'math500'])
     parser.add_argument('--score-compression', type=str, default=None)
     parser.add_argument('--scoring-method', type=str, default=None,
-                        choices=['ghost', 'ghost_greats', 'direct', 'compress'])
+                        choices=['reduced_ghost', 'full_ghost', 'direct', 'compress'])
+    parser.add_argument('--direct-batch-size', type=int, default=None,
+                        help='Chunk size for batched direct scoring. 0=all at once, 1=min memory.')
     parser.add_argument('--num-warmup', type=int, default=None)
     parser.add_argument('--num-iterations', type=int, default=None)
     parser.add_argument('--use-second-order', action='store_true')

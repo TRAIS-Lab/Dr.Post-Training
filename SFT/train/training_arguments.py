@@ -165,12 +165,12 @@ class TrainingArguments(TA):
         },
     )
     scoring_method: str = field(
-        default="ghost",
+        default="reduced_ghost",
         metadata={
             "help": (
                 "Scoring method for influence score computation: "
-                "'ghost' (default, our ghost inner product, never materializes per-sample grads), "
-                "'ghost_greats' (GREATS-style ghost IP, materializes for 3D but true ghost for 2D), "
+                "'reduced_ghost' (default, our ghost inner product, never materializes per-sample grads), "
+                "'full_ghost' (GREATS-style ghost IP, materializes for 3D but true ghost for 2D), "
                 "'direct' (explicit per-sample gradient materialization), "
                 "'compress' (compressed per-sample gradients, requires score_compression to be set)."
             )

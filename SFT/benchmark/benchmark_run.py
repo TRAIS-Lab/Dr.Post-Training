@@ -33,7 +33,7 @@ BENCHMARK_DIR = os.path.dirname(os.path.abspath(__file__))
 BENCHMARK_SH = os.path.join(BENCHMARK_DIR, "benchmark.sh")
 PROJECT_ROOT = os.path.abspath(os.path.join(BENCHMARK_DIR, "..", ".."))
 
-# Default configs covering both sides of the ghost/ghost_greats crossover.
+# Default configs covering both sides of the reduced_ghost/full_ghost crossover.
 # All use dummy dataset for guaranteed full-length sequences.
 DEFAULT_CONFIGS = [
     {"label": "n=8 T=512 m=1",   "batch_size": 8,  "seq_length": 512,  "val_batch_size": 1},
@@ -46,19 +46,19 @@ DEFAULT_CONFIGS = [
 # All method x scoring combinations to benchmark.
 # (method, scoring_method, score_compression)
 COMBOS = [
-    ("standard",        "ghost",        "none"),
-    ("layerwise",       "compress",     "normal-64*64"),
-    ("layerwise",       "ghost_greats", "none"),
-    ("layerwise",       "ghost",        "none"),
-    ("layerwise",       "direct",       "none"),
-    ("subset",          "compress",     "normal-64*64"),
-    ("subset",          "ghost_greats", "none"),
-    ("subset",          "ghost",        "none"),
-    ("subset",          "direct",       "none"),
-    ("subset_one_pass", "compress",     "normal-64*64"),
-    ("subset_one_pass", "ghost_greats", "none"),
-    ("subset_one_pass", "ghost",        "none"),
-    ("subset_one_pass", "direct",       "none"),
+    ("standard",        "reduced_ghost",  "none"),
+    ("layerwise",       "compress",       "normal-64*64"),
+    ("layerwise",       "full_ghost",     "none"),
+    ("layerwise",       "reduced_ghost",  "none"),
+    ("layerwise",       "direct",         "none"),
+    ("subset",          "compress",       "normal-64*64"),
+    ("subset",          "full_ghost",     "none"),
+    ("subset",          "reduced_ghost",  "none"),
+    ("subset",          "direct",         "none"),
+    ("subset_one_pass", "compress",       "normal-64*64"),
+    ("subset_one_pass", "full_ghost",     "none"),
+    ("subset_one_pass", "reduced_ghost",  "none"),
+    ("subset_one_pass", "direct",         "none"),
 ]
 
 
@@ -66,7 +66,7 @@ COMBOS = [
 # Subprocess runner
 # =============================================================================
 
-def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterations, model=None):
+def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterations, model=None, direct_batch_size=0):
     """Run a single benchmark via bash (clean process, no CUDA context leak)."""
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT + ":" + env.get("PYTHONPATH", "")
@@ -85,6 +85,7 @@ def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterati
         "--score-compression", score_comp,
         "--num-warmup", str(num_warmup),
         "--num-iterations", str(num_iterations),
+        "--direct-batch-size", str(direct_batch_size),
         "--output", tmp,
     ]
     cmd = ["bash", BENCHMARK_SH] + args
@@ -217,15 +218,15 @@ def print_summary(all_results, model_name):
 
     # Subset 1P overhead vs standard
     print(f"\n  Subset 1P Overhead vs Standard:")
-    print(f"  {'Config':<22} {'compress':>10} {'ghost_gr':>10} {'ghost':>10} {'direct':>10}")
+    print(f"  {'Config':<22} {'compress':>10} {'full_gh':>10} {'red_ghost':>10} {'direct':>10}")
     print(f"  {'-'*62}")
     for label, config_results in all_results.items():
-        std_r = config_results.get("standard/ghost")
+        std_r = config_results.get("standard/reduced_ghost")
         std_total = compute_total(std_r, "standard") if std_r else None
         if std_total is None:
             continue
         vals = []
-        for scoring in ["compress", "ghost_greats", "ghost", "direct"]:
+        for scoring in ["compress", "full_ghost", "reduced_ghost", "direct"]:
             key = f"subset_one_pass/{scoring}"
             r = config_results.get(key)
             total = compute_total(r, "subset_one_pass")
@@ -238,11 +239,11 @@ def print_summary(all_results, model_name):
 
     # Score cost
     print(f"\n  Score Cost (ms):")
-    print(f"  {'Config':<22} {'compress':>10} {'ghost_gr':>10} {'ghost':>10} {'direct':>10}")
+    print(f"  {'Config':<22} {'compress':>10} {'full_gh':>10} {'red_ghost':>10} {'direct':>10}")
     print(f"  {'-'*62}")
     for label, config_results in all_results.items():
         vals = []
-        for scoring in ["compress", "ghost_greats", "ghost", "direct"]:
+        for scoring in ["compress", "full_ghost", "reduced_ghost", "direct"]:
             key = f"subset_one_pass/{scoring}"
             r = config_results.get(key)
             if r is not None:
@@ -254,11 +255,11 @@ def print_summary(all_results, model_name):
 
     # One-pass speedup vs two-pass
     print(f"\n  One-Pass Speedup vs Two-Pass:")
-    print(f"  {'Config':<22} {'compress':>10} {'ghost_gr':>10} {'ghost':>10} {'direct':>10}")
+    print(f"  {'Config':<22} {'compress':>10} {'full_gh':>10} {'red_ghost':>10} {'direct':>10}")
     print(f"  {'-'*62}")
     for label, config_results in all_results.items():
         vals = []
-        for scoring in ["compress", "ghost_greats", "ghost", "direct"]:
+        for scoring in ["compress", "full_ghost", "reduced_ghost", "direct"]:
             r_2p = config_results.get(f"subset/{scoring}")
             r_1p = config_results.get(f"subset_one_pass/{scoring}")
             t_2p = compute_total(r_2p, "subset")
@@ -304,6 +305,7 @@ Examples:
     parser.add_argument("--val-batch-size", type=int, default=None, help="Override val batch size")
     parser.add_argument("--num-warmup", type=int, default=10, help="Warmup iterations (default: 10)")
     parser.add_argument("--num-iterations", type=int, default=20, help="Timed iterations (default: 20)")
+    parser.add_argument("--direct-batch-size", type=int, default=0, help="Chunk size for batched direct scoring (0=all at once)")
     parser.add_argument("--output", type=str, default=None, help="Save JSON results to file")
     args = parser.parse_args()
 
@@ -337,7 +339,8 @@ Examples:
             print(f"\n  [{run_idx}/{total_runs}] {tag}")
 
             r, err = run_single(method, scoring, score_comp, config, args.gpu,
-                                args.num_warmup, args.num_iterations, model)
+                                args.num_warmup, args.num_iterations, model,
+                                direct_batch_size=args.direct_batch_size)
             if r is None:
                 print(f"    FAILED: {err}")
             else:

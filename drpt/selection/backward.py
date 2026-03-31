@@ -32,7 +32,7 @@ from .utils import (
     augment_input_for_bias,
     split_train_val_batch,
     compute_scores_and_similarity,
-    compute_scores_ghost_greats,
+    compute_scores_full_ghost,
     compute_scores_direct_materialization,
     compute_selected_gradients,
     compute_total_gradient,
@@ -85,19 +85,20 @@ def _dispatch_scoring(
     val_input: "Optional[Tensor]",
     val_grad_total: "Optional[Tensor]",
     use_second_order: bool,
+    direct_batch_size: int = 0,
 ) -> "Tuple[Tensor, Optional[Tensor]]":
     """Dispatch to the appropriate scoring function based on scoring_method."""
     if scoring_method == "direct":
         return compute_scores_direct_materialization(
             train_grad_output, train_input, val_grad_output, val_input,
-            val_grad_total, use_second_order
+            val_grad_total, use_second_order, batch_size=direct_batch_size
         )
-    elif scoring_method == "ghost_greats":
-        return compute_scores_ghost_greats(
+    elif scoring_method == "full_ghost":
+        return compute_scores_full_ghost(
             train_grad_output, train_input, val_grad_output, val_input,
             val_grad_total, use_second_order
         )
-    else:  # "ghost" (default)
+    else:  # "reduced_ghost" (default)
         return compute_scores_and_similarity(
             train_grad_output, train_input, val_grad_output, val_input,
             val_grad_total, use_second_order
@@ -386,7 +387,7 @@ class LayerwiseLinearBackward(Function):
                 # Val capture: use compression only if val cache is in compressed mode
                 use_compressed_scoring = hook_manager._val_cache.is_compressed
             elif state is not None:
-                use_compressed_scoring = getattr(state, 'scoring_method', 'ghost') == 'compress'
+                use_compressed_scoring = getattr(state, 'scoring_method', 'reduced_ghost') == 'compress'
 
         with torch.no_grad():
             if use_compressed_scoring:
@@ -564,11 +565,12 @@ class LayerwiseLinearBackward(Function):
             val_bias_grad = None
             score_correction = state.score_correction
 
-        scoring_method = getattr(state, 'scoring_method', 'ghost')
+        scoring_method = getattr(state, 'scoring_method', 'reduced_ghost')
         scores, similarity = _dispatch_scoring(
             scoring_method, train_grad_output, train_input,
             val_grad_output, val_input, val_grad_total,
-            state.use_second_order
+            state.use_second_order,
+            direct_batch_size=getattr(state, 'direct_batch_size', 0)
         )
 
         # Add bias gradient contribution to scores
@@ -656,7 +658,7 @@ class SubsetLinearBackward(Function):
         # Use compressed scoring only when scoring_method="compress"
         use_compressed_scoring = (
             score_compressor is not None
-            and getattr(state, 'scoring_method', 'ghost') == 'compress'
+            and getattr(state, 'scoring_method', 'reduced_ghost') == 'compress'
         )
 
         with torch.no_grad():
@@ -743,7 +745,8 @@ class SubsetLinearBackward(Function):
         # Route to scoring method based on state configuration
         scores, similarity = _dispatch_scoring(
             state.scoring_method, train_grad_output, train_input,
-            val_go, val_inp, val_grad_total, state.use_second_order
+            val_go, val_inp, val_grad_total, state.use_second_order,
+            direct_batch_size=getattr(state, 'direct_batch_size', 0)
         )
 
         # Add bias gradient contribution to scores

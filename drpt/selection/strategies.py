@@ -15,9 +15,9 @@ gradients are obtained:
    - Training uses cached val gradients for curation scoring
    - Factory: create_separate_batch_strategy()
    - Val storage mode is derived from scoring_method in start_val_capture():
-       * ghost/direct: Stores total gradient [O, I] per layer.
+       * reduced_ghost/direct: Stores total gradient [O, I] per layer.
        Better when validation batch is large (e.g., self-reference validation in RLHF).
-       * ghost_greats: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
+       * full_ghost: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
        More memory-efficient during training as it avoids materializing [B_train, O, I].
        Better when validation batch is small (e.g., external validation set in SFT).
 """
@@ -62,7 +62,7 @@ class MergedBatchStrategy(ABC):
         use_second_order: bool = False,
         selection_mode: str = "topk",
         record_selections: bool = False,
-        scoring_method: str = "ghost",
+        scoring_method: str = "reduced_ghost",
     ):
         """
         Initialize curation strategy.
@@ -73,7 +73,7 @@ class MergedBatchStrategy(ABC):
             use_second_order: Use greedy curation with second-order
             selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
             record_selections: If True, record curation data for case study analysis
-            scoring_method: Scoring method for influence scores ("ghost", "ghost_greats", "direct")
+            scoring_method: Scoring method for influence scores ("reduced_ghost", "full_ghost", "direct")
         """
         self.grad_hook = grad_hook
         self.frac = frac
@@ -456,7 +456,7 @@ def create_merged_batch_strategy(
     use_second_order: bool = False,
     selection_mode: str = "topk",
     record_selections: bool = False,
-    scoring_method: str = "ghost",
+    scoring_method: str = "reduced_ghost",
     subset_mode: str = "one_pass",
 ) -> MergedBatchStrategy:
     """
@@ -471,7 +471,7 @@ def create_merged_batch_strategy(
         use_second_order: Use greedy curation with second-order
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
         record_selections: If True, record curation data for case study analysis
-        scoring_method: Scoring method ("ghost", "ghost_greats", "direct", "compress")
+        scoring_method: Scoring method ("reduced_ghost", "full_ghost", "direct", "compress")
         subset_mode: For Subset method: "one_pass" (Algorithm 4.2) or "two_pass" (Algorithm 4.3)
 
     Returns:
@@ -515,9 +515,9 @@ class SeparateBatchStrategy(ABC):
     rather than computed from a merged batch during the same forward pass.
 
     Val storage mode is derived from scoring_method in start_val_capture():
-    - ghost/direct: Stores total gradient [O, I] per layer.
+    - reduced_ghost/direct: Stores total gradient [O, I] per layer.
       Better when validation batch is large (e.g., self-reference validation in RLHF).
-    - ghost_greats: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
+    - full_ghost: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
       More memory-efficient during training. Better when validation batch is small.
     """
 
@@ -528,7 +528,7 @@ class SeparateBatchStrategy(ABC):
         use_second_order: bool = False,
         selection_mode: str = "topk",
         record_selections: bool = False,
-        scoring_method: str = "ghost",
+        scoring_method: str = "reduced_ghost",
     ):
         """
         Initialize stored-val curation strategy.
@@ -541,7 +541,7 @@ class SeparateBatchStrategy(ABC):
             use_second_order: Use greedy curation with second-order
             selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
             record_selections: If True, record curation data for case study analysis
-            scoring_method: Scoring method ("ghost", "ghost_greats", "direct", "compress")
+            scoring_method: Scoring method ("reduced_ghost", "full_ghost", "direct", "compress")
         """
         self.grad_hook = grad_hook
         self.frac = frac
@@ -893,7 +893,7 @@ def create_separate_batch_strategy(
     use_second_order: bool = False,
     selection_mode: str = "topk",
     record_selections: bool = False,
-    scoring_method: str = "ghost",
+    scoring_method: str = "reduced_ghost",
     subset_mode: str = "one_pass",
 ) -> SeparateBatchStrategy:
     """
@@ -910,7 +910,7 @@ def create_separate_batch_strategy(
         use_second_order: Use greedy curation with second-order
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
         record_selections: If True, record curation data for case study analysis
-        scoring_method: Scoring method ("ghost", "ghost_greats", "direct", "compress")
+        scoring_method: Scoring method ("reduced_ghost", "full_ghost", "direct", "compress")
         subset_mode: For Subset method: "one_pass" (Algorithm 4.2) or "two_pass" (Algorithm 4.3)
 
     Returns:

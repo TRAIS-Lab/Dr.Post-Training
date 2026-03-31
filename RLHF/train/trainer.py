@@ -260,7 +260,7 @@ class LayerwisePPOTrainer:
             frac=self.filter_frac,
             use_second_order=self.use_second_order,
             selection_mode="filtering",
-            scoring_method=getattr(self.args, 'scoring_method', 'ghost'),
+            scoring_method=getattr(self.args, 'scoring_method', 'reduced_ghost'),
             subset_mode=getattr(self.args, 'subset_mode', 'two_pass'),
         )
 
@@ -1492,7 +1492,7 @@ class LayerwisePPOTrainer:
                            f"Supported: 'reward', 'token-pg', 'train-loss'")
 
         # Start validation capture mode
-        scoring_method = getattr(self.args, 'scoring_method', 'ghost')
+        scoring_method = getattr(self.args, 'scoring_method', 'reduced_ghost')
         self.grad_hook.start_val_capture(scoring_method=scoring_method)
         self.grad_hook.enable_hooks()
         self.model.train()

@@ -15,9 +15,9 @@ This module provides two families of strategies for computing validation gradien
    - Factory: create_separate_batch_strategy()
    - Avoids padding overhead - val and train can have different seq lengths
    - Val storage mode is derived from scoring_method in start_val_capture():
-       * ghost/direct: Stores total gradient [O, I] per layer.
+       * reduced_ghost/direct: Stores total gradient [O, I] per layer.
        Better when validation batch is large (e.g., self-reference validation in RLHF).
-       * ghost_greats: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
+       * full_ghost: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
        More memory-efficient during training as it avoids materializing [B_train, O, I].
        Better when validation batch is small (e.g., external validation set in SFT).
 """

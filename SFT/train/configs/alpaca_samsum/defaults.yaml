@@ -33,4 +33,4 @@ n_val: 16
 val_batch_size: 1
 val_strategy: merged_batch
 scoring:
-  method: ghost
+  method: reduced_ghost

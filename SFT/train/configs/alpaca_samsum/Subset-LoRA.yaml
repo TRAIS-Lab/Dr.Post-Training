@@ -2,7 +2,7 @@
 method: Subset
 subset_mode: two_pass
 scoring:
-  method: ghost
+  method: reduced_ghost
 finetuning: LoRA
 learning_rate: 2.98e-04
 lora_r: 32

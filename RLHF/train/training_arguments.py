@@ -171,11 +171,11 @@ class TrainingArguments(TA):
     )
 
     scoring_method: str = field(
-        default="ghost",
+        default="reduced_ghost",
         metadata={
             "help": (
                 "Scoring method for influence score computation: "
-                "'ghost' (default), 'ghost_greats', 'direct', 'compress'."
+                "'reduced_ghost' (default), 'full_ghost', 'direct', 'compress'."
             )
         },
     )

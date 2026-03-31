@@ -116,7 +116,7 @@ class LayerwiseTrainer(Trainer):
                 f"val_strategy from '{val_strategy}' to 'merged_batch'"
             )
             val_strategy = 'merged_batch'
-        scoring_method = getattr(self.args, 'scoring_method', 'ghost')
+        scoring_method = getattr(self.args, 'scoring_method', 'reduced_ghost')
         subset_mode = getattr(self.args, 'subset_mode', 'one_pass')
         if val_strategy == 'merged_batch':
             self.selection_strategy = create_merged_batch_strategy(
@@ -359,12 +359,12 @@ class LayerwiseTrainer(Trainer):
             else:
                 # === SEPARATE BATCH MODE: Separate val pass, then train with stored grads ===
                 # Storage mode (factorized/full/compressed) is derived from scoring_method:
-                #   ghost_greats → factorized [V,S,O] + [V,S,I] (for pairwise scoring)
-                #   ghost/direct → full [O,I] (summed gradient, cheaper)
+                #   full_ghost   → factorized [V,S,O] + [V,S,I] (for pairwise scoring)
+                #   reduced_ghost/direct → full [O,I] (summed gradient, cheaper)
                 #   compress     → compressed [k]
                 # PASS 1: Capture validation gradients
                 self.grad_hook.start_val_capture(
-                    scoring_method=getattr(self.args, 'scoring_method', 'ghost'),
+                    scoring_method=getattr(self.args, 'scoring_method', 'reduced_ghost'),
                 )
                 model.zero_grad()
                 val_loss = self._compute_loss_for_selection(model, batch_val)

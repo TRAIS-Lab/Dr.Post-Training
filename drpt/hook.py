@@ -241,8 +241,9 @@ class GradientHook:
         compute_scores_only: bool = False,
         use_second_order: bool = False,
         selection_mode: str = "topk",
-        scoring_method: str = "ghost",
+        scoring_method: str = "reduced_ghost",
         one_pass: bool = False,
+        direct_batch_size: int = 0,
     ) -> None:
         """
         Set up curation state for Dr. Post-Training.
@@ -255,8 +256,10 @@ class GradientHook:
             compute_scores_only: If True, only compute scores (Subset pass 1)
             use_second_order: If True, use greedy curation with similarity matrix
             selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
-            scoring_method: For Subset: "ghost" (factored inner product) or "direct"
+            scoring_method: For Subset: "reduced_ghost" (factored inner product) or "direct"
                            (explicit per-sample gradient materialization, Algorithm 4.4)
+            direct_batch_size: Chunk size for batched direct scoring. 0 = all at once.
+                              Set to 1 for minimal memory at long sequences.
         """
         if selection_method == "Regular":
             self.selection_state = None
@@ -292,6 +295,7 @@ class GradientHook:
                 selection_mode=selection_mode,
                 scoring_method=scoring_method,
                 one_pass=one_pass,
+                direct_batch_size=direct_batch_size,
             )
         elif selection_method == "Layerwise":
             self.selection_state = LayerwiseState(
@@ -304,6 +308,7 @@ class GradientHook:
                 use_second_order=use_second_order,
                 selection_mode=selection_mode,
                 scoring_method=scoring_method,
+                direct_batch_size=direct_batch_size,
             )
         else:
             raise ValueError(
@@ -383,15 +388,15 @@ class GradientHook:
         """Get total tokens in validation batch."""
         return self._val_cache.total_tokens
 
-    def start_val_capture(self, scoring_method: str = "ghost") -> None:
+    def start_val_capture(self, scoring_method: str = "reduced_ghost") -> None:
         """
         Start capturing validation gradients.
 
         The storage mode is derived from the scoring method:
         - compress      → compressed storage [k] per layer
-        - ghost_greats  → factorized storage (val_go, val_inp) per layer
+        - full_ghost    → factorized storage (val_go, val_inp) per layer
                           (needed for pairwise dot products across val samples)
-        - ghost/direct  → full storage G_val [O, I] per layer
+        - reduced_ghost/direct → full storage G_val [O, I] per layer
                           (only the summed gradient is needed)
 
         Args:
@@ -399,10 +404,10 @@ class GradientHook:
         """
         if scoring_method == "compress" and self.compression_mode.uses_compressed_scoring:
             mode = "compressed"
-        elif scoring_method == "ghost_greats":
+        elif scoring_method == "full_ghost":
             mode = "factorized"
         else:
-            # ghost, direct: only need the summed val gradient
+            # reduced_ghost, direct: only need the summed val gradient
             mode = "full"
 
         self._val_cache.start_capture(mode=mode)
@@ -440,8 +445,9 @@ class GradientHook:
         use_second_order: bool = False,
         selection_mode: str = "topk",
         record_selections: bool = False,
-        scoring_method: str = "ghost",
+        scoring_method: str = "reduced_ghost",
         one_pass: bool = False,
+        direct_batch_size: int = 0,
     ) -> None:
         """
         Set up curation state using pre-captured validation gradients.
@@ -455,8 +461,9 @@ class GradientHook:
             use_second_order: If True, use greedy curation
             selection_mode: "topk" or "filtering"
             record_selections: If True, record selected indices/scores for case study
-            scoring_method: Scoring method ("ghost", "ghost_greats", "direct", "compress")
+            scoring_method: Scoring method ("reduced_ghost", "full_ghost", "direct", "compress")
             one_pass: If True, enable one-pass subset mode (retain layer data for post-hoc assembly)
+            direct_batch_size: Chunk size for batched direct scoring. 0 = all at once.
         """
         num_captured = self._val_cache.get_num_captured()
         if num_captured == 0:
@@ -493,6 +500,7 @@ class GradientHook:
                 record_selections=record_selections,
                 scoring_method=scoring_method,
                 one_pass=one_pass,
+                direct_batch_size=direct_batch_size,
             )
         elif selection_method == "Layerwise":
             self.selection_state = LayerwiseState(
@@ -506,6 +514,7 @@ class GradientHook:
                 selection_mode=selection_mode,
                 record_selections=record_selections,
                 scoring_method=scoring_method,
+                direct_batch_size=direct_batch_size,
             )
         else:
             raise ValueError(

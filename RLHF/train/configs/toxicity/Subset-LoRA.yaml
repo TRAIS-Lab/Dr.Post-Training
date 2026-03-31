@@ -1,10 +1,10 @@
 # Subset: global curation across all layers, per-mini-batch during PPO
 #
 # subset_mode: one_pass (faster) or two_pass (original GREATS)
-# scoring.method: ghost, ghost_greats, direct, compress
+# scoring.method: reduced_ghost, full_ghost, direct, compress
 #
 method: Subset
 finetuning: LoRA
 subset_mode: two_pass
 scoring:
-  method: ghost
+  method: reduced_ghost

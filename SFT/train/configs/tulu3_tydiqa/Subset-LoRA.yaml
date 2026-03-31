@@ -4,7 +4,7 @@ finetuning: LoRA
 learning_rate: 0.00207
 subset_mode: two_pass
 scoring:
-  method: ghost
+  method: reduced_ghost
 lora_r: 32
 lora_alpha: 1
 lora_dropout: 0.1

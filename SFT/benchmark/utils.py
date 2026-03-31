@@ -105,7 +105,8 @@ class BenchmarkConfig:
     use_second_order: bool = False  # If True, use greedy selection with O(k*n) complexity
     val_strategy: str = 'merged'  # 'separate' or 'merged' - how to handle validation gradients
     score_compression: str = "normal-64*64"  # Score-only compression for influence scoring (e.g., "normal-64*64")
-    scoring_method: str = 'ghost'  # Scoring method: 'ghost' (default), 'ghost_greats', 'direct', 'compress'
+    scoring_method: str = 'reduced_ghost'  # Scoring method: 'reduced_ghost' (default), 'full_ghost', 'direct', 'compress'
+    direct_batch_size: int = 0  # Chunk size for batched direct scoring. 0=all at once, 1=per-sample (min memory)
     val_dataset: str = 'tydiqa'  # Validation dataset for selection. Options: 'samsum', 'gsm8k', 'bbh', etc. If None, uses same as training dataset
     data_dir: str = 'data'  # Data directory for validation datasets (used when val_dataset is set)
 

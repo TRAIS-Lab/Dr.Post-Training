@@ -222,9 +222,10 @@ class LayerwiseState(SelectionState):
     and aggregates gradients. No global accumulation needed.
     """
 
-    def __init__(self, include_val_in_update: bool = False, scoring_method: str = "ghost", **kwargs):
+    def __init__(self, include_val_in_update: bool = False, scoring_method: str = "reduced_ghost", direct_batch_size: int = 0, **kwargs):
         super().__init__(**kwargs)
         self.scoring_method = scoring_method
+        self.direct_batch_size = direct_batch_size
         # Track last selected indices for stats
         self._last_selected_indices: Optional[Tensor] = None
 
@@ -315,14 +316,15 @@ class SubsetState(SelectionState):
     Pass 2: Uses global curation for gradient computation on selected samples
 
     Args (in addition to SelectionState):
-        scoring_method: "ghost" for ghost/factored inner product (default),
+        scoring_method: "reduced_ghost" for ghost/factored inner product (default),
                         "direct" for explicit per-sample gradient materialization
                         (Algorithm 4.4 in the paper).
     """
 
-    def __init__(self, scoring_method: str = "ghost", one_pass: bool = False, **kwargs):
+    def __init__(self, scoring_method: str = "reduced_ghost", one_pass: bool = False, direct_batch_size: int = 0, **kwargs):
         super().__init__(**kwargs)
         self.scoring_method = scoring_method
+        self.direct_batch_size = direct_batch_size
         self.one_pass = one_pass
 
         # Accumulators for global scoring

@@ -210,7 +210,7 @@ class CaseStudyTrainer(Trainer):
         lr = 1.0
 
         # ---- Capture validation gradients (shared for both methods) ----
-        self.grad_hook.start_val_capture(scoring_method="ghost")
+        self.grad_hook.start_val_capture(scoring_method="reduced_ghost")
         model.zero_grad()
         val_loss = self._compute_loss_for_scoring(model, val_batch)
         val_loss.backward()

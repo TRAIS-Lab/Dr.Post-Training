@@ -118,7 +118,7 @@ reset_config() {
     cfg_finetuning="Full"
 
     # Scoring (nested under scoring: in YAML)
-    cfg_scoring_method="ghost"
+    cfg_scoring_method="reduced_ghost"
     cfg_score_compression=""     # Single string: "normal-64*64" or "normal-64*64/sjlt-512"
 
     # Optimizer compression (nested under optimizer: in YAML)
