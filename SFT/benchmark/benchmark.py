@@ -675,8 +675,9 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
         if i is not None: timer.mark("wgrad", i, True)
         if len(selected) > 0:
             scale_factor = state._compute_scale_factor_for_assembly(selected)
-            # model.zero_grad() clears non-hooked grads; hooked layers got None from backward
-            model.zero_grad()
+            # No model.zero_grad() here — non-linear layers retain their autograd
+            # gradients from backward, and hooked linear layers have None grad
+            # (SubsetLinearBackward suppresses weight/bias grads).
             grad_hook.assemble_gradients_from_retained(selected, scale_factor)
         else:
             grad_hook.clear_retained_data()
@@ -925,6 +926,8 @@ def _build_config(args):
         kwargs['use_flash_attention'] = False
     if getattr(args, 'use_second_order', False):
         kwargs['use_second_order'] = True
+    if getattr(args, 'gradient_checkpointing', False):
+        kwargs['gradient_checkpointing'] = True
     return BenchmarkConfig(**kwargs)
 
 
@@ -948,6 +951,8 @@ def main():
     parser.add_argument('--num-warmup', type=int, default=None)
     parser.add_argument('--num-iterations', type=int, default=None)
     parser.add_argument('--use-second-order', action='store_true')
+    parser.add_argument('--gradient-checkpointing', action='store_true',
+                        help='Enable gradient (activation) checkpointing to trade compute for memory.')
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--method', type=str, default=None, choices=METHODS)
@@ -987,6 +992,8 @@ def main():
         cli_args += ["--no-flash-attention"]
     if config.use_second_order:
         cli_args += ["--use-second-order"]
+    if config.gradient_checkpointing:
+        cli_args += ["--gradient-checkpointing"]
 
     all_results = {}
     peak_mem = {}

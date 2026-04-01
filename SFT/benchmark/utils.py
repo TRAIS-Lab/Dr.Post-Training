@@ -110,6 +110,9 @@ class BenchmarkConfig:
     val_dataset: str = 'tydiqa'  # Validation dataset for selection. Options: 'samsum', 'gsm8k', 'bbh', etc. If None, uses same as training dataset
     data_dir: str = 'data'  # Data directory for validation datasets (used when val_dataset is set)
 
+    # Gradient checkpointing
+    gradient_checkpointing: bool = False
+
     # Reproducibility
     seed: int = 42
 
@@ -831,6 +834,9 @@ def setup_model(config: BenchmarkConfig):
         model_kwargs['attn_implementation'] = "flash_attention_2"
 
     model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs)
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        print("  Gradient checkpointing: enabled")
     model.train()
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)

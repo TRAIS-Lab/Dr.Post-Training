@@ -373,6 +373,10 @@ class MergedBatchSubsetOnePassStrategy(MergedBatchStrategy):
     Single forward+backward pass: scoring and data retention happen during backward,
     then post-hoc gradient assembly from retained (grad_output, input) per layer.
     Saves the second forward+backward at the cost of higher peak memory.
+
+    Non-linear layers (RMSNorm) are wrapped with TrainOnlyRMSNormBackward so
+    their grad_weight is computed from the train slice only, preventing
+    validation gradient leakage.
     """
 
     def execute_training_step(
@@ -395,7 +399,10 @@ class MergedBatchSubsetOnePassStrategy(MergedBatchStrategy):
         model.zero_grad()
         loss = compute_loss_fn(model, merged_batch)
         loss.backward()
-        # After backward: scores accumulated in state, layer data retained in hook
+        # After backward:
+        # - Scores accumulated in state, layer data retained in hook
+        # - Hooked linear layers: .grad is None (SubsetLinearBackward returns None)
+        # - RMSNorm layers: .grad contains train-only gradient (TrainOnlyRMSNormBackward)
 
         # Get globally selected indices
         state: SubsetState = self.grad_hook.selection_state
@@ -415,8 +422,10 @@ class MergedBatchSubsetOnePassStrategy(MergedBatchStrategy):
         # Compute scale factor for exact parity with two-pass
         scale_factor = state._compute_scale_factor_for_assembly(selected_indices)
 
-        # Post-hoc gradient assembly from retained data
-        model.zero_grad()
+        # Post-hoc gradient assembly for linear layers.
+        # No model.zero_grad() here — non-linear layers retain their train-only
+        # gradients from backward, and hooked linear layers have None grad
+        # (SubsetLinearBackward suppresses weight/bias grads).
         self.grad_hook.assemble_gradients_from_retained(selected_indices, scale_factor)
 
         self._cleanup()
@@ -485,14 +494,21 @@ def create_merged_batch_strategy(
         return MergedBatchNoSelectionStrategy(**kwargs)
 
     if method == "Layerwise":
-        return MergedBatchLayerwiseStrategy(**kwargs)
+        strategy = MergedBatchLayerwiseStrategy(**kwargs)
+        # Wrap non-linear layers so their grad_weight comes from train slice only.
+        grad_hook.wrap_nonlinear_layers()
+        return strategy
 
     if method == "LayerwiseWithVal":
-        return MergedBatchLayerwiseWithValStrategy(**kwargs)
+        strategy = MergedBatchLayerwiseWithValStrategy(**kwargs)
+        grad_hook.wrap_nonlinear_layers()
+        return strategy
 
     if method == "Subset":
         if subset_mode == "one_pass":
-            return MergedBatchSubsetOnePassStrategy(**kwargs)
+            strategy = MergedBatchSubsetOnePassStrategy(**kwargs)
+            grad_hook.wrap_nonlinear_layers()
+            return strategy
         else:
             return MergedBatchSubsetStrategy(**kwargs)
 
@@ -857,8 +873,10 @@ class SeparateBatchSubsetOnePassStrategy(SeparateBatchStrategy):
         state = self.grad_hook.selection_state
         scale_factor = state._compute_scale_factor_for_assembly(selected_indices)
 
-        # Post-hoc gradient assembly
-        model.zero_grad()
+        # Post-hoc gradient assembly for linear layers.
+        # Non-linear layers (LayerNorm, embeddings, etc.) retain their autograd
+        # gradients from backward — SubsetLinearBackward returns None for
+        # weight/bias, so hooked linear layers have no stale grad to clear.
         self.grad_hook.assemble_gradients_from_retained(selected_indices, scale_factor)
 
         stats["selection/n_selected"] = n_selected
@@ -928,7 +946,12 @@ def create_separate_batch_strategy(
 
     if method == "Subset":
         if subset_mode == "one_pass":
-            return SeparateBatchSubsetOnePassStrategy(**kwargs)
+            strategy = SeparateBatchSubsetOnePassStrategy(**kwargs)
+            # Safety check: warn about trainable params not covered by hooks.
+            # No non-linear wrapping needed (no val contamination in separate batch),
+            # but unhooked params get full-batch train grad instead of curated.
+            grad_hook.check_unhooked_trainable_params()
+            return strategy
         else:
             return SeparateBatchSubsetStrategy(**kwargs)
 

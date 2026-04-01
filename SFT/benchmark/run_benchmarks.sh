@@ -71,6 +71,42 @@ run_breakdown() {
         --results-dir "$RESULTS" --output "$RESULTS/breakdown_tables.txt" 2>/dev/null
 }
 
+# ── Benchmark 1c: Breakdown with Gradient Checkpointing ────────────────────
+
+run_breakdown_checkpointing() {
+    local RESULTS="SFT/benchmark/results/breakdown_checkpointing"
+    mkdir -p "$RESULTS"
+
+    run_model() {
+        local gpu="$1" model="$2" tag="$3"
+        shift 3
+        local configs=("$@")
+        echo "[GPU $gpu] $tag (checkpointing): ${#configs[@]} configs"
+        for cfg in "${configs[@]}"; do
+            IFS=',' read -r n T m <<< "$cfg"
+            local out="$RESULTS/${tag}_n${n}_T${T}_m${m}.json"
+            if [[ -f "$out" ]]; then
+                echo "[GPU $gpu] SKIP $tag n=$n T=$T m=$m"
+                continue
+            fi
+            echo "[GPU $gpu] Running $tag n=$n T=$T m=$m (checkpointing) ..."
+            $PYTHON SFT/benchmark/benchmark_run.py \
+                --gpu "$gpu" --model "$model" \
+                --batch-size "$n" --seq-length "$T" --val-batch-size "$m" \
+                --direct-batch-size 1 \
+                --gradient-checkpointing \
+                --output "$out" 2>&1 | tail -5
+        done
+        echo "[GPU $gpu] $tag (checkpointing) done"
+    }
+
+    echo "  Benchmark 1c: Breakdown with Gradient Checkpointing (3 models x 2 configs x 13 combos)"
+    run_model 1 "Qwen/Qwen3-0.6B"         "qwen3-0.6b"    "8,512,1" "2,1024,1" &
+    run_model 2 "Qwen/Qwen3-1.7B"         "qwen3-1.7b"    "8,512,1" "2,1024,1" &
+    run_model 3 "meta-llama/Llama-3.2-3B"  "llama-3.2-3b"  "8,512,1" "2,1024,1" &
+    wait
+}
+
 # ── Benchmark 2: Scoring ────────────────────────────────────────────────────
 
 run_scoring() {
@@ -101,6 +137,10 @@ echo "========================================"
 
 if [[ "$MODE" == "breakdown" || "$MODE" == "both" ]]; then
     run_breakdown
+fi
+
+if [[ "$MODE" == "checkpointing" || "$MODE" == "both" ]]; then
+    run_breakdown_checkpointing
 fi
 
 if [[ "$MODE" == "scoring" || "$MODE" == "both" ]]; then

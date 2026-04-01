@@ -36,7 +36,8 @@ from .selection.state import SelectionState, LayerwiseState, SubsetState
 from .selection.backward import (
     CompressedLinearBackward,
     LayerwiseLinearBackward,
-    SubsetLinearBackward
+    SubsetLinearBackward,
+    TrainOnlyRMSNormBackward,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,12 @@ class GradientHook:
         # During backward, SubsetLinearBackward stores (grad_output, input) per layer
         # so we can assemble gradients post-hoc after global selection
         self._retained_data: Dict[int, Tuple[Tensor, Tensor]] = {}
+
+        # Non-linear layer wrapping for merged-batch one-pass mode.
+        # When active, RMSNorm layers compute grad_weight from train slice only,
+        # preventing validation gradient leakage.
+        self._nonlinear_wrapped: bool = False
+        self._nonlinear_modules: Dict[str, nn.Module] = {}
 
         # Register hooks
         self._register_hooks()
@@ -680,7 +687,7 @@ class GradientHook:
         return num_refreshed, old_update_compressors
 
     def remove_hooks(self) -> None:
-        """Restore original forward methods."""
+        """Restore original forward methods for all wrapped layers."""
         for name, module in self.layer_name_to_module.items():
             if hasattr(module, '_original_forward'):
                 module.forward = module._original_forward
@@ -689,4 +696,132 @@ class GradientHook:
         self.forward_hooks = [None] * len(self.layer_names)
         self.hooks_registered = False
 
+        # Also unwrap non-linear layers if wrapped
+        self.unwrap_nonlinear_layers()
+
         logger.info("Restored original forward methods for all layers")
+
+    # =========================================================================
+    # Non-linear layer wrapping (merged-batch one-pass)
+    # =========================================================================
+
+    @staticmethod
+    def _is_rmsnorm(module: nn.Module) -> bool:
+        """Check if module is an RMSNorm variant (HuggingFace or PyTorch)."""
+        cls_name = type(module).__name__
+        return 'RMSNorm' in cls_name and hasattr(module, 'weight')
+
+    def wrap_nonlinear_layers(self) -> None:
+        """
+        Wrap trainable RMSNorm layers with TrainOnlyRMSNormBackward.
+
+        Call once at setup (not per-step). The wrapped forward reads
+        train_batch_size from self.selection_state during backward, so it
+        adapts per-step automatically.
+
+        Also checks for trainable parameters that are neither hooked (Linear)
+        nor wrapped (RMSNorm), and warns about them.
+        """
+        if self._nonlinear_wrapped:
+            return
+
+        for name, module in self.model.named_modules():
+            # Skip non-RMSNorm modules
+            if not self._is_rmsnorm(module):
+                continue
+            # Skip frozen layers
+            if not module.weight.requires_grad:
+                continue
+            # Skip hooked linear layers (shouldn't overlap, but be safe)
+            if name in self.layer_name_to_idx:
+                continue
+
+            self._nonlinear_modules[name] = module
+            module._original_forward = module.forward
+
+            eps = getattr(module, 'variance_epsilon', None) or getattr(module, 'eps', 1e-6)
+
+            def make_wrapped(mod, mod_eps):
+                def wrapped_forward(hidden_states):
+                    return TrainOnlyRMSNormBackward.apply(
+                        hidden_states, mod.weight, mod_eps, self
+                    )
+                return wrapped_forward
+
+            module.forward = make_wrapped(module, eps)
+
+        self._nonlinear_wrapped = True
+        if self._nonlinear_modules:
+            logger.info(f"Wrapped {len(self._nonlinear_modules)} RMSNorm layers for train-only grad_weight")
+
+        # Safety check: warn about trainable params not covered by any hook
+        self.check_unhooked_trainable_params()
+
+    def unwrap_nonlinear_layers(self) -> None:
+        """Restore original forward methods for wrapped non-linear layers."""
+        if not self._nonlinear_wrapped:
+            return
+
+        for name, module in self._nonlinear_modules.items():
+            if hasattr(module, '_original_forward'):
+                module.forward = module._original_forward
+                delattr(module, '_original_forward')
+
+        self._nonlinear_modules.clear()
+        self._nonlinear_wrapped = False
+
+    def check_unhooked_trainable_params(self) -> None:
+        """
+        Check that all trainable parameters belong to either a hooked Linear
+        layer or a wrapped non-linear layer.
+
+        Logs warnings for any trainable parameters that fall through the cracks.
+        In one-pass mode, such parameters would get incorrect gradients:
+        - Merged batch: grad from full merged batch (val + train) instead of train-only
+        - Separate batch: full-batch train grad instead of curated subset grad
+          (same approximation as non-linear layers, but worth flagging if unexpected)
+        """
+        hooked_names = set(self.layer_names)
+        wrapped_names = set(self._nonlinear_modules.keys())
+
+        uncovered = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Check if this param belongs to a hooked or wrapped module.
+            # param name is like "model.layers.0.self_attn.q_proj.weight"
+            # module name is like "model.layers.0.self_attn.q_proj"
+            # Strip the param suffix (.weight, .bias) to get the module name.
+            parts = name.rsplit('.', 1)
+            if len(parts) < 2:
+                continue
+            module_name = parts[0]
+
+            # Check all ancestor modules too (e.g. param "model.layers.0.input_layernorm.weight"
+            # has module_name "model.layers.0.input_layernorm")
+            covered = False
+            candidate = module_name
+            while candidate:
+                if candidate in hooked_names or candidate in wrapped_names:
+                    covered = True
+                    break
+                # Go up one level
+                if '.' in candidate:
+                    candidate = candidate.rsplit('.', 1)[0]
+                else:
+                    break
+
+            if not covered:
+                uncovered.append(name)
+
+        if uncovered:
+            logger.warning(
+                f"Found {len(uncovered)} trainable parameter(s) not covered by "
+                f"any hook or non-linear wrapper. In one-pass mode, these will "
+                f"receive full-batch gradients (not curated):"
+            )
+            for name in uncovered[:10]:
+                logger.warning(f"  - {name}")
+            if len(uncovered) > 10:
+                logger.warning(f"  ... and {len(uncovered) - 10} more")

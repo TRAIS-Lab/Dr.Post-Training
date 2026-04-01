@@ -66,7 +66,7 @@ COMBOS = [
 # Subprocess runner
 # =============================================================================
 
-def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterations, model=None, direct_batch_size=0):
+def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterations, model=None, direct_batch_size=0, gradient_checkpointing=False):
     """Run a single benchmark via bash (clean process, no CUDA context leak)."""
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT + ":" + env.get("PYTHONPATH", "")
@@ -88,6 +88,8 @@ def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterati
         "--direct-batch-size", str(direct_batch_size),
         "--output", tmp,
     ]
+    if gradient_checkpointing:
+        args += ["--gradient-checkpointing"]
     cmd = ["bash", BENCHMARK_SH] + args
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -306,6 +308,7 @@ Examples:
     parser.add_argument("--num-warmup", type=int, default=10, help="Warmup iterations (default: 10)")
     parser.add_argument("--num-iterations", type=int, default=20, help="Timed iterations (default: 20)")
     parser.add_argument("--direct-batch-size", type=int, default=0, help="Chunk size for batched direct scoring (0=all at once)")
+    parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient (activation) checkpointing")
     parser.add_argument("--output", type=str, default=None, help="Save JSON results to file")
     args = parser.parse_args()
 
@@ -340,7 +343,8 @@ Examples:
 
             r, err = run_single(method, scoring, score_comp, config, args.gpu,
                                 args.num_warmup, args.num_iterations, model,
-                                direct_batch_size=args.direct_batch_size)
+                                direct_batch_size=args.direct_batch_size,
+                                gradient_checkpointing=args.gradient_checkpointing)
             if r is None:
                 print(f"    FAILED: {err}")
             else:

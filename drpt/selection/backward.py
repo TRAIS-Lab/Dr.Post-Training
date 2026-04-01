@@ -1,10 +1,13 @@
 """
 Autograd functions for gradient-based data curation and compression.
 
-This module provides three distinct autograd Functions:
+This module provides three distinct autograd Functions for Linear layers:
 - CompressedLinearBackward: Pure gradient compression (no curation)
 - LayerwiseLinearBackward: Per-layer curation, single-pass
 - SubsetLinearBackward: Score accumulation, two-pass
+
+And one for non-linear layers in merged-batch one-pass mode:
+- TrainOnlyRMSNormBackward: RMSNorm that computes grad_weight from train slice only
 
 Each function routes to specific handlers based on CompressionMode:
 - NONE: Full gradients for scoring and updates
@@ -757,3 +760,85 @@ class SubsetLinearBackward(Function):
 
         # Accumulate scores using the state method (handles correction internally)
         state.accumulate_precomputed_scores(scores, similarity, score_correction)
+
+
+# =============================================================================
+# Non-linear layer backward for merged-batch one-pass mode
+# =============================================================================
+
+class TrainOnlyRMSNormBackward(Function):
+    """
+    Custom autograd Function for RMSNorm in merged-batch one-pass mode.
+
+    Computes grad_input for the full merged batch (needed for chain rule
+    propagation to earlier layers), but computes grad_weight from only the
+    train slice of the batch. This prevents validation gradient leakage
+    into non-linear layer parameter updates.
+
+    Matches the HuggingFace RMSNorm forward:
+        hidden = hidden.to(float32)
+        variance = hidden.pow(2).mean(-1, keepdim=True)
+        hidden = hidden * rsqrt(variance + eps)
+        return weight * hidden.to(input_dtype)
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        input: "Tensor",
+        weight: "Tensor",
+        eps: float,
+        hook_manager: "GradientHook",
+    ) -> "Tensor":
+        """Forward pass: standard RMSNorm."""
+        input_dtype = input.dtype
+        input_f32 = input.to(torch.float32)
+        variance = input_f32.pow(2).mean(-1, keepdim=True)
+        rsqrt_var = torch.rsqrt(variance + eps)
+        normalized = input_f32 * rsqrt_var
+        output = weight * normalized.to(input_dtype)
+
+        ctx.save_for_backward(input_f32, weight.to(torch.float32), rsqrt_var, normalized)
+        ctx.hook_manager_ref = weakref.ref(hook_manager)
+        ctx.input_dtype = input_dtype
+        return output
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: "Tensor",
+    ) -> "Tuple[Tensor, Tensor, None, None]":
+        """
+        Backward pass: full grad_input, train-only grad_weight.
+
+        grad_input must cover the full merged batch for correct chain rule
+        propagation. grad_weight is computed from the train slice only.
+        """
+        input_f32, weight_f32, rsqrt_var, normalized = ctx.saved_tensors
+
+        hook_manager = ctx.hook_manager_ref()
+        state = hook_manager.selection_state if hook_manager is not None else None
+        train_bs = state.train_batch_size if state is not None else None
+
+        D = input_f32.shape[-1]
+        grad_output_f32 = grad_output.to(torch.float32)
+
+        # grad_input: FULL batch (chain rule to earlier layers)
+        # d(RMSNorm)/dx = rsqrt * (I - x_hat * x_hat^T / D) * diag(weight)
+        grad_normalized = grad_output_f32 * weight_f32
+        grad_input = rsqrt_var * (
+            grad_normalized
+            - normalized * (grad_normalized * normalized).sum(-1, keepdim=True) / D
+        )
+        grad_input = grad_input.to(ctx.input_dtype)
+
+        # grad_weight: TRAIN-ONLY slice
+        if train_bs is not None and train_bs < grad_output.shape[0]:
+            train_go = grad_output_f32[:train_bs]
+            train_norm = normalized[:train_bs]
+            grad_weight = (train_go * train_norm).flatten(0, -2).sum(0)
+        else:
+            # Fallback: full batch (separate batch mode or no state)
+            grad_weight = (grad_output_f32 * normalized).flatten(0, -2).sum(0)
+
+        return grad_input, grad_weight, None, None
