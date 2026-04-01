@@ -195,6 +195,31 @@ class ValidationCache:
             else:
                 self._compressed[layer_idx] = self._compressed[layer_idx] + compressed_total
 
+    def store_precomputed(
+        self,
+        layer_idx: int,
+        grad_weight: Tensor,
+    ) -> None:
+        """
+        Store a pre-computed gradient directly (e.g., for Embedding layers).
+
+        Unlike store_layer which computes the gradient from (grad_output, input),
+        this accepts the already-materialized gradient and stores it in FULL mode.
+
+        Args:
+            layer_idx: Index of the layer.
+            grad_weight: Pre-computed gradient tensor (e.g., [V, D] for Embedding).
+        """
+        if not self.capturing:
+            raise RuntimeError(
+                "Cannot store validation gradient: not in capture mode. "
+                "Call start_capture() first."
+            )
+        if self._full[layer_idx] is None:
+            self._full[layer_idx] = grad_weight.detach()
+        else:
+            self._full[layer_idx] = self._full[layer_idx] + grad_weight.detach()
+
     def _compute_total_gradient(self, grad_output: Tensor, input: Tensor) -> Tensor:
         """Compute total gradient [O, I] from grad_output and input."""
         if grad_output.dim() == 3:

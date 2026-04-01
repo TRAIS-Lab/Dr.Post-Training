@@ -144,10 +144,14 @@ class SelectionState(ABC):
         """
         Compute token-based gradient scale factor for selected samples.
 
-        Returns train_total_tokens / selected_tokens to maintain proper gradient magnitude.
-        Returns 1.0 if no samples are selected (empty curation case).
+        Returns batch_total_tokens / selected_tokens so the curated gradient
+        matches the magnitude of a forward/backward on only the selected samples.
+
+        Uses batch_total_tokens (not train_total_tokens) because grad_output from
+        autograd is normalized by 1/batch_total_tokens. In separate-batch mode,
+        batch_total == train_total, so this is equivalent.
         """
-        if self.tokens_per_sample is None or self.train_total_tokens_tensor is None:
+        if self.tokens_per_sample is None or self.batch_total_tokens_tensor is None:
             raise RuntimeError(
                 "Token counts not set. Call set_token_counts() before curation. "
                 "For SeparateBatch strategies, pass 'labels' in kwargs to execute_training_step()."
@@ -156,7 +160,7 @@ class SelectionState(ABC):
         if selected_indices.numel() == 0:
             return torch.tensor(1.0, device=self.device, dtype=self.dtype)
         selected_tokens = self.tokens_per_sample[selected_indices].sum()
-        scale = self.train_total_tokens_tensor / selected_tokens
+        scale = self.batch_total_tokens_tensor / selected_tokens
         return torch.where(selected_tokens == 0, torch.ones_like(scale), scale)
 
     def _compute_scale_factor_with_val(self, selected_indices: Tensor) -> Tensor:

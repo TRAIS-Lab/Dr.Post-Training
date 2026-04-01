@@ -405,3 +405,100 @@ def compute_selected_gradients(
         grad_bias = selected_grad_output.sum(dim=0) * scale_factor if has_bias else None
 
     return grad_weight, grad_bias
+
+
+# =============================================================================
+# Embedding-specific utilities
+# =============================================================================
+
+def compute_embedding_scores(
+    train_go: Tensor,
+    train_ids: Tensor,
+    val_grad_weight: Tensor,
+) -> Tensor:
+    """
+    Compute per-sample influence scores for an Embedding layer.
+
+    score_b = Σ_s train_go[b, s, :] · val_grad_weight[train_ids[b, s], :]
+
+    This is the embedding analogue of the reduced ghost inner product — we
+    never materialize the full per-sample [V, D] gradient.
+
+    Args:
+        train_go: Training grad_output [B, S, D] or [B, D]
+        train_ids: Training token IDs [B, S] or [B]
+        val_grad_weight: Validation embedding gradient [V, D]
+
+    Returns:
+        scores: Per-sample scores [B]
+    """
+    # Gather val gradient rows for each position
+    val_at_positions = val_grad_weight[train_ids]  # [B, S, D] or [B, D]
+    # Per-sample score = sum of elementwise products across position and dim
+    if train_go.dim() == 3:
+        scores = (train_go * val_at_positions).sum(dim=(-1, -2))  # [B]
+    else:
+        scores = (train_go * val_at_positions).sum(dim=-1)  # [B]
+    return scores
+
+
+def compute_embedding_val_gradient(
+    grad_output: Tensor,
+    input_ids: Tensor,
+    num_embeddings: int,
+    dim: int,
+) -> Tensor:
+    """
+    Compute the total embedding gradient via scatter.
+
+    grad_weight[v] = Σ_{(b,s): input_ids[b,s]=v} grad_output[b, s, :]
+
+    Args:
+        grad_output: [B, S, D] or [B, D]
+        input_ids: [B, S] or [B]
+        num_embeddings: Vocabulary size V
+        dim: Embedding dimension D
+
+    Returns:
+        grad_weight: [V, D]
+    """
+    grad_weight = torch.zeros(num_embeddings, dim, device=grad_output.device, dtype=grad_output.dtype)
+    grad_weight.index_add_(0, input_ids.reshape(-1), grad_output.reshape(-1, dim))
+    return grad_weight
+
+
+def compute_embedding_selected_gradients(
+    grad_output: Tensor,
+    input_ids: Tensor,
+    selected_indices: Tensor,
+    scale_factor: Tensor,
+    num_embeddings: int,
+    dim: int,
+    padding_idx: int = -1,
+) -> Tensor:
+    """
+    Compute embedding gradient from selected samples only.
+
+    Args:
+        grad_output: [B, S, D] or [B, D]
+        input_ids: [B, S] or [B]
+        selected_indices: [K] indices of selected samples
+        scale_factor: Scalar scaling tensor
+        num_embeddings: Vocabulary size V
+        dim: Embedding dimension D
+        padding_idx: Padding index to zero out (-1 for none)
+
+    Returns:
+        grad_weight: [V, D]
+    """
+    sel_go = grad_output[selected_indices]
+    sel_ids = input_ids[selected_indices]
+
+    grad_weight = torch.zeros(num_embeddings, dim, device=grad_output.device, dtype=grad_output.dtype)
+    grad_weight.index_add_(0, sel_ids.reshape(-1), sel_go.reshape(-1, dim))
+    grad_weight.mul_(scale_factor)
+
+    if padding_idx >= 0:
+        grad_weight[padding_idx].zero_()
+
+    return grad_weight

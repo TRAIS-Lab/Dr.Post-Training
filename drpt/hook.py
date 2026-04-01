@@ -38,7 +38,8 @@ from .selection.backward import (
     LayerwiseLinearBackward,
     SubsetLinearBackward,
     TrainOnlyRMSNormBackward,
-    TrainOnlyEmbeddingBackward,
+    SubsetEmbeddingBackward,
+    LayerwiseEmbeddingBackward,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,9 @@ class GradientHook:
         # so we can assemble gradients post-hoc after global selection
         self._retained_data: Dict[int, Tuple[Tensor, Tensor]] = {}
 
+        # Track which layer indices are Embedding (vs Linear)
+        self._embedding_layer_indices: set = set()
+
         # Non-linear layer wrapping for merged-batch one-pass mode.
         # When active, RMSNorm layers compute grad_weight from train slice only,
         # preventing validation gradient leakage.
@@ -142,10 +146,13 @@ class GradientHook:
     # =========================================================================
 
     def _register_hooks(self):
-        """Monkey-patch Linear layers to use our custom Function."""
+        """Monkey-patch Linear and Embedding layers to use custom Functions."""
         if self.hooks_registered:
             logger.warning("Hooks already registered, skipping")
             return
+
+        n_linear = 0
+        n_embedding = 0
 
         for name, module in self.model.named_modules():
             if name in self.layer_names:
@@ -154,24 +161,26 @@ class GradientHook:
                 # Cache the module
                 self.layer_name_to_module[name] = module
 
-                # Only support Linear layers
-                if not isinstance(module, nn.Linear):
-                    logger.warning(f"Layer {name} is not nn.Linear, skipping")
-                    continue
-
                 # Save original forward method
                 module._original_forward = module.forward
 
-                # Create wrapped forward that uses our custom Function
-                wrapped_forward = functools.partial(
-                    self._custom_linear_forward, module, idx
-                )
-
-                # Replace the forward method
-                module.forward = wrapped_forward
+                if isinstance(module, nn.Linear):
+                    module.forward = functools.partial(
+                        self._custom_linear_forward, module, idx
+                    )
+                    n_linear += 1
+                elif isinstance(module, nn.Embedding):
+                    self._embedding_layer_indices.add(idx)
+                    module.forward = functools.partial(
+                        self._custom_embedding_forward, module, idx
+                    )
+                    n_embedding += 1
+                else:
+                    logger.warning(f"Layer {name} is neither nn.Linear nor nn.Embedding, skipping")
+                    continue
 
         self.hooks_registered = True
-        logger.info(f"Successfully wrapped {len(self.layer_names)} layers")
+        logger.info(f"Successfully wrapped {len(self.layer_names)} layers ({n_linear} Linear, {n_embedding} Embedding)")
 
     def _custom_linear_forward(self, module: nn.Linear, idx: int, input: Tensor) -> Tensor:
         """
@@ -214,6 +223,38 @@ class GradientHook:
         else:
             # No curation and no compression: use original forward
             return module._original_forward(input)
+
+    def _custom_embedding_forward(self, module: nn.Embedding, idx: int, input_ids: Tensor) -> Tensor:
+        """
+        Replacement forward method for Embedding layers.
+
+        Routing logic:
+        1. If hooks disabled -> call original forward
+        2. If Subset state -> SubsetEmbeddingBackward (score accumulation)
+        3. If Layerwise state -> LayerwiseEmbeddingBackward (per-layer curation)
+        4. If capture_val_mode -> LayerwiseEmbeddingBackward (val gradient capture)
+        5. Otherwise -> call original forward
+        """
+        if not self.hooks_enabled:
+            return module._original_forward(input_ids)
+
+        padding_idx = module.padding_idx if module.padding_idx is not None else -1
+        state = self.selection_state
+
+        if isinstance(state, SubsetState):
+            return SubsetEmbeddingBackward.apply(
+                input_ids, module.weight, self, idx, padding_idx
+            )
+        elif isinstance(state, LayerwiseState):
+            return LayerwiseEmbeddingBackward.apply(
+                input_ids, module.weight, self, idx, padding_idx
+            )
+        elif self.capture_val_mode:
+            return LayerwiseEmbeddingBackward.apply(
+                input_ids, module.weight, self, idx, padding_idx
+            )
+        else:
+            return module._original_forward(input_ids)
 
     def set_score_compressors(self, compressors: List[Optional[Compressor]]) -> None:
         """Set compressors for influence score computation."""
@@ -612,7 +653,11 @@ class GradientHook:
             scale_factor: Scaling factor (batch_total_tokens / selected_tokens)
         """
         import torch
-        from .selection.utils import compute_selected_gradients, augment_input_for_bias
+        from .selection.utils import (
+            compute_selected_gradients,
+            compute_embedding_selected_gradients,
+            augment_input_for_bias,
+        )
 
         for layer_idx in range(len(self.layer_names)):
             retained = self._retained_data.get(layer_idx)
@@ -620,32 +665,48 @@ class GradientHook:
                 continue
             grad_output, input_tensor = retained
             module = self._get_module_from_idx(layer_idx)
-            has_bias = module.bias is not None
 
-            update_compressor = self.update_compressors[layer_idx]
-            if update_compressor is not None:
-                # MeSO mode: compress selected gradients and store for optimizer
-                sel_go = grad_output[selected_indices]
-                sel_inp = augment_input_for_bias(input_tensor[selected_indices], has_bias)
-                compressed = update_compressor.forward((sel_go, sel_inp))
-                reduced = compressed.mean(dim=0, keepdim=True) * scale_factor
-                self._store_compressed_grad(layer_idx, reduced)
-            else:
-                # Standard mode: compute full weight gradient
-                grad_weight, grad_bias = compute_selected_gradients(
-                    grad_output, input_tensor,
-                    selected_indices, has_bias, scale_factor
+            is_embedding = layer_idx in self._embedding_layer_indices
+
+            if is_embedding:
+                # Embedding layer: scatter selected gradients
+                padding_idx = module.padding_idx if module.padding_idx is not None else -1
+                V, D = module.weight.shape
+                grad_weight = compute_embedding_selected_gradients(
+                    grad_output, input_tensor, selected_indices, scale_factor,
+                    V, D, padding_idx,
                 )
-                if grad_weight is not None:
-                    if module.weight.grad is None:
-                        module.weight.grad = grad_weight
-                    else:
-                        module.weight.grad.add_(grad_weight)
-                if grad_bias is not None and module.bias is not None:
-                    if module.bias.grad is None:
-                        module.bias.grad = grad_bias
-                    else:
-                        module.bias.grad.add_(grad_bias)
+                if module.weight.grad is None:
+                    module.weight.grad = grad_weight
+                else:
+                    module.weight.grad.add_(grad_weight)
+            else:
+                # Linear layer
+                has_bias = module.bias is not None
+                update_compressor = self.update_compressors[layer_idx]
+                if update_compressor is not None:
+                    # MeSO mode: compress selected gradients and store for optimizer
+                    sel_go = grad_output[selected_indices]
+                    sel_inp = augment_input_for_bias(input_tensor[selected_indices], has_bias)
+                    compressed = update_compressor.forward((sel_go, sel_inp))
+                    reduced = compressed.mean(dim=0, keepdim=True) * scale_factor
+                    self._store_compressed_grad(layer_idx, reduced)
+                else:
+                    # Standard mode: compute full weight gradient
+                    grad_weight, grad_bias = compute_selected_gradients(
+                        grad_output, input_tensor,
+                        selected_indices, has_bias, scale_factor
+                    )
+                    if grad_weight is not None:
+                        if module.weight.grad is None:
+                            module.weight.grad = grad_weight
+                        else:
+                            module.weight.grad.add_(grad_weight)
+                    if grad_bias is not None and module.bias is not None:
+                        if module.bias.grad is None:
+                            module.bias.grad = grad_bias
+                        else:
+                            module.bias.grad.add_(grad_bias)
 
         self.clear_retained_data()
 
@@ -718,23 +779,24 @@ class GradientHook:
 
         Supported layer types:
         - RMSNorm (LlamaRMSNorm, Qwen2RMSNorm, etc.) -> TrainOnlyRMSNormBackward
-        - nn.Embedding -> TrainOnlyEmbeddingBackward
+
+        Note: Embedding layers are NOT wrapped here — they are registered as
+        hooked layers (like Linear) and participate in scoring/selection directly.
 
         Call once at setup (not per-step). The wrapped forward reads
         train_batch_size from self.selection_state during backward, so it
         adapts per-step automatically.
 
-        Also checks for trainable parameters that are neither hooked (Linear)
+        Also checks for trainable parameters that are neither hooked
         nor wrapped, and warns about them.
         """
         if self._nonlinear_wrapped:
             return
 
         n_rmsnorm = 0
-        n_embedding = 0
 
         for name, module in self.model.named_modules():
-            # Skip hooked linear layers
+            # Skip hooked layers (Linear and Embedding)
             if name in self.layer_name_to_idx:
                 continue
 
@@ -756,29 +818,10 @@ class GradientHook:
                 module.forward = make_rmsnorm_wrapped(module, eps)
                 n_rmsnorm += 1
 
-            elif isinstance(module, nn.Embedding):
-                if not module.weight.requires_grad:
-                    continue
-                self._nonlinear_modules[name] = module
-                module._original_forward = module.forward
-
-                padding_idx = module.padding_idx if module.padding_idx is not None else -1
-
-                def make_embedding_wrapped(mod, pad_idx):
-                    def wrapped_forward(input):
-                        return TrainOnlyEmbeddingBackward.apply(
-                            input, mod.weight, self, pad_idx
-                        )
-                    return wrapped_forward
-
-                module.forward = make_embedding_wrapped(module, padding_idx)
-                n_embedding += 1
-
         self._nonlinear_wrapped = True
         if self._nonlinear_modules:
             logger.info(
-                f"Wrapped {len(self._nonlinear_modules)} non-linear layers "
-                f"for train-only grad_weight ({n_rmsnorm} RMSNorm, {n_embedding} Embedding)"
+                f"Wrapped {n_rmsnorm} RMSNorm layers for train-only grad_weight"
             )
 
         # Safety check: warn about trainable params not covered by any hook

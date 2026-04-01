@@ -84,8 +84,8 @@ def find_trainable_layers(model, lora_only=True):
                     lora_b_name = f"{name}.lora_B"
                     layer_names.append(lora_b_name)
         else:
-            # Find all Linear layers (for full fine-tuning)
-            if isinstance(module, torch.nn.Linear):
+            # Find all Linear and Embedding layers (for full fine-tuning)
+            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
                 layer_names.append(name)
 
     return layer_names

@@ -832,15 +832,15 @@ class TrainOnlyRMSNormBackward(Function):
         )
         grad_input = grad_input.to(ctx.input_dtype)
 
-        # grad_weight: TRAIN-ONLY slice with token scaling.
-        # grad_output carries 1/batch_total_tokens from the merged-batch loss mean.
-        # After slicing to train-only, we rescale by batch_total_tokens/train_total_tokens
-        # so the effective normalization is 1/train_total_tokens (matching a train-only loss).
+        # grad_weight: TRAIN-ONLY slice with normalization correction.
+        # grad_output carries 1/batch_total_tokens from the merged-batch loss.
+        # RMSNorm effectively "selects all train samples", so we rescale by
+        # batch_total_tokens / train_total_tokens to match a train-only loss
+        # (i.e., what you'd get from forward/backward on just the train samples).
         if train_bs is not None and train_bs < grad_output.shape[0]:
             train_go = grad_output_f32[:train_bs]
             train_norm = normalized[:train_bs]
             grad_weight = (train_go * train_norm).flatten(0, -2).sum(0)
-            # Rescale: undo 1/batch_total, apply 1/train_total
             if (state is not None
                     and state.batch_total_tokens_tensor is not None
                     and state.train_total_tokens_tensor is not None):
@@ -853,75 +853,188 @@ class TrainOnlyRMSNormBackward(Function):
         return grad_input, grad_weight, None, None
 
 
-class TrainOnlyEmbeddingBackward(Function):
+class SubsetEmbeddingBackward(Function):
     """
-    Custom autograd Function for nn.Embedding in merged-batch one-pass mode.
+    Autograd Function for Embedding in Subset method (global curation).
 
-    Computes grad_input (None, since embedding input is integer indices) and
-    grad_weight from only the train slice of the batch, preventing validation
-    gradient leakage into embedding parameter updates.
-
-    Supports padding_idx: positions with padding_idx get zero gradient.
+    Accumulates per-sample influence scores using gather-dot-sum
+    (the embedding analogue of the reduced ghost inner product).
+    In one-pass mode, retains (grad_output, input_ids) for post-hoc assembly.
     """
 
     @staticmethod
     def forward(
         ctx,
-        input: "Tensor",
+        input_ids: "Tensor",
         weight: "Tensor",
         hook_manager: "GradientHook",
+        layer_idx: int,
         padding_idx: int,
     ) -> "Tensor":
         """Forward pass: standard embedding lookup."""
-        ctx.save_for_backward(input, weight)
+        ctx.save_for_backward(input_ids, weight)
         ctx.hook_manager_ref = weakref.ref(hook_manager)
+        ctx.layer_idx = layer_idx
         ctx.padding_idx = padding_idx
-        output = F.embedding(input, weight, padding_idx=padding_idx if padding_idx >= 0 else None)
-        return output
+        return F.embedding(input_ids, weight, padding_idx=padding_idx if padding_idx >= 0 else None)
 
     @staticmethod
     def backward(
         ctx,
         grad_output: "Tensor",
-    ) -> "Tuple[None, Tensor, None, None]":
-        """
-        Backward pass: train-only grad_weight.
+    ) -> "Tuple[None, None, None, None, None]":
+        """Backward pass: accumulate scores, retain data. No weight gradient."""
+        from .utils import (
+            compute_embedding_scores,
+            compute_embedding_val_gradient,
+            split_train_val_batch,
+        )
 
-        Embedding input is integer indices, so grad_input is None.
-        grad_weight scatters grad_output into the weight matrix, but only
-        for train samples.
-        """
-        input, weight = ctx.saved_tensors
-        padding_idx = ctx.padding_idx
+        input_ids, weight = ctx.saved_tensors
+        layer_idx = ctx.layer_idx
 
         hook_manager = ctx.hook_manager_ref()
-        state = hook_manager.selection_state if hook_manager is not None else None
-        train_bs = state.train_batch_size if state is not None else None
+        if hook_manager is None:
+            return None, None, None, None, None
 
-        # Slice to train-only and rescale
-        is_merged = train_bs is not None and train_bs < input.shape[0]
-        if is_merged:
-            train_input = input[:train_bs]
-            train_go = grad_output[:train_bs]
-        else:
-            train_input = input
-            train_go = grad_output
+        state = hook_manager.selection_state
+        if state is None:
+            return None, None, None, None, None
 
-        # Scatter grad_output into grad_weight
-        grad_weight = torch.zeros_like(weight)
-        train_input_flat = train_input.reshape(-1)
-        train_go_flat = train_go.reshape(-1, weight.shape[1])
-        grad_weight.index_add_(0, train_input_flat, train_go_flat)
+        use_stored_val = getattr(state, '_use_stored_val', False)
 
-        # Rescale: undo 1/batch_total, apply 1/train_total
-        if (is_merged and state is not None
-                and state.batch_total_tokens_tensor is not None
-                and state.train_total_tokens_tensor is not None):
-            scale = state.batch_total_tokens_tensor / state.train_total_tokens_tensor
-            grad_weight = grad_weight * scale
+        with torch.no_grad():
+            if use_stored_val:
+                # Separate batch: entire batch is train, val grad from cache
+                train_go = grad_output
+                train_ids = input_ids
+                val_grad_weight = hook_manager.val_cache.get_full(layer_idx)
+                if val_grad_weight is None:
+                    # No val data for this layer — skip scoring
+                    if state.one_pass:
+                        hook_manager.retain_layer_data(layer_idx, grad_output, input_ids)
+                    return None, None, None, None, None
+                score_correction = None
+            else:
+                # Merged batch: split into train/val
+                train_go, val_go = split_train_val_batch(grad_output, state.train_batch_size)
+                train_ids, val_ids = split_train_val_batch(input_ids, state.train_batch_size)
+                # Compute val gradient by scattering val grad_output
+                V, D = weight.shape
+                val_grad_weight = compute_embedding_val_gradient(val_go, val_ids, V, D)
+                score_correction = state.score_correction
 
-        # Zero out padding_idx gradient
-        if padding_idx >= 0:
-            grad_weight[padding_idx].zero_()
+            # Compute per-sample scores
+            scores = compute_embedding_scores(train_go, train_ids, val_grad_weight)
 
-        return None, grad_weight, None, None
+            if score_correction is not None:
+                scores = scores * score_correction
+
+            # Accumulate into SubsetState (no similarity for embedding)
+            state.accumulate_precomputed_scores(scores, None, None)
+
+            # One-pass: retain data for post-hoc gradient assembly
+            if state.one_pass:
+                if use_stored_val:
+                    hook_manager.retain_layer_data(layer_idx, grad_output, input_ids)
+                else:
+                    # Merged batch: retain train portion only
+                    hook_manager.retain_layer_data(layer_idx, train_go, train_ids)
+
+        return None, None, None, None, None
+
+
+class LayerwiseEmbeddingBackward(Function):
+    """
+    Autograd Function for Embedding in Layerwise method (per-layer curation).
+
+    Computes scores, selects samples, and produces the curated gradient
+    for the embedding layer in a single pass.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        input_ids: "Tensor",
+        weight: "Tensor",
+        hook_manager: "GradientHook",
+        layer_idx: int,
+        padding_idx: int,
+    ) -> "Tensor":
+        """Forward pass: standard embedding lookup."""
+        ctx.save_for_backward(input_ids, weight)
+        ctx.hook_manager_ref = weakref.ref(hook_manager)
+        ctx.layer_idx = layer_idx
+        ctx.padding_idx = padding_idx
+        return F.embedding(input_ids, weight, padding_idx=padding_idx if padding_idx >= 0 else None)
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: "Tensor",
+    ) -> "Tuple[None, Optional[Tensor], None, None, None]":
+        """Backward pass: score, select, produce curated grad_weight."""
+        from .utils import (
+            compute_embedding_scores,
+            compute_embedding_val_gradient,
+            compute_embedding_selected_gradients,
+            split_train_val_batch,
+        )
+
+        input_ids, weight = ctx.saved_tensors
+        layer_idx = ctx.layer_idx
+        padding_idx = ctx.padding_idx
+        V, D = weight.shape
+
+        hook_manager = ctx.hook_manager_ref()
+        if hook_manager is None:
+            return None, None, None, None, None
+
+        state = hook_manager.selection_state
+        capture_val_mode = hook_manager.capture_val_mode
+        use_stored_val = (
+            state is not None and
+            getattr(state, '_use_stored_val', False)
+        )
+
+        with torch.no_grad():
+            # --- Val capture mode: store embedding val gradient ---
+            if capture_val_mode:
+                val_grad = compute_embedding_val_gradient(grad_output, input_ids, V, D)
+                hook_manager.val_cache.store_precomputed(layer_idx, val_grad)
+                return None, None, None, None, None
+
+            # --- No state: no curation ---
+            if state is None:
+                return None, None, None, None, None
+
+            # --- Get val gradient and train data ---
+            if use_stored_val:
+                train_go = grad_output
+                train_ids = input_ids
+                val_grad_weight = hook_manager.val_cache.get_full(layer_idx)
+                if val_grad_weight is None:
+                    return None, None, None, None, None
+                score_correction = None
+            else:
+                train_go, val_go = split_train_val_batch(grad_output, state.train_batch_size)
+                train_ids, val_ids = split_train_val_batch(input_ids, state.train_batch_size)
+                val_grad_weight = compute_embedding_val_gradient(val_go, val_ids, V, D)
+                score_correction = state.score_correction
+
+            # --- Compute scores ---
+            scores = compute_embedding_scores(train_go, train_ids, val_grad_weight)
+            if score_correction is not None:
+                scores = scores * score_correction
+
+            # --- Selection ---
+            selected_indices = _do_selection(state, layer_idx, scores, None)
+
+            # --- Gradient update for selected samples ---
+            scale_factor = state._compute_scale_factor(selected_indices)
+            grad_weight = compute_embedding_selected_gradients(
+                train_go, train_ids, selected_indices, scale_factor,
+                V, D, padding_idx,
+            )
+
+        return None, grad_weight, None, None, None
