@@ -832,13 +832,96 @@ class TrainOnlyRMSNormBackward(Function):
         )
         grad_input = grad_input.to(ctx.input_dtype)
 
-        # grad_weight: TRAIN-ONLY slice
+        # grad_weight: TRAIN-ONLY slice with token scaling.
+        # grad_output carries 1/batch_total_tokens from the merged-batch loss mean.
+        # After slicing to train-only, we rescale by batch_total_tokens/train_total_tokens
+        # so the effective normalization is 1/train_total_tokens (matching a train-only loss).
         if train_bs is not None and train_bs < grad_output.shape[0]:
             train_go = grad_output_f32[:train_bs]
             train_norm = normalized[:train_bs]
             grad_weight = (train_go * train_norm).flatten(0, -2).sum(0)
+            # Rescale: undo 1/batch_total, apply 1/train_total
+            if (state is not None
+                    and state.batch_total_tokens_tensor is not None
+                    and state.train_total_tokens_tensor is not None):
+                scale = state.batch_total_tokens_tensor / state.train_total_tokens_tensor
+                grad_weight = grad_weight * scale
         else:
             # Fallback: full batch (separate batch mode or no state)
             grad_weight = (grad_output_f32 * normalized).flatten(0, -2).sum(0)
 
         return grad_input, grad_weight, None, None
+
+
+class TrainOnlyEmbeddingBackward(Function):
+    """
+    Custom autograd Function for nn.Embedding in merged-batch one-pass mode.
+
+    Computes grad_input (None, since embedding input is integer indices) and
+    grad_weight from only the train slice of the batch, preventing validation
+    gradient leakage into embedding parameter updates.
+
+    Supports padding_idx: positions with padding_idx get zero gradient.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        input: "Tensor",
+        weight: "Tensor",
+        hook_manager: "GradientHook",
+        padding_idx: int,
+    ) -> "Tensor":
+        """Forward pass: standard embedding lookup."""
+        ctx.save_for_backward(input, weight)
+        ctx.hook_manager_ref = weakref.ref(hook_manager)
+        ctx.padding_idx = padding_idx
+        output = F.embedding(input, weight, padding_idx=padding_idx if padding_idx >= 0 else None)
+        return output
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: "Tensor",
+    ) -> "Tuple[None, Tensor, None, None]":
+        """
+        Backward pass: train-only grad_weight.
+
+        Embedding input is integer indices, so grad_input is None.
+        grad_weight scatters grad_output into the weight matrix, but only
+        for train samples.
+        """
+        input, weight = ctx.saved_tensors
+        padding_idx = ctx.padding_idx
+
+        hook_manager = ctx.hook_manager_ref()
+        state = hook_manager.selection_state if hook_manager is not None else None
+        train_bs = state.train_batch_size if state is not None else None
+
+        # Slice to train-only and rescale
+        is_merged = train_bs is not None and train_bs < input.shape[0]
+        if is_merged:
+            train_input = input[:train_bs]
+            train_go = grad_output[:train_bs]
+        else:
+            train_input = input
+            train_go = grad_output
+
+        # Scatter grad_output into grad_weight
+        grad_weight = torch.zeros_like(weight)
+        train_input_flat = train_input.reshape(-1)
+        train_go_flat = train_go.reshape(-1, weight.shape[1])
+        grad_weight.index_add_(0, train_input_flat, train_go_flat)
+
+        # Rescale: undo 1/batch_total, apply 1/train_total
+        if (is_merged and state is not None
+                and state.batch_total_tokens_tensor is not None
+                and state.train_total_tokens_tensor is not None):
+            scale = state.batch_total_tokens_tensor / state.train_total_tokens_tensor
+            grad_weight = grad_weight * scale
+
+        # Zero out padding_idx gradient
+        if padding_idx >= 0:
+            grad_weight[padding_idx].zero_()
+
+        return None, grad_weight, None, None

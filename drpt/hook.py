@@ -38,6 +38,7 @@ from .selection.backward import (
     LayerwiseLinearBackward,
     SubsetLinearBackward,
     TrainOnlyRMSNormBackward,
+    TrainOnlyEmbeddingBackward,
 )
 
 logger = logging.getLogger(__name__)
@@ -713,46 +714,72 @@ class GradientHook:
 
     def wrap_nonlinear_layers(self) -> None:
         """
-        Wrap trainable RMSNorm layers with TrainOnlyRMSNormBackward.
+        Wrap trainable non-linear layers for train-only grad_weight.
+
+        Supported layer types:
+        - RMSNorm (LlamaRMSNorm, Qwen2RMSNorm, etc.) -> TrainOnlyRMSNormBackward
+        - nn.Embedding -> TrainOnlyEmbeddingBackward
 
         Call once at setup (not per-step). The wrapped forward reads
         train_batch_size from self.selection_state during backward, so it
         adapts per-step automatically.
 
         Also checks for trainable parameters that are neither hooked (Linear)
-        nor wrapped (RMSNorm), and warns about them.
+        nor wrapped, and warns about them.
         """
         if self._nonlinear_wrapped:
             return
 
+        n_rmsnorm = 0
+        n_embedding = 0
+
         for name, module in self.model.named_modules():
-            # Skip non-RMSNorm modules
-            if not self._is_rmsnorm(module):
-                continue
-            # Skip frozen layers
-            if not module.weight.requires_grad:
-                continue
-            # Skip hooked linear layers (shouldn't overlap, but be safe)
+            # Skip hooked linear layers
             if name in self.layer_name_to_idx:
                 continue
 
-            self._nonlinear_modules[name] = module
-            module._original_forward = module.forward
+            if self._is_rmsnorm(module):
+                if not module.weight.requires_grad:
+                    continue
+                self._nonlinear_modules[name] = module
+                module._original_forward = module.forward
 
-            eps = getattr(module, 'variance_epsilon', None) or getattr(module, 'eps', 1e-6)
+                eps = getattr(module, 'variance_epsilon', None) or getattr(module, 'eps', 1e-6)
 
-            def make_wrapped(mod, mod_eps):
-                def wrapped_forward(hidden_states):
-                    return TrainOnlyRMSNormBackward.apply(
-                        hidden_states, mod.weight, mod_eps, self
-                    )
-                return wrapped_forward
+                def make_rmsnorm_wrapped(mod, mod_eps):
+                    def wrapped_forward(hidden_states):
+                        return TrainOnlyRMSNormBackward.apply(
+                            hidden_states, mod.weight, mod_eps, self
+                        )
+                    return wrapped_forward
 
-            module.forward = make_wrapped(module, eps)
+                module.forward = make_rmsnorm_wrapped(module, eps)
+                n_rmsnorm += 1
+
+            elif isinstance(module, nn.Embedding):
+                if not module.weight.requires_grad:
+                    continue
+                self._nonlinear_modules[name] = module
+                module._original_forward = module.forward
+
+                padding_idx = module.padding_idx if module.padding_idx is not None else -1
+
+                def make_embedding_wrapped(mod, pad_idx):
+                    def wrapped_forward(input):
+                        return TrainOnlyEmbeddingBackward.apply(
+                            input, mod.weight, self, pad_idx
+                        )
+                    return wrapped_forward
+
+                module.forward = make_embedding_wrapped(module, padding_idx)
+                n_embedding += 1
 
         self._nonlinear_wrapped = True
         if self._nonlinear_modules:
-            logger.info(f"Wrapped {len(self._nonlinear_modules)} RMSNorm layers for train-only grad_weight")
+            logger.info(
+                f"Wrapped {len(self._nonlinear_modules)} non-linear layers "
+                f"for train-only grad_weight ({n_rmsnorm} RMSNorm, {n_embedding} Embedding)"
+            )
 
         # Safety check: warn about trainable params not covered by any hook
         self.check_unhooked_trainable_params()
