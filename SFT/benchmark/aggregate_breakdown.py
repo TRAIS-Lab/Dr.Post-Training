@@ -74,6 +74,8 @@ def print_breakdown_table(entries, out, scoring_filter="compress"):
       w.grad     — weight gradient: dL/dW = dL/de^T @ a (for selected samples)
       retain     — save (go, inp) for post-hoc assembly (1P only)
       autograd   — PyTorch autograd overhead (hooks, graph traversal, alloc)
+    Note: embedding layer costs (gather-dot-sum scoring, scatter gradients)
+    are folded into the corresponding phases (score, select, w.grad, retain).
     selection  — global top-k across accumulated per-layer scores (subset only)
     assembly   — post-hoc w.grad from retained data (1P only)
     pass1/2    — two-pass variant runs scoring pass then gradient pass (2P only)
@@ -125,12 +127,12 @@ def print_breakdown_table(entries, out, scoring_filter="compress"):
             optim = r.get("optimizer", 0)
 
             if method == "subset":
-                # Two-pass: show full breakdown for both passes
+                # Two-pass: fold embedding into corresponding phases
                 p1f = r.get("pass1_forward", 0)
                 p1b = r.get("pass1_backward", 0)
                 p1_act = r.get("p1_act_grad", 0)
                 p1_comp = r.get("p1_compress", 0) or 0
-                p1_score = r.get("p1_score", 0) or 0
+                p1_score = (r.get("p1_score", 0) or 0) + (r.get("p1_emb_score", 0) or 0)
                 p1_auto = p1b - p1_act - p1_comp - p1_score
                 sel = r.get("selection", 0) or 0
                 p2f = r.get("pass2_forward", 0)
@@ -155,12 +157,13 @@ def print_breakdown_table(entries, out, scoring_filter="compress"):
                 out.write(f"{'':12s}  optimizer   {optim:>8.1f}ms\n")
                 out.write(f"{'':12s}  TOTAL       {total:>8.1f}ms  {ovh:>9s}  {mem:>5.1f}G\n")
             elif method == "subset_one_pass":
+                # Fold embedding into score/retain
                 fwd = r.get("forward", 0)
                 bwd = r.get("backward", 0)
                 act = r.get("act_grad", 0)
                 comp = r.get("compress", 0) or 0
-                score = r.get("score", 0) or 0
-                retain = r.get("retain", 0) or 0
+                score = (r.get("score", 0) or 0) + (r.get("emb_score", 0) or 0)
+                retain = (r.get("retain", 0) or 0) + (r.get("emb_retain", 0) or 0)
                 auto = bwd - act - comp - score - retain
                 sel = r.get("selection", 0) or 0
                 asm = r.get("wgrad", 0) or 0
@@ -179,14 +182,14 @@ def print_breakdown_table(entries, out, scoring_filter="compress"):
                 out.write(f"{'':12s}  optimizer   {optim:>8.1f}ms\n")
                 out.write(f"{'':12s}  TOTAL       {total:>8.1f}ms  {ovh:>9s}  {mem:>5.1f}G\n")
             else:
-                # Standard and Layerwise
+                # Standard and Layerwise: fold embedding into score/select/wgrad
                 fwd = r.get("forward", 0)
                 bwd = r.get("backward", 0)
                 act = r.get("act_grad", 0)
                 comp = r.get("compress", 0) or 0
-                score = r.get("score", 0) or 0
-                sel = r.get("select", 0) or 0
-                wg = r.get("wgrad", 0) or 0
+                score = (r.get("score", 0) or 0) + (r.get("emb_score", 0) or 0)
+                sel = (r.get("select", 0) or 0) + (r.get("emb_select", 0) or 0)
+                wg = (r.get("wgrad", 0) or 0) + (r.get("emb_wgrad", 0) or 0)
                 sw = r.get("select_wgrad", 0) or 0
                 measured = act + comp + score + sel + wg + sw
                 auto = bwd - measured
