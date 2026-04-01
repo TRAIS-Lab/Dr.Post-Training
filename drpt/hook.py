@@ -676,6 +676,7 @@ class GradientHook:
                     grad_output, input_tensor, selected_indices, scale_factor,
                     V, D, padding_idx,
                 )
+                grad_weight = grad_weight.to(module.weight.dtype)
                 if module.weight.grad is None:
                     module.weight.grad = grad_weight
                 else:
@@ -698,11 +699,13 @@ class GradientHook:
                         selected_indices, has_bias, scale_factor
                     )
                     if grad_weight is not None:
+                        grad_weight = grad_weight.to(module.weight.dtype)
                         if module.weight.grad is None:
                             module.weight.grad = grad_weight
                         else:
                             module.weight.grad.add_(grad_weight)
                     if grad_bias is not None and module.bias is not None:
+                        grad_bias = grad_bias.to(module.bias.dtype)
                         if module.bias.grad is None:
                             module.bias.grad = grad_bias
                         else:

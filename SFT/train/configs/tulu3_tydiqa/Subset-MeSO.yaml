@@ -2,7 +2,7 @@
 method: Subset
 finetuning: MeSO
 learning_rate: 3.00e-05
-subset_mode: two_pass
+subset_mode: one_pass
 scoring:
   method: reduced_ghost
 

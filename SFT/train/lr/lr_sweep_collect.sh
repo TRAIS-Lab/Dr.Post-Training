@@ -342,6 +342,7 @@ sys.exit(1)
     # Pick best LR: smallest LR within margin of best loss
     best_result=$(python3 -c "
 import sys
+inf = float('inf')
 
 lr_loss_pairs = []
 $(for lr in "${!lr_losses[@]}"; do echo "lr_loss_pairs.append(($lr, ${lr_losses[$lr]}))"; done)

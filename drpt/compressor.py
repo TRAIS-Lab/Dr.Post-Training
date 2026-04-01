@@ -750,7 +750,12 @@ def setup_model_compressors(
 
             # Create appropriate sparsifiers based on layer type
             # Sparsifiers are ALWAYS factorized
-            if isinstance(module, nn.Linear):
+            if isinstance(module, nn.Embedding):
+                # Embedding layers use dedicated scoring/gradient functions
+                # that don't need compressors. Skip and leave compressor as None.
+                logger.info(f"Skipping compression for Embedding layer: {module_name}")
+                continue
+            elif isinstance(module, nn.Linear):
                 _setup_linear_sparsifier(
                     sparsifier,
                     module,

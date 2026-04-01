@@ -1036,5 +1036,6 @@ class LayerwiseEmbeddingBackward(Function):
                 train_go, train_ids, selected_indices, scale_factor,
                 V, D, padding_idx,
             )
+            grad_weight = grad_weight.to(weight.dtype)
 
         return None, grad_weight, None, None, None
