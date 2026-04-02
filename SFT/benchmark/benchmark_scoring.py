@@ -112,7 +112,7 @@ def time_scoring_one_layer(method, n, T, m, O, I, device,
     elif method == "direct":
         fn = lambda: compute_scores_direct_materialization(
             train_go, train_inp, val_go, val_inp, None, False,
-            batch_size=direct_batch_size)
+            batch_size=direct_batch_size)[:2]
     else:
         raise ValueError(f"Unknown method: {method}")
 

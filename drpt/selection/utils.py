@@ -283,7 +283,8 @@ def compute_scores_direct_materialization(
     val_grad_total: Optional[Tensor],
     use_second_order: bool,
     batch_size: int = 0,
-) -> Tuple[Tensor, Optional[Tensor]]:
+    return_materialized: bool = False,
+) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     """
     Score computation via batch materialization of per-sample gradients.
 
@@ -303,9 +304,13 @@ def compute_scores_direct_materialization(
         val_grad_total: Total validation gradient [O, I] or None
         use_second_order: Whether to compute similarity matrix
         batch_size: Chunk size for batched processing. 0 = all at once.
+        return_materialized: If True, return G_train [B, O*I] so the caller
+            can reuse it for w.grad (avoids re-materializing from go/inp).
 
     Returns:
-        (scores, similarity) tuple where similarity is None if not use_second_order
+        (scores, similarity, G_train) tuple where similarity is None if not
+        use_second_order, and G_train is None unless return_materialized=True
+        with full (non-chunked) materialization.
     """
     target_dtype = train_grad_output.dtype
     if val_grad_output is not None:
@@ -328,11 +333,15 @@ def compute_scores_direct_materialization(
     B = train_grad_output.shape[0]
     val_flat = val_grad_total.flatten()  # [O*I]
 
+    G_out = None  # optionally returned for w.grad reuse
+
     if batch_size <= 0 or batch_size >= B:
         # Full materialization: all B samples at once
         G_train = _materialize_gradients(train_grad_output, train_input)
         scores = torch.matmul(G_train, val_flat)
         similarity = torch.matmul(G_train, G_train.T) if use_second_order else None
+        if return_materialized:
+            G_out = G_train
     else:
         # Chunked: materialize batch_size samples at a time
         scores = torch.empty(B, device=train_grad_output.device, dtype=target_dtype)
@@ -348,6 +357,8 @@ def compute_scores_direct_materialization(
                 chunks.append(G_chunk)
             G_train = torch.cat(chunks, dim=0)
             similarity = torch.matmul(G_train, G_train.T)
+            if return_materialized:
+                G_out = G_train
         else:
             similarity = None
             for start in range(0, B, batch_size):
@@ -358,7 +369,7 @@ def compute_scores_direct_materialization(
                 scores[start:end] = torch.matmul(G_chunk, val_flat)
                 # G_chunk is freed here — peak memory is batch_size × O × I
 
-    return scores, similarity
+    return scores, similarity, G_out
 
 
 def _materialize_gradients(grad_output: Tensor, inp: Tensor) -> Tensor:

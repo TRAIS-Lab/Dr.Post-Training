@@ -293,10 +293,18 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             vgt = None
             scorr = state.score_correction
         sm = getattr(state, 'scoring_method', 'reduced_ghost')
-        scores, sim = _dispatch_scoring(sm, tgo, ti, vgo, vinp, vgt, state.use_second_order)
+        dbs = getattr(state, 'direct_batch_size', 0)
+        include_val = (getattr(state, 'include_val_in_update', False) and not usv)
+        want_mat = (sm == "direct" and uc is None and not include_val)
+        scores, sim, G = _dispatch_scoring(
+            sm, tgo, ti, vgo, vinp, vgt, state.use_second_order,
+            direct_batch_size=dbs, return_materialized=want_mat)
         if scorr is not None:
             scores = scores * scorr
             if sim is not None: sim = sim * (scorr ** 2)
+        # Free raw activations when G_train available for wgrad reuse
+        if G is not None:
+            ti = vinp = vgt = vgo = None
         rec.mark('score')
         # Select
         rec.mark('select')
@@ -304,10 +312,11 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
         rec.mark('select')
         # Wgrad
         rec.mark('wgrad')
-        if (getattr(state, 'include_val_in_update', False) and not usv):
+        if include_val:
             gw, gb = _produce_gu_val(state, si, tgo, ti, vgo, vinp, hb)
         else:
-            gw, gb = _produce_gu(hm, uc, state, lidx, tgo, ti, si, hb)
+            gw, gb = _produce_gu(hm, uc, state, lidx, tgo, ti, si, hb,
+                                 materialized_grads=G)
         rec.mark('wgrad')
         return gw, gb
 

@@ -89,23 +89,32 @@ def _dispatch_scoring(
     val_grad_total: "Optional[Tensor]",
     use_second_order: bool,
     direct_batch_size: int = 0,
-) -> "Tuple[Tensor, Optional[Tensor]]":
-    """Dispatch to the appropriate scoring function based on scoring_method."""
+    return_materialized: bool = False,
+) -> "Tuple[Tensor, Optional[Tensor], Optional[Tensor]]":
+    """Dispatch to the appropriate scoring function based on scoring_method.
+
+    Returns:
+        (scores, similarity, materialized_grads) where materialized_grads is
+        the [B, O*I] per-sample weight gradient tensor when return_materialized=True
+        and scoring_method="direct", otherwise None.
+    """
     if scoring_method == "direct":
-        return compute_scores_direct_materialization(
+        scores, similarity, G_train = compute_scores_direct_materialization(
             train_grad_output, train_input, val_grad_output, val_input,
-            val_grad_total, use_second_order, batch_size=direct_batch_size
+            val_grad_total, use_second_order, batch_size=direct_batch_size,
+            return_materialized=return_materialized,
         )
+        return scores, similarity, G_train
     elif scoring_method == "full_ghost":
-        return compute_scores_full_ghost(
+        return (*compute_scores_full_ghost(
             train_grad_output, train_input, val_grad_output, val_input,
             val_grad_total, use_second_order
-        )
+        ), None)
     else:  # "reduced_ghost" (default)
-        return compute_scores_and_similarity(
+        return (*compute_scores_and_similarity(
             train_grad_output, train_input, val_grad_output, val_input,
             val_grad_total, use_second_order
-        )
+        ), None)
 
 
 def _add_bias_scores(
@@ -195,11 +204,16 @@ def _produce_gradient_update(
     train_input: Tensor,
     selected_indices: Tensor,
     has_bias: bool,
+    materialized_grads: Optional[Tensor] = None,
 ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
     """After curation, produce the gradient update.
 
     If update_compressor exists: compress selected gradients → store for MeSO → return (None, None).
     Otherwise: compute full gradients for selected samples → return (grad_weight, grad_bias).
+
+    When materialized_grads (G_train [B, O*I]) is provided from direct scoring,
+    reuses it for w.grad instead of recomputing from go/inp — avoids holding both
+    the raw activations and the gradient simultaneously.
     """
     scale_factor = _compute_scale_factor(state, selected_indices)
 
@@ -210,11 +224,25 @@ def _produce_gradient_update(
         reduced_grad = update_compressed.mean(dim=0, keepdim=True) * scale_factor
         hook_manager._store_compressed_grad(layer_idx, reduced_grad)
         return None, None
-    else:
-        grad_weight, grad_bias = compute_selected_gradients(
-            train_grad_output, train_input, selected_indices, has_bias, scale_factor
-        )
+
+    if materialized_grads is not None:
+        # Reuse G_train from direct scoring: G_train[i] = go_i^T @ inp_i flattened
+        # Note: materialized_grads contains weight grads only (no bias augmentation).
+        O = train_grad_output.shape[-1]
+        grad_weight = materialized_grads[selected_indices].sum(dim=0).reshape(O, -1) * scale_factor
+        grad_bias = None
+        if has_bias:
+            sel_go = train_grad_output[selected_indices]
+            if sel_go.dim() == 3:
+                grad_bias = sel_go.sum(dim=(0, 1)) * scale_factor
+            else:
+                grad_bias = sel_go.sum(dim=0) * scale_factor
         return grad_weight, grad_bias
+
+    grad_weight, grad_bias = compute_selected_gradients(
+        train_grad_output, train_input, selected_indices, has_bias, scale_factor
+    )
+    return grad_weight, grad_bias
 
 
 def _produce_gradient_update_with_val(
@@ -569,11 +597,19 @@ class LayerwiseLinearBackward(Function):
             score_correction = state.score_correction
 
         scoring_method = getattr(state, 'scoring_method', 'reduced_ghost')
-        scores, similarity = _dispatch_scoring(
+        # Request materialized G_train for direct scoring so we can reuse it
+        # for w.grad without keeping train_input alive.
+        include_val = (getattr(state, 'include_val_in_update', False)
+                       and not use_stored_val)
+        want_materialized = (scoring_method == "direct"
+                             and update_compressor is None
+                             and not include_val)
+        scores, similarity, materialized_grads = _dispatch_scoring(
             scoring_method, train_grad_output, train_input,
             val_grad_output, val_input, val_grad_total,
             state.use_second_order,
-            direct_batch_size=getattr(state, 'direct_batch_size', 0)
+            direct_batch_size=getattr(state, 'direct_batch_size', 0),
+            return_materialized=want_materialized,
         )
 
         # Add bias gradient contribution to scores
@@ -581,6 +617,11 @@ class LayerwiseLinearBackward(Function):
             scores, similarity, train_grad_output,
             val_grad_output, val_bias_grad, has_bias
         )
+
+        # Free raw activations early when we have materialized grads for w.grad.
+        # Use None assignment (not del) since train_input is still passed by name below.
+        if materialized_grads is not None:
+            train_input = val_input = val_grad_total = val_grad_output = None
 
         if score_correction is not None:
             scores = scores * score_correction
@@ -591,8 +632,7 @@ class LayerwiseLinearBackward(Function):
         selected_indices = _do_selection(state, layer_idx, scores, similarity)
 
         # LayerwiseWithVal: unified gradient from selected train + val in one einsum
-        if (getattr(state, 'include_val_in_update', False)
-                and not use_stored_val):
+        if include_val:
             return _produce_gradient_update_with_val(
                 state, selected_indices,
                 train_grad_output, train_input,
@@ -601,7 +641,8 @@ class LayerwiseLinearBackward(Function):
 
         return _produce_gradient_update(
             hook_manager, update_compressor, state, layer_idx,
-            train_grad_output, train_input, selected_indices, has_bias
+            train_grad_output, train_input, selected_indices, has_bias,
+            materialized_grads=materialized_grads,
         )
 
 
@@ -746,7 +787,7 @@ class SubsetLinearBackward(Function):
             score_correction = state.score_correction  # Tensor
 
         # Route to scoring method based on state configuration
-        scores, similarity = _dispatch_scoring(
+        scores, similarity, _ = _dispatch_scoring(
             state.scoring_method, train_grad_output, train_input,
             val_go, val_inp, val_grad_total, state.use_second_order,
             direct_batch_size=getattr(state, 'direct_batch_size', 0)
