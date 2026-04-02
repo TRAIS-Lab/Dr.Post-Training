@@ -852,7 +852,7 @@ def setup_grad_hook(
     device: str = 'cuda',
 ) -> GradientHook:
     """Create GradientHook with optional score compression."""
-    layer_names = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    layer_names = [n for n, m in model.named_modules() if isinstance(m, (nn.Linear, nn.Embedding))]
     grad_hook = GradientHook(model=model, layer_names=layer_names, device=device)
 
     # Set up score compressors if configured

@@ -324,6 +324,83 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
     _bwd.LayerwiseLinearBackward._backward_compressed = timed_compressed
     _bwd.LayerwiseLinearBackward._backward_full = timed_full
 
+    # --- Embedding timing patch ---
+    _orig_emb_backward = _bwd.LayerwiseEmbeddingBackward.backward
+
+    @staticmethod
+    def timed_emb_backward(ctx, grad_output):
+        from drpt.selection.utils import (
+            compute_embedding_scores,
+            compute_embedding_val_gradient,
+            compute_embedding_selected_gradients,
+            split_train_val_batch,
+        )
+        from drpt.selection.backward import _do_selection
+
+        input_ids, weight = ctx.saved_tensors
+        layer_idx = ctx.layer_idx
+        padding_idx = ctx.padding_idx
+        V, D = weight.shape
+
+        hook_manager = ctx.hook_manager_ref()
+        if hook_manager is None:
+            return None, None, None, None, None
+
+        state = hook_manager.selection_state
+        capture_val_mode = hook_manager.capture_val_mode
+        use_stored_val = (
+            state is not None and
+            getattr(state, '_use_stored_val', False)
+        )
+
+        with torch.no_grad():
+            if capture_val_mode:
+                val_grad = compute_embedding_val_gradient(grad_output, input_ids, V, D)
+                hook_manager.val_cache.store_precomputed(layer_idx, val_grad)
+                return None, None, None, None, None
+
+            if state is None:
+                return None, None, None, None, None
+
+            # Score (val gradient + scoring)
+            rec.mark('emb_score')
+            if use_stored_val:
+                train_go, train_ids = grad_output, input_ids
+                val_grad_weight = hook_manager.val_cache.get_full(layer_idx)
+                if val_grad_weight is None:
+                    rec.mark('emb_score')
+                    return None, None, None, None, None
+                score_correction = None
+            else:
+                train_go, val_go = split_train_val_batch(grad_output, state.train_batch_size)
+                train_ids, val_ids = split_train_val_batch(input_ids, state.train_batch_size)
+                val_grad_weight = compute_embedding_val_gradient(val_go, val_ids, V, D)
+                score_correction = state.score_correction
+
+            scores = compute_embedding_scores(train_go, train_ids, val_grad_weight)
+            if score_correction is not None:
+                scores = scores * score_correction
+            rec.mark('emb_score')
+
+            # Select
+            rec.mark('emb_select')
+            selected_indices = _do_selection(state, layer_idx, scores, None)
+            rec.mark('emb_select')
+
+            # Wgrad
+            rec.mark('emb_wgrad')
+            scale_factor = state._compute_scale_factor(selected_indices)
+            grad_weight = compute_embedding_selected_gradients(
+                train_go, train_ids, selected_indices, scale_factor,
+                V, D, padding_idx,
+            )
+            grad_weight = grad_weight.to(weight.dtype)
+            rec.mark('emb_wgrad')
+
+        return None, grad_weight, None, None, None
+
+    _bwd.LayerwiseEmbeddingBackward.backward = timed_emb_backward
+
     def step(batch, val_batch, i=None):
         train_bs = batch['input_ids'].shape[0]
         merged = pad_and_merge_batches(batch, val_batch, pad_token_id=pad_token_id)
@@ -355,6 +432,7 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
     _bwd.LayerwiseLinearBackward.backward = _orig_backward
     _bwd.LayerwiseLinearBackward._backward_compressed = _orig_compressed
     _bwd.LayerwiseLinearBackward._backward_full = _orig_full
+    _bwd.LayerwiseEmbeddingBackward.backward = _orig_emb_backward
 
     result = timer.mean_elapsed()
     result.update(comp)
@@ -466,6 +544,56 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
     _bwd.SubsetLinearBackward._accumulate_compressed = timed_accum
     _bwd.SubsetLinearBackward._accumulate_full = timed_accum_full
 
+    # --- Embedding timing patch (two-pass subset: score only, no wgrad in pass 1) ---
+    _orig_emb_backward = _bwd.SubsetEmbeddingBackward.backward
+
+    @staticmethod
+    def timed_emb_backward(ctx, grad_output):
+        from drpt.selection.utils import (
+            compute_embedding_scores,
+            compute_embedding_val_gradient,
+            split_train_val_batch,
+        )
+
+        input_ids, weight = ctx.saved_tensors
+        layer_idx = ctx.layer_idx
+
+        hook_manager = ctx.hook_manager_ref()
+        if hook_manager is None:
+            return None, None, None, None, None
+
+        state = hook_manager.selection_state
+        if state is None:
+            return None, None, None, None, None
+
+        use_stored_val = getattr(state, '_use_stored_val', False)
+
+        with torch.no_grad():
+            rec.mark('emb_score')
+            if use_stored_val:
+                train_go, train_ids = grad_output, input_ids
+                val_grad_weight = hook_manager.val_cache.get_full(layer_idx)
+                if val_grad_weight is None:
+                    rec.mark('emb_score')
+                    return None, None, None, None, None
+                score_correction = None
+            else:
+                train_go, val_go = split_train_val_batch(grad_output, state.train_batch_size)
+                train_ids, val_ids = split_train_val_batch(input_ids, state.train_batch_size)
+                V, D = weight.shape
+                val_grad_weight = compute_embedding_val_gradient(val_go, val_ids, V, D)
+                score_correction = state.score_correction
+
+            scores = compute_embedding_scores(train_go, train_ids, val_grad_weight)
+            if score_correction is not None:
+                scores = scores * score_correction
+            state.accumulate_precomputed_scores(scores, None, None)
+            rec.mark('emb_score')
+
+        return None, None, None, None, None
+
+    _bwd.SubsetEmbeddingBackward.backward = timed_emb_backward
+
     # Disable score compressors unless scoring_method is "compress"
     scoring_method = getattr(config, 'scoring_method', 'reduced_ghost')
     saved_score_compressors = grad_hook.score_compressors
@@ -552,6 +680,7 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
     _bwd.SubsetLinearBackward.backward = _orig_backward
     _bwd.SubsetLinearBackward._accumulate_compressed = _orig_accum
     _bwd.SubsetLinearBackward._accumulate_full = _orig_accum_full
+    _bwd.SubsetEmbeddingBackward.backward = _orig_emb_backward
     grad_hook.score_compressors = saved_score_compressors
 
     result = timer.mean_elapsed()
@@ -646,6 +775,68 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
     _bwd.SubsetLinearBackward._accumulate_full = timed_accum_full
     _bwd.SubsetLinearBackward._accumulate_compressed = timed_accum_compressed
 
+    # --- Embedding timing patch (one-pass: score + retain) ---
+    _orig_emb_backward = _bwd.SubsetEmbeddingBackward.backward
+
+    @staticmethod
+    def timed_emb_backward(ctx, grad_output):
+        from drpt.selection.utils import (
+            compute_embedding_scores,
+            compute_embedding_val_gradient,
+            split_train_val_batch,
+        )
+
+        input_ids, weight = ctx.saved_tensors
+        layer_idx = ctx.layer_idx
+
+        hook_manager = ctx.hook_manager_ref()
+        if hook_manager is None:
+            return None, None, None, None, None
+
+        state = hook_manager.selection_state
+        if state is None:
+            return None, None, None, None, None
+
+        use_stored_val = getattr(state, '_use_stored_val', False)
+
+        with torch.no_grad():
+            rec.mark('emb_score')
+            if use_stored_val:
+                train_go, train_ids = grad_output, input_ids
+                val_grad_weight = hook_manager.val_cache.get_full(layer_idx)
+                if val_grad_weight is None:
+                    rec.mark('emb_score')
+                    if state.one_pass:
+                        rec.mark('emb_retain')
+                        hook_manager.retain_layer_data(layer_idx, grad_output, input_ids)
+                        rec.mark('emb_retain')
+                    return None, None, None, None, None
+                score_correction = None
+            else:
+                train_go, val_go = split_train_val_batch(grad_output, state.train_batch_size)
+                train_ids, val_ids = split_train_val_batch(input_ids, state.train_batch_size)
+                V, D = weight.shape
+                val_grad_weight = compute_embedding_val_gradient(val_go, val_ids, V, D)
+                score_correction = state.score_correction
+
+            scores = compute_embedding_scores(train_go, train_ids, val_grad_weight)
+            if score_correction is not None:
+                scores = scores * score_correction
+            state.accumulate_precomputed_scores(scores, None, None)
+            rec.mark('emb_score')
+
+            if state.one_pass:
+                rec.mark('emb_retain')
+                if use_stored_val:
+                    hook_manager.retain_layer_data(layer_idx, grad_output, input_ids)
+                else:
+                    hook_manager.retain_layer_data(layer_idx, train_go, train_ids)
+                rec.mark('emb_retain')
+
+        return None, None, None, None, None
+
+    _bwd.SubsetEmbeddingBackward.backward = timed_emb_backward
+
     # Disable score compressors for one-pass — use exact scoring
     saved_score_compressors = grad_hook.score_compressors
     if scoring_method != "compress":
@@ -716,6 +907,7 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
     _bwd.SubsetLinearBackward.backward = _orig_backward
     _bwd.SubsetLinearBackward._accumulate_full = _orig_accum_full
     _bwd.SubsetLinearBackward._accumulate_compressed = _orig_accum_compressed
+    _bwd.SubsetEmbeddingBackward.backward = _orig_emb_backward
     grad_hook.score_compressors = saved_score_compressors
 
     result = timer.mean_elapsed()
@@ -809,7 +1001,10 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
     def _bkd(label, items, total):
         print(f"  {label}:")
         for name, val in items:
-            print(f"    {name:<33} {val:>8.1f} ms")
+            if name.startswith("---"):
+                print(f"    {name}")
+            else:
+                print(f"    {name:<33} {val:>8.1f} ms")
         print(f"    {'total backward':<33} {total:>8.1f} ms")
 
     # Standard
@@ -821,12 +1016,12 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
                    ("autograd overhead", s_bwd - s_act - s_wg)]
     _bkd("Standard", s_items, s_bwd)
 
-    # Layerwise
+    # Layerwise (fold embedding into corresponding phases)
     l_act = layerwise.get('act_grad', 0)
     l_comp = layerwise.get('compress', 0)
-    l_score = layerwise.get('score', 0)
-    l_sel = layerwise.get('select', 0)
-    l_wg = layerwise.get('wgrad', 0)
+    l_score = layerwise.get('score', 0) + layerwise.get('emb_score', 0)
+    l_sel = layerwise.get('select', 0) + layerwise.get('emb_select', 0)
+    l_wg = layerwise.get('wgrad', 0) + layerwise.get('emb_wgrad', 0)
     l_sw = layerwise.get('select_wgrad', 0)
     l_measured = l_act + l_comp + l_score + l_sel + l_wg + l_sw
     l_items = [("act_grad (chain rule)", l_act),
@@ -839,10 +1034,10 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
     l_items.append(("autograd overhead", l_bwd - l_measured))
     _bkd("Layerwise", l_items, l_bwd)
 
-    # Subset two-pass
+    # Subset two-pass (fold embedding into score)
     p1_act = subset.get('p1_act_grad', 0)
     p1_comp = subset.get('p1_compress', 0)
-    p1_score = subset.get('p1_score', 0)
+    p1_score = subset.get('p1_score', 0) + subset.get('p1_emb_score', 0)
     p1_measured = p1_act + p1_comp + p1_score
     p1_total = sub_p1b + sub_sel
     p1_items = [("act_grad (chain rule)", p1_act),
@@ -863,12 +1058,12 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
         print(f"    {'autograd overhead':<33} {p2_overhead:>8.1f} ms")
     print(f"    {'backward':<33} {sub_p2b:>8.1f} ms")
 
-    # Subset one-pass
+    # Subset one-pass (fold embedding into score/retain)
     if has_op:
         op_act = subset_one_pass.get('act_grad', 0)
         op_comp = subset_one_pass.get('compress', 0)
-        op_score = subset_one_pass.get('score', 0)
-        op_retain = subset_one_pass.get('retain', 0)
+        op_score = subset_one_pass.get('score', 0) + subset_one_pass.get('emb_score', 0)
+        op_retain = subset_one_pass.get('retain', 0) + subset_one_pass.get('emb_retain', 0)
         op_measured = op_act + op_comp + op_score + op_retain
         op_items = [("act_grad (chain rule)", op_act),
                     ("compress (sparsifier.forward)", op_comp),
