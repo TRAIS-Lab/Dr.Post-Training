@@ -35,10 +35,6 @@ from drpt.selection.utils import (
 # =============================================================================
 
 MODEL_DEFS = {
-    "qwen3-0.6b": {
-        "name": "Qwen/Qwen3-0.6B",
-        "h": 1024, "i": 3072, "L": 28, "heads": 16, "kv": 8, "hd": 128,
-    },
     "qwen3-1.7b": {
         "name": "Qwen/Qwen3-1.7B",
         "h": 2048, "i": 6144, "L": 28, "heads": 16, "kv": 8, "hd": 128,
@@ -46,6 +42,10 @@ MODEL_DEFS = {
     "qwen3-4b": {
         "name": "Qwen/Qwen3-4B",
         "h": 2560, "i": 9728, "L": 36, "heads": 32, "kv": 8, "hd": 128,
+    },
+    "qwen3-8b": {
+        "name": "Qwen/Qwen3-8B",
+        "h": 4096, "i": 12288, "L": 36, "heads": 32, "kv": 8, "hd": 128,
     },
 }
 
