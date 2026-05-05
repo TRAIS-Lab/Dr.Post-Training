@@ -35,17 +35,17 @@ from drpt.selection.utils import (
 # =============================================================================
 
 MODEL_DEFS = {
-    "qwen3-1.7b": {
-        "name": "Qwen/Qwen3-1.7B",
-        "h": 2048, "i": 6144, "L": 28, "heads": 16, "kv": 8, "hd": 128,
+    "smollm2-360m": {
+        "name": "HuggingFaceTB/SmolLM2-360M",
+        "h": 960, "i": 2560, "L": 32, "heads": 15, "kv": 5, "hd": 64,
     },
-    "qwen3-4b": {
-        "name": "Qwen/Qwen3-4B",
-        "h": 2560, "i": 9728, "L": 36, "heads": 32, "kv": 8, "hd": 128,
+    "tinyllama-1.1b": {
+        "name": "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+        "h": 2048, "i": 5632, "L": 22, "heads": 32, "kv": 4, "hd": 64,
     },
-    "qwen3-8b": {
-        "name": "Qwen/Qwen3-8B",
-        "h": 4096, "i": 12288, "L": 36, "heads": 32, "kv": 8, "hd": 128,
+    "llama-3.2-3b": {
+        "name": "meta-llama/Llama-3.2-3B",
+        "h": 3072, "i": 8192, "L": 28, "heads": 24, "kv": 8, "hd": 128,
     },
 }
 

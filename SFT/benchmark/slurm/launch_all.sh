@@ -141,9 +141,9 @@ print(f\"{tag} complete.\", flush=True)
 '
 }
 
-run_model 0 'Qwen/Qwen3-0.6B'        'qwen3-0.6b'   '$REPO_ROOT/$CONFIGS_DIR/qwen3-0.6b.json'   &
-run_model 1 'Qwen/Qwen3-1.7B'        'qwen3-1.7b'    '$REPO_ROOT/$CONFIGS_DIR/qwen3-1.7b.json'   &
-run_model 2 'Qwen/Qwen3-4B'           'qwen3-4b'     '$REPO_ROOT/$CONFIGS_DIR/qwen3-4b.json'     &
+run_model 0 'HuggingFaceTB/SmolLM2-360M'                          'smollm2-360m'   '$REPO_ROOT/$CONFIGS_DIR/smollm2-360m.json'   &
+run_model 1 'TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T' 'tinyllama-1.1b' '$REPO_ROOT/$CONFIGS_DIR/tinyllama-1.1b.json' &
+run_model 2 'meta-llama/Llama-3.2-3B'                              'llama-3.2-3b'   '$REPO_ROOT/$CONFIGS_DIR/llama-3.2-3b.json'   &
 wait
 echo '$suffix complete.'
 "
@@ -159,16 +159,16 @@ submit_scoring() {
 mkdir -p $results_dir
 
 python3 SFT/benchmark/benchmark_scoring.py \
-    --gpu 0 --model-tag qwen3-0.6b \
-    --output $results_dir/scoring_qwen3-0.6b.json &
+    --gpu 0 --model-tag smollm2-360m \
+    --output $results_dir/scoring_smollm2-360m.json &
 
 python3 SFT/benchmark/benchmark_scoring.py \
-    --gpu 1 --model-tag qwen3-1.7b \
-    --output $results_dir/scoring_qwen3-1.7b.json &
+    --gpu 1 --model-tag tinyllama-1.1b \
+    --output $results_dir/scoring_tinyllama-1.1b.json &
 
 python3 SFT/benchmark/benchmark_scoring.py \
-    --gpu 2 --model-tag qwen3-4b \
-    --output $results_dir/scoring_qwen3-4b.json &
+    --gpu 2 --model-tag llama-3.2-3b \
+    --output $results_dir/scoring_llama-3.2-3b.json &
 
 wait
 echo 'Scoring complete.'

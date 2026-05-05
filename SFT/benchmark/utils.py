@@ -839,6 +839,11 @@ def setup_model(config: BenchmarkConfig):
         print("  Gradient checkpointing: enabled")
     model.train()
 
+    if os.environ.get("TORCH_COMPILE", "0") == "1":
+        import torch
+        print("  torch.compile: enabled (mode=reduce-overhead)")
+        model = torch.compile(model, mode="reduce-overhead")
+
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     tokenizer.pad_token = tokenizer.eos_token
 

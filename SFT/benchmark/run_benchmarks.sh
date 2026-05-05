@@ -9,7 +9,7 @@
 #   2. Scoring: Standalone scoring comparison with synthetic tensors.
 #      Shows regime-dependent optimal scoring method.
 #
-# Models: Qwen3-0.6B, Qwen3-1.7B, Qwen3-4B
+# Models: SmolLM2-360M, TinyLlama-1.1B, Llama-3.2-3B (3 architectures, A40)
 # Configs: Same (n, T, m) across all models for fair comparison.
 #   Config A: n=8  T=512  m=1
 #   Config B: n=2  T=1024 m=1
@@ -61,9 +61,9 @@ run_breakdown() {
     }
 
     echo "  Benchmark 1: Breakdown (3 models x 2 configs x 13 combos)"
-    run_model 0 "Qwen/Qwen3-0.6B"         "qwen3-0.6b"    "8,512,1" "2,1024,1" &
-    run_model 1 "Qwen/Qwen3-1.7B"         "qwen3-1.7b"    "8,512,1" "2,1024,1" &
-    run_model 2 "Qwen/Qwen3-4B"            "qwen3-4b"      "8,512,1" "2,1024,1" &
+    run_model 0 "HuggingFaceTB/SmolLM2-360M"                            "smollm2-360m"   "8,512,1" "2,1024,1" &
+    run_model 1 "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"   "tinyllama-1.1b" "8,512,1" "2,1024,1" &
+    run_model 2 "meta-llama/Llama-3.2-3B"                                "llama-3.2-3b"   "8,512,1" "2,1024,1" &
     wait
 
     echo "  Generating tables..."
@@ -101,9 +101,9 @@ run_breakdown_checkpointing() {
     }
 
     echo "  Benchmark 1c: Breakdown with Gradient Checkpointing (3 models x 2 configs x 13 combos)"
-    run_model 1 "Qwen/Qwen3-0.6B"         "qwen3-0.6b"    "8,512,1" "2,1024,1" &
-    run_model 2 "Qwen/Qwen3-1.7B"         "qwen3-1.7b"    "8,512,1" "2,1024,1" &
-    run_model 3 "Qwen/Qwen3-4B"            "qwen3-4b"      "8,512,1" "2,1024,1" &
+    run_model 1 "HuggingFaceTB/SmolLM2-360M"                            "smollm2-360m"   "8,512,1" "2,1024,1" &
+    run_model 2 "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"   "tinyllama-1.1b" "8,512,1" "2,1024,1" &
+    run_model 3 "meta-llama/Llama-3.2-3B"                                "llama-3.2-3b"   "8,512,1" "2,1024,1" &
     wait
 }
 
@@ -115,16 +115,16 @@ run_scoring() {
 
     echo "  Benchmark 2: Scoring (3 models x 10 configs x 4 methods)"
     $PYTHON SFT/benchmark/benchmark_scoring.py \
-        --gpu 0 --model-tag qwen3-0.6b \
-        --output "$RESULTS/scoring_qwen3-0.6b.json" &
+        --gpu 0 --model-tag smollm2-360m \
+        --output "$RESULTS/scoring_smollm2-360m.json" &
 
     $PYTHON SFT/benchmark/benchmark_scoring.py \
-        --gpu 1 --model-tag qwen3-1.7b \
-        --output "$RESULTS/scoring_qwen3-1.7b.json" &
+        --gpu 1 --model-tag tinyllama-1.1b \
+        --output "$RESULTS/scoring_tinyllama-1.1b.json" &
 
     $PYTHON SFT/benchmark/benchmark_scoring.py \
-        --gpu 2 --model-tag qwen3-4b \
-        --output "$RESULTS/scoring_qwen3-4b.json" &
+        --gpu 2 --model-tag llama-3.2-3b \
+        --output "$RESULTS/scoring_llama-3.2-3b.json" &
     wait
 }
 
