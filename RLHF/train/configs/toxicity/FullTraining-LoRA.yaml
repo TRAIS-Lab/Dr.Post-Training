@@ -1,0 +1,3 @@
+# Standard PPO (no data curation)
+method: FullTraining
+finetuning: LoRA

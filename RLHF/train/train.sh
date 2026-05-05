@@ -56,7 +56,7 @@ while [[ $# -gt 0 ]]; do
                 [[ "$name" != "defaults" ]] && echo "  $name"
             done
             echo ""
-            echo "Categories: all, baseline, iif, layerwise, subset"
+            echo "Categories: all, baseline, iif, layer-wise-subset, global-subset"
             exit 0
             ;;
         --help|-h)
@@ -78,11 +78,11 @@ Optional:
   --dry-run               Print commands without executing
   --list                  List available methods and exit
 
-Categories: all, baseline, iif, layerwise, subset
+Categories: all, baseline, iif, layer-wise-subset, global-subset
 
 Examples:
   bash train.sh -c configs/toxicity -m all
-  bash train.sh -c configs/toxicity -m "Layerwise-LoRA,Subset-LoRA" --seed 123
+  bash train.sh -c configs/toxicity -m "LayerWiseSubset-LoRA,GlobalSubset-LoRA" --seed 123
   bash train.sh -c configs/toxicity -m baseline --dry-run
 HELP
             exit 0
@@ -111,7 +111,7 @@ fi
 # =============================================================================
 reset_config() {
     # Method
-    cfg_method="Standard"
+    cfg_method="FullTraining"
     cfg_finetuning="LoRA"
 
     # Scoring
@@ -269,10 +269,10 @@ resolve_methods() {
         item=$(echo "$item" | xargs)
         case "$item" in
             all)       for m in "${available[@]}"; do resolved="${resolved:+$resolved,}$m"; done ;;
-            baseline)  for m in "${available[@]}"; do [[ "$m" == Standard-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            baseline)  for m in "${available[@]}"; do [[ "$m" == FullTraining-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             iif)       for m in "${available[@]}"; do [[ "$m" == IIF-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            layerwise) for m in "${available[@]}"; do [[ "$m" == Layerwise-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            subset)    for m in "${available[@]}"; do [[ "$m" == Subset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            layer-wise-subset) for m in "${available[@]}"; do [[ "$m" == LayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            global-subset)    for m in "${available[@]}"; do [[ "$m" == GlobalSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             lora)      for m in "${available[@]}"; do [[ "$m" == *-LoRA ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             *)
                 if [[ -f "$config_dir/${item}.yaml" ]]; then
@@ -319,7 +319,7 @@ run_method() {
 
     # Derived values
     local internal_method="NA"
-    [[ "$cfg_method" != "Standard" ]] && internal_method="$cfg_method"
+    [[ "$cfg_method" != "FullTraining" ]] && internal_method="$cfg_method"
 
     local model_name=$(basename "$cfg_model")
     local method_str="${cfg_method}"

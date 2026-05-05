@@ -87,7 +87,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --train NAME         Filter by training dataset (alpaca, less, tulu3, wizardlm)"
             echo "  --task NAME          Override task (samsum, tydiqa, mmlu, bbh, gsm8k, math500)"
             echo "  --subject NAME       MMLU subject or BBH task to evaluate on (default: all)"
-            echo "  --method NAME        Filter by method (e.g., Standard-MeSO, Layerwise-Full)"
+            echo "  --method NAME        Filter by method (e.g., FullTraining-MeSO, LayerWiseSubset-Full)"
             echo "  --n_test N           Number of test examples (-1 for all)"
             echo "  --batch_size N       Batch size for generation (default: 1)"
             echo "  --max_new_tokens N   Max tokens to generate (default: 128)"

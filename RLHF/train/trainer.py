@@ -1,5 +1,5 @@
 """
-Layerwise PPO trainer with unified data curation and model update.
+LayerWiseSubset PPO trainer with unified data curation and model update.
 """
 
 import logging
@@ -149,7 +149,7 @@ def compute_gae(
     return advantages, returns
 
 
-class LayerwisePPOTrainer:
+class LayerWiseSubsetPPOTrainer:
     """
     PPO Trainer supporting gradient-based data curation with optional compression.
     """
@@ -266,7 +266,7 @@ class LayerwisePPOTrainer:
 
         # Log configuration
         logger.info("=" * 60)
-        logger.info("LayerwisePPOTrainer Configuration")
+        logger.info("LayerWiseSubsetPPOTrainer Configuration")
         logger.info(f"  Method: {self.method}")
         if self.method == "IIF":
             logger.info(f"  IIF: Pre-filter entire rollout before PPO epochs")
@@ -1535,15 +1535,15 @@ class LayerwisePPOTrainer:
         validation gradient, then filters out samples with negative influence
         BEFORE starting PPO epochs.
 
-        This is different from Subset/Layerwise which filter during each mini-batch.
+        This is different from GlobalSubset/LayerWiseSubset which filter during each mini-batch.
 
         Key differences:
         - IIF: Pre-filter entire rollout ONCE → train on filtered data for ALL PPO epochs
-        - Subset: Filter EACH mini-batch during PPO epochs
-        - Layerwise: Per-layer, per-mini-batch filtering
+        - GlobalSubset: Filter EACH mini-batch during PPO epochs
+        - LayerWiseSubset: Per-layer, per-mini-batch filtering
 
         Implementation:
-        - Uses Subset-style batched score computation (efficient)
+        - Uses GlobalSubset-style batched score computation (efficient)
         - Processes mini-batches to accumulate scores for all samples
         - Applies global curation after all scores are computed
         - No model update during score computation
@@ -1556,7 +1556,7 @@ class LayerwisePPOTrainer:
         Returns:
             Tensor of selected sample indices
         """
-        from drpt.selection.state import SubsetState
+        from drpt.selection.state import GlobalSubsetState
         from drpt.utils import negative_filtering
 
         response_ids = rollout_data["response_ids"]
@@ -1577,7 +1577,7 @@ class LayerwisePPOTrainer:
         # Save original state
         original_state = self.grad_hook.selection_state
 
-        # Enable hooks for Subset-style score computation
+        # Enable hooks for GlobalSubset-style score computation
         self.grad_hook.enable_hooks()
         self.model.train()
 
@@ -1590,8 +1590,8 @@ class LayerwisePPOTrainer:
             mb_end = min(mb_start + mini_batch_size, batch_size)
             mb_size = mb_end - mb_start
 
-            # Create a SubsetState sized for this mini-batch
-            mb_state = SubsetState(
+            # Create a GlobalSubsetState sized for this mini-batch
+            mb_state = GlobalSubsetState(
                 train_batch_size=mb_size,
                 num_layers=num_layers,
                 frac=self.filter_frac,  # Not used for curation here, just for state init
@@ -1647,7 +1647,7 @@ class LayerwisePPOTrainer:
             per_sample_loss = -masked_term.sum(dim=1) / mb_response_mask.sum(dim=1).clamp(min=1)
             mb_loss = per_sample_loss.sum()  # Sum for per-sample gradient semantics
 
-            # Backward pass - this triggers Subset score accumulation via hooks
+            # Backward pass - this triggers GlobalSubset score accumulation via hooks
             mb_loss.backward()
 
             # Collect accumulated scores for this mini-batch
@@ -1829,8 +1829,8 @@ class LayerwisePPOTrainer:
 
         Uses the curation strategy pattern for clean separation of methods:
         - NA: Standard PPO update
-        - Layerwise: Per-layer curation during backward (uses stored val grads)
-        - Subset: Global curation (two-pass for training)
+        - LayerWiseSubset: Per-layer curation during backward (uses stored val grads)
+        - GlobalSubset: Global curation (two-pass for training)
 
         Args:
             query_ids, response_ids: Token IDs
@@ -1861,7 +1861,7 @@ class LayerwisePPOTrainer:
                 old_logprobs, advantages, returns, old_values,
             )
 
-        # For Subset, create filter_batch_fn to get filtered compute_loss_fn
+        # For GlobalSubset, create filter_batch_fn to get filtered compute_loss_fn
         def filter_batch_fn(selected_indices: Tensor) -> Callable[[], Tuple[Tensor, Dict]]:
             def filtered_compute_loss_fn() -> Tuple[Tensor, Dict]:
                 return self.compute_ppo_loss(
@@ -1907,11 +1907,11 @@ class LayerwisePPOTrainer:
         if self.method != "NA" and self.grad_hook is not None:
             sel_state = getattr(self.grad_hook, 'selection_state', None)
             if sel_state is not None:
-                if self.method == "Layerwise":
+                if self.method == "LayerWiseSubset":
                     if hasattr(sel_state, '_layer_selections') and sel_state._layer_selections:
                         n_selected_list = [n for _, n in sel_state._layer_selections]
                         stats["selection/avg_selected"] = sum(n_selected_list) / len(n_selected_list)
-                elif self.method == "Subset":
+                elif self.method == "GlobalSubset":
                     n_selected = getattr(sel_state, 'num_selected', None)
                     if n_selected is not None:
                         stats["selection/n_selected"] = n_selected
@@ -2341,7 +2341,7 @@ class LayerwisePPOTrainer:
                         # Use self-referencing validation (same rollout data)
                         self.capture_validation_gradients(query_ids, query_mask, rollout_data)
 
-                # IIF: Pre-filter rollouts BEFORE PPO epochs (different from Subset/Layerwise)
+                # IIF: Pre-filter rollouts BEFORE PPO epochs (different from GlobalSubset/LayerWiseSubset)
                 # IIF filters the entire rollout once, then runs standard PPO on filtered data
                 if self.method == "IIF":
                     original_batch_size = query_ids.shape[0]

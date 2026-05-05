@@ -1,0 +1,33 @@
+# LESS mixture (flan_v2 + cot + dolly + oasst1) -> TyDiQA multilingual QA
+# General SFT mixture (~1.96M total) → multilingual extractive QA. The training
+# pool contains long-form CoT/oasst examples, avoiding the seq-length mismatch
+# that broke nq_open->tydiqa (NQ avg ~30 tokens vs tydiqa val needs much longer).
+# Replaces dropped less_mmlu (subject plumbing) with a non-subject task.
+model: meta-llama/Llama-3.2-1B
+train_dataset: less
+target_task: tydiqa
+# pct=0.005 ≈ 9.8K samples; with bs=8 1 epoch → ~1225 main steps (matches less_mmlu budget)
+percentage: 0.005
+
+seed: 42
+batch_size: 8
+gradient_accumulation_steps: 1
+optim: adamw_torch
+max_seq_length: 512
+lr_scheduler_type: linear
+warmup_ratio: 0.03
+weight_decay: 0.0
+num_train_epochs: 1
+# eval_steps = 12 -> ~102 ppl points across 1225 steps
+eval_steps: 12
+use_flash_attention: true
+
+n_eval: 500
+
+selection_frac: 0.5
+selection_mode: topk
+n_val: 16
+val_batch_size: 1
+val_strategy: merged_batch
+scoring:
+  method: reduced_ghost

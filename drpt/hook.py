@@ -2,8 +2,8 @@
 Hook manager with monkey-patching and custom autograd Functions.
 
 The hook supports two distinct curation methods via the selection module:
-- Layerwise: Per-layer curation, single-pass (LayerwiseLinearBackward)
-- Subset: Global curation, two-pass (SubsetLinearBackward)
+- LayerWiseSubset: Per-layer curation, single-pass (LayerWiseSubsetLinearBackward)
+- GlobalSubset: Global curation, two-pass (GlobalSubsetLinearBackward)
 
 Compression is configured independently for two purposes:
 - Score compression: compresses gradients for influence score computation
@@ -32,14 +32,14 @@ from .compression_mode import CompressionMode
 from .validation_cache import ValidationCache
 
 # Curation module
-from .selection.state import SelectionState, LayerwiseState, SubsetState
+from .selection.state import SelectionState, LayerWiseSubsetState, GlobalSubsetState
 from .selection.backward import (
     CompressedLinearBackward,
-    LayerwiseLinearBackward,
-    SubsetLinearBackward,
+    LayerWiseSubsetLinearBackward,
+    GlobalSubsetLinearBackward,
     TrainOnlyRMSNormBackward,
-    SubsetEmbeddingBackward,
-    LayerwiseEmbeddingBackward,
+    GlobalSubsetEmbeddingBackward,
+    LayerWiseSubsetEmbeddingBackward,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ class GradientHook:
     This class manages:
     1. Monkey-patching Linear layers for custom backward passes
     2. Compression configuration (via CompressionMode)
-    3. Curation state management (Layerwise/Subset)
+    3. Curation state management (LayerWiseSubset/GlobalSubset)
     4. Validation gradient caching (for separate-batch strategies)
     5. Token count tracking for proper gradient scaling
     """
@@ -105,7 +105,7 @@ class GradientHook:
         self.tokens_per_sample: Optional[Tensor] = None
 
         # Retained layer data for one-pass subset descent (Algorithm 4.2)
-        # During backward, SubsetLinearBackward stores (grad_output, input) per layer
+        # During backward, GlobalSubsetLinearBackward stores (grad_output, input) per layer
         # so we can assemble gradients post-hoc after global selection
         self._retained_data: Dict[int, Tuple[Tensor, Tensor]] = {}
 
@@ -188,9 +188,9 @@ class GradientHook:
 
         Routing logic:
         1. If hooks disabled -> call original forward method
-        2. If Subset state -> SubsetLinearBackward (score accumulation)
-        3. If Layerwise state -> LayerwiseLinearBackward (per-layer curation)
-        4. If capture_val_mode -> LayerwiseLinearBackward (val gradient capture)
+        2. If GlobalSubset state -> GlobalSubsetLinearBackward (score accumulation)
+        3. If LayerWiseSubset state -> LayerWiseSubsetLinearBackward (per-layer curation)
+        4. If capture_val_mode -> LayerWiseSubsetLinearBackward (val gradient capture)
         5. If compressor present -> CompressedLinearBackward (compression only)
         6. Otherwise -> call original forward method
         """
@@ -202,17 +202,17 @@ class GradientHook:
         # Route based on selection state type
         state = self.selection_state
 
-        if isinstance(state, SubsetState):
-            return SubsetLinearBackward.apply(
+        if isinstance(state, GlobalSubsetState):
+            return GlobalSubsetLinearBackward.apply(
                 input, module.weight, module.bias, self, idx
             )
-        elif isinstance(state, LayerwiseState):
-            return LayerwiseLinearBackward.apply(
+        elif isinstance(state, LayerWiseSubsetState):
+            return LayerWiseSubsetLinearBackward.apply(
                 input, module.weight, module.bias, self, idx
             )
         elif self.capture_val_mode:
-            # Val capture mode: use LayerwiseLinearBackward
-            return LayerwiseLinearBackward.apply(
+            # Val capture mode: use LayerWiseSubsetLinearBackward
+            return LayerWiseSubsetLinearBackward.apply(
                 input, module.weight, module.bias, self, idx
             )
         elif self.update_compressors[idx] is not None:
@@ -230,9 +230,9 @@ class GradientHook:
 
         Routing logic:
         1. If hooks disabled -> call original forward
-        2. If Subset state -> SubsetEmbeddingBackward (score accumulation)
-        3. If Layerwise state -> LayerwiseEmbeddingBackward (per-layer curation)
-        4. If capture_val_mode -> LayerwiseEmbeddingBackward (val gradient capture)
+        2. If GlobalSubset state -> GlobalSubsetEmbeddingBackward (score accumulation)
+        3. If LayerWiseSubset state -> LayerWiseSubsetEmbeddingBackward (per-layer curation)
+        4. If capture_val_mode -> LayerWiseSubsetEmbeddingBackward (val gradient capture)
         5. Otherwise -> call original forward
         """
         if not self.hooks_enabled:
@@ -241,16 +241,16 @@ class GradientHook:
         padding_idx = module.padding_idx if module.padding_idx is not None else -1
         state = self.selection_state
 
-        if isinstance(state, SubsetState):
-            return SubsetEmbeddingBackward.apply(
+        if isinstance(state, GlobalSubsetState):
+            return GlobalSubsetEmbeddingBackward.apply(
                 input_ids, module.weight, self, idx, padding_idx
             )
-        elif isinstance(state, LayerwiseState):
-            return LayerwiseEmbeddingBackward.apply(
+        elif isinstance(state, LayerWiseSubsetState):
+            return LayerWiseSubsetEmbeddingBackward.apply(
                 input_ids, module.weight, self, idx, padding_idx
             )
         elif self.capture_val_mode:
-            return LayerwiseEmbeddingBackward.apply(
+            return LayerWiseSubsetEmbeddingBackward.apply(
                 input_ids, module.weight, self, idx, padding_idx
             )
         else:
@@ -299,13 +299,13 @@ class GradientHook:
 
         Args:
             train_batch_size: Number of training samples
-            selection_method: Curation method ("Layerwise", "Subset", or "Regular")
+            selection_method: Curation method ("LayerWiseSubset", "GlobalSubset", or "Regular")
             frac: Curation fraction (topk) or filter fraction (filtering)
             lr: Learning rate for score scaling
-            compute_scores_only: If True, only compute scores (Subset pass 1)
+            compute_scores_only: If True, only compute scores (GlobalSubset pass 1)
             use_second_order: If True, use greedy curation with similarity matrix
             selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
-            scoring_method: For Subset: "reduced_ghost" (factored inner product) or "direct"
+            scoring_method: For GlobalSubset: "reduced_ghost" (factored inner product) or "direct"
                            (explicit per-sample gradient materialization, Algorithm 4.4)
             direct_batch_size: Chunk size for batched direct scoring. 0 = all at once.
                               Set to 1 for minimal memory at long sequences.
@@ -332,8 +332,8 @@ class GradientHook:
         dtype = next(self.model.parameters()).dtype
         num_layers = len(self.layer_names)
 
-        if selection_method == "Subset":
-            self.selection_state = SubsetState(
+        if selection_method == "GlobalSubset":
+            self.selection_state = GlobalSubsetState(
                 train_batch_size=train_batch_size,
                 num_layers=num_layers,
                 frac=frac,
@@ -346,8 +346,8 @@ class GradientHook:
                 one_pass=one_pass,
                 direct_batch_size=direct_batch_size,
             )
-        elif selection_method == "Layerwise":
-            self.selection_state = LayerwiseState(
+        elif selection_method == "LayerWiseSubset":
+            self.selection_state = LayerWiseSubsetState(
                 train_batch_size=train_batch_size,
                 num_layers=num_layers,
                 frac=frac,
@@ -362,7 +362,7 @@ class GradientHook:
         else:
             raise ValueError(
                 f"Unknown selection_method: {selection_method}. "
-                f"Use 'Layerwise', 'Subset', or 'Regular'."
+                f"Use 'LayerWiseSubset', 'GlobalSubset', or 'Regular'."
             )
 
         logger.debug(
@@ -503,10 +503,10 @@ class GradientHook:
 
         Args:
             train_batch_size: Number of training samples
-            selection_method: Curation method ("Layerwise" or "Subset")
+            selection_method: Curation method ("LayerWiseSubset" or "GlobalSubset")
             frac: Curation/filter fraction
             lr: Learning rate for score scaling
-            compute_scores_only: If True, only compute scores (Subset pass 1)
+            compute_scores_only: If True, only compute scores (GlobalSubset pass 1)
             use_second_order: If True, use greedy curation
             selection_mode: "topk" or "filtering"
             record_selections: If True, record selected indices/scores for case study
@@ -536,8 +536,8 @@ class GradientHook:
         dtype = next(self.model.parameters()).dtype
         num_layers = len(self.layer_names)
 
-        if selection_method == "Subset":
-            self.selection_state = SubsetState(
+        if selection_method == "GlobalSubset":
+            self.selection_state = GlobalSubsetState(
                 train_batch_size=train_batch_size,
                 num_layers=num_layers,
                 frac=frac,
@@ -551,8 +551,8 @@ class GradientHook:
                 one_pass=one_pass,
                 direct_batch_size=direct_batch_size,
             )
-        elif selection_method == "Layerwise":
-            self.selection_state = LayerwiseState(
+        elif selection_method == "LayerWiseSubset":
+            self.selection_state = LayerWiseSubsetState(
                 train_batch_size=train_batch_size,
                 num_layers=num_layers,
                 frac=frac,
@@ -568,7 +568,7 @@ class GradientHook:
         else:
             raise ValueError(
                 f"Unknown selection_method: {selection_method}. "
-                f"Use 'Layerwise' or 'Subset'."
+                f"Use 'LayerWiseSubset' or 'GlobalSubset'."
             )
 
         # Mark that we're using stored validation gradients
@@ -618,7 +618,7 @@ class GradientHook:
         return [self._get_compressed_grad(idx) for idx in range(len(self.layer_names))]
 
     # =========================================================================
-    # Retained Layer Data (One-Pass Subset Descent)
+    # Retained Layer Data (One-Pass GlobalSubset Descent)
     # =========================================================================
 
     def retain_layer_data(self, layer_idx: int, grad_output: Tensor, input: Tensor) -> None:

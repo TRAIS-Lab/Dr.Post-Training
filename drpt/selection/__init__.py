@@ -22,50 +22,50 @@ This module provides two families of strategies for computing validation gradien
        Better when validation batch is small (e.g., external validation set in SFT).
 """
 
-from .state import SelectionState, LayerwiseState, SubsetState
+from .state import SelectionState, LayerWiseSubsetState, GlobalSubsetState
 from .backward import (
     CompressedLinearBackward,
-    LayerwiseLinearBackward,
-    SubsetLinearBackward,
+    LayerWiseSubsetLinearBackward,
+    GlobalSubsetLinearBackward,
 )
 from .strategies import (
     # MergedBatch strategies
     MergedBatchStrategy,
     MergedBatchNoSelectionStrategy,
-    MergedBatchLayerwiseStrategy,
-    MergedBatchSubsetStrategy,
-    MergedBatchSubsetOnePassStrategy,
+    MergedBatchLayerWiseSubsetStrategy,
+    MergedBatchGlobalSubsetStrategy,
+    MergedBatchGlobalSubsetOnePassStrategy,
     create_merged_batch_strategy,
     # SeparateBatch strategies
     SeparateBatchStrategy,
     SeparateBatchNoSelectionStrategy,
-    SeparateBatchLayerwiseStrategy,
-    SeparateBatchSubsetStrategy,
-    SeparateBatchSubsetOnePassStrategy,
+    SeparateBatchLayerWiseSubsetStrategy,
+    SeparateBatchGlobalSubsetStrategy,
+    SeparateBatchGlobalSubsetOnePassStrategy,
     create_separate_batch_strategy,
 )
 
 __all__ = [
     # State classes
     "SelectionState",
-    "LayerwiseState",
-    "SubsetState",
+    "LayerWiseSubsetState",
+    "GlobalSubsetState",
     # Autograd functions
     "CompressedLinearBackward",
-    "LayerwiseLinearBackward",
-    "SubsetLinearBackward",
+    "LayerWiseSubsetLinearBackward",
+    "GlobalSubsetLinearBackward",
     # MergedBatch strategies
     "MergedBatchStrategy",
     "MergedBatchNoSelectionStrategy",
-    "MergedBatchLayerwiseStrategy",
-    "MergedBatchSubsetStrategy",
-    "MergedBatchSubsetOnePassStrategy",
+    "MergedBatchLayerWiseSubsetStrategy",
+    "MergedBatchGlobalSubsetStrategy",
+    "MergedBatchGlobalSubsetOnePassStrategy",
     "create_merged_batch_strategy",
     # SeparateBatch strategies
     "SeparateBatchStrategy",
     "SeparateBatchNoSelectionStrategy",
-    "SeparateBatchLayerwiseStrategy",
-    "SeparateBatchSubsetStrategy",
-    "SeparateBatchSubsetOnePassStrategy",
+    "SeparateBatchLayerWiseSubsetStrategy",
+    "SeparateBatchGlobalSubsetStrategy",
+    "SeparateBatchGlobalSubsetOnePassStrategy",
     "create_separate_batch_strategy",
 ]

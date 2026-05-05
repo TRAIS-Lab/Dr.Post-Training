@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 import torch
 import torch.nn as nn
-from .state import LayerwiseState, SubsetState
+from .state import LayerWiseSubsetState, GlobalSubsetState
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ class MergedBatchStrategy(ABC):
     def has_update_compression(self) -> bool:
         """Check if update compression (MeSO) is enabled.
 
-        When True, hooks stay enabled during Subset pass 2 so that
+        When True, hooks stay enabled during GlobalSubset pass 2 so that
         CompressedLinearBackward stores compressed gradients for MeSO.
         """
         if self.grad_hook is None:
@@ -164,9 +164,9 @@ class MergedBatchNoSelectionStrategy(MergedBatchStrategy):
         return loss.detach()
 
 
-class MergedBatchLayerwiseStrategy(MergedBatchStrategy):
+class MergedBatchLayerWiseSubsetStrategy(MergedBatchStrategy):
     """
-    Layer-wise strategy with merged batch: single-pass, per-layer curation.
+    Layer-Wise Subset strategy with merged batch: single-pass, per-layer curation.
 
     Curation and gradient aggregation happen layer-by-layer
     during the backward pass.
@@ -203,10 +203,10 @@ class MergedBatchLayerwiseStrategy(MergedBatchStrategy):
         return loss.detach()
 
     def _setup_state(self, train_batch_size: int, lr: float) -> None:
-        """Set up LayerwiseState for this step."""
+        """Set up LayerWiseSubsetState for this step."""
         dtype = next(self.grad_hook.model.parameters()).dtype
 
-        state = LayerwiseState(
+        state = LayerWiseSubsetState(
             train_batch_size=train_batch_size,
             num_layers=len(self.grad_hook.layer_names),
             frac=self.frac,
@@ -227,39 +227,9 @@ class MergedBatchLayerwiseStrategy(MergedBatchStrategy):
         self.grad_hook.clear_token_counts()
 
 
-class MergedBatchLayerwiseWithValStrategy(MergedBatchLayerwiseStrategy):
+class MergedBatchGlobalSubsetStrategy(MergedBatchStrategy):
     """
-    Layer-wise strategy with merged batch that also trains on validation data.
-
-    Same as MergedBatchLayerwiseStrategy but includes validation gradients
-    in the parameter update, effectively training on both selected train
-    samples and validation samples.
-    """
-
-    def _setup_state(self, train_batch_size: int, lr: float) -> None:
-        """Set up LayerwiseState with include_val_in_update=True."""
-        dtype = next(self.grad_hook.model.parameters()).dtype
-
-        state = LayerwiseState(
-            train_batch_size=train_batch_size,
-            num_layers=len(self.grad_hook.layer_names),
-            frac=self.frac,
-            lr=lr,
-            device=self.grad_hook.device,
-            dtype=dtype,
-            use_second_order=self.use_second_order,
-            selection_mode=self.selection_mode,
-            record_selections=self.record_selections,
-            scoring_method=self.scoring_method,
-            include_val_in_update=True,
-        )
-
-        self.grad_hook.selection_state = state
-
-
-class MergedBatchSubsetStrategy(MergedBatchStrategy):
-    """
-    Subset strategy with merged batch: two-pass, global curation.
+    GlobalSubset strategy with merged batch: two-pass, global curation.
 
     Pass 1: Compute curation scores across all layers
     Pass 2: Forward/backward only on globally selected samples
@@ -288,7 +258,7 @@ class MergedBatchSubsetStrategy(MergedBatchStrategy):
         loss_for_scoring.backward()
 
         # Get globally selected indices
-        state: SubsetState = self.grad_hook.selection_state
+        state: GlobalSubsetState = self.grad_hook.selection_state
         selected_indices = state.get_final_selection()
         # Sort indices for sequential memory access (better cache locality)
         selected_indices = selected_indices.sort()[0]
@@ -342,10 +312,10 @@ class MergedBatchSubsetStrategy(MergedBatchStrategy):
         return loss.detach()
 
     def _setup_state(self, train_batch_size: int, lr: float) -> None:
-        """Set up SubsetState for this step."""
+        """Set up GlobalSubsetState for this step."""
         dtype = next(self.grad_hook.model.parameters()).dtype
 
-        state = SubsetState(
+        state = GlobalSubsetState(
             train_batch_size=train_batch_size,
             num_layers=len(self.grad_hook.layer_names),
             frac=self.frac,
@@ -366,7 +336,7 @@ class MergedBatchSubsetStrategy(MergedBatchStrategy):
         self.grad_hook.clear_token_counts()
 
 
-class MergedBatchSubsetOnePassStrategy(MergedBatchStrategy):
+class MergedBatchGlobalSubsetOnePassStrategy(MergedBatchStrategy):
     """
     One-pass subset strategy with merged batch (Algorithm 4.2).
 
@@ -390,7 +360,7 @@ class MergedBatchSubsetOnePassStrategy(MergedBatchStrategy):
         """Training step with one-pass global curation."""
         lr = kwargs.get('lr', 1e-4)
 
-        # Set up SubsetState with one_pass=True
+        # Set up GlobalSubsetState with one_pass=True
         self._setup_state(train_batch_size, lr)
 
         if 'labels' in merged_batch:
@@ -401,11 +371,11 @@ class MergedBatchSubsetOnePassStrategy(MergedBatchStrategy):
         loss.backward()
         # After backward:
         # - Scores accumulated in state, layer data retained in hook
-        # - Hooked linear layers: .grad is None (SubsetLinearBackward returns None)
+        # - Hooked linear layers: .grad is None (GlobalSubsetLinearBackward returns None)
         # - RMSNorm layers: .grad contains train-only gradient (TrainOnlyRMSNormBackward)
 
         # Get globally selected indices
-        state: SubsetState = self.grad_hook.selection_state
+        state: GlobalSubsetState = self.grad_hook.selection_state
         selected_indices = state.get_final_selection()
         selected_indices = selected_indices.sort()[0]
         n_selected = len(selected_indices)
@@ -425,17 +395,17 @@ class MergedBatchSubsetOnePassStrategy(MergedBatchStrategy):
         # Post-hoc gradient assembly for linear layers.
         # No model.zero_grad() here — non-linear layers retain their train-only
         # gradients from backward, and hooked linear layers have None grad
-        # (SubsetLinearBackward suppresses weight/bias grads).
+        # (GlobalSubsetLinearBackward suppresses weight/bias grads).
         self.grad_hook.assemble_gradients_from_retained(selected_indices, scale_factor)
 
         self._cleanup()
         return loss.detach()
 
     def _setup_state(self, train_batch_size: int, lr: float) -> None:
-        """Set up SubsetState with one_pass=True."""
+        """Set up GlobalSubsetState with one_pass=True."""
         dtype = next(self.grad_hook.model.parameters()).dtype
 
-        state = SubsetState(
+        state = GlobalSubsetState(
             train_batch_size=train_batch_size,
             num_layers=len(self.grad_hook.layer_names),
             frac=self.frac,
@@ -474,14 +444,14 @@ def create_merged_batch_strategy(
     Note: Has padding overhead when val/train have different sequence lengths.
 
     Args:
-        method: Curation method ("NA", "Layerwise", "Subset")
+        method: Curation method ("NA", "LayerWiseSubset", "GlobalSubset")
         grad_hook: GradientHook instance
         frac: Curation/filter fraction
         use_second_order: Use greedy curation with second-order
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
         record_selections: If True, record curation data for case study analysis
         scoring_method: Scoring method ("reduced_ghost", "full_ghost", "direct", "compress")
-        subset_mode: For Subset method: "one_pass" (Algorithm 4.2) or "two_pass" (Algorithm 4.3)
+        subset_mode: For GlobalSubset method: "one_pass" (Algorithm 4.2) or "two_pass" (Algorithm 4.3)
 
     Returns:
         Appropriate MergedBatchStrategy instance
@@ -493,24 +463,19 @@ def create_merged_batch_strategy(
     if method == "NA":
         return MergedBatchNoSelectionStrategy(**kwargs)
 
-    if method == "Layerwise":
-        strategy = MergedBatchLayerwiseStrategy(**kwargs)
+    if method == "LayerWiseSubset":
+        strategy = MergedBatchLayerWiseSubsetStrategy(**kwargs)
         # Wrap non-linear layers so their grad_weight comes from train slice only.
         grad_hook.wrap_nonlinear_layers()
         return strategy
 
-    if method == "LayerwiseWithVal":
-        strategy = MergedBatchLayerwiseWithValStrategy(**kwargs)
-        grad_hook.wrap_nonlinear_layers()
-        return strategy
-
-    if method == "Subset":
+    if method == "GlobalSubset":
         if subset_mode == "one_pass":
-            strategy = MergedBatchSubsetOnePassStrategy(**kwargs)
+            strategy = MergedBatchGlobalSubsetOnePassStrategy(**kwargs)
             grad_hook.wrap_nonlinear_layers()
             return strategy
         else:
-            return MergedBatchSubsetStrategy(**kwargs)
+            return MergedBatchGlobalSubsetStrategy(**kwargs)
 
     raise ValueError(f"Unknown curation method: {method}")
 
@@ -571,7 +536,7 @@ class SeparateBatchStrategy(ABC):
     def has_update_compression(self) -> bool:
         """Check if update compression (MeSO) is enabled.
 
-        When True, hooks stay enabled during Subset pass 2 so that
+        When True, hooks stay enabled during GlobalSubset pass 2 so that
         CompressedLinearBackward stores compressed gradients for MeSO.
         """
         if self.grad_hook is None:
@@ -606,7 +571,7 @@ class SeparateBatchStrategy(ABC):
             batch_size: Number of samples in the batch
             compute_loss_fn: Zero-arg function that computes loss and returns (loss, stats)
             lr: Learning rate for score scaling
-            **kwargs: Additional arguments (filter_batch_fn for Subset)
+            **kwargs: Additional arguments (filter_batch_fn for GlobalSubset)
 
         Returns:
             Tuple of (loss, stats_dict) where stats includes curation metrics
@@ -643,9 +608,9 @@ class SeparateBatchNoSelectionStrategy(SeparateBatchStrategy):
         return loss.detach(), stats
 
 
-class SeparateBatchLayerwiseStrategy(SeparateBatchStrategy):
+class SeparateBatchLayerWiseSubsetStrategy(SeparateBatchStrategy):
     """
-    Layer-wise strategy with cached val: per-layer curation.
+    Layer-Wise Subset strategy with cached val: per-layer curation.
 
     Curation and gradient aggregation happen layer-by-layer during backward,
     using pre-captured validation gradients.
@@ -701,10 +666,10 @@ class SeparateBatchLayerwiseStrategy(SeparateBatchStrategy):
         return loss.detach(), stats
 
     def _setup_state(self, batch_size: int, lr: float) -> None:
-        """Set up LayerwiseState with stored val gradients."""
+        """Set up LayerWiseSubsetState with stored val gradients."""
         self.grad_hook.setup_selection_with_stored_val(
             train_batch_size=batch_size,
-            selection_method="Layerwise",
+            selection_method="LayerWiseSubset",
             frac=self.frac,
             lr=lr,
             compute_scores_only=False,
@@ -719,9 +684,9 @@ class SeparateBatchLayerwiseStrategy(SeparateBatchStrategy):
         self.grad_hook.clear_selection()
 
 
-class SeparateBatchSubsetStrategy(SeparateBatchStrategy):
+class SeparateBatchGlobalSubsetStrategy(SeparateBatchStrategy):
     """
-    Subset strategy with cached val: global curation.
+    GlobalSubset strategy with cached val: global curation.
 
     Pass 1: Compute curation scores across all layers
     Pass 2: Forward/backward only on globally selected samples
@@ -740,7 +705,7 @@ class SeparateBatchSubsetStrategy(SeparateBatchStrategy):
         # and returns a new compute_loss_fn for the filtered batch
         filter_batch_fn = kwargs.get('filter_batch_fn')
         if filter_batch_fn is None:
-            raise ValueError("Subset strategy requires 'filter_batch_fn' in kwargs")
+            raise ValueError("GlobalSubset strategy requires 'filter_batch_fn' in kwargs")
 
         # === PASS 1: Score Accumulation ===
         self._setup_state(batch_size, lr)
@@ -805,10 +770,10 @@ class SeparateBatchSubsetStrategy(SeparateBatchStrategy):
         return loss.detach(), stats
 
     def _setup_state(self, batch_size: int, lr: float) -> None:
-        """Set up SubsetState with stored val gradients."""
+        """Set up GlobalSubsetState with stored val gradients."""
         self.grad_hook.setup_selection_with_stored_val(
             train_batch_size=batch_size,
-            selection_method="Subset",
+            selection_method="GlobalSubset",
             frac=self.frac,
             lr=lr,
             compute_scores_only=True,  # Only accumulate scores in pass 1
@@ -823,7 +788,7 @@ class SeparateBatchSubsetStrategy(SeparateBatchStrategy):
         self.grad_hook.clear_selection()
 
 
-class SeparateBatchSubsetOnePassStrategy(SeparateBatchStrategy):
+class SeparateBatchGlobalSubsetOnePassStrategy(SeparateBatchStrategy):
     """
     One-pass subset strategy with separate val batch (Algorithm 4.2).
 
@@ -842,7 +807,7 @@ class SeparateBatchSubsetOnePassStrategy(SeparateBatchStrategy):
         """Training step with one-pass global curation using stored val grads."""
         labels = kwargs.get('labels')
 
-        # Set up SubsetState with one_pass=True and stored val
+        # Set up GlobalSubsetState with one_pass=True and stored val
         self._setup_state(batch_size, lr)
 
         if labels is not None:
@@ -875,7 +840,7 @@ class SeparateBatchSubsetOnePassStrategy(SeparateBatchStrategy):
 
         # Post-hoc gradient assembly for linear layers.
         # Non-linear layers (LayerNorm, embeddings, etc.) retain their autograd
-        # gradients from backward — SubsetLinearBackward returns None for
+        # gradients from backward — GlobalSubsetLinearBackward returns None for
         # weight/bias, so hooked linear layers have no stale grad to clear.
         self.grad_hook.assemble_gradients_from_retained(selected_indices, scale_factor)
 
@@ -884,10 +849,10 @@ class SeparateBatchSubsetOnePassStrategy(SeparateBatchStrategy):
         return loss.detach(), stats
 
     def _setup_state(self, batch_size: int, lr: float) -> None:
-        """Set up SubsetState with one_pass=True and stored val gradients."""
+        """Set up GlobalSubsetState with one_pass=True and stored val gradients."""
         self.grad_hook.setup_selection_with_stored_val(
             train_batch_size=batch_size,
-            selection_method="Subset",
+            selection_method="GlobalSubset",
             frac=self.frac,
             lr=lr,
             compute_scores_only=True,
@@ -920,7 +885,7 @@ def create_separate_batch_strategy(
     Avoids padding overhead when val/train have different sequence lengths.
 
     Args:
-        method: Curation method ("NA", "Layerwise", "Subset")
+        method: Curation method ("NA", "LayerWiseSubset", "GlobalSubset")
         grad_hook: GradientHook instance
         frac: Fraction parameter. Meaning depends on selection_mode:
               - "topk": Fraction of samples to select (top frac by score)
@@ -929,7 +894,7 @@ def create_separate_batch_strategy(
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
         record_selections: If True, record curation data for case study analysis
         scoring_method: Scoring method ("reduced_ghost", "full_ghost", "direct", "compress")
-        subset_mode: For Subset method: "one_pass" (Algorithm 4.2) or "two_pass" (Algorithm 4.3)
+        subset_mode: For GlobalSubset method: "one_pass" (Algorithm 4.2) or "two_pass" (Algorithm 4.3)
 
     Returns:
         Appropriate SeparateBatchStrategy instance
@@ -941,18 +906,18 @@ def create_separate_batch_strategy(
     if method == "NA":
         return SeparateBatchNoSelectionStrategy(**kwargs)
 
-    if method == "Layerwise":
-        return SeparateBatchLayerwiseStrategy(**kwargs)
+    if method == "LayerWiseSubset":
+        return SeparateBatchLayerWiseSubsetStrategy(**kwargs)
 
-    if method == "Subset":
+    if method == "GlobalSubset":
         if subset_mode == "one_pass":
-            strategy = SeparateBatchSubsetOnePassStrategy(**kwargs)
+            strategy = SeparateBatchGlobalSubsetOnePassStrategy(**kwargs)
             # Safety check: warn about trainable params not covered by hooks.
             # No non-linear wrapping needed (no val contamination in separate batch),
             # but unhooked params get full-batch train grad instead of curated.
             grad_hook.check_unhooked_trainable_params()
             return strategy
         else:
-            return SeparateBatchSubsetStrategy(**kwargs)
+            return SeparateBatchGlobalSubsetStrategy(**kwargs)
 
     raise ValueError(f"Unknown curation method: {method}")

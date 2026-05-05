@@ -34,17 +34,16 @@ def get_train_files_for_dataset(data_dir: str, dataset_name: str) -> List[str]:
     """
     dataset_mapping = {
         # Single dataset files
-        "alpaca": [f"{data_dir}/train/alpaca/alpaca_data.jsonl"],
-        "dolly": [f"{data_dir}/train/dolly/dolly_data.jsonl"],
-        "flan_v2": [f"{data_dir}/train/flan_v2/flan_v2_data.jsonl"],
-        "cot": [f"{data_dir}/train/cot/cot_data.jsonl"],
-        "oasst1": [f"{data_dir}/train/oasst1/oasst1_data.jsonl"],
-        "gsm8k": [f"{data_dir}/train/gsm8k/gsm8k_train_data.jsonl"],
-        "vicuna": [f"{data_dir}/train/vicuna/vicuna_data.jsonl"],
-        "wizardlm": [f"{data_dir}/train/wizardlm/wizardlm_data.jsonl"],
-        "openhermes": [f"{data_dir}/train/openhermes/openhermes_data.jsonl"],
-        "tulu3": [f"{data_dir}/train/tulu3/tulu3_data.jsonl"],
-        "samsum": [f"{data_dir}/train/samsum/samsum_train_data.jsonl"],
+        "alpaca":   [f"{data_dir}/train/alpaca/alpaca_data.jsonl"],
+        "dolly":    [f"{data_dir}/train/dolly/dolly_data.jsonl"],
+        "flan_v2":  [f"{data_dir}/train/flan_v2/flan_v2_data.jsonl"],
+        "cot":      [f"{data_dir}/train/cot/cot_data.jsonl"],
+        "oasst1":   [f"{data_dir}/train/oasst1/oasst1_data.jsonl"],
+        "tulu3":    [f"{data_dir}/train/tulu3/tulu3_data.jsonl"],
+        "samsum":   [f"{data_dir}/train/samsum/samsum_train_data.jsonl"],
+        "nq_open":  [f"{data_dir}/train/nq_open/nq_open_data.jsonl"],
+        "triviaqa": [f"{data_dir}/train/triviaqa/triviaqa_data.jsonl"],
+        "squad":    [f"{data_dir}/train/squad/squad_data.jsonl"],
         # LESS mixture (flan_v2 + cot + dolly + oasst1)
         "less": [
             f"{data_dir}/train/flan_v2/flan_v2_data.jsonl",
@@ -81,13 +80,10 @@ def _get_default_train_files(data_dir: str, task: str) -> List[str]:
     ]
 
     task_defaults = {
-        "samsum": [f"{data_dir}/train/alpaca/alpaca_data.jsonl"],
-        "gsm8k": [f"{data_dir}/train/gsm8k/gsm8k_train_data.jsonl"],
-        # Test-only tasks use LESS mixture by default
-        "mmlu": less_mixture,
-        "bbh": less_mixture,
-        "tydiqa": less_mixture,
-        "math500": less_mixture,
+        "samsum":   [f"{data_dir}/train/alpaca/alpaca_data.jsonl"],
+        "tydiqa":   less_mixture,
+        "triviaqa": [f"{data_dir}/train/nq_open/nq_open_data.jsonl"],
+        "nq_open":  [f"{data_dir}/train/triviaqa/triviaqa_data.jsonl"],
     }
 
     return task_defaults.get(task, less_mixture)

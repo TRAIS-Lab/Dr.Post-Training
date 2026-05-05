@@ -1,0 +1,8 @@
+# LayerWiseSubset data curation with full fine-tuning
+method: LayerWiseSubset
+finetuning: Full
+learning_rate: 2.00e-05
+
+scoring:
+  method: compress
+  compression: normal-64*64

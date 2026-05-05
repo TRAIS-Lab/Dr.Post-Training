@@ -46,19 +46,19 @@ DEFAULT_CONFIGS = [
 # All method x scoring combinations to benchmark.
 # (method, scoring_method, score_compression)
 COMBOS = [
-    ("standard",        "reduced_ghost",  "none"),
-    ("layerwise",       "compress",       "normal-64*64"),
-    ("layerwise",       "full_ghost",     "none"),
-    ("layerwise",       "reduced_ghost",  "none"),
-    ("layerwise",       "direct",         "none"),
-    ("subset",          "compress",       "normal-64*64"),
-    ("subset",          "full_ghost",     "none"),
-    ("subset",          "reduced_ghost",  "none"),
-    ("subset",          "direct",         "none"),
-    ("subset_one_pass", "compress",       "normal-64*64"),
-    ("subset_one_pass", "full_ghost",     "none"),
-    ("subset_one_pass", "reduced_ghost",  "none"),
-    ("subset_one_pass", "direct",         "none"),
+    ("full_training",        "reduced_ghost",  "none"),
+    ("layer_wise_subset",       "compress",       "normal-64*64"),
+    ("layer_wise_subset",       "full_ghost",     "none"),
+    ("layer_wise_subset",       "reduced_ghost",  "none"),
+    ("layer_wise_subset",       "direct",         "none"),
+    ("global_subset",          "compress",       "normal-64*64"),
+    ("global_subset",          "full_ghost",     "none"),
+    ("global_subset",          "reduced_ghost",  "none"),
+    ("global_subset",          "direct",         "none"),
+    ("global_subset_one_pass", "compress",       "normal-64*64"),
+    ("global_subset_one_pass", "full_ghost",     "none"),
+    ("global_subset_one_pass", "reduced_ghost",  "none"),
+    ("global_subset_one_pass", "direct",         "none"),
 ]
 
 
@@ -109,13 +109,13 @@ def compute_total(r, method):
     """Compute total step time from result dict."""
     if r is None:
         return None
-    if method in ("standard", "layerwise"):
+    if method in ("full_training", "layer_wise_subset"):
         return r.get("forward", 0) + r.get("backward", 0) + r.get("optimizer", 0)
-    elif method == "subset":
+    elif method == "global_subset":
         return (r.get("pass1_forward", 0) + r.get("pass1_backward", 0) +
                 r.get("selection", 0) + r.get("pass2_forward", 0) +
                 r.get("pass2_backward", 0) + r.get("optimizer", 0))
-    elif method == "subset_one_pass":
+    elif method == "global_subset_one_pass":
         return (r.get("forward", 0) + r.get("backward", 0) +
                 r.get("selection", 0) + r.get("wgrad", 0) +
                 r.get("optimizer", 0))
@@ -134,7 +134,7 @@ def print_breakdown(method, scoring, r):
 
     mem = r.get("peak_memory_gb", 0)
 
-    if method == "standard":
+    if method == "full_training":
         fwd, bwd, opt = r.get("forward", 0), r.get("backward", 0), r.get("optimizer", 0)
         act, wg = r.get("act_grad", 0), r.get("wgrad", 0)
         print(f"    forward         {fwd:>8.1f} ms")
@@ -145,7 +145,7 @@ def print_breakdown(method, scoring, r):
         print(f"    optimizer       {opt:>8.1f} ms")
         print(f"    TOTAL           {fwd + bwd + opt:>8.1f} ms  |  mem={mem:.2f} GB")
 
-    elif method == "layerwise":
+    elif method == "layer_wise_subset":
         fwd, bwd, opt = r.get("forward", 0), r.get("backward", 0), r.get("optimizer", 0)
         act = r.get("act_grad", 0)
         comp, score, sel, wg = r.get("compress", 0), r.get("score", 0), r.get("select", 0), r.get("wgrad", 0)
@@ -165,7 +165,7 @@ def print_breakdown(method, scoring, r):
         print(f"    optimizer       {opt:>8.1f} ms")
         print(f"    TOTAL           {fwd + bwd + opt:>8.1f} ms  |  mem={mem:.2f} GB")
 
-    elif method == "subset":
+    elif method == "global_subset":
         p1f, p1b = r.get("pass1_forward", 0), r.get("pass1_backward", 0)
         sel_t = r.get("selection", 0)
         p2f, p2b = r.get("pass2_forward", 0), r.get("pass2_backward", 0)
@@ -189,7 +189,7 @@ def print_breakdown(method, scoring, r):
         print(f"    optimizer       {opt:>8.1f} ms")
         print(f"    TOTAL           {total:>8.1f} ms  |  mem={mem:.2f} GB")
 
-    elif method == "subset_one_pass":
+    elif method == "global_subset_one_pass":
         fwd, bwd = r.get("forward", 0), r.get("backward", 0)
         sel_t, asm, opt = r.get("selection", 0), r.get("wgrad", 0), r.get("optimizer", 0)
         act, comp, score, retain = r.get("act_grad", 0), r.get("compress", 0), r.get("score", 0), r.get("retain", 0)
@@ -218,20 +218,20 @@ def print_summary(all_results, model_name):
     print(f"  SUMMARY: {model_name}")
     print(f"{'='*80}")
 
-    # Subset 1P overhead vs standard
-    print(f"\n  Subset 1P Overhead vs Standard:")
+    # Global Subset 1P overhead vs full-training
+    print(f"\n  GlobalSubset 1P Overhead vs Full-Training:")
     print(f"  {'Config':<22} {'compress':>10} {'full_gh':>10} {'red_ghost':>10} {'direct':>10}")
     print(f"  {'-'*62}")
     for label, config_results in all_results.items():
-        std_r = config_results.get("standard/reduced_ghost")
-        std_total = compute_total(std_r, "standard") if std_r else None
+        std_r = config_results.get("full_training/reduced_ghost")
+        std_total = compute_total(std_r, "full_training") if std_r else None
         if std_total is None:
             continue
         vals = []
         for scoring in ["compress", "full_ghost", "reduced_ghost", "direct"]:
-            key = f"subset_one_pass/{scoring}"
+            key = f"global_subset_one_pass/{scoring}"
             r = config_results.get(key)
-            total = compute_total(r, "subset_one_pass")
+            total = compute_total(r, "global_subset_one_pass")
             if total is not None:
                 ovh = (total / std_total - 1) * 100
                 vals.append(f"{ovh:>+9.1f}%")
@@ -246,7 +246,7 @@ def print_summary(all_results, model_name):
     for label, config_results in all_results.items():
         vals = []
         for scoring in ["compress", "full_ghost", "reduced_ghost", "direct"]:
-            key = f"subset_one_pass/{scoring}"
+            key = f"global_subset_one_pass/{scoring}"
             r = config_results.get(key)
             if r is not None:
                 score = r.get("score", 0) + r.get("compress", 0)
@@ -262,10 +262,10 @@ def print_summary(all_results, model_name):
     for label, config_results in all_results.items():
         vals = []
         for scoring in ["compress", "full_ghost", "reduced_ghost", "direct"]:
-            r_2p = config_results.get(f"subset/{scoring}")
-            r_1p = config_results.get(f"subset_one_pass/{scoring}")
-            t_2p = compute_total(r_2p, "subset")
-            t_1p = compute_total(r_1p, "subset_one_pass")
+            r_2p = config_results.get(f"global_subset/{scoring}")
+            r_1p = config_results.get(f"global_subset_one_pass/{scoring}")
+            t_2p = compute_total(r_2p, "global_subset")
+            t_1p = compute_total(r_1p, "global_subset_one_pass")
             if t_2p and t_1p and t_2p > 0:
                 speedup = (1 - t_1p / t_2p) * 100
                 vals.append(f"{speedup:>9.1f}%")

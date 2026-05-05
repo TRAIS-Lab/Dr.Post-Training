@@ -1,0 +1,10 @@
+# GlobalSubset data curation with MeSO optimizer (exact scoring)
+method: GlobalSubset
+subset_mode: one_pass
+scoring:
+  method: reduced_ghost
+finetuning: MeSO
+learning_rate: 2.00e-05
+
+optimizer:
+  compression: normal-512*512

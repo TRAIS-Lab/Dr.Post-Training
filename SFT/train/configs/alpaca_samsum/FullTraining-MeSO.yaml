@@ -1,0 +1,7 @@
+# Standard MeSO fine-tuning (no data curation, compressed optimizer)
+method: FullTraining
+finetuning: MeSO
+learning_rate: 2.00e-05
+
+optimizer:
+  compression: normal-512*512

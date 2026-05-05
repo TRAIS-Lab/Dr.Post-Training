@@ -10,7 +10,7 @@
 #   2. Submit training jobs (5 seeds per method)
 #   3. Submit eval jobs (dependent on training completion)
 #
-# Methods: Layerwise-{Full,LoRA,MeSO}, Subset-{Full,LoRA,MeSO}
+# Methods: LayerWiseSubset-{Full,LoRA,MeSO}, GlobalSubset-{Full,LoRA,MeSO}
 # Datasets: alpaca_samsum, tulu3_tydiqa
 # Seeds: 2, 22, 42, 62, 82
 
@@ -22,7 +22,7 @@ cd "$REPO_ROOT"
 source cluster_env.sh || { echo "ERROR: cluster_env.sh not found."; exit 1; }
 activate_env
 
-METHODS="layerwise,subset"
+METHODS="layer-wise-subset,global-subset"
 SEEDS=(2 22 42 62 82)
 
 DATASETS=(
@@ -86,7 +86,7 @@ echo ""
 echo "=== Step 2: Submitting training jobs ==="
 
 # Resolve method names
-RESOLVED_METHODS="Layerwise-Full,Layerwise-LoRA,Layerwise-MeSO,Subset-Full,Subset-LoRA,Subset-MeSO"
+RESOLVED_METHODS="LayerWiseSubset-Full,LayerWiseSubset-LoRA,LayerWiseSubset-MeSO,GlobalSubset-Full,GlobalSubset-LoRA,GlobalSubset-MeSO"
 
 declare -A TRAIN_IDS  # key="config:method" value="id1:id2:id3:id4:id5"
 

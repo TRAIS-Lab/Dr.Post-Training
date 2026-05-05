@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 """
-Training script for RLHF with layer-wise data selection.
+Training script for RLHF with layer_wise_subset data selection.
 """
 
 import logging
@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
 from RLHF.data.get_prompts import get_prompt_dataset, get_validation_prompt_dataset, collator
 from RLHF.train.model_arguments import ModelArguments, add_padding_to_tokenizer
 from RLHF.train.training_arguments import TrainingArguments
-from RLHF.train.trainer import LayerwisePPOTrainer
+from RLHF.train.trainer import LayerWiseSubsetPPOTrainer
 from RLHF.train.rewards import load_reward_model, RewardModelWrapper
 from RLHF.train.evaluator import create_evaluator
 
@@ -518,7 +518,7 @@ def main():
         logger.info("Evaluator ready")
 
     # Create trainer
-    trainer = LayerwisePPOTrainer(
+    trainer = LayerWiseSubsetPPOTrainer(
         model=model,
         ref_model=ref_model,  # None for PEFT, shared-layer ref model for non-PEFT
         reward_model=reward_model,

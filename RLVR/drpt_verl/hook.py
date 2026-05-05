@@ -25,7 +25,7 @@ from torch.autograd import Function
 
 import torch.distributed as dist
 
-from .selection_state import SelectionStateVerl, LayerwiseStateVerl, SubsetStateVerl
+from .selection_state import SelectionStateVerl, LayerWiseSubsetStateVerl, GlobalSubsetStateVerl
 from .packed_ops import (
     compute_scores_packed_vectorized,
     compute_selected_gradients_packed_vectorized,
@@ -150,12 +150,12 @@ class GradientHookVerl:
 
         state = self.selection_state
 
-        if isinstance(state, SubsetStateVerl):
-            return SubsetLinearBackwardVerl.apply(
+        if isinstance(state, GlobalSubsetStateVerl):
+            return GlobalSubsetLinearBackwardVerl.apply(
                 input, module.weight, module.bias, self, idx
             )
-        elif isinstance(state, LayerwiseStateVerl):
-            return LayerwiseLinearBackwardVerl.apply(
+        elif isinstance(state, LayerWiseSubsetStateVerl):
+            return LayerWiseSubsetLinearBackwardVerl.apply(
                 input, module.weight, module.bias, self, idx
             )
         elif self._capturing_val:
@@ -208,8 +208,8 @@ class GradientHookVerl:
         dtype = next(self.model.parameters()).dtype
         num_layers = len(self.layer_names)
 
-        if selection_method == "Subset":
-            self.selection_state = SubsetStateVerl(
+        if selection_method == "GlobalSubset":
+            self.selection_state = GlobalSubsetStateVerl(
                 train_batch_size=train_batch_size,
                 num_layers=num_layers,
                 frac=frac,
@@ -219,8 +219,8 @@ class GradientHookVerl:
                 use_second_order=use_second_order,
                 selection_mode=selection_mode
             )
-        elif selection_method == "Layerwise":
-            self.selection_state = LayerwiseStateVerl(
+        elif selection_method == "LayerWiseSubset":
+            self.selection_state = LayerWiseSubsetStateVerl(
                 train_batch_size=train_batch_size,
                 num_layers=num_layers,
                 frac=frac,
@@ -445,8 +445,8 @@ class ValCaptureLinearBackward(Function):
         return grad_input, None, None, None, None
 
 
-class LayerwiseLinearBackwardVerl(Function):
-    """Layerwise backward with packed sequence support."""
+class LayerWiseSubsetLinearBackwardVerl(Function):
+    """LayerWiseSubset backward with packed sequence support."""
 
     @staticmethod
     def forward(ctx, input, weight, bias, hook_manager, layer_idx):
@@ -470,7 +470,7 @@ class LayerwiseLinearBackwardVerl(Function):
 
         grad_input = grad_output @ weight.to(grad_output.dtype)
 
-        state: LayerwiseStateVerl = hook_manager.selection_state
+        state: LayerWiseSubsetStateVerl = hook_manager.selection_state
         if state is None:
             return grad_input, None, None, None, None
 
@@ -525,8 +525,8 @@ class LayerwiseLinearBackwardVerl(Function):
         return grad_input, grad_weight, grad_bias, None, None
 
 
-class SubsetLinearBackwardVerl(Function):
-    """Subset backward with packed sequence support."""
+class GlobalSubsetLinearBackwardVerl(Function):
+    """GlobalSubset backward with packed sequence support."""
 
     @staticmethod
     def forward(ctx, input, weight, bias, hook_manager, layer_idx):
@@ -550,7 +550,7 @@ class SubsetLinearBackwardVerl(Function):
 
         grad_input = grad_output @ weight.to(grad_output.dtype)
 
-        state: SubsetStateVerl = hook_manager.selection_state
+        state: GlobalSubsetStateVerl = hook_manager.selection_state
         if state is None:
             return grad_input, None, None, None, None
 
@@ -567,7 +567,7 @@ class SubsetLinearBackwardVerl(Function):
             )
 
             if is_packed:
-                # sample_ids not needed for Subset (no gradient computation in this pass)
+                # sample_ids not needed for GlobalSubset (no gradient computation in this pass)
                 scores, similarity, _ = compute_scores_packed_vectorized(
                     grad_output, input, val_grad_total,
                     state.cu_seqlens, state.use_second_order

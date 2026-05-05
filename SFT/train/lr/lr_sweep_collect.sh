@@ -9,7 +9,7 @@
 #
 # Usage:
 #   bash lr_sweep_collect.sh -c configs/tulu3_tydiqa -m all
-#   bash lr_sweep_collect.sh -c configs/tulu3_tydiqa -m Standard-Full --lr_margin 0.02
+#   bash lr_sweep_collect.sh -c configs/tulu3_tydiqa -m FullTraining-Full --lr_margin 0.02
 #   bash lr_sweep_collect.sh -c configs/tulu3_tydiqa -m all --dry-run
 # =============================================================================
 
@@ -60,7 +60,7 @@ Options:
 Examples:
   bash lr_sweep_collect.sh -c configs/tulu3_tydiqa -m all
   bash lr_sweep_collect.sh -c configs/tulu3_tydiqa -m all --lr_margin 0.02
-  bash lr_sweep_collect.sh -c configs/tulu3_tydiqa -m Standard-Full --dry-run
+  bash lr_sweep_collect.sh -c configs/tulu3_tydiqa -m FullTraining-Full --dry-run
 HELP
             exit 0
             ;;
@@ -84,7 +84,7 @@ fi
 # Config parser (same as train.sh)
 # =============================================================================
 reset_config() {
-    cfg_method="Standard"; cfg_finetuning="Full"
+    cfg_method="FullTraining"; cfg_finetuning="Full"
     cfg_score_sparsifier=""; cfg_score_projector=""
     cfg_opt_sparsifier=""; cfg_opt_projector=""
     cfg_selection_frac="0.5"; cfg_n_val="8"
@@ -175,9 +175,9 @@ resolve_methods() {
         item=$(echo "$item" | xargs)
         case "$item" in
             all)            for m in "${available[@]}"; do resolved="${resolved:+$resolved,}$m"; done ;;
-            baseline)       for m in "${available[@]}"; do [[ "$m" == Standard-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            layerwise)      for m in "${available[@]}"; do [[ "$m" == Layerwise-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            subset)         for m in "${available[@]}"; do [[ "$m" == Subset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            baseline)       for m in "${available[@]}"; do [[ "$m" == FullTraining-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            layer-wise-subset)      for m in "${available[@]}"; do [[ "$m" == LayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            global-subset)         for m in "${available[@]}"; do [[ "$m" == GlobalSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             lora)           for m in "${available[@]}"; do [[ "$m" == *-LoRA ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             compression)    for m in "${available[@]}"; do [[ "$m" == *-MeSO ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             *)

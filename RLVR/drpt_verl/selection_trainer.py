@@ -7,7 +7,7 @@ with online validation rollouts. It:
 1. Generates fresh rollouts for validation prompts using the current policy
 2. Computes rewards on validation responses
 3. Captures validation gradients for selection
-4. Applies Layerwise or Subset selection during training
+4. Applies LayerWiseSubset or GlobalSubset selection during training
 
 This matches the intended design from RLHF/train/trainer.py.
 
@@ -70,7 +70,7 @@ class SelectionTrainerConfig:
     # Enable/disable selection
     enable: bool = False
 
-    # Selection method: "Layerwise", "Subset", or "NA"
+    # Selection method: "LayerWiseSubset", "GlobalSubset", or "NA"
     method: str = "NA"
 
     # Fraction of samples to select (0.0 to 1.0)
@@ -105,7 +105,7 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
     PPO Trainer with online validation rollout generation for gradient-based selection.
 
     This trainer generates fresh validation rollouts each step (or every N steps),
-    computes validation gradients, and uses them for Layerwise/Subset data selection.
+    computes validation gradients, and uses them for LayerWiseSubset/GlobalSubset data selection.
 
     Key differences from base RayPPOTrainer:
     1. Maintains a validation data manager with prompt pool
@@ -360,7 +360,7 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
+            if self.config.trainer.get("target_only", False):
                 return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):

@@ -27,7 +27,7 @@ use_flash_attention: true
 # Evaluation
 n_eval: 500
 
-# Curation defaults (used by Layerwise/Subset methods)
+# Curation defaults (used by LayerWiseSubset/GlobalSubset methods)
 selection_frac: 0.5
 selection_mode: topk
 n_val: 16

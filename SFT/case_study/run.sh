@@ -12,7 +12,7 @@ cd $CODE_DIR/Dr.Post-Training
 export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 # =============================================================================
-# Case study: Standard training with dual Layerwise + Subset scoring
+# Case study: Standard training with dual LayerWiseSubset + GlobalSubset scoring
 # =============================================================================
 
 # Defaults
@@ -26,7 +26,7 @@ seed=42
 batch_size=8
 n_val=16
 n_eval=500
-lr="4.96e-05"  # Standard-Full LR for tulu3_tydiqa
+lr="4.96e-05"  # FullTraining-Full LR for tulu3_tydiqa
 selection_frac="0.5"
 val_batch_size="1"
 val_strategy="separate_batch_factorized"

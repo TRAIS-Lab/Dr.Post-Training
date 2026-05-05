@@ -67,7 +67,7 @@ while [[ $# -gt 0 ]]; do
                 [[ "$name" != "defaults" ]] && echo "  $name"
             done
             echo ""
-            echo "Categories: all, standard, layerwise, subset, full"
+            echo "Categories: all, full-training, layer-wise-subset, global-subset, full"
             exit 0
             ;;
         --help|-h)
@@ -76,7 +76,7 @@ Usage: bash train.sh -c <config_dir> -m <methods> [options]
 
 All experiment settings live in config files.
 Each config directory has a defaults.yaml for shared settings, plus per-method configs.
-Config naming convention: Method-Finetuning.yaml (e.g., Layerwise-Full.yaml)
+Config naming convention: Method-Finetuning.yaml (e.g., LayerWiseSubset-Full.yaml)
 
 Required:
   -c, --config_dir <dir>  Config directory (relative to RLVR/ or absolute)
@@ -88,13 +88,13 @@ Optional:
   --dry-run               Print commands without executing
   --list                  List available methods and exit
 
-Categories: all, standard, layerwise, subset, full
+Categories: all, full-training, layer-wise-subset, global-subset, full
 
 Examples:
   bash train.sh -c configs/math -m all
-  bash train.sh -c configs/math -m Layerwise-Full --seed 123
-  bash train.sh -c configs/math -m "Standard-Full,Layerwise-Full" --dry-run
-  bash train.sh -c configs/math -m layerwise --dry-run
+  bash train.sh -c configs/math -m LayerWiseSubset-Full --seed 123
+  bash train.sh -c configs/math -m "FullTraining-Full,LayerWiseSubset-Full" --dry-run
+  bash train.sh -c configs/math -m layer-wise-subset --dry-run
 HELP
             exit 0
             ;;
@@ -122,7 +122,7 @@ fi
 # =============================================================================
 reset_config() {
     # Method
-    cfg_method="Standard"
+    cfg_method="FullTraining"
     cfg_finetuning="Full"
 
     # Model
@@ -224,9 +224,9 @@ resolve_methods() {
         item=$(echo "$item" | xargs)
         case "$item" in
             all)       for m in "${available[@]}"; do resolved="${resolved:+$resolved,}$m"; done ;;
-            standard)  for m in "${available[@]}"; do [[ "$m" == Standard-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            layerwise) for m in "${available[@]}"; do [[ "$m" == Layerwise-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            subset)    for m in "${available[@]}"; do [[ "$m" == Subset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            full-training)  for m in "${available[@]}"; do [[ "$m" == FullTraining-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            layer-wise-subset) for m in "${available[@]}"; do [[ "$m" == LayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            global-subset)    for m in "${available[@]}"; do [[ "$m" == GlobalSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             full)      for m in "${available[@]}"; do [[ "$m" == *-Full ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             *)
                 if [[ -f "$config_dir/${item}.yaml" ]]; then
@@ -265,7 +265,7 @@ run_method() {
 
     # Derived: selection.enable based on method
     local selection_enabled="False"
-    [[ "$cfg_method" != "Standard" ]] && selection_enabled="True"
+    [[ "$cfg_method" != "FullTraining" ]] && selection_enabled="True"
 
     # Derived: val_prompts_path from val_source
     local val_prompts_path

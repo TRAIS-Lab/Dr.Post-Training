@@ -134,8 +134,8 @@ GPUS=1 TIME=1:00:00 MEM=64g ./submit.sh SFT/eval/eval.sh --task samsum
 
 | Experiment | Environment | Description                                                             | Documentation                    |
 | ---------- | ----------- | ----------------------------------------------------------------------- | -------------------------------- |
-| **SFT**    | `drpt`      | Supervised Fine-Tuning with layerwise data curation                     | [SFT/README.md](SFT/README.md)   |
-| **RLHF**   | `drpt`      | Reinforcement Learning from Human Feedback with layerwise data curation | [RLHF/README.md](RLHF/README.md) |
+| **SFT**    | `drpt`      | Supervised Fine-Tuning with layer-wise-subset data curation                     | [SFT/README.md](SFT/README.md)   |
+| **RLHF**   | `drpt`      | Reinforcement Learning from Human Feedback with layer-wise-subset data curation | [RLHF/README.md](RLHF/README.md) |
 | **RLVR**   | `drpt_rlvr` | Reinforcement Learning with Verifiable Rewards (VERL + vLLM)            | [RLVR/README.md](RLVR/README.md) |
 
 ## TODOs

@@ -1,18 +1,18 @@
-# Case Study: Layerwise vs Subset Selection Analysis
+# Case Study: LayerWiseSubset vs GlobalSubset Selection Analysis
 
 ## Overview
 
-This case study examines **why Layerwise selection outperforms Subset selection** by analyzing the per-layer influence scores during standard training. We find two key results:
+This case study examines **why LayerWiseSubset selection outperforms GlobalSubset selection** by analyzing the per-layer influence scores during standard training. We find two key results:
 
 1. **Score magnitudes are heavily skewed across layer types and blocks.** `down_proj` layers produce scores 40–114× larger than `k_proj` layers, despite some having identical parameter counts. Block 1's `down_proj` alone dominates the entire score landscape.
 
-2. **Different layer types would select different training samples.** The within-attention rank correlation is only 0.33–0.55, meaning Q/K/V/O projections frequently disagree on which samples are most useful. Subset selection, dominated by `down_proj`'s large scores, effectively ignores the preferences of Q and K projections (Jaccard with Subset ≈ 0.45, barely above random).
+2. **Different layer types would select different training samples.** The within-attention rank correlation is only 0.33–0.55, meaning Q/K/V/O projections frequently disagree on which samples are most useful. GlobalSubset selection, dominated by `down_proj`'s large scores, effectively ignores the preferences of Q and K projections (Jaccard with GlobalSubset ≈ 0.45, barely above random).
 
-Together, these explain why Subset underperforms: it forces all layers to train on data chosen by a single layer type, even though different layers benefit from different samples. Layerwise selection respects each layer's individual preference.
+Together, these explain why GlobalSubset underperforms: it forces all layers to train on data chosen by a single layer type, even though different layers benefit from different samples. LayerWiseSubset selection respects each layer's individual preference.
 
 ## Experimental Setup
 
-The case study uses the **same training configuration as the main SFT experiments** — same model, data percentage, learning rate, and hyperparameters. The only addition is that at each training step, we compute what both Layerwise and Subset selection **would** pick (without applying the selection), recording per-layer scores for post-hoc analysis.
+The case study uses the **same training configuration as the main SFT experiments** — same model, data percentage, learning rate, and hyperparameters. The only addition is that at each training step, we compute what both LayerWiseSubset and GlobalSubset selection **would** pick (without applying the selection), recording per-layer scores for post-hoc analysis.
 
 ### Model
 - **Llama-3.2-1B** (16 transformer blocks, 113 linear layers)
@@ -45,8 +45,8 @@ The case study uses the **same training configuration as the main SFT experiment
 At each training step:
 1. Standard forward + backward pass (no hooks) → real gradients for optimizer
 2. Save real gradients
-3. Layerwise scoring pass → per-layer influence scores and selections for all 113 layers
-4. Subset scoring pass → global accumulated scores and selection
+3. LayerWiseSubset scoring pass → per-layer influence scores and selections for all 113 layers
+4. GlobalSubset scoring pass → global accumulated scores and selection
 5. Restore real gradients → optimizer step proceeds normally
 
 The scoring uses `lr=1.0` (since only relative rankings matter) and factorized validation gradient storage.
@@ -80,31 +80,31 @@ Key observations:
 | Within-attention correlation       | 0.33           | 0.55            |
 | Within-MLP correlation             | 0.52           | 0.67            |
 | Unique selection patterns per step | 5.3            | 4.3             |
-| K Jaccard with Subset              | 0.45           | 0.50            |
-| Down Jaccard with Subset           | 0.90           | 0.86            |
-| Down Spearman with Subset          | 0.96           | 0.94            |
+| K Jaccard with GlobalSubset              | 0.45           | 0.50            |
+| Down Jaccard with GlobalSubset           | 0.90           | 0.86            |
+| Down Spearman with GlobalSubset          | 0.96           | 0.94            |
 
 Key observations:
-- Q and K projections have **near-random overlap with Subset** (Jaccard 0.45–0.50 vs random baseline ~0.43)
-- Down has **near-perfect correlation with Subset** (Spearman 0.96/0.94)
+- Q and K projections have **near-random overlap with GlobalSubset** (Jaccard 0.45–0.50 vs random baseline ~0.43)
+- Down has **near-perfect correlation with GlobalSubset** (Spearman 0.96/0.94)
 - On average, **5+ distinct selection patterns** exist among the 7 layer types at each step
-- Subset's selection is effectively determined by `down_proj`, which has the largest score magnitude
+- GlobalSubset's selection is effectively determined by `down_proj`, which has the largest score magnitude
 
 ### Implication
 
-Subset selection is not a balanced vote across layers — it is a **magnitude-weighted average dominated by `down_proj`**. Layers like K and Q, which represent 32 of the model's 112 block-level linear layers, have essentially no influence on which data they receive. Layerwise selection gives each layer equal voice, allowing it to train on the data most beneficial for its specific function.
+GlobalSubset selection is not a balanced vote across layers — it is a **magnitude-weighted average dominated by `down_proj`**. Layers like K and Q, which represent 32 of the model's 112 block-level linear layers, have essentially no influence on which data they receive. LayerWiseSubset selection gives each layer equal voice, allowing it to train on the data most beneficial for its specific function.
 
 ## Files
 
 | File                          | Description                                                           |
 | ----------------------------- | --------------------------------------------------------------------- |
-| `analyze_selection.py`        | Case study trainer: standard training + dual Layerwise/Subset scoring |
+| `analyze_selection.py`        | Case study trainer: standard training + dual LayerWiseSubset/GlobalSubset scoring |
 | `run.sh`                      | Launch script with correct hyperparameters                            |
 | `plot_case_study.py`          | Analysis and plotting (produces individual subplot PDFs)              |
 | `figures/magnitude_tulu3.pdf` | Score magnitude by block × type (tulu3→tydiqa)                        |
 | `figures/magnitude_alpaca.pdf`| Score magnitude by block × type (alpaca→samsum)                       |
-| `figures/correlation_tulu3.pdf` | Rank correlation with Subset by block × type (tulu3→tydiqa)         |
-| `figures/correlation_alpaca.pdf`| Rank correlation with Subset by block × type (alpaca→samsum)        |
+| `figures/correlation_tulu3.pdf` | Rank correlation with GlobalSubset by block × type (tulu3→tydiqa)         |
+| `figures/correlation_alpaca.pdf`| Rank correlation with GlobalSubset by block × type (alpaca→samsum)        |
 | `figures/legend.pdf`          | Standalone legend for all subplots                                    |
 
 ### Raw data (on scratch)
@@ -120,10 +120,10 @@ Each directory contains `selection_records.json` with per-step, per-layer scores
 ```bash
 cd $CODE_DIR/Dr.Post-Training
 
-# tulu3 → tydiqa (matching Standard-Full config)
+# tulu3 → tydiqa (matching FullTraining-Full config)
 bash SFT/case_study/run.sh
 
-# alpaca → samsum (matching Standard-Full config)
+# alpaca → samsum (matching FullTraining-Full config)
 bash SFT/case_study/run.sh --train alpaca --task samsum --percentage 0.4 --lr 1e-06 --record_freq 2
 
 # Generate figure

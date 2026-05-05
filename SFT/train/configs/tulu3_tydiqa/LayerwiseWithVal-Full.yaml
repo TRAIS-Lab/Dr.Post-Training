@@ -1,9 +1,0 @@
-# Layerwise data curation with full fine-tuning + validation training
-# Same as Layerwise-Full but also trains on validation data
-method: LayerwiseWithVal
-finetuning: Full
-learning_rate: 4.96e-05
-
-scoring:
-  method: compress
-  compression: normal-64*64

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 """
-Training script for SFT with layer-wise descent.
+Training script for SFT with layer_wise_subset descent.
 """
 
 import logging
@@ -31,7 +31,7 @@ from drpt import (
     create_sample_inputs,
     CompressionMode,
 )
-from SFT.train.trainer import LayerwiseTrainer
+from SFT.train.trainer import LayerWiseSubsetTrainer
 
 from SFT.train.data_arguments import DataArguments, get_data_statistics
 from SFT.train.model_arguments import ModelArguments, add_padding_to_tokenizer
@@ -207,10 +207,10 @@ def main():
 
     # Determine if gradient hooks are needed based on training method
     # Hooks are needed for:
-    # 1. Selection method is not NA (Layerwise or Subset)
+    # 1. Selection method is not NA (LayerWiseSubset or GlobalSubset)
     # 2. Compression enabled (implies MeSO optimizer)
     has_explicit_compression = (training_args.sparsification is not None or training_args.projection is not None)
-    needs_selection = training_args.method in ('Layerwise', 'Subset', 'LayerwiseWithVal')
+    needs_selection = training_args.method in ('LayerWiseSubset', 'GlobalSubset')
     needs_grad_hook = needs_selection or has_explicit_compression
 
     # Determine compression needs independently for score and update
@@ -342,7 +342,7 @@ def main():
             "Add 'compression: normal-64*64' under the scoring section."
         )
 
-    # Prepare validation dataset (used for data selection in layer-wise descent)
+    # Prepare validation dataset (used for data selection in layer_wise_subset descent)
     # Use rejection sampling to filter out validation samples that are significantly
     # longer than the average training sequence length
     val_seq_length_threshold = int(avg_train_seq_length * DEFAULT_SEQ_LENGTH_MULTIPLIER)
@@ -355,7 +355,6 @@ def main():
         max_length=data_args.max_seq_length,
         split="validation",
         k=training_args.n_val,
-        subject=training_args.subject,
         seed=training_args.seed,
         max_seq_length_threshold=val_seq_length_threshold
     )
@@ -368,14 +367,13 @@ def main():
         max_length=data_args.max_seq_length,
         split=data_args.eval_split,
         k=training_args.n_eval,
-        subject=training_args.subject
     )
 
     # Data collator
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True)
 
-    # Initialize layer-wise trainer with data selection capabilities
-    trainer = LayerwiseTrainer(
+    # Initialize layer_wise_subset trainer with data selection capabilities
+    trainer = LayerWiseSubsetTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

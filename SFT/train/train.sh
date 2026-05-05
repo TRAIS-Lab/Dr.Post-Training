@@ -60,7 +60,7 @@ while [[ $# -gt 0 ]]; do
                 [[ "$name" != "defaults" ]] && echo "  $name"
             done
             echo ""
-            echo "Categories: all, standard, layerwise, subset, full, lora, meso"
+            echo "Categories: all, full-training, layer-wise-subset, global-subset, full, lora, meso"
             exit 0
             ;;
         --help|-h)
@@ -81,12 +81,12 @@ Optional:
   --dry-run               Print commands without executing
   --list                  List available methods and exit
 
-Categories: all, standard, layerwise, subset, full, lora, meso
+Categories: all, full-training, layer-wise-subset, global-subset, full, lora, meso
 
 Examples:
   bash train.sh -c configs/tulu3_tydiqa -m all
-  bash train.sh -c configs/tulu3_tydiqa -m "Layerwise-Full,Subset-Full" --seed 123
-  bash train.sh -c configs/tulu3_tydiqa -m standard --dry-run
+  bash train.sh -c configs/tulu3_tydiqa -m "LayerWiseSubset-Full,GlobalSubset-Full" --seed 123
+  bash train.sh -c configs/tulu3_tydiqa -m full-training --dry-run
 HELP
             exit 0
             ;;
@@ -114,7 +114,7 @@ fi
 # =============================================================================
 reset_config() {
     # Method
-    cfg_method="Standard"
+    cfg_method="FullTraining"
     cfg_finetuning="Full"
 
     # Scoring (nested under scoring: in YAML)
@@ -159,7 +159,6 @@ reset_config() {
     # Dataset
     cfg_train_dataset=""
     cfg_target_task=""
-    cfg_subject=""
     cfg_percentage=""
 
     # Extras
@@ -233,7 +232,6 @@ parse_yaml() {
             eval_steps)                          cfg_eval_steps="$val" ;;
             train_dataset)                       cfg_train_dataset="$val" ;;
             target_task)                         cfg_target_task="$val" ;;
-            subject)                             cfg_subject="$val" ;;
             percentage)                          cfg_percentage="$val" ;;
             record_selections)                   cfg_record_selections="$val" ;;
             record_selections_freq)              cfg_record_selections_freq="$val" ;;
@@ -263,9 +261,9 @@ resolve_methods() {
         item=$(echo "$item" | xargs)
         case "$item" in
             all)            for m in "${available[@]}"; do resolved="${resolved:+$resolved,}$m"; done ;;
-            standard)       for m in "${available[@]}"; do [[ "$m" == Standard-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            layerwise)      for m in "${available[@]}"; do [[ "$m" == Layerwise-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            subset)         for m in "${available[@]}"; do [[ "$m" == Subset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            full-training)       for m in "${available[@]}"; do [[ "$m" == FullTraining-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            layer-wise-subset)      for m in "${available[@]}"; do [[ "$m" == LayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            global-subset)         for m in "${available[@]}"; do [[ "$m" == GlobalSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             full)           for m in "${available[@]}"; do [[ "$m" == *-Full ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             lora)           for m in "${available[@]}"; do [[ "$m" == *-LoRA ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             meso)           for m in "${available[@]}"; do [[ "$m" == *-MeSO ]] && resolved="${resolved:+$resolved,}$m"; done ;;
@@ -312,14 +310,14 @@ run_method() {
 
     # Derived values
     local internal_method="NA"
-    [[ "$cfg_method" != "Standard" ]] && internal_method="$cfg_method"
+    [[ "$cfg_method" != "FullTraining" ]] && internal_method="$cfg_method"
 
     local use_lora="false"
     [[ "$cfg_finetuning" == "LoRA" || "$cfg_finetuning" == "MeSO-LoRA" ]] && use_lora="true"
 
-    # LR fallback if not specified anywhere
+    # LR fallback if not specified anywhere (every YAML should set this explicitly)
     if [[ -z "$cfg_learning_rate" ]]; then
-        [[ "$use_lora" == "true" ]] && cfg_learning_rate="2e-04" || cfg_learning_rate="5e-05"
+        [[ "$use_lora" == "true" ]] && cfg_learning_rate="5e-04" || cfg_learning_rate="2e-05"
     fi
 
     local model_name=$(basename "$cfg_model")
@@ -328,12 +326,7 @@ run_method() {
 
     # Build job name
     local train_str="${cfg_train_dataset:-default}"
-    local JOB_NAME
-    if [[ -n "$cfg_subject" ]]; then
-        JOB_NAME="${train_str}_${cfg_target_task}_${cfg_subject}-${model_name}-${method_str}-p${cfg_percentage}-lr${cfg_learning_rate}-b${cfg_batch_size}-v${cfg_n_val}-s${cfg_seed}"
-    else
-        JOB_NAME="${train_str}_${cfg_target_task}-${model_name}-${method_str}-p${cfg_percentage}-lr${cfg_learning_rate}-b${cfg_batch_size}-v${cfg_n_val}-s${cfg_seed}"
-    fi
+    local JOB_NAME="${train_str}_${cfg_target_task}-${model_name}-${method_str}-p${cfg_percentage}-lr${cfg_learning_rate}-b${cfg_batch_size}-v${cfg_n_val}-s${cfg_seed}"
 
     local data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
     local output_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/${JOB_NAME}"
@@ -397,7 +390,6 @@ $fsdp_args \
 --use_flash_attention $cfg_use_flash_attention"
 
     # Optional args
-    [[ -n "$cfg_subject" ]] && cmd="$cmd --subject $cfg_subject"
     [[ -n "$cfg_train_dataset" ]] && cmd="$cmd --train_dataset_names $cfg_train_dataset"
     [[ -n "$cfg_val_batch_size" ]] && cmd="$cmd --val_batch_size_for_selection $cfg_val_batch_size"
 

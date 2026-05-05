@@ -4,11 +4,9 @@ Unified evaluation script for SFT experiments.
 
 Supports:
 - SamSUM: Dialogue summarization (ROUGE-1, ROUGE-2, ROUGE-L)
-- TyDiQA: Multilingual QA (F1 score)
-- MMLU: Multiple-choice QA (Accuracy)
-- BBH: Big Bench Hard reasoning tasks (Accuracy)
-- GSM8K: Grade school math (Accuracy)
-- MATH500: Competition math (Accuracy)
+- TyDiQA: Multilingual QA (F1, EM)
+- NQ-open: Closed-book factoid QA (EM, F1)
+- SQuAD: Closed-book reading-comprehension QA, no context (EM, F1)
 """
 
 import argparse
@@ -181,7 +179,7 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None, method: Op
     Args:
         models_dir: Directory containing model directories
         train_dataset: Filter prefix (e.g., "tulu3_tydiqa")
-        method: Method filter (e.g., "Standard-MeSO", "Layerwise-Full")
+        method: Method filter (e.g., "FullTraining-MeSO", "LayerWiseSubset-Full")
     """
     model_paths = []
     for entry in os.listdir(models_dir):
@@ -198,10 +196,10 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None, method: Op
                 if not (entry.startswith(train_dataset + "-") or entry.startswith(train_dataset + "_")):
                     continue
 
-            # Check method filter (e.g., "Standard-MeSO" matches "-Standard-MeSO-")
+            # Check method filter (e.g., "FullTraining-MeSO" matches "-FullTraining-MeSO-")
             if method is not None:
                 # Method appears in directory name as -{method}-{finetuning}-
-                # e.g., tulu3_tydiqa-Llama-3.2-1B-Standard-MeSO-p0.01-...
+                # e.g., tulu3_tydiqa-Llama-3.2-1B-FullTraining-MeSO-p0.01-...
                 method_pattern = f"-{method}-"
                 if method_pattern not in entry:
                     continue
@@ -244,84 +242,31 @@ def evaluate_tydiqa(args, model, tokenizer) -> dict:
     }
 
 
-def evaluate_mmlu(args, model, tokenizer) -> dict:
-    """Run MMLU evaluation."""
-    from .tasks.mmlu import compute_accuracy
-
-    logger.info("Evaluating on MMLU")
+def evaluate_nq_open(args, model, tokenizer) -> dict:
+    """Run NQ-open closed-book QA evaluation (EM/F1)."""
+    from .tasks.nq_open import compute_accuracy
+    logger.info("Evaluating on NQ-open")
     results = compute_accuracy(
-        args=args,
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size
+        args=args, model=model, tokenizer=tokenizer,
+        batch_size=args.batch_size, max_new_tokens=32,
     )
-    return {
-        "task": "mmlu",
-        "accuracy": results["accuracy"],
-        "n_test": results["n_test"],
-    }
+    return {"task": "nq_open", "em": results["em"], "f1": results["f1"], "n_test": results["n_test"]}
 
 
-def evaluate_bbh(args, model, tokenizer) -> dict:
-    """Run BBH (Big Bench Hard) evaluation."""
-    from .tasks.bbh import compute_accuracy
-
-    logger.info("Evaluating on BBH")
+def evaluate_squad(args, model, tokenizer) -> dict:
+    """Run SQuAD closed-book (no context) evaluation (EM/F1)."""
+    from .tasks.squad import compute_accuracy
+    logger.info("Evaluating on SQuAD (closed-book)")
     results = compute_accuracy(
-        args=args,
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        max_new_tokens=512  # Chain-of-thought requires more tokens
+        args=args, model=model, tokenizer=tokenizer,
+        batch_size=args.batch_size, max_new_tokens=32,
     )
-    return {
-        "task": "bbh",
-        "accuracy": results["accuracy"],
-        "n_test": results["n_test"],
-    }
-
-
-def evaluate_gsm8k(args, model, tokenizer) -> dict:
-    """Run GSM8K evaluation."""
-    from .tasks.gsm8k import compute_accuracy
-
-    logger.info("Evaluating on GSM8K")
-    results = compute_accuracy(
-        args=args,
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        max_new_tokens=256
-    )
-    return {
-        "task": "gsm8k",
-        "accuracy": results["accuracy"],
-        "n_test": results["n_test"],
-    }
-
-
-def evaluate_math500(args, model, tokenizer) -> dict:
-    """Run MATH500 evaluation."""
-    from .tasks.math500 import compute_accuracy
-
-    logger.info("Evaluating on MATH500")
-    results = compute_accuracy(
-        args=args,
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        max_new_tokens=512
-    )
-    return {
-        "task": "math500",
-        "accuracy": results["accuracy"],
-        "n_test": results["n_test"],
-    }
+    return {"task": "squad", "em": results["em"], "f1": results["f1"], "n_test": results["n_test"]}
 
 
 def get_task_from_model_name(model_name: str) -> Optional[str]:
     """Extract the evaluation task from model name (e.g., alpaca_samsum -> samsum)."""
-    valid_tasks = ["samsum", "tydiqa", "mmlu", "bbh", "gsm8k", "math500"]
+    valid_tasks = ["samsum", "tydiqa", "nq_open", "squad"]
     parts = model_name.split("-")
     if parts:
         train_task = parts[0].split("_")
@@ -370,9 +315,7 @@ def evaluate_model(
     args.n_test = n_test
     args.batch_size = batch_size
     args.max_new_tokens = max_new_tokens
-    args.subject = subject  # For MMLU
-    args.bbh_task = subject  # For BBH (uses same value)
-    args.n_val = 5  # Few-shot examples for MMLU
+    args.subject = subject  # legacy arg; unused in current scope
 
     try:
         if task == "samsum":
@@ -394,37 +337,21 @@ def evaluate_model(
             with open(os.path.join(model_path, "tydiqa_results.json"), "w") as f:
                 json.dump(tydiqa_results, f, indent=2)
 
-        elif task == "mmlu":
-            logger.info(f"Evaluating {model_name} on MMLU...")
-            mmlu_results = evaluate_mmlu(args, model, tokenizer)
-            results["mmlu_accuracy"] = mmlu_results["accuracy"]
+        elif task == "nq_open":
+            logger.info(f"Evaluating {model_name} on NQ-open...")
+            nq_results = evaluate_nq_open(args, model, tokenizer)
+            results["nq_open_em"] = nq_results["em"]
+            results["nq_open_f1"] = nq_results["f1"]
+            with open(os.path.join(model_path, "nq_open_results.json"), "w") as f:
+                json.dump(nq_results, f, indent=2)
 
-            with open(os.path.join(model_path, "mmlu_results.json"), "w") as f:
-                json.dump(mmlu_results, f, indent=2)
-
-        elif task == "bbh":
-            logger.info(f"Evaluating {model_name} on BBH...")
-            bbh_results = evaluate_bbh(args, model, tokenizer)
-            results["bbh_accuracy"] = bbh_results["accuracy"]
-
-            with open(os.path.join(model_path, "bbh_results.json"), "w") as f:
-                json.dump(bbh_results, f, indent=2)
-
-        elif task == "gsm8k":
-            logger.info(f"Evaluating {model_name} on GSM8K...")
-            gsm8k_results = evaluate_gsm8k(args, model, tokenizer)
-            results["gsm8k_accuracy"] = gsm8k_results["accuracy"]
-
-            with open(os.path.join(model_path, "gsm8k_results.json"), "w") as f:
-                json.dump(gsm8k_results, f, indent=2)
-
-        elif task == "math500":
-            logger.info(f"Evaluating {model_name} on MATH500...")
-            math500_results = evaluate_math500(args, model, tokenizer)
-            results["math500_accuracy"] = math500_results["accuracy"]
-
-            with open(os.path.join(model_path, "math500_results.json"), "w") as f:
-                json.dump(math500_results, f, indent=2)
+        elif task == "squad":
+            logger.info(f"Evaluating {model_name} on SQuAD (closed-book)...")
+            sq_results = evaluate_squad(args, model, tokenizer)
+            results["squad_em"] = sq_results["em"]
+            results["squad_f1"] = sq_results["f1"]
+            with open(os.path.join(model_path, "squad_results.json"), "w") as f:
+                json.dump(sq_results, f, indent=2)
 
     except Exception as e:
         logger.error(f"Evaluation failed: {e}")
@@ -460,12 +387,12 @@ def main():
     parser.add_argument("--train", type=str, default=None,
         help="Filter by training dataset (e.g., alpaca, less, tulu3, wizardlm)")
     parser.add_argument("--task", type=str, default=None,
-        choices=["samsum", "tydiqa", "mmlu", "bbh", "gsm8k", "math500"],
+        choices=["samsum", "tydiqa", "nq_open", "squad"],
         help="Override auto-detected task (optional)")
     parser.add_argument("--subject", type=str, default=None,
-        help="MMLU subject or BBH task to evaluate on (default: all)")
+        help="(legacy; unused in current scope)")
     parser.add_argument("--method", type=str, default=None,
-        help="Filter by method (e.g., Standard-MeSO, Layerwise-Full)")
+        help="Filter by method (e.g., FullTraining-MeSO, LayerWiseSubset-Full)")
     parser.add_argument("--data_dir", type=str, default=None,
         help="Data directory (default: auto-detect)")
     parser.add_argument("--n_test", type=int, default=-1,
@@ -571,45 +498,25 @@ def main():
             print(f"{r['model_name'][:80]:<80} "
                   f"{r['tydiqa_f1']:>8.4f} {r.get('tydiqa_em', 0):>8.4f}")
 
-    # MMLU results
-    mmlu_results = [r for r in all_results if "mmlu_accuracy" in r]
-    if mmlu_results:
-        print(f"\nMMLU Results:")
-        print(f"{'Model':<90} {'Acc':>8}")
+    # NQ-open results
+    nq_results = [r for r in all_results if "nq_open_em" in r]
+    if nq_results:
+        print(f"\nNQ-open Results:")
+        print(f"{'Model':<80} {'EM':>8} {'F1':>8}")
         print("-" * 100)
-        for r in sorted(mmlu_results, key=lambda x: x.get("mmlu_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:90]:<90} "
-                  f"{r['mmlu_accuracy']:>8.4f}")
+        for r in sorted(nq_results, key=lambda x: x.get("nq_open_em", 0), reverse=True):
+            print(f"{r['model_name'][:80]:<80} "
+                  f"{r['nq_open_em']:>8.4f} {r.get('nq_open_f1', 0):>8.4f}")
 
-    # BBH results
-    bbh_results = [r for r in all_results if "bbh_accuracy" in r]
-    if bbh_results:
-        print(f"\nBBH Results:")
-        print(f"{'Model':<90} {'Acc':>8}")
+    # SQuAD (closed-book) results
+    squad_results = [r for r in all_results if "squad_em" in r]
+    if squad_results:
+        print(f"\nSQuAD (closed-book) Results:")
+        print(f"{'Model':<80} {'EM':>8} {'F1':>8}")
         print("-" * 100)
-        for r in sorted(bbh_results, key=lambda x: x.get("bbh_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:90]:<90} "
-                  f"{r['bbh_accuracy']:>8.4f}")
-
-    # GSM8K results
-    gsm8k_results = [r for r in all_results if "gsm8k_accuracy" in r]
-    if gsm8k_results:
-        print(f"\nGSM8K Results:")
-        print(f"{'Model':<90} {'Acc':>8}")
-        print("-" * 100)
-        for r in sorted(gsm8k_results, key=lambda x: x.get("gsm8k_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:90]:<90} "
-                  f"{r['gsm8k_accuracy']:>8.4f}")
-
-    # MATH500 results
-    math500_results = [r for r in all_results if "math500_accuracy" in r]
-    if math500_results:
-        print(f"\nMATH500 Results:")
-        print(f"{'Model':<90} {'Acc':>8}")
-        print("-" * 100)
-        for r in sorted(math500_results, key=lambda x: x.get("math500_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:90]:<90} "
-                  f"{r['math500_accuracy']:>8.4f}")
+        for r in sorted(squad_results, key=lambda x: x.get("squad_em", 0), reverse=True):
+            print(f"{r['model_name'][:80]:<80} "
+                  f"{r['squad_em']:>8.4f} {r.get('squad_f1', 0):>8.4f}")
 
     errors = [r for r in all_results if r.get("error")]
     if errors:

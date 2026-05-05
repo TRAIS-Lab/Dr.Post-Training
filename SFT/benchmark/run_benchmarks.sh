@@ -4,8 +4,8 @@
 # =============================================================================
 #
 # Two benchmarks:
-#   1. Breakdown: Per-component timing for all 4 methods (Standard, Layerwise,
-#      Subset 2P, Subset 1P) with all scoring variants. Uses real models.
+#   1. Breakdown: Per-component timing for all 4 methods (Full-Training, LayerWiseSubset,
+#      GlobalSubset 2P, GlobalSubset 1P) with all scoring variants. Uses real models.
 #   2. Scoring: Standalone scoring comparison with synthetic tensors.
 #      Shows regime-dependent optimal scoring method.
 #

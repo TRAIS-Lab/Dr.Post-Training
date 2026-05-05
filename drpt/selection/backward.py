@@ -3,8 +3,8 @@ Autograd functions for gradient-based data curation and compression.
 
 This module provides three distinct autograd Functions for Linear layers:
 - CompressedLinearBackward: Pure gradient compression (no curation)
-- LayerwiseLinearBackward: Per-layer curation, single-pass
-- SubsetLinearBackward: Score accumulation, two-pass
+- LayerWiseSubsetLinearBackward: Per-layer curation, single-pass
+- GlobalSubsetLinearBackward: Score accumulation, two-pass
 
 And one for non-linear layers in merged-batch one-pass mode:
 - TrainOnlyRMSNormBackward: RMSNorm that computes grad_weight from train slice only
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import Optional, Tuple
     from torch import Tensor
-    from .state import LayerwiseState, SubsetState
+    from .state import LayerWiseSubsetState, GlobalSubsetState
     from ..hook import GradientHook
     from ..compressor import Compressor
 
@@ -71,13 +71,13 @@ def _get_val_components(
     return None, None, val_grad_total, val_bias_grad
 
 
-def _compute_scale_factor(state: LayerwiseState, selected_indices: Tensor) -> Tensor:
+def _compute_scale_factor(state: LayerWiseSubsetState, selected_indices: Tensor) -> Tensor:
     """Compute token-based gradient scale factor for selected samples."""
     return state._compute_scale_factor(selected_indices)
 
 
 # =============================================================================
-# Shared helpers for Layerwise backward paths
+# Shared helpers for LayerWiseSubset backward paths
 # =============================================================================
 
 def _dispatch_scoring(
@@ -173,7 +173,7 @@ def _add_bias_scores(
 
 
 def _do_selection(
-    state: "LayerwiseState",
+    state: "LayerWiseSubsetState",
     layer_idx: int,
     scores: Tensor,
     similarity: Optional[Tensor],
@@ -198,7 +198,7 @@ def _do_selection(
 def _produce_gradient_update(
     hook_manager: "GradientHook",
     update_compressor: Optional["Compressor"],
-    state: "LayerwiseState",
+    state: "LayerWiseSubsetState",
     layer_idx: int,
     train_grad_output: Tensor,
     train_input: Tensor,
@@ -242,41 +242,6 @@ def _produce_gradient_update(
     grad_weight, grad_bias = compute_selected_gradients(
         train_grad_output, train_input, selected_indices, has_bias, scale_factor
     )
-    return grad_weight, grad_bias
-
-
-def _produce_gradient_update_with_val(
-    state: "LayerwiseState",
-    selected_indices: Tensor,
-    train_grad_output: Tensor,
-    train_input: Tensor,
-    val_grad_output: Tensor,
-    val_input: Tensor,
-    has_bias: bool,
-) -> "Tuple[Tensor, Optional[Tensor]]":
-    """Compute gradient from selected train + val samples in a single einsum.
-
-    Concatenates selected train and val activations, then computes the gradient
-    with a unified scale factor: batch_total_tokens / (selected_train_tokens + val_tokens).
-    When selection_frac=1.0, scale=1.0 (matching baseline).
-    """
-    # Concatenate selected train + all val for unified gradient computation
-    all_go = torch.cat([train_grad_output[selected_indices], val_grad_output], dim=0)
-    all_inp = torch.cat([train_input[selected_indices], val_input], dim=0)
-
-    # Unified scale factor accounting for all contributing tokens
-    scale = state._compute_scale_factor_with_val(selected_indices)
-
-    # Single einsum over all contributing samples
-    grad_weight = compute_total_gradient(all_go, all_inp) * scale
-
-    grad_bias = None
-    if has_bias:
-        if all_go.dim() == 3:
-            grad_bias = all_go.sum(dim=(0, 1)) * scale
-        else:
-            grad_bias = all_go.sum(dim=0) * scale
-
     return grad_weight, grad_bias
 
 
@@ -359,9 +324,9 @@ class CompressedLinearBackward(Function):
         return grad_input, None, None, None, None
 
 
-class LayerwiseLinearBackward(Function):
+class LayerWiseSubsetLinearBackward(Function):
     """
-    Autograd Function for layer-wise descent (per-layer curation).
+    Autograd Function for layer_wise_subset descent (per-layer curation).
 
     Single-pass: At each layer, computes scores, selects samples,
     and aggregates gradients immediately.
@@ -403,7 +368,7 @@ class LayerwiseLinearBackward(Function):
 
         score_compressor = hook_manager.score_compressors[layer_idx]
         update_compressor = hook_manager.update_compressors[layer_idx]
-        state: Optional[LayerwiseState] = hook_manager.selection_state
+        state: Optional[LayerWiseSubsetState] = hook_manager.selection_state
         capture_val_mode = hook_manager.capture_val_mode
         use_stored_val = (
             state is not None and
@@ -422,12 +387,12 @@ class LayerwiseLinearBackward(Function):
 
         with torch.no_grad():
             if use_compressed_scoring:
-                grad_weight, grad_bias = LayerwiseLinearBackward._backward_compressed(
+                grad_weight, grad_bias = LayerWiseSubsetLinearBackward._backward_compressed(
                     hook_manager, score_compressor, update_compressor, state, layer_idx,
                     input, grad_output, bias, capture_val_mode, use_stored_val
                 )
             else:
-                grad_weight, grad_bias = LayerwiseLinearBackward._backward_full(
+                grad_weight, grad_bias = LayerWiseSubsetLinearBackward._backward_full(
                     hook_manager, update_compressor, state, layer_idx,
                     input, bias, grad_output,
                     capture_val_mode, use_stored_val
@@ -440,7 +405,7 @@ class LayerwiseLinearBackward(Function):
         hook_manager: "GradientHook",
         score_compressor: "Compressor",
         update_compressor: Optional["Compressor"],
-        state: Optional["LayerwiseState"],
+        state: Optional["LayerWiseSubsetState"],
         layer_idx: int,
         input: Tensor,
         grad_output: Tensor,
@@ -448,7 +413,7 @@ class LayerwiseLinearBackward(Function):
         capture_val_mode: bool,
         use_stored_val: bool
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
-        """Layerwise backward with score compression.
+        """LayerWiseSubset backward with score compression.
 
         Score computation uses score_compressor. Gradient updates are either:
         - Compressed via update_compressor (MeSO): returns (None, None)
@@ -529,17 +494,8 @@ class LayerwiseLinearBackward(Function):
         if use_stored_val:
             train_grad_output, train_input = grad_output, input
         else:
-            train_grad_output, val_grad_output_raw = split_train_val_batch(grad_output, state.train_batch_size)
-            train_input, val_input_raw = split_train_val_batch(input, state.train_batch_size)
-
-        # LayerwiseWithVal: unified gradient from selected train + val in one einsum
-        if (getattr(state, 'include_val_in_update', False)
-                and not use_stored_val):
-            return _produce_gradient_update_with_val(
-                state, selected_indices,
-                train_grad_output, train_input,
-                val_grad_output_raw, val_input_raw, has_bias,
-            )
+            train_grad_output, _ = split_train_val_batch(grad_output, state.train_batch_size)
+            train_input, _ = split_train_val_batch(input, state.train_batch_size)
 
         return _produce_gradient_update(
             hook_manager, update_compressor, state, layer_idx,
@@ -550,7 +506,7 @@ class LayerwiseLinearBackward(Function):
     def _backward_full(
         hook_manager: "GradientHook",
         update_compressor: Optional["Compressor"],
-        state: Optional["LayerwiseState"],
+        state: Optional["LayerWiseSubsetState"],
         layer_idx: int,
         input: Tensor,
         bias: Optional[Tensor],
@@ -558,7 +514,7 @@ class LayerwiseLinearBackward(Function):
         capture_val_mode: bool,
         use_stored_val: bool
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
-        """Layerwise backward without score compression (full gradient scoring).
+        """LayerWiseSubset backward without score compression (full gradient scoring).
 
         If update_compressor is set, compresses selected gradients for MeSO.
         """
@@ -599,11 +555,8 @@ class LayerwiseLinearBackward(Function):
         scoring_method = getattr(state, 'scoring_method', 'reduced_ghost')
         # Request materialized G_train for direct scoring so we can reuse it
         # for w.grad without keeping train_input alive.
-        include_val = (getattr(state, 'include_val_in_update', False)
-                       and not use_stored_val)
         want_materialized = (scoring_method == "direct"
-                             and update_compressor is None
-                             and not include_val)
+                             and update_compressor is None)
         scores, similarity, materialized_grads = _dispatch_scoring(
             scoring_method, train_grad_output, train_input,
             val_grad_output, val_input, val_grad_total,
@@ -631,14 +584,6 @@ class LayerwiseLinearBackward(Function):
         # --- Select, then produce gradient update ---
         selected_indices = _do_selection(state, layer_idx, scores, similarity)
 
-        # LayerwiseWithVal: unified gradient from selected train + val in one einsum
-        if include_val:
-            return _produce_gradient_update_with_val(
-                state, selected_indices,
-                train_grad_output, train_input,
-                val_grad_output, val_input, has_bias,
-            )
-
         return _produce_gradient_update(
             hook_manager, update_compressor, state, layer_idx,
             train_grad_output, train_input, selected_indices, has_bias,
@@ -646,9 +591,9 @@ class LayerwiseLinearBackward(Function):
         )
 
 
-class SubsetLinearBackward(Function):
+class GlobalSubsetLinearBackward(Function):
     """
-    Autograd Function for Subset method (global curation).
+    Autograd Function for GlobalSubset method (global curation).
 
     Pass 1: Accumulates scores across all layers (no gradient output).
     Pass 2: Forward/backward on selected samples only.
@@ -692,7 +637,7 @@ class SubsetLinearBackward(Function):
         grad_input = grad_output @ weight.to(grad_output.dtype)
 
         score_compressor = hook_manager.score_compressors[layer_idx]
-        state: Optional[SubsetState] = hook_manager.selection_state
+        state: Optional[GlobalSubsetState] = hook_manager.selection_state
 
         if state is None:
             return grad_input, None, None, None, None
@@ -707,12 +652,12 @@ class SubsetLinearBackward(Function):
 
         with torch.no_grad():
             if use_compressed_scoring:
-                SubsetLinearBackward._accumulate_compressed(
+                GlobalSubsetLinearBackward._accumulate_compressed(
                     hook_manager, score_compressor, state, layer_idx,
                     input, grad_output, bias, use_stored_val
                 )
             else:
-                SubsetLinearBackward._accumulate_full(
+                GlobalSubsetLinearBackward._accumulate_full(
                     hook_manager, state, layer_idx,
                     input, grad_output, bias is not None, use_stored_val
                 )
@@ -734,7 +679,7 @@ class SubsetLinearBackward(Function):
     def _accumulate_compressed(
         hook_manager: "GradientHook",
         compressor: "Compressor",
-        state: "SubsetState",
+        state: "GlobalSubsetState",
         layer_idx: int,
         input: Tensor,
         grad_output: Tensor,
@@ -762,7 +707,7 @@ class SubsetLinearBackward(Function):
     @staticmethod
     def _accumulate_full(
         hook_manager: "GradientHook",
-        state: "SubsetState",
+        state: "GlobalSubsetState",
         layer_idx: int,
         input: Tensor,
         grad_output: Tensor,
@@ -894,9 +839,9 @@ class TrainOnlyRMSNormBackward(Function):
         return grad_input, grad_weight, None, None
 
 
-class SubsetEmbeddingBackward(Function):
+class GlobalSubsetEmbeddingBackward(Function):
     """
-    Autograd Function for Embedding in Subset method (global curation).
+    Autograd Function for Embedding in GlobalSubset method (global curation).
 
     Accumulates per-sample influence scores using gather-dot-sum
     (the embedding analogue of the reduced ghost inner product).
@@ -971,7 +916,7 @@ class SubsetEmbeddingBackward(Function):
             if score_correction is not None:
                 scores = scores * score_correction
 
-            # Accumulate into SubsetState (no similarity for embedding)
+            # Accumulate into GlobalSubsetState (no similarity for embedding)
             state.accumulate_precomputed_scores(scores, None, None)
 
             # One-pass: retain data for post-hoc gradient assembly
@@ -985,9 +930,9 @@ class SubsetEmbeddingBackward(Function):
         return None, None, None, None, None
 
 
-class LayerwiseEmbeddingBackward(Function):
+class LayerWiseSubsetEmbeddingBackward(Function):
     """
-    Autograd Function for Embedding in Layerwise method (per-layer curation).
+    Autograd Function for Embedding in LayerWiseSubset method (per-layer curation).
 
     Computes scores, selects samples, and produces the curated gradient
     for the embedding layer in a single pass.

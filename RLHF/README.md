@@ -14,16 +14,16 @@ All methods use **LoRA training** (no MeSO compression). Each method has a YAML 
 
 | Config                | Curation  | Description                                    |
 | --------------------- | --------- | ---------------------------------------------- |
-| `Standard-LoRA.yaml`    | NA        | Baseline PPO (no data curation)               |
+| `FullTraining-LoRA.yaml`    | NA        | Baseline PPO (no data curation)               |
 | `IIF-LoRA.yaml`         | IIF       | Pre-filter rollout before PPO epochs           |
-| `Layerwise-LoRA.yaml`   | Layerwise | Per-layer curation with projected scoring |
-| `Subset-LoRA.yaml`      | Subset    | Global curation with exact scoring        |
+| `LayerWiseSubset-LoRA.yaml`   | LayerWiseSubset | Per-layer curation with projected scoring |
+| `GlobalSubset-LoRA.yaml`      | GlobalSubset    | Global curation with exact scoring        |
 
 **Curation Methods:**
 - **NA**: No data curation (baseline)
 - **IIF**: Influence Function-based Filtering — pre-filter entire rollout *before* PPO epochs
-- **Layerwise**: Per-layer, per-mini-batch curation during PPO training
-- **Subset**: Global curation across all layers, per-mini-batch during PPO training
+- **LayerWiseSubset**: Per-layer, per-mini-batch curation during PPO training
+- **GlobalSubset**: Global curation across all layers, per-mini-batch during PPO training
 
 ### Training Commands
 
@@ -35,11 +35,11 @@ bash RLHF/train/train.sh -c configs/toxicity -m all
 
 # Run by category
 bash RLHF/train/train.sh -c configs/toxicity -m baseline
-bash RLHF/train/train.sh -c configs/toxicity -m layerwise
-bash RLHF/train/train.sh -c configs/toxicity -m subset
+bash RLHF/train/train.sh -c configs/toxicity -m layer-wise-subset
+bash RLHF/train/train.sh -c configs/toxicity -m global-subset
 
 # Run specific methods
-bash RLHF/train/train.sh -c configs/toxicity -m "Layerwise-LoRA,Subset-LoRA"
+bash RLHF/train/train.sh -c configs/toxicity -m "LayerWiseSubset-LoRA,GlobalSubset-LoRA"
 
 # Dry run / list
 bash RLHF/train/train.sh -c configs/toxicity -m all --dry-run
@@ -57,16 +57,16 @@ for s in 42 123 456; do
 done
 
 # Quick LR test
-bash RLHF/train/train.sh -c configs/toxicity -m Layerwise-LoRA --lr 5e-6
+bash RLHF/train/train.sh -c configs/toxicity -m LayerWiseSubset-LoRA --lr 5e-6
 ```
 
 | Category    | Matches            |
 | ----------- | ------------------ |
 | `all`       | All methods        |
-| `baseline`  | `Standard-*`       |
+| `baseline`  | `FullTraining-*`       |
 | `iif`       | `IIF-*`            |
-| `layerwise` | `Layerwise-*`      |
-| `subset`    | `Subset-*`         |
+| `layer-wise-subset` | `LayerWiseSubset-*`      |
+| `global-subset`    | `GlobalSubset-*`         |
 | `lora`      | `*-LoRA`           |
 
 <details>
@@ -79,10 +79,10 @@ Each config directory contains a `defaults.yaml` and one YAML per method:
 ```
 configs/toxicity/
   defaults.yaml          # shared: model, reward_model, PPO params, LR, LoRA
-  Standard-LoRA.yaml     # method only (everything else from defaults)
+  FullTraining-LoRA.yaml     # method only (everything else from defaults)
   IIF-LoRA.yaml          # method + compression
-  Layerwise-LoRA.yaml    # method + compression
-  Subset-LoRA.yaml       # method + compression
+  LayerWiseSubset-LoRA.yaml    # method + compression
+  GlobalSubset-LoRA.yaml       # method + compression
 ```
 
 #### defaults.yaml (shared experiment settings)
@@ -106,10 +106,10 @@ lora_alpha: 32
 
 #### Method config (method-specific settings)
 
-Method configs only specify what differs from defaults. Example (`Layerwise-LoRA.yaml`):
+Method configs only specify what differs from defaults. Example (`LayerWiseSubset-LoRA.yaml`):
 
 ```yaml
-method: Layerwise
+method: LayerWiseSubset
 finetuning: LoRA
 
 score_grad_compression:

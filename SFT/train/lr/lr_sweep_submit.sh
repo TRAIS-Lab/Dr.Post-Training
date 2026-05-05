@@ -8,7 +8,7 @@
 #
 # Usage:
 #   bash lr_sweep_submit.sh -c configs/tulu3_tydiqa -m all
-#   bash lr_sweep_submit.sh -c configs/tulu3_tydiqa -m Standard-Full --n_lrs 10
+#   bash lr_sweep_submit.sh -c configs/tulu3_tydiqa -m FullTraining-Full --n_lrs 10
 #   bash lr_sweep_submit.sh -c configs/tulu3_tydiqa -m lora --dry-run
 # =============================================================================
 
@@ -31,6 +31,8 @@ config_dir=""
 methods=""
 dry_run=false
 n_lrs=20
+lr_min_override=""
+lr_max_override=""
 
 # SLURM defaults for sweep jobs
 sweep_gpus="${SWEEP_GPUS:-1}"
@@ -42,6 +44,8 @@ while [[ $# -gt 0 ]]; do
         --config_dir|-c)  config_dir="$2"; shift 2 ;;
         --methods|-m)     methods="$2"; shift 2 ;;
         --n_lrs)          n_lrs="$2"; shift 2 ;;
+        --lr_min)         lr_min_override="$2"; shift 2 ;;
+        --lr_max)         lr_max_override="$2"; shift 2 ;;
         --dry-run)        dry_run=true; shift ;;
         --help|-h)
             cat <<'HELP'
@@ -65,7 +69,7 @@ Environment overrides:
 
 Examples:
   bash lr_sweep_submit.sh -c configs/tulu3_tydiqa -m all
-  bash lr_sweep_submit.sh -c configs/tulu3_tydiqa -m Standard-Full --n_lrs 10
+  bash lr_sweep_submit.sh -c configs/tulu3_tydiqa -m FullTraining-Full --n_lrs 10
   bash lr_sweep_submit.sh -c configs/alpaca_samsum -m lora --dry-run
 HELP
             exit 0
@@ -90,7 +94,7 @@ fi
 # Config parser (same as train.sh)
 # =============================================================================
 reset_config() {
-    cfg_method="Standard"; cfg_finetuning="Full"
+    cfg_method="FullTraining"; cfg_finetuning="Full"
     cfg_score_sparsifier=""; cfg_score_projector=""
     cfg_opt_sparsifier=""; cfg_opt_projector=""
     cfg_selection_frac="0.5"; cfg_n_val="8"
@@ -181,9 +185,9 @@ resolve_methods() {
         item=$(echo "$item" | xargs)
         case "$item" in
             all)            for m in "${available[@]}"; do resolved="${resolved:+$resolved,}$m"; done ;;
-            baseline)       for m in "${available[@]}"; do [[ "$m" == Standard-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            layerwise)      for m in "${available[@]}"; do [[ "$m" == Layerwise-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            subset)         for m in "${available[@]}"; do [[ "$m" == Subset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            baseline)       for m in "${available[@]}"; do [[ "$m" == FullTraining-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            layer-wise-subset)      for m in "${available[@]}"; do [[ "$m" == LayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            global-subset)         for m in "${available[@]}"; do [[ "$m" == GlobalSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             lora)           for m in "${available[@]}"; do [[ "$m" == *-LoRA ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             compression)    for m in "${available[@]}"; do [[ "$m" == *-MeSO ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             *)
@@ -247,7 +251,10 @@ for exp_name in "${method_list[@]}"; do
     [[ "$cfg_finetuning" == "LoRA" || "$cfg_finetuning" == "MeSO-LoRA" ]] && use_lora="true"
 
     # Determine LR range based on finetuning type
-    if [[ "$use_lora" == "true" ]]; then
+    if [[ -n "$lr_min_override" ]]; then
+        lr_min="$lr_min_override"
+        lr_max="$lr_max_override"
+    elif [[ "$use_lora" == "true" ]]; then
         lr_min="1e-5"; lr_max="1e-1"
     else
         lr_min="1e-7"; lr_max="1e-3"

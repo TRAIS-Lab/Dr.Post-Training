@@ -6,7 +6,7 @@ Each YAML file defines a training method as `{CurationMethod}-{FinetuningMethod}
 
 | Field | Values | Description |
 |---|---|---|
-| `method` | Standard, Layerwise, Subset | Data curation method |
+| `method` | Standard, LayerWiseSubset, GlobalSubset | Data curation method |
 | `finetuning` | Full, LoRA, MeSO, MeSO-LoRA | Training approach |
 | `lora_r`, `lora_alpha`, `lora_dropout` | int, int, float | LoRA hyperparameters |
 
@@ -45,7 +45,7 @@ Examples:
 
 ### Design Rules
 
-- **score_grad_compression**: Used for influence score computation in Layerwise/Subset curation.
+- **score_grad_compression**: Used for influence score computation in LayerWiseSubset/GlobalSubset curation.
   Set `sparsifier: none` for exact scoring (higher accuracy, more memory).
 - **opt_grad_compression**: Used by MeSO optimizer for memory-efficient updates.
   When both sections use the same sparsifier value, compressor objects are shared (zero overhead).

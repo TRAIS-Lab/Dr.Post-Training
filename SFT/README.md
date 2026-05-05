@@ -1,215 +1,148 @@
 # SFT Experiments
 
-This folder contains the training and evaluation code and method configurations for Supervised Fine-Tuning.
+Training and evaluation code for Supervised Fine-Tuning experiments. See
+`PROGRESS.md` for the current scope and run inventory.
+
+## Scope
+
+7 train→target settings, Full-FT only first (`*-Full` methods + Target-only
+baseline). LoRA / MeSO can be added once the curation gain is verified on
+Full-FT for the new settings.
+
+| # | Config dir          | Train pool | Target task | Model        | Step budget | `eval_steps` |
+|---|---------------------|------------|-------------|--------------|-------------|--------------|
+| 1 | `alpaca_samsum`     | alpaca     | samsum      | Llama-3.2-1B | 2600        | 26           |
+| 2 | `tulu3_tydiqa`      | tulu3      | tydiqa      | Llama-3.2-1B | 1174        | 12           |
+| 3 | `nq_triviaqa`       | nq_open    | triviaqa    | Llama-3.2-1B | 1100        | 11           |
+| 4 | `less_tydiqa`       | less (mix) | tydiqa      | Llama-3.2-1B | 1225        | 12           |
+| 5 | `nq_triviaqa_qwen3` | nq_open    | triviaqa    | Qwen3-1.7B-Base | 1100     | 11           |
+| 6 | `triviaqa_nq`       | triviaqa   | nq_open     | Llama-3.2-1B | 1107        | 11           |
+| 7 | `squad_triviaqa`    | squad      | triviaqa    | Llama-3.2-1B | 1095        | 11           |
+
+LESS-mix = `flan_v2 + cot + dolly + oasst1` (~1.96M).
 
 ## Data Preparation
 
-Download and prepare datasets using the unified data preparation script:
-
 ```bash
-# See available datasets and options
-python SFT/data/prepare_datasets.py -h
+# Eval splits (val/lr/test)
+python SFT/data/prepare_datasets.py --datasets tydiqa samsum triviaqa nq_open_eval
 
-# Download specific datasets
-python SFT/data/prepare_datasets.py --datasets mmlu bbh tydiqa
+# Training pools
+python SFT/data/prepare_datasets.py --datasets nq_open triviaqa_train squad alpaca tulu3
 
-# Download all evaluation datasets
-python SFT/data/prepare_datasets.py --datasets mmlu bbh tydiqa gsm8k math500 samsum
-
-# Download training datasets
-python SFT/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
+# LESS-mix components (used as a single train pool via train_dataset_names: ['less'])
+python SFT/data/prepare_datasets.py --datasets flan_v2 cot dolly oasst1
 ```
 
-<details>
-  <summary>Available Datasets</summary>
+| Dataset            | Role  | Size  | Description                                      |
+| ------------------ | ----- | ----- | ------------------------------------------------ |
+| `tydiqa`           | eval  | 4877 (test) | Multilingual extractive QA                  |
+| `samsum`           | eval  | 719 (test)  | Dialogue summarization (also has train split) |
+| `triviaqa`         | eval  | 1000 (test) | Closed-book factoid QA                        |
+| `nq_open_eval`     | eval  | 1000 (test) | NaturalQuestions-open closed-book QA          |
+| `nq_open`          | train | 88K   | NQ-open Q→A pairs                                |
+| `triviaqa_train`   | train | 138K  | TriviaQA `rc.nocontext` Q→A pairs                |
+| `squad`            | train | 88K   | SQuAD with-context reading-comprehension         |
+| `tulu3`            | train | 939K  | Tulu-3 SFT mixture                               |
+| `alpaca`           | train | 52K   | Stanford Alpaca instruction-following            |
+| `dolly`/`flan_v2`/`cot`/`oasst1` | train | 1.96M total | LESS-mix components            |
 
-### Evaluation Datasets
+## Methods (Full-FT only)
 
-| Dataset   | Task Type          | Description                                              |
-| --------- | ------------------ | -------------------------------------------------------- |
-| `samsum`  | Summarization      | SamSUM dialogue summarization                            |
-| `tydiqa`  | Question Answering | Typologically Diverse QA (9 languages)                   |
-| `mmlu`    | Multiple Choice    | Massive Multitask Language Understanding (57 subjects)   |
-| `bbh`     | Reasoning          | BIG-Bench Hard (23 challenging reasoning tasks with CoT) |
-| `gsm8k`   | Math               | Grade School Math (8K problems)                          |
-| `math500` | Math               | MATH benchmark (500 competition problems)                |
+| Config              | Curation type    | Description                                  |
+| ------------------- | ---------------- | -------------------------------------------- |
+| `FullTraining-Full` | NA               | Baseline full fine-tuning, no data curation  |
+| `GlobalSubset-Full` | GlobalSubset     | Global top-k curation, full fine-tuning      |
+| `LayerWiseSubset-Full` | LayerWiseSubset | Per-layer top-k curation, full fine-tuning |
+| Target-only (`FullTraining-Full` via `train_val_ablation.sh`) | NA | Baseline trained directly on the n_val=16 task validation samples |
 
-### Training Datasets
+> Run dirs: `{train}_{task}-{model}-{Method}-p{pct}-lr{lr}-b{batch}-v{nval}-s{seed}`
 
-| Dataset      | Size | Description                           |
-| ------------ | ---- | ------------------------------------- |
-| `less`       | 1M   | LESS-selected instruction data        |
-| `alpaca`     | 52K  | Stanford Alpaca instruction-following |
-| `tulu3`      | 939K | Tulu-3 SFT mixture                    |
-| `dolly`      | 15K  | Databricks Dolly 2.0                  |
-| `flan_v2`    | 100K | FLAN v2 instruction tuning mixture    |
-| `cot`        | 100K | Chain-of-Thought reasoning examples   |
-| `oasst1`     | 88K  | OpenAssistant conversations           |
-| `vicuna`     | 125K | ShareGPT-based conversations          |
-| `wizardlm`   | 196K | WizardLM evolved instructions         |
-| `openhermes` | 1M   | OpenHermes 2.5 diverse instructions   |
-</details>
+## LR Sweep
 
-## Experiment Summary
+Best LRs are written into each method's YAML config (`learning_rate:` field) and
+into `Target-only.lr.txt` for target-only.
 
-The following methods have been run and can be rerun with the commands below.
-
-| Train Dataset | Eval Task | Percentage | Batch | Val Size | LoRA Rank |
-| ------------- | --------- | ---------- | ----- | -------- | --------- |
-| Alpaca        | SamSUM    | 0.4        | 8     | 16       | 32        |
-| Tulu3         | TydiQA    | 0.01       | 8     | 16       | 32        |
-
-### Experiment Configurations
-
-We consider the following 9 methods for each of the training datasets above. Each method has a YAML config in `SFT/train/configs/`:
-
-| Config           | Curation  | Description                          |
-| ---------------- | --------- | ------------------------------------ |
-| `Standard-Full`  | NA        | Baseline full fine-tuning            |
-| `Standard-LoRA`  | NA        | Baseline LoRA fine-tuning            |
-| `Standard-MeSO`  | NA        | Baseline MeSO fine-tuning            |
-| `Layerwise-Full` | Layerwise | Per-layer curation, full fine-tuning |
-| `Layerwise-LoRA` | Layerwise | Per-layer curation, LoRA fine-tuning |
-| `Layerwise-MeSO` | Layerwise | Per-layer curation + MeSO            |
-| `Subset-Full`    | Subset    | Global curation, full fine-tuning    |
-| `Subset-LoRA`    | Subset    | Global curation, LoRA fine-tuning    |
-| `Subset-MeSO`    | Subset    | Global curation + MeSO               |
-
-> Experiments follow the pattern: `{train}_{task}-{model}-{Method}-{FinetuningMethod}-p{pct}-lr{lr}-b{batch}-v{nval}-s{seed}`
-
-### LR Sweep
-
-The `SFT/train/lr/` folder contains tools for finding optimal learning rates. Best LRs are written directly into each method's YAML config file (the `learning_rate:` field).
-
-#### Three-Way Data Split
-
-Evaluation data is split into three parts to prevent contamination:
+#### Three-way data split
 
 | Split | File | Purpose |
 |-------|------|---------|
-| `validation` | `{task}_validation_data.jsonl` | Data curation (during training) |
+| `validation` | `{task}_validation_data.jsonl` | Source of n_val=16 curation reference + target-only training |
 | `lr` | `{task}_lr_data.jsonl` | LR sweep evaluation |
-| `test` | `{task}_test_data.jsonl` | Final evaluation only |
+| `test` | `{task}_test_data.jsonl` | During-training perplexity (first 500) + final task metric (first 500) |
 
-Regenerate splits with: `python SFT/data/prepare_datasets.py --datasets tydiqa samsum`
+Regenerate splits with: `python SFT/data/prepare_datasets.py --datasets <task>`
 
-#### Parallel Sweep (Recommended)
-
-Uses SLURM to submit all LR trials as parallel 1-GPU jobs. Each job trains 1 epoch with the method's full config and evaluates on the `lr` split.
+#### Main-run LR sweep
 
 ```bash
-# Step 1: Submit all trials (9 methods x 20 LRs = 180 jobs per config)
-bash SFT/train/lr/lr_sweep_submit.sh -c configs/tulu3_tydiqa -m all
-bash SFT/train/lr/lr_sweep_submit.sh -c configs/alpaca_samsum -m all
+# 3 methods × 20 LRs = 60 jobs per setting
+bash SFT/train/lr/lr_sweep_submit.sh -c configs/<setting> -m all
 
-# Step 2: After all jobs complete, collect results and update YAML configs
-bash SFT/train/lr/lr_sweep_collect.sh -c configs/tulu3_tydiqa -m all
-bash SFT/train/lr/lr_sweep_collect.sh -c configs/alpaca_samsum -m all
+# After completion, write best LR back to method YAMLs
+bash SFT/train/lr/lr_sweep_collect.sh -c configs/<setting> -m all
 ```
 
-The grid uses 20 log-spaced LR values:
-- **Full/MeSO**: `1e-7` to `1e-3`
-- **LoRA**: `1e-5` to `1e-1`
+Grid: 20 log-spaced LRs in `[1e-7, 1e-3]`. Collect picks the smallest LR within
+1% of best eval_loss (stability margin).
 
-The collect script picks the smallest LR within 1% of the best eval_loss (stability margin), writes it back to the method YAML, and cleans up model weights.
-
-Options:
-```bash
-# Customize grid density
-bash SFT/train/lr/lr_sweep_submit.sh -c configs/tulu3_tydiqa -m all --n_lrs 10
-
-# Dry run (print commands without submitting)
-bash SFT/train/lr/lr_sweep_submit.sh -c configs/tulu3_tydiqa -m Standard-Full --dry-run
-
-# Adjust stability margin
-bash SFT/train/lr/lr_sweep_collect.sh -c configs/tulu3_tydiqa -m all --lr_margin 0.02
-```
-
-#### Sequential Sweep (Single GPU)
-
-For local/interactive use without SLURM. Runs trials sequentially on the current machine:
+#### Target-only LR sweep
 
 ```bash
-bash SFT/train/lr/lr_sweep.sh -c configs/tulu3_tydiqa -m all
-bash SFT/train/lr/lr_sweep.sh -c configs/tulu3_tydiqa -m Standard-Full --mode grid
+# Per-task; ms (max_steps) and bs (batch_size) must match the corresponding main run
+bash SFT/train/lr/lr_sweep_submit_val.sh --task <task> --max_steps <ms> --batch_size 8 --methods FullTraining-Full
+
+bash SFT/train/lr/lr_sweep_collect_val.sh --task <task> --max_steps <ms> --batch_size 8 \
+    --out_file SFT/train/configs/<setting>/Target-only.lr.txt
 ```
 
-### Training Commands
-
-All methods are launched using `train.sh` with a config directory. Each config directory is self-contained: a `defaults.yaml` for shared experiment settings (model, dataset, batch size, LR scheduler, etc.) and one YAML per method (curation type, LR, compression).
+## Training
 
 ```bash
-# Alpaca -> SamSUM (all 9 methods)
-bash SFT/train/train.sh -c configs/alpaca_samsum -m all
-
-# Tulu3 -> TydiQA (all 9 methods)
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m all
+bash SFT/train/train.sh -c configs/<setting> -m all
+bash SFT/train/train.sh -c configs/<setting> -m FullTraining-Full --seed 42
+bash SFT/train/train.sh -c configs/<setting> --list
 ```
 
-#### Seed Sweeps and CLI Overrides
+Categories: `all`, `full-training`, `layer-wise-subset`, `global-subset`, `full`, `lora`, `meso`.
 
-The `--seed` and `--lr` flags override the corresponding config values, useful for sweeps:
+## Target-only training
 
 ```bash
-# Run all methods with 3 different seeds
-for s in 42 123 456; do
-  bash SFT/train/train.sh -c configs/tulu3_tydiqa -m all --seed $s
-done
-
-# Quick LR test on a single method
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m Layerwise-Full --lr 1e-04
+bash SFT/train/train_val_ablation.sh \
+    --task <target_task> --methods FullTraining-Full \
+    --max_steps <main_ms> --batch_size 8 --eval_steps <main_eval_steps> \
+    --seed <seed>
 ```
 
-#### Running by Category
+## Evaluation
 
 ```bash
-# Run by category
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m standard    # All Standard-* variants
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m layerwise   # All Layerwise-* variants
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m subset      # All Subset-* variants
-
-# Run specific methods
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m "Layerwise-Full,Subset-Full"
-
-# Dry run (print commands without executing)
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m all --dry-run
-
-# List available methods in a config directory
-bash SFT/train/train.sh -c configs/tulu3_tydiqa --list
+# n_test=500 matches the during-training perplexity sample for direct comparison
+bash SFT/eval/eval.sh --train <train> --task <task> --batch_size 64 --n_test 500
 ```
 
-| Category    | Matches                            |
-| ----------- | ---------------------------------- |
-| `all`       | All methods in the config directory|
-| `standard`  | `Standard-*`                       |
-| `layerwise` | `Layerwise-*`                      |
-| `subset`    | `Subset-*`                         |
-| `full`      | `*-Full`                           |
-| `lora`      | `*-LoRA`                           |
-| `meso`      | `*-MeSO`                           |
+Supported tasks: `samsum`, `tydiqa`, `triviaqa`, `nq_open`.
 
-<details>
-  <summary>Config Directory Structure</summary>
+## Config Directory Structure
 
-#### Layout
-
-Each config directory contains a `defaults.yaml` and one YAML per method:
+Each config dir has `defaults.yaml` (shared) and one YAML per method:
 
 ```
-configs/tulu3_tydiqa/
-  defaults.yaml          # shared: model, dataset, training hyperparams
-  Standard-Full.yaml     # method + learning_rate
-  Layerwise-Full.yaml    # method + learning_rate + compression
-  ...
+configs/<setting>/
+  defaults.yaml             # model, train pool, target task, step budget, etc.
+  FullTraining-Full.yaml    # learning_rate (LR-swept)
+  GlobalSubset-Full.yaml    # learning_rate + scoring
+  LayerWiseSubset-Full.yaml # learning_rate + scoring (compress)
+  Target-only.lr.txt        # LR-swept value for Target-only baseline
 ```
 
-#### defaults.yaml (shared experiment settings)
-
+`defaults.yaml` example:
 ```yaml
 model: meta-llama/Llama-3.2-1B
-train_dataset: tulu3
-target_task: tydiqa
-percentage: 0.01
+train_dataset: nq_open
+target_task: triviaqa
+percentage: 0.1
 seed: 42
 batch_size: 8
 gradient_accumulation_steps: 1
@@ -219,55 +152,26 @@ lr_scheduler_type: linear
 warmup_ratio: 0.03
 weight_decay: 0.0
 num_train_epochs: 1
-eval_steps: 50
+eval_steps: 11        # ~100 ppl points across 1100 steps
 use_flash_attention: true
-n_eval: 500
+n_eval: 500           # during-training perplexity samples (first 500 of test)
 selection_frac: 0.5
 selection_mode: topk
 n_val: 16
 val_batch_size: 1
 val_strategy: merged_batch
+scoring:
+  method: reduced_ghost
 ```
 
-#### Method config (method-specific settings)
+Load order: defaults → `defaults.yaml` → method YAML → CLI overrides (`--seed`, `--lr`).
 
-Method configs only need to specify what differs from defaults. Example (`Layerwise-Full.yaml`):
+#### Adding a new setting
 
-```yaml
-method: Layerwise
-finetuning: Full
-learning_rate: 3.36e-05
-
-score_grad_compression:
-  sparsifier: normal-64*64
-  projector: none
-```
-
-Values in the method config override `defaults.yaml`. The load order is: `reset_config()` defaults → `defaults.yaml` → method config → CLI overrides (`--seed`, `--lr`).
-
-#### Creating a New Experiment
-
-To set up a new dataset combination:
-
-1. Create a new folder under `configs/` (e.g., `configs/less_mmlu_sociology/`)
-2. Copy a `defaults.yaml` from an existing experiment and update dataset, percentage, subject, etc.
-3. Copy method configs (learning rates will be placeholder values)
-4. Prepare data splits: `python SFT/data/prepare_datasets.py --datasets <task>`
-5. Run LR sweep: `bash SFT/train/lr/lr_sweep_submit.sh -c configs/<new_config> -m all`
-6. Collect results: `bash SFT/train/lr/lr_sweep_collect.sh -c configs/<new_config> -m all`
-
-</details>
-
-### Evaluation Commands
-Evaluation commands for each experiment:
-
-```bash
-# Alpaca -> SamSUM
-bash SFT/eval/eval.sh --train alpaca --task samsum --batch_size 64
-
-# Tulu3 -> TyDiQA
-bash SFT/eval/eval.sh --train tulu3 --task tydiqa --batch_size 64 --n_test 500
-
-# LESS -> MMLU/BBH
-bash SFT/eval/eval.sh --train less --task mmlu --subject sociology --batch_size 64
-```
+1. Create `configs/<new_setting>/` (e.g., `configs/triviaqa_nq/`).
+2. Copy a `defaults.yaml` from an existing setting; update `train_dataset`,
+   `target_task`, `percentage`, `eval_steps` to give ~100 ppl points.
+3. Copy 3 method YAMLs (LR placeholders).
+4. Prepare data: `python SFT/data/prepare_datasets.py --datasets <pool> <task>`.
+5. LR sweep: `bash SFT/train/lr/lr_sweep_submit.sh -c configs/<new_setting> -m all`.
+6. Collect: `bash SFT/train/lr/lr_sweep_collect.sh -c configs/<new_setting> -m all`.

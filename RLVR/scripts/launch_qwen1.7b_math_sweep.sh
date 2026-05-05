@@ -1,6 +1,6 @@
 #!/bin/bash
 # Launch script for running Qwen 1.7B GRPO on MATH with multiple seeds and settings
-# Settings: Baseline, Layerwise (default), Subset
+# Settings: Baseline, LayerWiseSubset (default), GlobalSubset
 
 set -e
 
@@ -24,16 +24,16 @@ for SEED in "${SEEDS[@]}"; do
     #     --export=ALL,SEED=$SEED,SELECTION_ENABLED=False \
     #     "$MAIN_SCRIPT"
 
-    # 2. Layerwise (default selection method)
-    echo "Submitting: Layerwise (seed=$SEED)"
-    sbatch --job-name="RLVR-MATH-layerwise-s${SEED}" \
-        --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=Layerwise \
+    # 2. LayerWiseSubset (default selection method)
+    echo "Submitting: LayerWiseSubset (seed=$SEED)"
+    sbatch --job-name="RLVR-MATH-layer-wise-subset-s${SEED}" \
+        --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=LayerWiseSubset \
         "$MAIN_SCRIPT"
 
-    # # 3. Subset selection
-    # echo "Submitting: Subset (seed=$SEED)"
-    # sbatch --job-name="RLVR-MATH-subset-s${SEED}" \
-    #     --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=Subset \
+    # # 3. GlobalSubset selection
+    # echo "Submitting: GlobalSubset (seed=$SEED)"
+    # sbatch --job-name="RLVR-MATH-global-subset-s${SEED}" \
+    #     --export=ALL,SEED=$SEED,SELECTION_ENABLED=True,SELECTION_METHOD=GlobalSubset \
     #     "$MAIN_SCRIPT"
 done
 

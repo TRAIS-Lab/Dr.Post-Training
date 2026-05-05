@@ -1,6 +1,6 @@
 # Timing Benchmark
 
-Per-component runtime analysis for **Standard**, **Layerwise**, **Subset (two-pass)**, and **Subset (one-pass)** across three model sizes, with four scoring mechanisms.
+Per-component runtime analysis for **Standard**, **LayerWiseSubset**, **GlobalSubset (two-pass)**, and **GlobalSubset (one-pass)** across three model sizes, with four scoring mechanisms.
 
 ## Models
 
@@ -74,7 +74,7 @@ bash SFT/benchmark/run_benchmarks.sh
 bash SFT/benchmark/slurm/launch_all.sh
 
 # Single method benchmark
-python benchmark.py --method layerwise --model Qwen/Qwen3-0.6B \
+python benchmark.py --method layer-wise-subset --model Qwen/Qwen3-0.6B \
     --batch-size 8 --seq-length 512 --scoring-method compress
 
 # Aggregate tables

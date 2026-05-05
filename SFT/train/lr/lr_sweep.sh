@@ -10,7 +10,7 @@
 #
 # Usage:
 #   bash SFT/train/lr/lr_sweep.sh -c configs/tulu3_tydiqa -m all
-#   bash SFT/train/lr/lr_sweep.sh -c configs/tulu3_tydiqa -m Standard-Full --mode grid
+#   bash SFT/train/lr/lr_sweep.sh -c configs/tulu3_tydiqa -m FullTraining-Full --mode grid
 #   bash SFT/train/lr/lr_sweep.sh -c configs/alpaca_samsum -m all --sweep_percentage 0.1
 # =============================================================================
 
@@ -109,7 +109,7 @@ Binary Search:
 
 Examples:
   bash lr_sweep.sh -c configs/tulu3_tydiqa -m all
-  bash lr_sweep.sh -c configs/alpaca_samsum -m Standard-Full --mode grid
+  bash lr_sweep.sh -c configs/alpaca_samsum -m FullTraining-Full --mode grid
   bash lr_sweep.sh -c configs/tulu3_tydiqa -m lora --sweep_percentage 0.005
 HELP
             exit 0
@@ -134,7 +134,7 @@ fi
 # Config parser (same as train.sh)
 # =============================================================================
 reset_config() {
-    cfg_method="Standard"; cfg_finetuning="Full"
+    cfg_method="FullTraining"; cfg_finetuning="Full"
     cfg_score_sparsifier=""; cfg_score_projector=""
     cfg_opt_sparsifier=""; cfg_opt_projector=""
     cfg_selection_frac="0.5"; cfg_n_val="8"
@@ -225,9 +225,9 @@ resolve_methods() {
         item=$(echo "$item" | xargs)
         case "$item" in
             all)            for m in "${available[@]}"; do resolved="${resolved:+$resolved,}$m"; done ;;
-            baseline)       for m in "${available[@]}"; do [[ "$m" == Standard-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            layerwise)      for m in "${available[@]}"; do [[ "$m" == Layerwise-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            subset)         for m in "${available[@]}"; do [[ "$m" == Subset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            baseline)       for m in "${available[@]}"; do [[ "$m" == FullTraining-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            layer-wise-subset)      for m in "${available[@]}"; do [[ "$m" == LayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            global-subset)         for m in "${available[@]}"; do [[ "$m" == GlobalSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             lora)           for m in "${available[@]}"; do [[ "$m" == *-LoRA ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             compression)    for m in "${available[@]}"; do [[ "$m" == *-MeSO ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             *)
@@ -288,7 +288,7 @@ run_lr_trial() {
     local trial_output_dir="$2"
 
     local internal_method="NA"
-    [[ "$cfg_method" != "Standard" ]] && internal_method="$cfg_method"
+    [[ "$cfg_method" != "FullTraining" ]] && internal_method="$cfg_method"
     local use_lora="false"
     [[ "$cfg_finetuning" == "LoRA" || "$cfg_finetuning" == "MeSO-LoRA" ]] && use_lora="true"
 

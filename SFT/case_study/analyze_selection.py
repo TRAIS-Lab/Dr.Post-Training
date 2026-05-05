@@ -4,14 +4,14 @@
 Case study: Selection analysis during standard training.
 
 Runs standard full-parameter training (no selection, full batch Adam) while
-simultaneously computing what Layerwise and Subset selection would pick at
+simultaneously computing what LayerWiseSubset and GlobalSubset selection would pick at
 each step. This provides an apples-to-apples comparison of both selection
 methods on the same model state and same data batches.
 
 Output: selection_records.json with per-step records of:
   - Decoded training and validation sample texts
-  - Layerwise: per-layer scores and selected indices
-  - Subset: global accumulated scores and selected indices
+  - LayerWiseSubset: per-layer scores and selected indices
+  - GlobalSubset: global accumulated scores and selected indices
 """
 
 import json
@@ -43,7 +43,7 @@ from SFT.train.model_arguments import ModelArguments, add_padding_to_tokenizer
 from SFT.train.training_arguments import TrainingArguments
 
 from drpt import GradientHook
-from drpt.selection.state import LayerwiseState, SubsetState
+from drpt.selection.state import LayerWiseSubsetState, GlobalSubsetState
 
 logger = logging.getLogger(__name__)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -60,7 +60,7 @@ def find_trainable_layers(model):
 
 class CaseStudyTrainer(Trainer):
     """
-    Standard trainer that also computes Layerwise and Subset selection scores
+    Full-Training trainer that also computes LayerWiseSubset and GlobalSubset selection scores
     at each training step for analysis purposes. The actual training uses
     standard full-batch Adam (no selection).
     """
@@ -97,8 +97,8 @@ class CaseStudyTrainer(Trainer):
 
         logger.info("=" * 60)
         logger.info("Case Study Trainer initialized")
-        logger.info(f"  Training: Standard Full (no selection)")
-        logger.info(f"  Scoring: Layerwise + Subset at each step")
+        logger.info(f"  Training: Full-Training Full (no selection)")
+        logger.info(f"  Scoring: LayerWiseSubset + GlobalSubset at each step")
         logger.info(f"  Selection fraction: {selection_frac}")
         logger.info(f"  Record frequency: every {record_freq} steps")
         logger.info(f"  Val set size: {len(val_dataset)}")
@@ -128,20 +128,20 @@ class CaseStudyTrainer(Trainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """
-        Standard training step + scoring-only passes for both methods.
+        Full-Training training step + scoring-only passes for both methods.
 
         Flow:
         1. Disable hooks → standard forward+backward → real gradients
         2. Save gradients
-        3. Enable hooks → capture val grads → Layerwise scoring → extract records
-        4. Enable hooks → Subset scoring (reuse val cache) → extract records
+        3. Enable hooks → capture val grads → LayerWiseSubset scoring → extract records
+        4. Enable hooks → GlobalSubset scoring (reuse val cache) → extract records
         5. Restore real gradients for optimizer step
         """
         model.train()
         inputs = self._prepare_inputs(inputs)
 
         # ============================================================
-        # Step 1: Standard forward + backward (no hooks, real training)
+        # Step 1: Full-Training forward + backward (no hooks, real training)
         # ============================================================
         self.grad_hook.disable_hooks()
 
@@ -193,12 +193,12 @@ class CaseStudyTrainer(Trainer):
 
     def _run_dual_scoring(self, model, train_batch, step):
         """
-        Run both Layerwise and Subset scoring on the same batch.
+        Run both LayerWiseSubset and GlobalSubset scoring on the same batch.
 
         Uses the existing drpt infrastructure:
         1. Capture val gradients (shared for both methods)
-        2. Run Layerwise scoring backward → extract per-layer records
-        3. Run Subset scoring backward → extract global records
+        2. Run LayerWiseSubset scoring backward → extract per-layer records
+        3. Run GlobalSubset scoring backward → extract global records
         """
         val_batch = self._get_val_batch()
         val_batch = self._prepare_inputs(val_batch)
@@ -216,10 +216,10 @@ class CaseStudyTrainer(Trainer):
         val_loss.backward()
         self.grad_hook.end_val_capture()
 
-        # ---- Layerwise scoring ----
+        # ---- LayerWiseSubset scoring ----
         self.grad_hook.setup_selection_with_stored_val(
             train_batch_size=train_batch_size,
-            selection_method="Layerwise",
+            selection_method="LayerWiseSubset",
             frac=self.selection_frac,
             lr=lr,
             record_selections=True,
@@ -230,17 +230,17 @@ class CaseStudyTrainer(Trainer):
         train_loss_lw = self._compute_loss_for_scoring(model, train_batch)
         train_loss_lw.backward()
 
-        # Extract layerwise records
+        # Extract layer_wise_subset records
         lw_state = self.grad_hook.selection_state
-        layerwise_records = list(lw_state._selection_records) if lw_state._selection_records else []
+        layer_wise_subset_records = list(lw_state._selection_records) if lw_state._selection_records else []
 
         self.grad_hook.clear_selection()
         self.grad_hook.clear_token_counts()
 
-        # ---- Subset scoring (reuse val cache) ----
+        # ---- GlobalSubset scoring (reuse val cache) ----
         self.grad_hook.setup_selection_with_stored_val(
             train_batch_size=train_batch_size,
-            selection_method="Subset",
+            selection_method="GlobalSubset",
             frac=self.selection_frac,
             lr=lr,
             compute_scores_only=True,
@@ -273,8 +273,8 @@ class CaseStudyTrainer(Trainer):
             'train_loss': train_loss_lw.item(),
             'train_samples': train_texts,
             'val_samples': val_texts,
-            'layerwise': {
-                'layers': layerwise_records,
+            'layer_wise_subset': {
+                'layers': layer_wise_subset_records,
             },
             'subset': {
                 'selection': subset_records[0] if subset_records else {},
@@ -285,8 +285,8 @@ class CaseStudyTrainer(Trainer):
         self._selection_records.append(step_record)
 
         # Log progress
-        if layerwise_records:
-            lw_first_layer = layerwise_records[0]
+        if layer_wise_subset_records:
+            lw_first_layer = layer_wise_subset_records[0]
             lw_selected = lw_first_layer.get('selected_indices', [])
         else:
             lw_selected = []
@@ -294,8 +294,8 @@ class CaseStudyTrainer(Trainer):
 
         logger.info(
             f"Step {step}: Scored {train_batch_size} samples | "
-            f"Layerwise L0 selected: {lw_selected} | "
-            f"Subset selected: {ss_selected}"
+            f"LayerWiseSubset L0 selected: {lw_selected} | "
+            f"GlobalSubset selected: {ss_selected}"
         )
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
@@ -389,8 +389,8 @@ class CaseStudyTrainer(Trainer):
                 'metadata': {
                     'experiment': 'case_study_dual_scoring',
                     'description': (
-                        'Standard training (full batch Adam) with simultaneous '
-                        'Layerwise and Subset scoring at each step. '
+                        'Full-Training (full batch Adam) with simultaneous '
+                        'LayerWiseSubset and GlobalSubset scoring at each step. '
                         'Same model, same batches, different selection methods.'
                     ),
                     'selection_frac': self.selection_frac,

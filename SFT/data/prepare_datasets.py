@@ -1,46 +1,21 @@
 #!/usr/bin/env python3
 """
 Script to download and prepare datasets for training and evaluation.
-Supports: MMLU, BBH, TyDiQA, MATH500, GSM8K, SamSUM (eval) + Alpaca, Dolly, FLAN-v2, CoT, OASST1, Vicuna, WizardLM, OpenHermes, Tulu3 (train)
+Supports: TyDiQA, SamSUM, TriviaQA, NQ-open (eval) + NQ-open, TriviaQA, SQuAD, Alpaca, Dolly, FLAN-v2, CoT, OASST1, Tulu3 (train).
 """
 
 import json
 import os
+import random
 import argparse
-import shutil
-import urllib.request
 from pathlib import Path
 from datasets import load_dataset
 from tqdm import tqdm
 
 
-# BBH CoT prompts URL from the original BIG-Bench Hard repository
-BBH_COT_PROMPTS_BASE_URL = "https://raw.githubusercontent.com/suzgunmirac/BIG-Bench-Hard/main/cot-prompts/"
-
-
-def _generate_bbh_fewshot_from_cot_prompts(cot_prompts_dir):
-    """
-    Generate BBH few-shot JSON from existing cot-prompts directory.
-
-    Args:
-        cot_prompts_dir: Directory containing .txt files with CoT prompts
-
-    Returns:
-        Dictionary mapping task names to CoT prompt strings
-    """
-    fewshot_data = {}
-    for filename in os.listdir(cot_prompts_dir):
-        if filename.endswith('.txt'):
-            task_name = filename.replace('.txt', '')
-            filepath = os.path.join(cot_prompts_dir, filename)
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-                # Remove the canary string if present
-                lines = content.split('\n')
-                if lines and 'canary' in lines[0].lower():
-                    content = '\n'.join(lines[2:]).strip()
-                fewshot_data[task_name] = content
-    return fewshot_data
+# Fixed seed for shuffling eval splits. Decoupled from any per-run seed so the
+# val/lr/test partition is reproducible across runs.
+EVAL_SHUFFLE_SEED = 42
 
 
 def ensure_dir(path):
@@ -48,475 +23,245 @@ def ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def extract_gsm8k_answer(answer_text):
-    """Extract the final numerical answer from GSM8K format (after ####)."""
-    if "####" in answer_text:
-        # Split on #### and get the part after it
-        parts = answer_text.split("####")
-        if len(parts) > 1:
-            # Clean up the answer (remove whitespace, commas in numbers)
-            final_answer = parts[-1].strip()
-            # Remove commas from numbers (e.g., "1,234" -> "1234")
-            final_answer = final_answer.replace(",", "")
-            return final_answer
-    return ""
+def shuffled_examples(examples, seed=EVAL_SHUFFLE_SEED):
+    """Return a shuffled copy of `examples` using a fixed seed.
+
+    Many HF datasets are ordered by article/language/topic (e.g., SQuAD validation
+    is grouped by article, TyDiQA test is grouped by language). Slicing the first
+    N examples therefore produces a topically-narrow eval set that doesn't
+    represent the full distribution. Shuffle once before slicing val/lr/test.
+    """
+    examples = list(examples)
+    random.Random(seed).shuffle(examples)
+    return examples
 
 
-def prepare_gsm8k_train(output_dir):
-    """Prepare GSM8K training data."""
-    print("Preparing GSM8K training data...")
-    dataset = load_dataset("openai/gsm8k", "main", split="train")
+def prepare_nq_open_train(output_dir):
+    """
+    Prepare NaturalQuestions open (closed-book) as a SFT training set.
+    Q -> A pairs, ~88K examples.
+    """
+    print("Preparing NaturalQuestions (nq_open) training data...")
+    ds = load_dataset("nq_open", split="train")
 
-    output_file = os.path.join(output_dir, "train", "gsm8k", "gsm8k_train_data.jsonl")
+    output_file = os.path.join(output_dir, "train", "nq_open", "nq_open_data.jsonl")
     ensure_dir(os.path.dirname(output_file))
 
-    with open(output_file, 'w', encoding='utf-8') as f:
-        for idx, example in enumerate(tqdm(dataset)):
-            question = example['question']
-            answer = example['answer']
-            final_answer = extract_gsm8k_answer(answer)
-
+    with open(output_file, "w", encoding="utf-8") as f:
+        for idx, ex in enumerate(tqdm(ds)):
+            question = ex["question"]
+            answers = ex["answer"]
+            if not answers:
+                continue
+            answer = answers[0]
             data = {
-                "dataset": "gsm8k",
-                "id": f"gsm8k_train_{idx}",
+                "dataset": "nq_open",
+                "id": f"nq_open_{idx}",
                 "messages": [
-                    {"role": "user", "content": f"Solve the following math problem step by step:\n{question}"},
-                    {"role": "assistant", "content": answer}
+                    {"role": "user", "content": f"Answer the following question.\nQuestion: {question}"},
+                    {"role": "assistant", "content": answer},
                 ],
-                "metadata": {
-                    "answer": final_answer
-                }
             }
-            f.write(json.dumps(data, ensure_ascii=False) + '\n')
-
-    print(f"GSM8K training data saved to {output_file}")
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+    print(f"NQ-open training data saved to {output_file}")
     return output_file
 
 
-def prepare_gsm8k_test(output_dir):
+def prepare_nq_open_eval(output_dir):
     """
-    Prepare GSM8K validation and test data in unified JSONL format.
-
-    Splits the test set into validation (first 100) and test (remaining).
-    Uses unified format with 'messages' field.
+    Prepare NaturalQuestions open (closed-book) for evaluation.
+    Splits the validation set into val/lr/test for n_val/LR-sweep/final-eval.
+    Same Q->A format as nq_open_train, with answer aliases stored in metadata.
     """
-    print("Preparing GSM8K validation and test data...")
-    dataset = load_dataset("openai/gsm8k", "main", split="test")
+    print("Preparing NaturalQuestions (nq_open) eval splits...")
+    ds = shuffled_examples(load_dataset("nq_open", split="validation"))  # 3.6k, shuffled
 
-    output_dir_gsm8k = os.path.join(output_dir, "eval", "gsm8k")
-    ensure_dir(output_dir_gsm8k)
+    output_dir_nq = os.path.join(output_dir, "eval", "nq_open")
+    ensure_dir(output_dir_nq)
 
-    # Split: first 100 for validation, rest for test
     val_size = 100
-    all_examples = list(dataset)
-    val_examples = all_examples[:val_size]
-    test_examples = all_examples[val_size:]
+    lr_size = 100
+    test_size = 1000
 
-    # Validation data
-    val_file = os.path.join(output_dir_gsm8k, "gsm8k_validation_data.jsonl")
-    with open(val_file, 'w', encoding='utf-8') as f:
-        for idx, example in enumerate(val_examples):
-            final_answer = extract_gsm8k_answer(example['answer'])
-            data = {
-                "dataset": "gsm8k",
-                "id": f"gsm8k_val_{idx}",
-                "messages": [
-                    {"role": "user", "content": f"Solve the following math problem step by step:\n{example['question']}"},
-                    {"role": "assistant", "content": example['answer']}
-                ],
-                "metadata": {
-                    "answer": final_answer
-                }
-            }
-            f.write(json.dumps(data, ensure_ascii=False) + '\n')
-
-    # Test data
-    test_file = os.path.join(output_dir_gsm8k, "gsm8k_test_data.jsonl")
-    with open(test_file, 'w', encoding='utf-8') as f:
-        for idx, example in enumerate(test_examples):
-            final_answer = extract_gsm8k_answer(example['answer'])
-            data = {
-                "dataset": "gsm8k",
-                "id": f"gsm8k_test_{idx}",
-                "messages": [
-                    {"role": "user", "content": f"Solve the following math problem step by step:\n{example['question']}"},
-                    {"role": "assistant", "content": example['answer']}
-                ],
-                "metadata": {
-                    "answer": final_answer
-                }
-            }
-            f.write(json.dumps(data, ensure_ascii=False) + '\n')
-
-    print(f"GSM8K data saved:")
-    print(f"  Validation: {val_file} ({len(val_examples)} examples)")
-    print(f"  Test: {test_file} ({len(test_examples)} examples)")
-    return val_file, test_file
-
-
-def prepare_mmlu(output_dir):
-    """
-    Prepare MMLU (Massive Multitask Language Understanding) dataset.
-
-    Downloads from cais/mmlu on HuggingFace and saves in unified JSONL format:
-    - mmlu_validation_data.jsonl: For data selection
-    - mmlu_test_data.jsonl: For evaluation
-
-    Uses unified format with 'messages' field, same as other datasets.
-    """
-    print("Preparing MMLU dataset...")
-
-    output_dir_mmlu = os.path.join(output_dir, "eval", "mmlu")
-    ensure_dir(output_dir_mmlu)
-
-    # MMLU subjects
-    subjects = [
-        "abstract_algebra", "anatomy", "astronomy", "business_ethics",
-        "clinical_knowledge", "college_biology", "college_chemistry",
-        "college_computer_science", "college_mathematics", "college_medicine",
-        "college_physics", "computer_security", "conceptual_physics",
-        "econometrics", "electrical_engineering", "elementary_mathematics",
-        "formal_logic", "global_facts", "high_school_biology",
-        "high_school_chemistry", "high_school_computer_science",
-        "high_school_european_history", "high_school_geography",
-        "high_school_government_and_politics", "high_school_macroeconomics",
-        "high_school_mathematics", "high_school_microeconomics",
-        "high_school_physics", "high_school_psychology", "high_school_statistics",
-        "high_school_us_history", "high_school_world_history", "human_aging",
-        "human_sexuality", "international_law", "jurisprudence",
-        "logical_fallacies", "machine_learning", "management", "marketing",
-        "medical_genetics", "miscellaneous", "moral_disputes", "moral_scenarios",
-        "nutrition", "philosophy", "prehistory", "professional_accounting",
-        "professional_law", "professional_medicine", "professional_psychology",
-        "public_relations", "security_studies", "sociology", "us_foreign_policy",
-        "virology", "world_religions"
-    ]
-
-    choices_letters = ["A", "B", "C", "D"]
-    val_examples = []
-    test_examples = []
-
-    def format_question(question, choices):
-        """Format MMLU question with choices."""
-        prompt = f"The following is a multiple choice question. Answer with A, B, C, or D.\n\n{question}\n"
-        for i, choice in enumerate(choices):
-            prompt += f"{choices_letters[i]}. {choice}\n"
-        prompt += "\nAnswer:"
-        return prompt
-
-    def format_answer(answer_idx):
-        """Convert answer index to letter."""
-        if isinstance(answer_idx, int):
-            return choices_letters[answer_idx]
-        return answer_idx
-
-    for subject in tqdm(subjects, desc="Downloading MMLU subjects"):
-        try:
-            # Load subject data from HuggingFace
-            dataset = load_dataset("cais/mmlu", subject)
-
-            # Process validation split
-            if "validation" in dataset:
-                for idx, example in enumerate(dataset["validation"]):
-                    val_examples.append({
-                        "dataset": "mmlu",
-                        "id": f"mmlu_val_{subject}_{idx}",
-                        "subject": subject,
-                        "messages": [
-                            {"role": "user", "content": format_question(example["question"], example["choices"])},
-                            {"role": "assistant", "content": format_answer(example["answer"])}
-                        ]
-                    })
-
-            # Process test split
-            if "test" in dataset:
-                for idx, example in enumerate(dataset["test"]):
-                    test_examples.append({
-                        "dataset": "mmlu",
-                        "id": f"mmlu_test_{subject}_{idx}",
-                        "subject": subject,
-                        "messages": [
-                            {"role": "user", "content": format_question(example["question"], example["choices"])},
-                            {"role": "assistant", "content": format_answer(example["answer"])}
-                        ]
-                    })
-
-        except Exception as e:
-            print(f"  Warning: Failed to load subject '{subject}': {e}")
+    val_records, lr_records, test_records = [], [], []
+    for idx, ex in enumerate(ds):
+        question = ex["question"]
+        answers = ex["answer"]  # list of valid answer strings
+        if not answers:
             continue
+        primary = answers[0]
 
-    # Write validation data (from HF validation split, used for data curation)
-    val_file = os.path.join(output_dir_mmlu, "mmlu_validation_data.jsonl")
-    with open(val_file, 'w', encoding='utf-8') as f:
-        for example in val_examples:
-            f.write(json.dumps(example, ensure_ascii=False) + '\n')
+        if len(val_records) < val_size:
+            split, bucket = "val", val_records
+        elif len(lr_records) < lr_size:
+            split, bucket = "lr", lr_records
+        elif len(test_records) < test_size:
+            split, bucket = "test", test_records
+        else:
+            break
 
-    # Three-way split of test data (per subject):
-    #   - LR sweep: first 40 per subject
-    #   - Test: next 100 per subject
-    lr_size_per_subject = 40
-    test_size_per_subject = 100
+        rec = {
+            "dataset": "nq_open",
+            "id": f"nq_open_{split}_{len(bucket)}",
+            "messages": [
+                {"role": "user", "content": f"Answer the following question.\nQuestion: {question}"},
+                {"role": "assistant", "content": primary},
+            ],
+            "metadata": {
+                "primary_answer": primary,
+                "aliases": list(set(answers)),
+            },
+        }
+        bucket.append(rec)
 
-    # Group test examples by subject
-    test_by_subject = {}
-    for example in test_examples:
-        subj = example.get("subject", "unknown")
-        test_by_subject.setdefault(subj, []).append(example)
+    val_file = os.path.join(output_dir_nq, "nq_open_validation_data.jsonl")
+    lr_file = os.path.join(output_dir_nq, "nq_open_lr_data.jsonl")
+    test_file = os.path.join(output_dir_nq, "nq_open_test_data.jsonl")
+    for fname, recs in [(val_file, val_records), (lr_file, lr_records), (test_file, test_records)]:
+        with open(fname, "w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    lr_examples = []
-    final_test_examples = []
-    for subj, examples in test_by_subject.items():
-        lr_examples.extend(examples[:lr_size_per_subject])
-        final_test_examples.extend(examples[lr_size_per_subject:lr_size_per_subject + test_size_per_subject])
-
-    # Write LR sweep data
-    lr_file = os.path.join(output_dir_mmlu, "mmlu_lr_data.jsonl")
-    with open(lr_file, 'w', encoding='utf-8') as f:
-        for example in lr_examples:
-            f.write(json.dumps(example, ensure_ascii=False) + '\n')
-
-    # Write test data
-    test_file = os.path.join(output_dir_mmlu, "mmlu_test_data.jsonl")
-    with open(test_file, 'w', encoding='utf-8') as f:
-        for example in final_test_examples:
-            f.write(json.dumps(example, ensure_ascii=False) + '\n')
-
-    print(f"MMLU data saved:")
-    print(f"  Validation: {val_file} ({len(val_examples)} examples, for data curation)")
-    print(f"  LR sweep: {lr_file} ({len(lr_examples)} examples, {lr_size_per_subject}/subject)")
-    print(f"  Test: {test_file} ({len(final_test_examples)} examples, {test_size_per_subject}/subject)")
-    print(f"  Subjects: {len(subjects)}")
+    print(f"NQ-open eval data saved:")
+    print(f"  Validation: {val_file} ({len(val_records)})")
+    print(f"  LR sweep:   {lr_file} ({len(lr_records)})")
+    print(f"  Test:       {test_file} ({len(test_records)})")
     return val_file, lr_file, test_file
 
 
-def prepare_math500(output_dir):
+def prepare_triviaqa_train(output_dir):
     """
-    Prepare MATH500 validation and test data in unified JSONL format.
-
-    Splits the test set into validation (first 50) and test (remaining).
-    Uses unified format with 'messages' field.
+    Prepare TriviaQA closed-book (rc.nocontext) train split as a SFT training pool.
+    Q -> A pairs, ~78K examples. Same format as nq_open_train so curation
+    (TriviaQA -> NQ) parallels (NQ -> TriviaQA).
     """
-    print("Preparing MATH500 validation and test data...")
-    dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+    print("Preparing TriviaQA (rc.nocontext) training data...")
+    ds = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="train")
 
-    output_dir_math = os.path.join(output_dir, "eval", "math500")
-    ensure_dir(output_dir_math)
+    output_file = os.path.join(output_dir, "train", "triviaqa", "triviaqa_data.jsonl")
+    ensure_dir(os.path.dirname(output_file))
 
-    # Split: first 50 for validation, rest for test
-    val_size = 50
-    all_examples = list(dataset)
-    val_examples = all_examples[:val_size]
-    test_examples = all_examples[val_size:]
-
-    def format_problem(example):
-        level = example.get('level', 'unknown')
-        prob_type = example.get('type', 'unknown')
-        return f"Solve the following Level {level} {prob_type} problem:\n{example['problem']}"
-
-    # Validation data
-    val_file = os.path.join(output_dir_math, "math500_validation_data.jsonl")
-    with open(val_file, 'w', encoding='utf-8') as f:
-        for idx, example in enumerate(val_examples):
+    n = 0
+    with open(output_file, "w", encoding="utf-8") as f:
+        for idx, ex in enumerate(tqdm(ds)):
+            question = ex["question"]
+            ans = ex["answer"]
+            primary = ans.get("value", "") if isinstance(ans, dict) else ""
+            if not primary:
+                continue
             data = {
-                "dataset": "math500",
-                "id": f"math500_val_{idx}",
+                "dataset": "triviaqa",
+                "id": f"triviaqa_train_{idx}",
                 "messages": [
-                    {"role": "user", "content": format_problem(example)},
-                    {"role": "assistant", "content": example['solution']}
+                    {"role": "user", "content": f"Answer the following question.\nQuestion: {question}"},
+                    {"role": "assistant", "content": primary},
                 ],
-                "metadata": {
-                    "level": example.get('level', 'unknown'),
-                    "type": example.get('type', 'unknown'),
-                    "answer": example.get('answer', '')
-                }
             }
-            f.write(json.dumps(data, ensure_ascii=False) + '\n')
-
-    # Test data
-    test_file = os.path.join(output_dir_math, "math500_test_data.jsonl")
-    with open(test_file, 'w', encoding='utf-8') as f:
-        for idx, example in enumerate(test_examples):
-            data = {
-                "dataset": "math500",
-                "id": f"math500_test_{idx}",
-                "messages": [
-                    {"role": "user", "content": format_problem(example)},
-                    {"role": "assistant", "content": example['solution']}
-                ],
-                "metadata": {
-                    "level": example.get('level', 'unknown'),
-                    "type": example.get('type', 'unknown'),
-                    "answer": example.get('answer', '')
-                }
-            }
-            f.write(json.dumps(data, ensure_ascii=False) + '\n')
-
-    print(f"MATH500 data saved:")
-    print(f"  Validation: {val_file} ({len(val_examples)} examples)")
-    print(f"  Test: {test_file} ({len(test_examples)} examples)")
-    return val_file, test_file
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+            n += 1
+    print(f"TriviaQA training data saved to {output_file} ({n} examples)")
+    return output_file
 
 
-def prepare_bbh(output_dir):
+def prepare_squad_eval(output_dir):
     """
-    Prepare BIG-Bench Hard (BBH) validation and test data in unified JSONL format.
-
-    Reads from existing test/*.json files and splits into validation/test.
-    Preserves the few-shot prompts file (bbh_fewshot.json) for downstream evaluation.
-
-    Output files:
-    - bbh_validation_data.jsonl: For data selection (n_val examples per task)
-    - bbh_test_data.jsonl: For evaluation
-    - bbh_fewshot.json: Few-shot prompts for each task (preserved/renamed)
+    Prepare SQuAD as a closed-book QA eval target (no context).
+    Strips the context from each SQuAD validation example so the model is
+    asked Q -> A only. Same Q->A messages format as nq_open eval.
+    answers.text (1-3 clean strings) is stored as `aliases` in metadata.
     """
-    print("Preparing BBH validation and test data...")
+    print("Preparing SQuAD eval splits (no context)...")
+    ds = shuffled_examples(load_dataset("rajpurkar/squad", split="validation"))  # ~10.5K, shuffled
 
-    output_dir_bbh = os.path.join(output_dir, "eval", "bbh")
-    ensure_dir(output_dir_bbh)
+    output_dir_squad = os.path.join(output_dir, "eval", "squad")
+    ensure_dir(output_dir_squad)
 
-    # Check if we have existing test data in test/*.json format
-    test_dir = os.path.join(output_dir_bbh, "test")
-    existing_three_shot = os.path.join(output_dir_bbh, "bbh-three-shot.json")
+    val_size = 100
+    lr_size = 100
+    test_size = 1000
 
-    # Try to load from existing test/*.json files first
-    if os.path.exists(test_dir) and any(f.endswith('.json') for f in os.listdir(test_dir)):
-        print("Found existing BBH test data, loading from test/*.json files...")
-        all_tasks_data = {}
-        for filename in os.listdir(test_dir):
-            if filename.endswith('.json') and not filename.startswith('.'):
-                task_name = filename.replace('.json', '')
-                filepath = os.path.join(test_dir, filename)
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    task_data = json.load(f)
-                    # Handle the canary format
-                    if 'examples' in task_data:
-                        all_tasks_data[task_name] = task_data['examples']
-                    else:
-                        all_tasks_data[task_name] = task_data
-    else:
-        # Download from HuggingFace - need to load each task config separately
-        print("Downloading BBH from HuggingFace...")
-        bbh_tasks = [
-            'boolean_expressions', 'causal_judgement', 'date_understanding',
-            'disambiguation_qa', 'dyck_languages', 'formal_fallacies',
-            'geometric_shapes', 'hyperbaton', 'logical_deduction_five_objects',
-            'logical_deduction_seven_objects', 'logical_deduction_three_objects',
-            'movie_recommendation', 'multistep_arithmetic_two', 'navigate',
-            'object_counting', 'penguins_in_a_table', 'reasoning_about_colored_objects',
-            'ruin_names', 'salient_translation_error_detection', 'snarks',
-            'sports_understanding', 'temporal_sequences',
-            'tracking_shuffled_objects_five_objects', 'tracking_shuffled_objects_seven_objects',
-            'tracking_shuffled_objects_three_objects', 'web_of_lies', 'word_sorting'
-        ]
-        all_tasks_data = {}
-        for task_name in tqdm(bbh_tasks, desc="Downloading BBH tasks"):
-            try:
-                dataset = load_dataset("lukaemon/bbh", task_name)
-                all_tasks_data[task_name] = [
-                    {"input": ex.get('input', ''), "target": ex.get('target', '')}
-                    for ex in dataset['test']
-                ]
-            except Exception as e:
-                print(f"  Warning: Failed to load BBH task '{task_name}': {e}")
+    val_records, lr_records, test_records = [], [], []
+    for idx, ex in enumerate(ds):
+        question = ex["question"]
+        answers = ex["answers"]["text"]
+        if not answers:
+            continue
+        primary = answers[0]
 
-    # Split each task: first 3 for validation, rest for test
-    # (BBH tasks typically have ~250 examples each)
-    val_per_task = 3
-    val_examples = []
-    test_examples = []
-
-    for task_name, examples in all_tasks_data.items():
-        task_val = examples[:val_per_task]
-        task_test = examples[val_per_task:]
-
-        for idx, ex in enumerate(task_val):
-            val_examples.append({
-                "dataset": "bbh",
-                "id": f"bbh_val_{task_name}_{idx}",
-                "task": task_name,
-                "messages": [
-                    {"role": "user", "content": ex.get('input', '')},
-                    {"role": "assistant", "content": ex.get('target', '')}
-                ]
-            })
-
-        for idx, ex in enumerate(task_test):
-            test_examples.append({
-                "dataset": "bbh",
-                "id": f"bbh_test_{task_name}_{idx}",
-                "task": task_name,
-                "messages": [
-                    {"role": "user", "content": ex.get('input', '')},
-                    {"role": "assistant", "content": ex.get('target', '')}
-                ]
-            })
-
-    # Write validation data
-    val_file = os.path.join(output_dir_bbh, "bbh_validation_data.jsonl")
-    with open(val_file, 'w', encoding='utf-8') as f:
-        for example in val_examples:
-            f.write(json.dumps(example, ensure_ascii=False) + '\n')
-
-    # Write test data
-    test_file = os.path.join(output_dir_bbh, "bbh_test_data.jsonl")
-    with open(test_file, 'w', encoding='utf-8') as f:
-        for example in test_examples:
-            f.write(json.dumps(example, ensure_ascii=False) + '\n')
-
-    # Handle few-shot prompts file (Chain-of-Thought prompts for downstream evaluation)
-    fewshot_file = os.path.join(output_dir_bbh, "bbh_fewshot.json")
-    cot_prompts_dir = os.path.join(output_dir_bbh, "cot-prompts")
-
-    if os.path.exists(existing_three_shot) and not os.path.exists(fewshot_file):
-        # Copy/rename the existing few-shot file
-        shutil.copy(existing_three_shot, fewshot_file)
-        print(f"  Few-shot prompts copied to: {fewshot_file}")
-    elif os.path.exists(fewshot_file):
-        print(f"  Few-shot prompts already exist: {fewshot_file}")
-    else:
-        # Try to generate from existing cot-prompts directory
-        if os.path.exists(cot_prompts_dir) and any(f.endswith('.txt') for f in os.listdir(cot_prompts_dir)):
-            print("  Generating few-shot prompts from existing cot-prompts...")
-            fewshot_data = _generate_bbh_fewshot_from_cot_prompts(cot_prompts_dir)
+        if len(val_records) < val_size:
+            split, bucket = "val", val_records
+        elif len(lr_records) < lr_size:
+            split, bucket = "lr", lr_records
+        elif len(test_records) < test_size:
+            split, bucket = "test", test_records
         else:
-            # Download CoT prompts from GitHub
-            print("  Downloading Chain-of-Thought prompts from BIG-Bench-Hard repository...")
-            ensure_dir(cot_prompts_dir)
-            fewshot_data = {}
+            break
 
-            for task_name in all_tasks_data.keys():
-                url = f"{BBH_COT_PROMPTS_BASE_URL}{task_name}.txt"
-                cot_file = os.path.join(cot_prompts_dir, f"{task_name}.txt")
+        rec = {
+            "dataset": "squad",
+            "id": f"squad_{split}_{len(bucket)}",
+            "messages": [
+                {"role": "user", "content": f"Answer the following question.\nQuestion: {question}"},
+                {"role": "assistant", "content": primary},
+            ],
+            "metadata": {
+                "primary_answer": primary,
+                "aliases": list(set(answers)),
+            },
+        }
+        bucket.append(rec)
 
-                try:
-                    urllib.request.urlretrieve(url, cot_file)
-                    # Parse the CoT prompt file
-                    with open(cot_file, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        # Remove the canary string (first two lines)
-                        lines = content.split('\n')
-                        if lines and 'canary' in lines[0].lower():
-                            # Skip canary and separator line
-                            content = '\n'.join(lines[2:]).strip()
-                        fewshot_data[task_name] = content
-                except Exception as e:
-                    print(f"    Warning: Failed to download CoT prompt for '{task_name}': {e}")
-                    # Fallback: use raw input/target (less useful but better than nothing)
-                    examples = all_tasks_data[task_name][:3]
-                    fallback_prompt = f"Answer the following questions.\n\n"
-                    for ex in examples:
-                        fallback_prompt += f"Q: {ex.get('input', '')}\nA: {ex.get('target', '')}\n\n"
-                    fewshot_data[task_name] = fallback_prompt.strip()
+    val_file = os.path.join(output_dir_squad, "squad_validation_data.jsonl")
+    lr_file = os.path.join(output_dir_squad, "squad_lr_data.jsonl")
+    test_file = os.path.join(output_dir_squad, "squad_test_data.jsonl")
+    for fname, recs in [(val_file, val_records), (lr_file, lr_records), (test_file, test_records)]:
+        with open(fname, "w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-        with open(fewshot_file, 'w', encoding='utf-8') as f:
-            json.dump(fewshot_data, f, ensure_ascii=False, indent=4)
-        print(f"  Few-shot prompts saved to: {fewshot_file}")
+    print(f"SQuAD (no-context) eval data saved:")
+    print(f"  Validation: {val_file} ({len(val_records)})")
+    print(f"  LR sweep:   {lr_file} ({len(lr_records)})")
+    print(f"  Test:       {test_file} ({len(test_records)})")
+    return val_file, lr_file, test_file
 
-    print(f"BBH data saved:")
-    print(f"  Validation: {val_file} ({len(val_examples)} examples)")
-    print(f"  Test: {test_file} ({len(test_examples)} examples)")
-    print(f"  Tasks: {len(all_tasks_data)}")
-    return val_file, test_file
+
+def prepare_squad(output_dir):
+    """
+    Prepare SQuAD as a SFT training pool (with context).
+    Reading-comprehension format: (context + question) -> answer.
+    """
+    print("Preparing SQuAD training data...")
+    ds = load_dataset("rajpurkar/squad", split="train")  # 87.6k
+
+    output_file = os.path.join(output_dir, "train", "squad", "squad_data.jsonl")
+    ensure_dir(os.path.dirname(output_file))
+
+    n = 0
+    with open(output_file, "w", encoding="utf-8") as f:
+        for idx, ex in enumerate(tqdm(ds)):
+            question = ex["question"]
+            context = ex["context"]
+            answers = ex["answers"]["text"]
+            if not answers:
+                continue
+            answer = answers[0]
+            user_content = (
+                f"Answer the question based on the given context.\n\n"
+                f"Context: {context}\n\nQuestion: {question}"
+            )
+            data = {
+                "dataset": "squad",
+                "id": f"squad_{idx}",
+                "messages": [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": answer},
+                ],
+            }
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+            n += 1
+    print(f"SQuAD training data saved to {output_file} ({n} examples)")
+    return output_file
 
 
 def prepare_tydiqa(output_dir):
@@ -543,8 +288,10 @@ def prepare_tydiqa(output_dir):
     print("Loading TyDiQA from HuggingFace...")
     dataset = load_dataset("tydiqa", "secondary_task")
 
-    # Use validation split (TyDiQA doesn't have a test split in secondary_task)
-    all_data = list(dataset["validation"])
+    # Use validation split (TyDiQA doesn't have a test split in secondary_task).
+    # Shuffle before slicing — TyDiQA's HF validation order is grouped by language,
+    # so the first 500 are all Arabic without this shuffle.
+    all_data = shuffled_examples(dataset["validation"])
 
     # Split: first 100 for validation, next 100 for LR sweep, rest for test
     val_size = 100
@@ -886,10 +633,10 @@ def prepare_samsum(output_dir):
     ensure_dir(os.path.dirname(train_file))
     ensure_dir(os.path.dirname(val_file))
 
-    # Load from knkarthick/samsum
+    # Load from knkarthick/samsum (shuffle val + test for consistency with other tasks)
     train_dataset = load_dataset("knkarthick/samsum", split="train")
-    val_dataset = load_dataset("knkarthick/samsum", split="validation")
-    test_dataset = load_dataset("knkarthick/samsum", split="test")
+    val_dataset = shuffled_examples(load_dataset("knkarthick/samsum", split="validation"))
+    test_dataset = shuffled_examples(load_dataset("knkarthick/samsum", split="test"))
 
     # Split test into LR sweep (first 100) and final test (rest)
     test_list = list(test_dataset)
@@ -969,127 +716,6 @@ def prepare_samsum(output_dir):
     return train_file
 
 
-def prepare_vicuna(output_dir):
-    """
-    Prepare Vicuna (ShareGPT) training data.
-    Using Anon8231489123/ShareGPT_Vicuna_unfiltered dataset.
-    """
-    print("Preparing Vicuna training data...")
-    print("Note: This dataset is large and may take some time to download.")
-
-    # Using the filtered ShareGPT dataset
-    dataset = load_dataset("Aeala/ShareGPT_Vicuna_unfiltered", split="train")
-
-    output_file = os.path.join(output_dir, "train", "vicuna", "vicuna_data.jsonl")
-    ensure_dir(os.path.dirname(output_file))
-
-    with open(output_file, 'w', encoding='utf-8') as f:
-        for idx, example in enumerate(tqdm(dataset)):
-            # ShareGPT format has 'conversations' field
-            conversations = example.get('conversations', [])
-
-            messages = []
-            for conv in conversations:
-                role = conv.get('from', '')
-                content = conv.get('value', '')
-
-                if role == 'human':
-                    role = 'user'
-                elif role == 'gpt':
-                    role = 'assistant'
-                else:
-                    continue
-
-                messages.append({"role": role, "content": content})
-
-            if len(messages) >= 2:
-                data = {
-                    "dataset": "vicuna",
-                    "id": f"vicuna_{idx}",
-                    "messages": messages
-                }
-                f.write(json.dumps(data, ensure_ascii=False) + '\n')
-
-    print(f"Vicuna training data saved to {output_file}")
-    return output_file
-
-
-def prepare_wizardlm(output_dir):
-    """Prepare WizardLM training data."""
-    print("Preparing WizardLM training data...")
-    dataset = load_dataset("WizardLMTeam/WizardLM_evol_instruct_V2_196k", split="train")
-
-    output_file = os.path.join(output_dir, "train", "wizardlm", "wizardlm_data.jsonl")
-    ensure_dir(os.path.dirname(output_file))
-
-    with open(output_file, 'w', encoding='utf-8') as f:
-        for idx, example in enumerate(tqdm(dataset)):
-            conversations = example.get('conversations', [])
-
-            messages = []
-            for conv in conversations:
-                role = conv.get('from', conv.get('role', ''))
-                content = conv.get('value', conv.get('content', ''))
-
-                if role in ['human', 'user']:
-                    role = 'user'
-                elif role in ['gpt', 'assistant', 'system']:
-                    role = 'assistant'
-                else:
-                    continue
-
-                messages.append({"role": role, "content": content})
-
-            if len(messages) >= 2:
-                data = {
-                    "dataset": "wizardlm",
-                    "id": f"wizardlm_{idx}",
-                    "messages": messages
-                }
-                f.write(json.dumps(data, ensure_ascii=False) + '\n')
-
-    print(f"WizardLM training data saved to {output_file}")
-    return output_file
-
-
-def prepare_openhermes(output_dir):
-    """Prepare OpenHermes2.5 training data."""
-    print("Preparing OpenHermes2.5 training data...")
-    dataset = load_dataset("teknium/OpenHermes-2.5", split="train")
-
-    output_file = os.path.join(output_dir, "train", "openhermes", "openhermes_data.jsonl")
-    ensure_dir(os.path.dirname(output_file))
-
-    with open(output_file, 'w', encoding='utf-8') as f:
-        for idx, example in enumerate(tqdm(dataset)):
-            conversations = example.get('conversations', [])
-
-            messages = []
-            for conv in conversations:
-                role = conv.get('from', conv.get('role', ''))
-                content = conv.get('value', conv.get('content', ''))
-
-                if role in ['human', 'user']:
-                    role = 'user'
-                elif role in ['gpt', 'assistant']:
-                    role = 'assistant'
-                else:
-                    continue
-
-                messages.append({"role": role, "content": content})
-
-            if len(messages) >= 2:
-                data = {
-                    "dataset": "openhermes",
-                    "id": f"openhermes_{idx}",
-                    "messages": messages
-                }
-                f.write(json.dumps(data, ensure_ascii=False) + '\n')
-
-    print(f"OpenHermes training data saved to {output_file}")
-    return output_file
-
-
 def prepare_tulu3(output_dir):
     """Prepare Tulu-3 SFT mixture training data."""
     print("Preparing Tulu-3 training data...")
@@ -1129,24 +755,19 @@ def main():
         epilog="""
 Available Datasets:
 
-  Evaluation Datasets (with validation/test splits):
-    mmlu      - MMLU: Massive Multitask Language Understanding (57 subjects)
-    bbh       - BBH: BIG-Bench Hard (23 reasoning tasks with CoT prompts)
-    tydiqa    - TyDiQA: Typologically Diverse QA (9 languages)
-    gsm8k     - GSM8K: Grade School Math (includes train split)
-    math500   - MATH500: Competition math problems
-    samsum    - SamSUM: Dialogue summarization (includes train split)
+  Evaluation Datasets (validation/lr/test splits):
+    tydiqa         - TyDiQA: Typologically Diverse QA (multilingual)
+    samsum         - SamSUM: Dialogue summarization (includes train split)
+    nq_open_eval   - NQ-open: eval splits (val/lr/test from HF nq_open validation)
+    squad_eval     - SQuAD: closed-book eval splits (NO context; answer.text list)
 
-  Training Datasets:
-    alpaca    - Stanford Alpaca (52K instruction-following examples)
-    dolly     - Databricks Dolly 2.0 (15K examples)
-    flan_v2   - FLAN v2 instruction mixture (100K examples)
-    cot       - Chain-of-Thought reasoning (100K examples)
-    oasst1    - OpenAssistant conversations (88K examples)
-    vicuna    - ShareGPT-based conversations (125K examples)
-    wizardlm  - WizardLM evolved instructions (196K examples)
-    openhermes - OpenHermes 2.5 (1M examples)
-    tulu3     - Tulu-3 SFT mixture (939K examples)
+  Training Pools:
+    nq_open         - NQ-open: train pool (~88K Q->A pairs)
+    triviaqa_train  - TriviaQA: train pool (~138K Q->A pairs from rc.nocontext)
+    squad           - SQuAD: with-context reading-comprehension (~88K)
+    tulu3           - Tulu-3 SFT mixture (~939K)
+    alpaca          - Stanford Alpaca (~52K)
+    dolly, flan_v2, cot, oasst1 - LESS-mix components (~1.96M combined)
 """
     )
     parser.add_argument(
@@ -1154,8 +775,9 @@ Available Datasets:
         nargs='+',
         required=True,
         metavar='DATASET',
-        choices=['mmlu', 'gsm8k', 'math500', 'bbh', 'tydiqa', 'vicuna', 'wizardlm', 'openhermes', 'tulu3',
-                 'alpaca', 'dolly', 'flan_v2', 'cot', 'oasst1', 'samsum'],
+        choices=['tydiqa', 'samsum', 'nq_open_eval', 'squad_eval',
+                 'nq_open', 'triviaqa_train', 'squad', 'tulu3', 'alpaca',
+                 'dolly', 'flan_v2', 'cot', 'oasst1'],
         help="Datasets to prepare (see list below)"
     )
     parser.add_argument(
@@ -1174,51 +796,44 @@ Available Datasets:
 
     results = {}
 
-    # Evaluation datasets (with validation/test split)
-    if 'mmlu' in datasets_to_prepare:
-        val_file, lr_file, test_file = prepare_mmlu(args.output_dir)
-        results['mmlu_validation'] = val_file
-        results['mmlu_lr'] = lr_file
-        results['mmlu_test'] = test_file
-
-    if 'gsm8k' in datasets_to_prepare:
-        results['gsm8k_train'] = prepare_gsm8k_train(args.output_dir)
-        val_file, test_file = prepare_gsm8k_test(args.output_dir)
-        results['gsm8k_validation'] = val_file
-        results['gsm8k_test'] = test_file
-
-    if 'math500' in datasets_to_prepare:
-        val_file, test_file = prepare_math500(args.output_dir)
-        results['math500_validation'] = val_file
-        results['math500_test'] = test_file
-
-    if 'bbh' in datasets_to_prepare:
-        val_file, test_file = prepare_bbh(args.output_dir)
-        results['bbh_validation'] = val_file
-        results['bbh_test'] = test_file
-
+    # Evaluation datasets (validation / lr / test splits)
     if 'tydiqa' in datasets_to_prepare:
         val_file, test_file = prepare_tydiqa(args.output_dir)
         results['tydiqa_validation'] = val_file
         results['tydiqa_test'] = test_file
 
-    # New training datasets
-    if 'vicuna' in datasets_to_prepare:
-        results['vicuna'] = prepare_vicuna(args.output_dir)
+    if 'samsum' in datasets_to_prepare:
+        results['samsum'] = prepare_samsum(args.output_dir)
 
-    if 'wizardlm' in datasets_to_prepare:
-        results['wizardlm'] = prepare_wizardlm(args.output_dir)
+    if 'nq_open_eval' in datasets_to_prepare:
+        val_file, lr_file, test_file = prepare_nq_open_eval(args.output_dir)
+        results['nq_open_validation'] = val_file
+        results['nq_open_lr'] = lr_file
+        results['nq_open_test'] = test_file
 
-    if 'openhermes' in datasets_to_prepare:
-        results['openhermes'] = prepare_openhermes(args.output_dir)
+    if 'squad_eval' in datasets_to_prepare:
+        val_file, lr_file, test_file = prepare_squad_eval(args.output_dir)
+        results['squad_validation'] = val_file
+        results['squad_lr'] = lr_file
+        results['squad_test'] = test_file
+
+    # Training pools
+    if 'nq_open' in datasets_to_prepare:
+        results['nq_open_train'] = prepare_nq_open_train(args.output_dir)
+
+    if 'triviaqa_train' in datasets_to_prepare:
+        results['triviaqa_train'] = prepare_triviaqa_train(args.output_dir)
+
+    if 'squad' in datasets_to_prepare:
+        results['squad'] = prepare_squad(args.output_dir)
 
     if 'tulu3' in datasets_to_prepare:
         results['tulu3'] = prepare_tulu3(args.output_dir)
 
-    # Existing training datasets (LESS + others)
     if 'alpaca' in datasets_to_prepare:
         results['alpaca'] = prepare_alpaca(args.output_dir)
 
+    # LESS-mix components (used as combined train pool for less_tydiqa)
     if 'dolly' in datasets_to_prepare:
         results['dolly'] = prepare_dolly(args.output_dir)
 
@@ -1230,9 +845,6 @@ Available Datasets:
 
     if 'oasst1' in datasets_to_prepare:
         results['oasst1'] = prepare_oasst1(args.output_dir)
-
-    if 'samsum' in datasets_to_prepare:
-        results['samsum'] = prepare_samsum(args.output_dir)
 
     print("\n" + "="*50)
     print("Dataset preparation complete!")

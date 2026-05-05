@@ -2,7 +2,7 @@
 Training arguments for RLHF experiments.
 
 Following SFT conventions:
-- `method`: Controls data curation (NA, Layerwise, Subset)
+- `method`: Controls data curation (NA, LayerWiseSubset, GlobalSubset)
 - `sparsification`/`projection`: Controls compression (implies MeSO optimizer)
 - PPO-specific arguments for RLHF
 """
@@ -16,7 +16,7 @@ from transformers import TrainingArguments as TA
 @dataclass
 class TrainingArguments(TA):
     """
-    Training arguments for RLHF with layer-wise data curation.
+    Training arguments for RLHF with layer_wise_subset data curation.
 
     Inherits from transformers.TrainingArguments and adds:
     - Data curation arguments (method, filter_frac)
@@ -74,8 +74,8 @@ class TrainingArguments(TA):
                 "Training method: "
                 "'NA' (baseline, no curation), "
                 "'IIF' (pre-filter entire rollout before PPO epochs), "
-                "'Layerwise' (per-layer curation, single-pass), "
-                "'Subset' (global curation, two-pass)"
+                "'LayerWiseSubset' (per-layer curation, single-pass), "
+                "'GlobalSubset' (global curation, two-pass)"
             )
         },
     )
@@ -183,7 +183,7 @@ class TrainingArguments(TA):
         default="two_pass",
         metadata={
             "help": (
-                "Subset descent mode: "
+                "GlobalSubset descent mode: "
                 "'one_pass' (Algorithm 4.2, single backward + post-hoc assembly) or "
                 "'two_pass' (Algorithm 4.3, scoring pass + gradient pass on selected subset). "
                 "Default: two_pass for RLHF."
@@ -404,7 +404,7 @@ class TrainingArguments(TA):
             raise ValueError(f"task must be one of {valid_tasks}, got {self.task}")
 
         # Validate method
-        valid_methods = ["NA", "IIF", "Layerwise", "Subset"]
+        valid_methods = ["NA", "IIF", "LayerWiseSubset", "GlobalSubset"]
         if self.method not in valid_methods:
             raise ValueError(f"method must be one of {valid_methods}, got {self.method}")
 

@@ -1,5 +1,0 @@
-# TEST: Subset with no compression at all (exact scoring, full updates)
-# Expected: no compressors created, exact scoring with full gradients
-method: Subset
-finetuning: Full
-

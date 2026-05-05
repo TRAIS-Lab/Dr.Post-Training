@@ -1,0 +1,8 @@
+# GlobalSubset data curation with full fine-tuning (exact scoring)
+method: GlobalSubset
+subset_mode: one_pass
+scoring:
+  method: reduced_ghost
+finetuning: Full
+learning_rate: 2.00e-05
+

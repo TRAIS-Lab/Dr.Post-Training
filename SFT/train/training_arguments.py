@@ -85,7 +85,7 @@ class TrainingArguments(TA):
         metadata={
             "help": (
                 "Data curation method: 'NA' (no curation), "
-                "'Layerwise' (per-layer curation), or 'Subset' (global curation)"
+                "'LayerWiseSubset' (per-layer curation), or 'GlobalSubset' (global curation)"
             )
         },
     )
@@ -101,10 +101,6 @@ class TrainingArguments(TA):
                 "'filtering' (drop bottom frac of negative-score samples)."
             )
         },
-    )
-    subject: str = field(
-        default="sociology",
-        metadata={"help": "Subject for MMLU/BBH evaluation"},
     )
     n_val: int = field(
         default=8,
@@ -180,7 +176,7 @@ class TrainingArguments(TA):
         default="one_pass",
         metadata={
             "help": (
-                "Subset descent mode (only used when method='Subset'): "
+                "GlobalSubset descent mode (only used when method='GlobalSubset'): "
                 "'one_pass' (default, Algorithm 4.2): Single forward+backward pass, "
                 "retains activations for post-hoc gradient assembly. "
                 "'two_pass' (Algorithm 4.3): First pass for scoring, second pass on selected subset."
@@ -216,7 +212,7 @@ class TrainingArguments(TA):
         metadata={
             "help": (
                 "Record selected sample indices and scores per step for case study analysis. "
-                "For Layerwise: records per-layer curation. For Subset: records global curation. "
+                "For LayerWiseSubset: records per-layer curation. For GlobalSubset: records global curation. "
                 "Saves to output_dir/selection_records.json."
             )
         },

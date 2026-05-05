@@ -1,5 +1,5 @@
 """
-Layer-wise SFT trainer with unified data curation and model update.
+Layer-Wise Subset SFT trainer with unified data curation and model update.
 """
 
 import json
@@ -23,7 +23,7 @@ from drpt.selection import create_separate_batch_strategy, create_merged_batch_s
 logger = logging.getLogger(__name__)
 
 
-class LayerwiseTrainer(Trainer):
+class LayerWiseSubsetTrainer(Trainer):
     """
     SFT Trainer supporting gradient-based data curation with optional compression.
     """
@@ -44,7 +44,7 @@ class LayerwiseTrainer(Trainer):
         # Extract eval_dataset from kwargs before passing to parent
         eval_dataset = kwargs.get('eval_dataset', None)
         if eval_dataset is None:
-            raise ValueError("LayerwiseTrainer requires an eval_dataset to be passed in kwargs")
+            raise ValueError("LayerWiseSubsetTrainer requires an eval_dataset to be passed in kwargs")
 
         # Pass eval_dataset to parent Trainer
         super().__init__(*args, **kwargs)
@@ -83,7 +83,7 @@ class LayerwiseTrainer(Trainer):
         )
 
         # Create validation dataloader iterator for efficient batch sampling during training
-        # Only needed if we're doing layer-wise data curation
+        # Only needed if we're doing layer_wise_subset data curation
         if val_dataset is not None:
             self.val_dataloader_iter = iter(
                 self.get_val_dataloader(self.val_dataset, batch_size=self.val_batch_size_for_selection, shuffle=True)
@@ -109,13 +109,6 @@ class LayerwiseTrainer(Trainer):
         # - separate_batch: Separate val pass, store mean gradient
         # - merged_batch: Merge train+val into single batch
         val_strategy = getattr(self.args, 'val_strategy', 'separate_batch_factorized')
-        # LayerwiseWithVal requires merged_batch strategy
-        if self.args.method == 'LayerwiseWithVal' and val_strategy != 'merged_batch':
-            logger.warning(
-                f"LayerwiseWithVal requires merged_batch strategy, overriding "
-                f"val_strategy from '{val_strategy}' to 'merged_batch'"
-            )
-            val_strategy = 'merged_batch'
         scoring_method = getattr(self.args, 'scoring_method', 'reduced_ghost')
         subset_mode = getattr(self.args, 'subset_mode', 'one_pass')
         if val_strategy == 'merged_batch':
@@ -144,7 +137,7 @@ class LayerwiseTrainer(Trainer):
         self.val_strategy = val_strategy
 
         logger.info("="*60)
-        logger.info("Initialized LayerwiseTrainer")
+        logger.info("Initialized LayerWiseSubsetTrainer")
         selection_frac = getattr(self.args, 'selection_frac', None)
         logger.info(f"  Method: {self.args.method} (curation fraction: {selection_frac})")
         logger.info(f"  Validation strategy: {self.val_strategy}")
@@ -158,7 +151,7 @@ class LayerwiseTrainer(Trainer):
 
         # Log the training mode based on configuration
         # Naming convention: {curation}-{compression}-{training_type}
-        if self.args.method in ('Layerwise', 'Subset', 'LayerwiseWithVal'):
+        if self.args.method in ('LayerWiseSubset', 'GlobalSubset'):
             if self.has_compression:
                 logger.info(f"  Mode: {self.args.method} with compression (MeSO optimizer)")
             else:
@@ -305,8 +298,8 @@ class LayerwiseTrainer(Trainer):
         Training step using curation strategy pattern.
 
         The curation strategy handles the difference between:
-        - Layerwise: Single-pass, per-layer curation
-        - Subset: Two-pass, global curation
+        - LayerWiseSubset: Single-pass, per-layer curation
+        - GlobalSubset: Two-pass, global curation
         - NA: Baseline (no curation)
 
         With or without compression (MeSO).
@@ -320,8 +313,8 @@ class LayerwiseTrainer(Trainer):
             if isinstance(unwrapped_optimizer, MeSOAdamW):
                 unwrapped_optimizer.refresh_compressors_if_needed()
 
-        # === DATA CURATION MODE (Layerwise or Subset) ===
-        if args.method in ('Layerwise', 'Subset', 'LayerwiseWithVal'):
+        # === DATA CURATION MODE (LayerWiseSubset or GlobalSubset) ===
+        if args.method in ('LayerWiseSubset', 'GlobalSubset'):
             # Get validation batch for curation
             try:
                 val_batch = next(self.val_dataloader_iter)
@@ -354,7 +347,7 @@ class LayerwiseTrainer(Trainer):
                     train_batch_size=train_batch_size,
                     compute_loss_fn=compute_loss,
                     lr=lr,
-                    batch_train=batch_train,  # For Subset pass 2
+                    batch_train=batch_train,  # For GlobalSubset pass 2
                 )
             else:
                 # === SEPARATE BATCH MODE: Separate val pass, then train with stored grads ===
@@ -383,7 +376,7 @@ class LayerwiseTrainer(Trainer):
                     lr=lr,
                     # Pass labels for token-based gradient scaling
                     labels=batch_train.get('labels'),
-                    # For Subset pass 2, provide filter function
+                    # For GlobalSubset pass 2, provide filter function
                     filter_batch_fn=lambda indices: (
                         lambda: (self._compute_loss_for_selection(model, {
                             'input_ids': batch_train['input_ids'][indices],
@@ -455,7 +448,7 @@ class LayerwiseTrainer(Trainer):
         """Capture curation record from the last training step.
 
         Records decoded text for both training and validation samples,
-        along with per-layer (Layerwise) or global (Subset) curation data.
+        along with per-layer (LayerWiseSubset) or global (GlobalSubset) curation data.
         """
         record = getattr(self.selection_strategy, 'last_selection_record', None)
         if record is None:
@@ -472,10 +465,10 @@ class LayerwiseTrainer(Trainer):
             'val_samples': val_texts,
         }
 
-        if self.args.method in ('Layerwise', 'LayerwiseWithVal'):
+        if self.args.method == 'LayerWiseSubset':
             step_record['layers'] = record
         else:
-            # Subset: single global curation
+            # GlobalSubset: single global curation
             step_record['selection'] = record[0] if record else {}
 
         self._selection_records.append(step_record)
@@ -592,9 +585,16 @@ class LayerwiseTrainer(Trainer):
         )
 
         # Re-enable hooks after evaluation if curation method is active OR compression is used
-        # Hooks are needed for both: (1) layer-wise data curation, (2) MeSO compressed gradients
+        # Hooks are needed for both: (1) layer_wise_subset data curation, (2) MeSO compressed gradients
         if self.grad_hook is not None and (self.args.method != "NA" or self.has_compression):
             self.grad_hook.enable_hooks()
+
+        # Reset control.should_evaluate flag (HF Trainer's CallbackHandler.on_evaluate normally
+        # does this; without it, target-only runs would double-eval when a step boundary
+        # coincides with an epoch boundary — _maybe_log_save_evaluate fires once at on_step_end
+        # and again at on_epoch_end with the flag still True).
+        if hasattr(self, 'callback_handler') and hasattr(self, 'state') and hasattr(self, 'control'):
+            self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, eval_metrics)
 
         return eval_metrics
 

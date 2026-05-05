@@ -10,19 +10,19 @@ Measures per-component runtime for each method:
   5. Optimizer step
 
 Methods benchmarked:
-  - Standard: baseline training (forward + backward + optimizer)
-  - Layerwise: per-layer selection (single-pass backward with scores + w.grad)
-  - Subset: global selection (two-pass: scoring pass + materialization pass)
+  - Full-Training: baseline training (forward + backward + optimizer)
+  - LayerWiseSubset: per-layer selection (single-pass backward with scores + w.grad)
+  - GlobalSubset: global selection (two-pass: scoring pass + materialization pass)
 
 Methodology for decomposing backward into components:
   - Activation-grad time: Backward with requires_grad=False on all weight params
     (except embedding). This makes PyTorch skip grad_weight computation per layer,
     measuring only the chain-rule grad_input propagation.
-  - Score time: Subset pass-1 backward (activation grads + score accumulation,
+  - Score time: GlobalSubset pass-1 backward (activation grads + score accumulation,
     no w.grad) minus activation-grad-only time.
-  - w.grad time (Standard): Full backward minus activation-grad-only backward.
-  - w.grad time (Layerwise): Total train backward minus activation-grad minus score.
-  - w.grad time (Subset): Pass-2 forward + pass-2 backward (direct measurement).
+  - w.grad time (Full-Training): Full backward minus activation-grad-only backward.
+  - w.grad time (LayerWiseSubset): Total train backward minus activation-grad minus score.
+  - w.grad time (GlobalSubset): Pass-2 forward + pass-2 backward (direct measurement).
 
 All timing uses CUDA events for accurate GPU measurement.
 """
@@ -801,9 +801,9 @@ class BreakdownResult:
     val_backward_ms: float = 0.0
     train_forward_ms: float = 0.0
     train_backward_ms: float = 0.0  # Total backward (method-specific)
-    selection_decision_ms: float = 0.0  # Subset only
-    pass2_forward_ms: float = 0.0  # Subset only
-    pass2_backward_ms: float = 0.0  # Subset only
+    selection_decision_ms: float = 0.0  # GlobalSubset only
+    pass2_forward_ms: float = 0.0  # GlobalSubset only
+    pass2_backward_ms: float = 0.0  # GlobalSubset only
     optimizer_step_ms: float = 0.0
 
     # Decomposed components (ms)
@@ -815,7 +815,7 @@ class BreakdownResult:
     total_step_ms: float = 0.0
     peak_memory_gb: float = 0.0
 
-    # Instrumented backward components (directly measured, Layerwise only)
+    # Instrumented backward components (directly measured, LayerWiseSubset only)
     bwd_compress_ms: float = 0.0
     bwd_score_ms: float = 0.0
     bwd_select_ms: float = 0.0

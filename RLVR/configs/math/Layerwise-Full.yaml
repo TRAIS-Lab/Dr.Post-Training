@@ -1,8 +1,0 @@
-# Layerwise data curation with full parameter fine-tuning
-# Per-layer, per-mini-batch negative filtering during GRPO training
-method: Layerwise
-finetuning: Full
-
-# Curation: drop all negative-influence samples per layer
-selection_frac: 1.0
-val_loss_type: reward
