@@ -43,9 +43,9 @@ MODEL_DEFS = {
         "name": "Qwen/Qwen3-1.7B",
         "h": 2048, "i": 6144, "L": 28, "heads": 16, "kv": 8, "hd": 128,
     },
-    "llama-3.2-3b": {
-        "name": "meta-llama/Llama-3.2-3B",
-        "h": 3072, "i": 8192, "L": 28, "heads": 24, "kv": 8, "hd": 128,
+    "qwen3-4b": {
+        "name": "Qwen/Qwen3-4B",
+        "h": 2560, "i": 9728, "L": 36, "heads": 32, "kv": 8, "hd": 128,
     },
 }
 

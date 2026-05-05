@@ -8,7 +8,7 @@ Per-component runtime analysis for **Standard**, **LayerWiseSubset**, **GlobalSu
 |-------|--------|-------------|--------|--------|
 | Qwen3-0.6B | 1024 | 3072 | 28 | 0.6B |
 | Qwen3-1.7B | 2048 | 6144 | 28 | 1.7B |
-| Llama-3.2-3B | 3072 | 8192 | 28 | 3.2B |
+| Qwen3-4B | 2560 | 9728 | 36 | 4.0B |
 
 ## Benchmarks
 
@@ -54,7 +54,7 @@ Results: `results/scoring/`
 |-------|------------|
 | Qwen3-0.6B | 1.4 |
 | Qwen3-1.7B | 2.5 |
-| Llama-3.2-3B | 3.6 |
+| Qwen3-4B | 3.4 |
 
 **reduced_ghost vs direct** — crossover at `T* = Σ(O·I) / Σ(√(O·I))`:
 
@@ -62,7 +62,7 @@ Results: `results/scoring/`
 |-------|-----|
 | Qwen3-0.6B | 1532 |
 | Qwen3-1.7B | 2854 |
-| Llama-3.2-3B | 4069 |
+| Qwen3-4B | 4088 |
 
 ## Quick Start
 

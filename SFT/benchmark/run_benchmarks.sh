@@ -9,7 +9,7 @@
 #   2. Scoring: Standalone scoring comparison with synthetic tensors.
 #      Shows regime-dependent optimal scoring method.
 #
-# Models: Qwen3-0.6B, Qwen3-1.7B, Llama-3.2-3B
+# Models: Qwen3-0.6B, Qwen3-1.7B, Qwen3-4B
 # Configs: Same (n, T, m) across all models for fair comparison.
 #   Config A: n=8  T=512  m=1
 #   Config B: n=2  T=1024 m=1
@@ -63,7 +63,7 @@ run_breakdown() {
     echo "  Benchmark 1: Breakdown (3 models x 2 configs x 13 combos)"
     run_model 0 "Qwen/Qwen3-0.6B"         "qwen3-0.6b"    "8,512,1" "2,1024,1" &
     run_model 1 "Qwen/Qwen3-1.7B"         "qwen3-1.7b"    "8,512,1" "2,1024,1" &
-    run_model 2 "meta-llama/Llama-3.2-3B"  "llama-3.2-3b"  "8,512,1" "2,1024,1" &
+    run_model 2 "Qwen/Qwen3-4B"            "qwen3-4b"      "8,512,1" "2,1024,1" &
     wait
 
     echo "  Generating tables..."
@@ -103,7 +103,7 @@ run_breakdown_checkpointing() {
     echo "  Benchmark 1c: Breakdown with Gradient Checkpointing (3 models x 2 configs x 13 combos)"
     run_model 1 "Qwen/Qwen3-0.6B"         "qwen3-0.6b"    "8,512,1" "2,1024,1" &
     run_model 2 "Qwen/Qwen3-1.7B"         "qwen3-1.7b"    "8,512,1" "2,1024,1" &
-    run_model 3 "meta-llama/Llama-3.2-3B"  "llama-3.2-3b"  "8,512,1" "2,1024,1" &
+    run_model 3 "Qwen/Qwen3-4B"            "qwen3-4b"      "8,512,1" "2,1024,1" &
     wait
 }
 
@@ -123,8 +123,8 @@ run_scoring() {
         --output "$RESULTS/scoring_qwen3-1.7b.json" &
 
     $PYTHON SFT/benchmark/benchmark_scoring.py \
-        --gpu 2 --model-tag llama-3.2-3b \
-        --output "$RESULTS/scoring_llama-3.2-3b.json" &
+        --gpu 2 --model-tag qwen3-4b \
+        --output "$RESULTS/scoring_qwen3-4b.json" &
     wait
 }
 

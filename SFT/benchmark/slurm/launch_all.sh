@@ -143,7 +143,7 @@ print(f\"{tag} complete.\", flush=True)
 
 run_model 0 'Qwen/Qwen3-0.6B'        'qwen3-0.6b'   '$REPO_ROOT/$CONFIGS_DIR/qwen3-0.6b.json'   &
 run_model 1 'Qwen/Qwen3-1.7B'        'qwen3-1.7b'    '$REPO_ROOT/$CONFIGS_DIR/qwen3-1.7b.json'   &
-run_model 2 'meta-llama/Llama-3.2-3B' 'llama-3.2-3b'  '$REPO_ROOT/$CONFIGS_DIR/llama-3.2-3b.json' &
+run_model 2 'Qwen/Qwen3-4B'           'qwen3-4b'     '$REPO_ROOT/$CONFIGS_DIR/qwen3-4b.json'     &
 wait
 echo '$suffix complete.'
 "
@@ -167,8 +167,8 @@ python3 SFT/benchmark/benchmark_scoring.py \
     --output $results_dir/scoring_qwen3-1.7b.json &
 
 python3 SFT/benchmark/benchmark_scoring.py \
-    --gpu 2 --model-tag llama-3.2-3b \
-    --output $results_dir/scoring_llama-3.2-3b.json &
+    --gpu 2 --model-tag qwen3-4b \
+    --output $results_dir/scoring_qwen3-4b.json &
 
 wait
 echo 'Scoring complete.'
