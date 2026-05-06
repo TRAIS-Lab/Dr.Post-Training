@@ -472,6 +472,9 @@ def main():
     avg_train_seq_length = get_data_statistics(train_dataset, return_avg_length=True)
     val_seq_length_threshold = int(avg_train_seq_length * DEFAULT_SEQ_LENGTH_MULTIPLIER)
 
+    # Pass seed so the val/eval splits are shuffled per-run (see load_unified_jsonl).
+    # Without seed= the loaders return the first k examples in file order, which makes
+    # the val set deterministic across seeds and undermines the point of multi-seed runs.
     val_dataset = get_dataset(
         task=training_args.analysis_dataset,
         data_dir=data_args.data_dir,
@@ -479,7 +482,7 @@ def main():
         max_length=data_args.max_seq_length,
         split="validation",
         k=training_args.n_val,
-        subject=training_args.subject,
+        seed=training_args.data_seed if training_args.data_seed is not None else training_args.seed,
         max_seq_length_threshold=val_seq_length_threshold,
     )
 
@@ -490,7 +493,7 @@ def main():
         max_length=data_args.max_seq_length,
         split="test",
         k=training_args.n_eval,
-        subject=training_args.subject,
+        seed=training_args.data_seed if training_args.data_seed is not None else training_args.seed,
     )
 
     # Set up gradient hook for scoring (no compressors = exact scoring)

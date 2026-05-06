@@ -5,7 +5,7 @@ model: meta-llama/Llama-3.2-1B
 train_dataset: triviaqa
 target_task: nq_open
 # TriviaQA train pool size = 138384. pct=0.064 ≈ 8857 samples; with bs=8 1 epoch → ~1107 main steps (matches nq_triviaqa @ 1100)
-percentage: 0.064
+percentage: 0.05
 
 seed: 42
 batch_size: 8

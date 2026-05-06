@@ -1,10 +1,7 @@
 """
-SQuAD closed-book evaluation (no context): model is given the question only,
-must produce the answer string. Metric: EM and F1 against the answers.text list
-(typically 1-3 clean gold strings per question).
-
-NOTE: SQuAD questions are usually context-dependent — closed-book performance
-will be low compared to the open-book setting.
+TriviaQA closed-book evaluation: model is given a question, must produce an
+answer string. Metric: EM and F1 against the alias list (best-alias scoring),
+identical to the nq_open task.
 """
 
 import json
@@ -17,9 +14,9 @@ from ..utils import generate_completions, get_eos_token_ids
 
 
 def load_test(data_dir: str, k: int = -1) -> List[Dict]:
-    f = os.path.join(data_dir, "eval", "squad", "squad_test_data.jsonl")
+    f = os.path.join(data_dir, "eval", "triviaqa", "triviaqa_test_data.jsonl")
     if not os.path.exists(f):
-        raise FileNotFoundError(f"SQuAD test data not found: {f}")
+        raise FileNotFoundError(f"TriviaQA test data not found: {f}")
     out = []
     with open(f) as fp:
         for line in fp:
@@ -36,7 +33,7 @@ def compute_accuracy(args, model, tokenizer, batch_size: int = 4, max_new_tokens
         n_test = 100000
 
     test = load_test(data_dir, k=n_test)
-    print(f"Loaded {len(test)} SQuAD (closed-book) test examples")
+    print(f"Loaded {len(test)} TriviaQA test examples")
 
     prompts = [render_chat(tokenizer, r['messages'][0]['content']) for r in test]
     print("Generating answers...")
@@ -51,9 +48,7 @@ def compute_accuracy(args, model, tokenizer, batch_size: int = 4, max_new_tokens
         disable_tqdm=False,
     )
 
-    em_total = 0.0
-    f1_total = 0.0
-    n = 0
+    em_total, f1_total, n = 0.0, 0.0, 0
     for r, g in zip(test, gens):
         out = g.strip()
         for stop in ["<|im_end|>", "<|im_start|>", "\n"]:
@@ -70,7 +65,7 @@ def compute_accuracy(args, model, tokenizer, batch_size: int = 4, max_new_tokens
 
     em_mean = em_total / n if n else 0.0
     f1_mean = f1_total / n if n else 0.0
-    print(f"\nSQuAD (closed-book) Results:")
+    print(f"\nTriviaQA Results:")
     print(f"  EM: {em_mean*100:.2f}  F1: {f1_mean*100:.2f}  n={n}")
     return {
         "f1_score": f1_mean * 100.0,

@@ -1,9 +1,9 @@
 # LayerWiseSubset data curation with LoRA fine-tuning
 method: LayerWiseSubset
 finetuning: LoRA
-learning_rate: 5.00e-04
-lora_r: 32
-lora_alpha: 1
+learning_rate: 1.00e-04
+lora_r: 8
+lora_alpha: 16
 lora_dropout: 0.1
 
 scoring:

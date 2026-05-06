@@ -23,7 +23,7 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           DataCollatorForSeq2Seq, HfArgumentParser, set_seed)
 
 from SFT.data.get_train_dataset import get_training_dataset
-from SFT.data.get_val_dataset import get_dataset, DEFAULT_SEQ_LENGTH_MULTIPLIER
+from SFT.data.get_val_dataset import get_dataset, ensure_chat_template, DEFAULT_SEQ_LENGTH_MULTIPLIER
 
 from drpt import (
     GradientHook,
@@ -129,6 +129,7 @@ def main():
     set_seed(training_args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+    ensure_chat_template(tokenizer)
 
     # Load training dataset
     train_dataset = get_training_dataset(
@@ -171,13 +172,16 @@ def main():
 
     # Apply LoRA using standard PEFT (no custom layers!)
     if not isinstance(model, PeftModel) and model_args.lora:
+        target_modules = model_args.lora_target_modules
+        if isinstance(target_modules, list) and target_modules == ["all-linear"]:
+            target_modules = "all-linear"
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
             r=model_args.lora_r,
             lora_alpha=model_args.lora_alpha,
             lora_dropout=model_args.lora_dropout,
-            target_modules=model_args.lora_target_modules,
+            target_modules=target_modules,
         )
 
         model = get_peft_model(model, lora_config)

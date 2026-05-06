@@ -148,14 +148,20 @@ def load_raw_dataset(train_files: Union[List[str], str], sample_size=None, sampl
     return sampled_dataset
 
 
-def encode_data(raw_datasets, tokenizer, max_seq_length, processing_num_workers=10, overwrite_cache=False, func_name="encode_with_messages_format"):
-    """ encode data with the specified tokenizer and the chat format. """
-    # if already encoded, return
+def encode_data(raw_datasets, tokenizer, max_seq_length, processing_num_workers=10, overwrite_cache=False):
+    """Encode messages-format examples with the tokenizer's native chat template."""
     if "input_ids" in raw_datasets.features:
         return raw_datasets
-    encode_function = get_encode_function(
-        raw_datasets, tokenizer, max_seq_length, func_name)
-    # To speed up this part, we use multiprocessing.
+    if "messages" not in raw_datasets.column_names:
+        raise ValueError(
+            "Training data must have a 'messages' column. Got columns: "
+            f"{raw_datasets.column_names}"
+        )
+    encode_function = partial(
+        encode_with_messages_format,
+        tokenizer=tokenizer,
+        max_seq_length=max_seq_length,
+    )
     lm_datasets = raw_datasets.map(
         encode_function,
         batched=False,
@@ -167,187 +173,78 @@ def encode_data(raw_datasets, tokenizer, max_seq_length, processing_num_workers=
     return lm_datasets
 
 
-def get_encode_function(raw_datasets, tokenizer, max_seq_length, func="encode_with_messages_format"):
-    """ get encode function based on the dataset. """
-    if "prompt" in raw_datasets.column_names and "completion" in raw_datasets.column_names:
-        encode_function = partial(
-            encode_with_prompt_completion_format,
-            tokenizer=tokenizer,
-            max_seq_length=max_seq_length,
-        )
-    elif "messages" in raw_datasets.column_names:
-        if func == "encode_with_messages_format":
-            encode_func = encode_with_messages_format
-        else:
-            encode_func = encode_with_messages_format_with_llama2_chat
-        encode_function = partial(
-            encode_func,
-            tokenizer=tokenizer,
-            max_seq_length=max_seq_length,
-        )
-    else:
-        raise ValueError(
-            "You need to have either 'prompt'&'completion' or 'messages' in your column names.")
-    return encode_function
-
-
-def encode_with_prompt_completion_format(example, tokenizer, max_seq_length):
-    '''
-    Original implementation of the function: https://github.com/allenai/open-instruct/blob/9ebcb582cfc243a6dab75b4302fa432784db26c2/open_instruct/finetune.py#L238
-
-    Here we assume each example has 'prompt' and 'completion' fields.
-    We concatenate prompt and completion and tokenize them together because otherwise prompt will be padded/truncated
-    and it doesn't make sense to follow directly with the completion.
-    '''
-    # if prompt doesn't end with space and completion doesn't start with space, add space
-    if not example['prompt'].endswith((' ', '\n', '\t')) and not example['completion'].startswith((' ', '\n', '\t')):
-        example_text = example['prompt'] + ' ' + example['completion']
-    else:
-        example_text = example['prompt'] + example['completion']
-    example_text = example_text + tokenizer.eos_token
-    tokenized_example = tokenizer(
-        example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
-    input_ids = tokenized_example.input_ids
-    labels = input_ids.clone()
-    tokenized_prompt = tokenizer(
-        example['prompt'], return_tensors='pt', max_length=max_seq_length, truncation=True)
-    # mask the prompt part for avoiding loss
-    labels[:, :tokenized_prompt.input_ids.shape[1]] = -100
-    attention_mask = torch.ones_like(input_ids)
-    return {
-        'input_ids': input_ids.flatten(),
-        'labels': labels.flatten(),
-        'attention_mask': attention_mask.flatten(),
-    }
-
-
 def encode_with_messages_format(example, tokenizer, max_seq_length):
-    '''
-    Original implementation of the function: https://github.com/allenai/open-instruct/blob/9ebcb582cfc243a6dab75b4302fa432784db26c2/open_instruct/finetune.py#L264C1-L322C1
+    '''Render `example['messages']` with the tokenizer's chat template and
+    produce labels that supervise only each assistant *answer* span.
 
-    Here we assume each example has a 'messages' field Each message is a dict with 'role' and 'content' fields.
-    We concatenate all messages with the roles as delimiters and tokenize them together.
+    Template-agnostic: works for any tokenizer whose `apply_chat_template`
+    is prefix-stable — i.e. partial-prefix renders are byte-prefixes of the
+    full render. This holds for Llama (open-instruct/Tulu fallback, Llama-Instruct)
+    and for Qwen3 single-turn data. For Qwen3 multi-turn the auto-injected
+    empty `<think></think>` block on the last assistant means the partial render
+    of an *intermediate* assistant turn won't be a strict prefix; this isn't
+    a concern for the active settings (alpaca/samsum is single-turn) but
+    re-evaluate when re-enabling tulu3 / oasst1.
+
+    For each assistant message, the label-bearing span is
+    `[len(prefix_to_assistant), len(prefix_through_assistant))` where:
+
+      prefix_to_assistant       = render(messages[:i], add_generation_prompt=True)
+      prefix_through_assistant  = render(messages[:i+1], add_generation_prompt=False)
+
+    Token positions are recovered by re-encoding each prefix with
+    `add_special_tokens=False` (same setting `apply_chat_template(tokenize=True)`
+    uses internally, so the encodings agree at boundary positions).
     '''
+    from SFT.data.get_val_dataset import ensure_chat_template
+    ensure_chat_template(tokenizer)
+
     messages = example['messages']
     if len(messages) == 0:
         raise ValueError('messages field is empty.')
 
-    example_text = concat_messages(messages, tokenizer)
-    tokenized_example = tokenizer(
-        example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
-    input_ids = tokenized_example.input_ids
-    labels = input_ids.clone()
+    full_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+    full_ids = tokenizer.encode(
+        full_text, add_special_tokens=False, max_length=max_seq_length, truncation=True
+    )
+    input_ids = torch.tensor(full_ids, dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
 
-    # mask the non-assistant part for avoiding loss
     for message_idx, message in enumerate(messages):
         if message["role"] != "assistant":
-            if message_idx == 0:
-                message_start_idx = 0
-            else:
-                message_start_idx = tokenizer(
-                    concat_messages(messages[:message_idx], tokenizer), return_tensors='pt', max_length=max_seq_length, truncation=True
-                ).input_ids.shape[1]
-            if message_idx < len(messages) - 1 and messages[message_idx+1]["role"] == "assistant":
-                # here we also ignore the role of the assistant
-                messages_so_far = concat_messages(
-                    messages[:message_idx+1], tokenizer) + "<|assistant|>\n"
-            else:
-                messages_so_far = concat_messages(
-                    messages[:message_idx+1], tokenizer)
-            message_end_idx = tokenizer(
-                messages_so_far,
-                return_tensors='pt',
-                max_length=max_seq_length,
-                truncation=True
-            ).input_ids.shape[1]
-            labels[:, message_start_idx:message_end_idx] = -100
+            continue
 
-            if message_end_idx >= max_seq_length:
-                break
+        prefix_to_text = tokenizer.apply_chat_template(
+            messages[:message_idx], tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        prefix_through_text = tokenizer.apply_chat_template(
+            messages[:message_idx + 1], tokenize=False, add_generation_prompt=False,
+        )
+        if not full_text.startswith(prefix_through_text):
+            # Multi-turn Qwen edge case (see docstring). Skip this turn rather
+            # than risk mislabeled positions.
+            continue
+
+        start_len = min(
+            len(tokenizer.encode(prefix_to_text, add_special_tokens=False)),
+            len(input_ids),
+        )
+        end_len = min(
+            len(tokenizer.encode(prefix_through_text, add_special_tokens=False)),
+            len(input_ids),
+        )
+
+        if start_len < end_len:
+            labels[start_len:end_len] = input_ids[start_len:end_len]
+        if end_len >= len(input_ids):
+            break
 
     attention_mask = torch.ones_like(input_ids)
     return {
-        'input_ids': input_ids.flatten(),
-        'labels': labels.flatten(),
-        'attention_mask': attention_mask.flatten(),
-    }
-
-
-def concat_messages(messages, tokenizer):
-    message_text = ""
-    for message in messages:
-        if message["role"] == "system":
-            message_text += "<|system|>\n" + message["content"].strip() + "\n"
-        elif message["role"] == "user":
-            message_text += "<|user|>\n" + message["content"].strip() + "\n"
-        elif message["role"] == "assistant":
-            message_text += "<|assistant|>\n" + \
-                message["content"].strip() + tokenizer.eos_token + "\n"
-        else:
-            raise ValueError("Invalid role: {}".format(message["role"]))
-    return message_text
-
-
-def encode_with_messages_format_with_llama2_chat(example, tokenizer, max_seq_length):
-    '''
-    Here we assume each example has a 'messages' field Each message is a dict with 'role' and 'content' fields.
-    We concatenate all messages with the roles as delimiters and tokenize them together.
-    '''
-    messages = example['messages']
-    if len(messages) == 0:
-        raise ValueError('messages field is empty.')
-
-    def _concat_messages(messages, ):
-        B_INST, E_INST = "[INST]", "[/INST]"
-        bos = "<s>"
-        eos = "</s>"
-        formatted_text = ""
-        for message in messages:
-            if message["role"] == "user":
-                formatted_text += bos + \
-                    f"{B_INST} {(message['content']).strip()} {E_INST}"
-            elif message["role"] == "assistant":
-                formatted_text += f" {(message['content'])} " + eos
-            else:
-                raise ValueError(
-                    "Llama2 chat template only supports 'system', 'user' and 'assistant' roles. Invalid role: {}.".format(
-                        message["role"])
-                )
-        formatted_text = formatted_text[len(bos):]
-        return formatted_text
-
-    example_text = _concat_messages(messages).strip()
-    print(example_text)
-    tokenized_example = tokenizer(
-        example_text, return_tensors='pt', max_length=max_seq_length, truncation=True)
-    input_ids = tokenized_example.input_ids
-    labels = input_ids.clone()
-
-    # mask the non-assistant part for avoiding loss
-    for message_idx, message in enumerate(messages):
-        if message["role"] != "assistant":
-            if message_idx == 0:
-                message_start_idx = 0
-            else:
-                message_start_idx = tokenizer(
-                    _concat_messages(messages[:message_idx]), return_tensors='pt', max_length=max_seq_length, truncation=True
-                ).input_ids.shape[1]
-            if messages[message_idx+1]["role"] == "assistant":
-                messages_so_far = _concat_messages(messages[:message_idx+1])
-            message_end_idx = tokenizer(
-                messages_so_far,
-                return_tensors='pt',
-                max_length=max_seq_length,
-                truncation=True
-            ).input_ids.shape[1]
-            labels[:, message_start_idx:message_end_idx] = -100
-
-            if message_end_idx >= max_seq_length:
-                break
-
-    attention_mask = torch.ones_like(input_ids)
-    return {
-        'input_ids': input_ids.flatten(),
-        'labels': labels.flatten(),
-        'attention_mask': attention_mask.flatten(),
+        'input_ids': input_ids,
+        'labels': labels,
+        'attention_mask': attention_mask,
     }

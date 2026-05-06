@@ -15,24 +15,26 @@ export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 # Case study: Standard training with dual LayerWiseSubset + GlobalSubset scoring
 # =============================================================================
 
-# Defaults
+# Defaults — match `less_tydiqa` from the main 4-setting matrix.
+# Override via CLI to run any of the other 3 settings, or use --sweep
+# to run all 4 settings × 5 seeds.
 model="meta-llama/Llama-3.2-1B"
-data_dir="$SCRATCH_DIR/Gradient-Streaming/SFT/data"
+data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
 task="tydiqa"
-train_dataset="tulu3"
-subject="sociology"
-percentage=0.01
+train_dataset="less"
+percentage=0.005
 seed=42
 batch_size=8
 n_val=16
 n_eval=500
-lr="4.96e-05"  # FullTraining-Full LR for tulu3_tydiqa
+lr="1e-05"  # FullTraining-Full LR (matches main experiment)
 selection_frac="0.5"
 val_batch_size="1"
 val_strategy="separate_batch_factorized"
 record_freq=1
 max_steps=-1  # -1 = full epoch
 dry_run=false
+sweep=false
 
 # Parse CLI arguments
 while [[ $# -gt 0 ]]; do
@@ -40,7 +42,6 @@ while [[ $# -gt 0 ]]; do
         --model)          model="$2"; shift 2 ;;
         --task)           task="$2"; shift 2 ;;
         --train)          train_dataset="$2"; shift 2 ;;
-        --subject)        subject="$2"; shift 2 ;;
         --batch_size)     batch_size="$2"; shift 2 ;;
         --percentage)     percentage="$2"; shift 2 ;;
         --lr)             lr="$2"; shift 2 ;;
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --val_batch_size) val_batch_size="$2"; shift 2 ;;
         --record_freq)    record_freq="$2"; shift 2 ;;
         --max_steps)      max_steps="$2"; shift 2 ;;
+        --sweep)          sweep=true; shift ;;
         --dry-run)        dry_run=true; shift ;;
         *)
             echo "Unknown argument: $1"
@@ -59,13 +61,46 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# --sweep: run all 4 settings × 5 seeds (matches main 4-setting matrix).
+# Re-invokes this script per (setting, seed) so each run gets its own
+# JOB_NAME / output_dir.
+if [[ "$sweep" == "true" ]]; then
+    SETTINGS=(
+        # train:task:percentage
+        "alpaca:samsum:0.4"
+        "less:tydiqa:0.005"
+        "triviaqa:nq_open:0.05"
+        "less:squad:0.005"
+    )
+    SEEDS=(2 22 42 62 82)
+    SCRIPT="$(realpath "${BASH_SOURCE[0]}")"
+    dry_flag=""
+    [[ "$dry_run" == "true" ]] && dry_flag="--dry-run"
+
+    for entry in "${SETTINGS[@]}"; do
+        IFS=':' read -r tr tk pct <<< "$entry"
+        for s in "${SEEDS[@]}"; do
+            echo ""
+            echo "############################################################"
+            echo "  Sweep: ${tr} → ${tk} (p=${pct}) seed=${s}"
+            echo "############################################################"
+            bash "$SCRIPT" --train "$tr" --task "$tk" --percentage "$pct" \
+                --seed "$s" --lr "$lr" $dry_flag
+        done
+    done
+    exit 0
+fi
+
 model_name=$(basename "$model")
 DATA_SEED=$((seed + 1))
 ID=$RANDOM
 PORT=$((29400 + RANDOM % 10000))
 
-JOB_NAME="case_study_${train_dataset}_${task}-${model_name}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
-output_dir=$SCRATCH_DIR/Dr.Post-Training/SFT/${JOB_NAME}
+# Case-study dirs live under runs/case_study/ (sibling of main + target-only dirs).
+# Inner dir name has no "case_study_" prefix since the parent dir already encodes that,
+# and we don't want collision with main runs (which share the same {train}_{task}-... prefix).
+JOB_NAME="${train_dataset}_${task}-${model_name}-p${percentage}-lr${lr}-b${batch_size}-v${n_val}-s${seed}"
+output_dir=$SCRATCH_DIR/Dr.Post-Training/SFT/runs/case_study/${JOB_NAME}
 mkdir -p "$output_dir"
 
 echo ""
@@ -108,7 +143,6 @@ training_args="--do_train=True \
 --data_seed $DATA_SEED \
 --per_device_train_batch_size $batch_size \
 --method NA \
---subject $subject \
 --n_val $n_val \
 --n_eval $n_eval \
 --analysis_dataset $task \

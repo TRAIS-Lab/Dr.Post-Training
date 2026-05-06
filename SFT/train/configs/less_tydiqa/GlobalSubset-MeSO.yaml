@@ -1,7 +1,7 @@
 # GlobalSubset data curation with MeSO optimizer
 method: GlobalSubset
 finetuning: MeSO
-learning_rate: 2.00e-05
+learning_rate: 1.00e-05
 subset_mode: one_pass
 scoring:
   method: reduced_ghost

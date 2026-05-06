@@ -1,15 +1,45 @@
 import json
 import os
+import unicodedata
+from collections import Counter, defaultdict
 from typing import Dict, List, Tuple
 
-import evaluate
-metric = evaluate.load("squad")
+from SFT.data.get_val_dataset import load_unified_jsonl, render_chat
+from ..utils import generate_completions, get_eos_token_ids
 
-from SFT.data.get_val_dataset import load_unified_jsonl
-from ..utils import generate_completions
 
-# llama-chat model's instruction format
-B_INST, E_INST = "[INST]", "[/INST]"
+# TyDiQA-style scoring (replaces evaluate.load("squad")):
+# - Lowercase (Unicode-aware) and strip Unicode punctuation (any category P*)
+# - Whitespace-tokenize (matches the official TyDiQA-GoldP convention)
+# - Do NOT strip English articles a/an/the — that bias is harmful for the 8
+#   non-English TyDiQA languages (arabic, bengali, finnish, indonesian, korean,
+#   russian, swahili, telugu) and was the main concern with the prior SQuAD scorer.
+def _normalize_answer(s: str) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = "".join(ch for ch in s if not unicodedata.category(ch).startswith("P"))
+    return " ".join(s.split())
+
+
+def _get_tokens(s: str) -> List[str]:
+    return _normalize_answer(s).split() if s else []
+
+
+def _f1(prediction: str, ground_truth: str) -> float:
+    pt, gt = _get_tokens(prediction), _get_tokens(ground_truth)
+    if not pt or not gt:
+        return float(pt == gt)
+    common = Counter(pt) & Counter(gt)
+    n = sum(common.values())
+    if n == 0:
+        return 0.0
+    p, r = n / len(pt), n / len(gt)
+    return 2 * p * r / (p + r)
+
+
+def _em(prediction: str, ground_truth: str) -> float:
+    return float(_normalize_answer(prediction) == _normalize_answer(ground_truth))
 
 # Language-specific templates for TyDiQA
 # Same template as https://github.com/allenai/open-instruct/blob/main/eval/tydiqa/run_eval.py#L17
@@ -58,29 +88,18 @@ def format_oneshot_prompt(example: Dict, language: str) -> str:
 
 
 def get_tydiqa_dataset_df(
+        tokenizer,
         data_dir: str,
         split: str = "test",
-        use_chat_format: bool = True,
-        chat_format: str = "tulu",
         k: int = 100,
         oneshot_examples: Dict = None
     ) -> List[Tuple[str, str, str]]:
-    """
-    Get TyDiQA dataset as a list of tuples for evaluation.
+    """Get TyDiQA dataset as a list of (prompt, answer, language) tuples.
 
-    This function returns data in the format expected by the TyDiQA evaluation:
-    - List of (formatted_prompt, answer, language) tuples
-
-    Args:
-        data_dir: The main data directory.
-        split: Which split to load ("validation", "test", or "lr").
-        use_chat_format: Whether to format prompts with chat template.
-        chat_format: The chat format to use ("tulu" or "llama2").
-        k: Number of examples to load.
-        oneshot_examples: Dictionary of one-shot examples by language.
-
-    Returns:
-        List of (formatted_prompt, answer, language) tuples
+    Prompts are rendered with the tokenizer's native chat template; if a
+    one-shot example is available for the question's language, it is
+    prepended to the user content (so it sits inside the user turn, before
+    the question being asked).
     """
     examples = load_unified_jsonl(data_dir, "tydiqa", split, k)
 
@@ -94,28 +113,17 @@ def get_tydiqa_dataset_df(
         answer = messages[1]['content']
         language = example.get('metadata', {}).get('language', 'unknown')
 
-        # Build prompt with one-shot example if available
         if oneshot_examples:
-            # Get one-shot example for this language, fallback to English
             lang_examples = oneshot_examples.get(language) or oneshot_examples.get("english", [])
             if lang_examples:
                 oneshot_prompt = format_oneshot_prompt(lang_examples[0], language)
-                # Prepend one-shot example to the user content
                 full_content = oneshot_prompt + user_content
             else:
                 full_content = user_content
         else:
             full_content = user_content
 
-        # Format the prompt with chat template
-        if use_chat_format:
-            if chat_format == "tulu":
-                prompt = f"<|user|>\n{full_content}\n<|assistant|>\n"
-            else:
-                prompt = f"<s> {B_INST} {full_content} {E_INST} "
-        else:
-            prompt = f"{full_content}\nAnswer: "
-
+        prompt = render_chat(tokenizer, full_content)
         results.append((prompt, answer, language))
 
     return results
@@ -145,75 +153,84 @@ def compute_accuracy(args, model, tokenizer):
     else:
         print("Warning: No one-shot examples found, using 0-shot evaluation")
 
-    # Load test dataset with one-shot prompting
-    # Note: get_tydiqa_dataset_df returns list of tuples: (formatted_prompt, answer, lang)
-    # where formatted_prompt already contains the full prompt with context and question
     test_dataset = get_tydiqa_dataset_df(
+        tokenizer=tokenizer,
         data_dir=data_dir,
         split="test",
-        use_chat_format=True,  # This controls the format returned by get_tydiqa_dataset_df
-        chat_format="tulu",
         k=n_test,
         oneshot_examples=oneshot_examples
     )
 
     print(f'Loaded {len(test_dataset)} test examples (1-shot evaluation)')
 
-    # Extract prompts from the dataset (they're already formatted)
     prompts = [prompt for prompt, answer, lang in test_dataset]
 
-    # Generate completions
     print("Generating completions...")
     generations = generate_completions(
         model,
         tokenizer,
         prompts,
         batch_size=1,
-        max_new_tokens=50
+        max_new_tokens=50,
+        eos_token_id=get_eos_token_ids(tokenizer),
     )
 
-    # Clean outputs
-    outputs = [g.strip().replace("\n", "") for g in generations]
+    # 2K-char cap is well above any legitimate TyDiQA short-form answer and
+    # avoids feeding pathological generations into the scorer.
+    MAX_PRED_CHARS = 2048
+    outputs = [g.strip().replace("\n", "")[:MAX_PRED_CHARS] for g in generations]
 
-    # Compute F1 and exact match scores
-    total_f1, total_em, valid_count = 0, 0, 0
-    for i, (prompt, answer, lang) in enumerate(test_dataset):
-        # Clean up the output by removing any special tokens
-        if "<|user|>" in outputs[i]:
-            index = outputs[i].find("<|user|>")
-            output = outputs[i][:index]
-        else:
-            output = outputs[i]
+    by_lang: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: {"f1": [], "em": []})
 
-        try:
-            # Strip whitespace from both answer and output for fair comparison
-            clean_answer = answer.strip()
-            clean_output = output.strip()
-            lang_predictions = [{"id": str(i), "prediction_text": clean_output}]
-            # SQuAD metric expects answers in format: {'text': [list], 'answer_start': [list]}
-            lang_references = [{"id": str(i), "answers": {"text": [clean_answer], "answer_start": [0]}}]
-            res = metric.compute(predictions=lang_predictions, references=lang_references)
-            if isinstance(res["f1"], float):
-                total_f1 += res["f1"]
-                total_em += res["exact_match"]
-                valid_count += 1
-        except Exception as e:
-            # Skip examples where computation fails
-            continue
+    for i, (_, answer, lang) in enumerate(test_dataset):
+        output = outputs[i]
+        for stop in ("<|im_end|>", "<|im_start|>"):
+            if stop in output:
+                output = output[:output.find(stop)]
 
-    if valid_count == 0:
+        clean_answer = answer.strip()[:MAX_PRED_CHARS]
+        clean_output = output.strip()[:MAX_PRED_CHARS]
+
+        by_lang[lang]["f1"].append(_f1(clean_output, clean_answer) * 100.0)
+        by_lang[lang]["em"].append(_em(clean_output, clean_answer) * 100.0)
+
+    if not by_lang:
         print("Warning: No valid scores computed")
         return {"f1_score": 0.0, "exact_match": 0.0, "n_test": len(test_dataset)}
 
-    avg_f1 = total_f1 / valid_count
-    avg_em = total_em / valid_count
-    print(f"\nTyDiQA Results:")
-    print(f"  F1 Score: {avg_f1:.4f}")
-    print(f"  Exact Match: {avg_em:.4f}")
-    print(f"  Examples evaluated: {valid_count}/{len(test_dataset)}")
+    per_language = {
+        lang: {
+            "f1": float(sum(d["f1"]) / len(d["f1"])),
+            "em": float(sum(d["em"]) / len(d["em"])),
+            "n":  len(d["f1"]),
+        }
+        for lang, d in by_lang.items()
+    }
+    macro_f1 = sum(p["f1"] for p in per_language.values()) / len(per_language)
+    macro_em = sum(p["em"] for p in per_language.values()) / len(per_language)
+    all_f1 = [v for d in by_lang.values() for v in d["f1"]]
+    all_em = [v for d in by_lang.values() for v in d["em"]]
+    micro_f1 = sum(all_f1) / len(all_f1)
+    micro_em = sum(all_em) / len(all_em)
 
+    print(f"\nTyDiQA Results (TyDiQA-style scoring, {len(per_language)} languages):")
+    print(f"  Macro F1 (avg across languages): {macro_f1:.4f}")
+    print(f"  Macro EM (avg across languages): {macro_em:.4f}")
+    print(f"  Micro F1 (avg across examples):  {micro_f1:.4f}")
+    print(f"  Micro EM (avg across examples):  {micro_em:.4f}")
+    print(f"  Examples evaluated: {len(all_f1)}/{len(test_dataset)}")
+    print(f"  Per-language:")
+    for lang in sorted(per_language):
+        p = per_language[lang]
+        print(f"    {lang:12s} n={p['n']:3d}  F1={p['f1']:6.2f}  EM={p['em']:6.2f}")
+
+    # Keep f1_score / exact_match as micro-avg for backward compatibility with
+    # existing notebooks; expose macro and per-language as additional fields.
     return {
-        "f1_score": avg_f1,
-        "exact_match": avg_em,
-        "n_test": len(test_dataset)
+        "f1_score": micro_f1,
+        "exact_match": micro_em,
+        "f1_macro": macro_f1,
+        "exact_match_macro": macro_em,
+        "per_language": per_language,
+        "n_test": len(test_dataset),
     }

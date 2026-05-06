@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -63,6 +64,8 @@ def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None):
             tokenizer_path = adapter_config.get("base_model_name_or_path", model_path)
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    from SFT.data.get_val_dataset import ensure_chat_template
+    ensure_chat_template(tokenizer)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -115,61 +118,64 @@ def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None):
     return model, tokenizer
 
 
+# Output dir naming convention:
+#   main:         {train}_{task}-{model}-{curation}-{finetuning}-p{pct}-lr{lr}-b{bs}-v{nv}-s{seed}
+#   target-only:  {task}_val_{task}-{model}-{curation}-{finetuning}-ms{steps}-lr{lr}-b{bs}-v{nv}-s{seed}
+# Both {model} (e.g. "Llama-3.2-1B") and {curation}-{finetuning} (e.g. "FullTraining-LoRA")
+# contain hyphens, so positional split-on-"-" parsing is wrong. Anchor on the
+# fixed suffix tokens (-p|-ms, -lr, -b, -v, -s) instead.
+_NAME_RE = re.compile(
+    r"^"
+    r"(?P<prefix>[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)"
+    r"-(?P<model>.+?)"
+    r"-(?P<curation>FullTraining|GlobalSubset|LayerWiseSubset|Standard)"
+    r"-(?P<finetuning>MeSO-LoRA|Full|LoRA|MeSO)"
+    r"-(?:p(?P<percentage>[\d.]+)|ms(?P<max_steps>\d+))"
+    r"-lr(?P<learning_rate>[\d.]+e-?\d+)"
+    r"-b(?P<batch_size>\d+)"
+    r"-v(?P<n_val>\d+)"
+    r"-s(?P<seed>\d+)"
+    r"$"
+)
+
+
 def parse_model_name(model_name: str) -> Dict[str, str]:
-    """Parse model name to extract experiment configuration."""
+    """Parse a model output-dir name into experiment fields. Cosmetic — used
+    only for the printed eval summary and the master log row.
+    """
     config = {
         "model_name": model_name,
-        "train_dataset": "",
-        "eval_task": "",
-        "selection": "",
-        "compression": "",
+        "train_dataset": "", "eval_task": "",
         "model": "",
-        "training_type": "",
-        "percentage": "",
-        "learning_rate": "",
-        "batch_size": "",
-        "n_val": "",
-        "seed": "",
+        "selection": "", "training_type": "",
+        "percentage": "", "max_steps": "",
+        "learning_rate": "", "batch_size": "", "n_val": "", "seed": "",
     }
+    m = _NAME_RE.match(model_name)
+    if not m:
+        return config
+    g = m.groupdict()
 
-    parts = model_name.split("-")
-    if len(parts) >= 6:
-        train_task = parts[0].split("_")
-        if len(train_task) >= 2:
-            config["train_dataset"] = train_task[0]
-            config["eval_task"] = train_task[1]
-        else:
-            config["train_dataset"] = parts[0]
+    # Prefix splits as either "{train}_{task}" (main) or "{task}_val_{task}" (target-only)
+    prefix_parts = g["prefix"].split("_")
+    if len(prefix_parts) == 3 and prefix_parts[1] == "val":
+        config["train_dataset"] = f"{prefix_parts[0]}_val"
+        config["eval_task"] = prefix_parts[2]
+    elif len(prefix_parts) == 2:
+        config["train_dataset"] = prefix_parts[0]
+        config["eval_task"] = prefix_parts[1]
+    else:
+        config["train_dataset"] = g["prefix"]
 
-        config["selection"] = parts[1]
-
-        idx = 2
-        if parts[idx] == "LoGra" and len(parts) > idx + 1 and parts[idx + 1] == "2nd":
-            config["compression"] = "LoGra-2nd"
-            idx = 4
-        else:
-            config["compression"] = parts[idx]
-            idx = 3
-
-        if idx < len(parts):
-            config["model"] = parts[idx]
-            idx += 1
-        if idx < len(parts):
-            config["training_type"] = parts[idx]
-            idx += 1
-
-        for part in parts[idx:]:
-            if part.startswith("p") and "." in part:
-                config["percentage"] = part[1:]
-            elif part.startswith("lr"):
-                config["learning_rate"] = part[2:]
-            elif part.startswith("b") and part[1:].isdigit():
-                config["batch_size"] = part[1:]
-            elif part.startswith("v") and part[1:].isdigit():
-                config["n_val"] = part[1:]
-            elif part.startswith("s") and part[1:].isdigit():
-                config["seed"] = part[1:]
-
+    config["model"] = g["model"]
+    config["selection"] = g["curation"]
+    config["training_type"] = g["finetuning"]
+    config["percentage"] = g["percentage"] or ""
+    config["max_steps"] = g["max_steps"] or ""
+    config["learning_rate"] = g["learning_rate"]
+    config["batch_size"] = g["batch_size"]
+    config["n_val"] = g["n_val"]
+    config["seed"] = g["seed"]
     return config
 
 
@@ -178,7 +184,7 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None, method: Op
 
     Args:
         models_dir: Directory containing model directories
-        train_dataset: Filter prefix (e.g., "tulu3_tydiqa")
+        train_dataset: Filter prefix (e.g., "alpaca_samsum")
         method: Method filter (e.g., "FullTraining-MeSO", "LayerWiseSubset-Full")
     """
     model_paths = []
@@ -199,7 +205,7 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None, method: Op
             # Check method filter (e.g., "FullTraining-MeSO" matches "-FullTraining-MeSO-")
             if method is not None:
                 # Method appears in directory name as -{method}-{finetuning}-
-                # e.g., tulu3_tydiqa-Llama-3.2-1B-FullTraining-MeSO-p0.01-...
+                # e.g., alpaca_samsum-Llama-3.2-1B-FullTraining-MeSO-p0.4-...
                 method_pattern = f"-{method}-"
                 if method_pattern not in entry:
                     continue
@@ -213,19 +219,16 @@ def evaluate_samsum(args, model, tokenizer) -> dict:
     from .tasks.samsum import compute_accuracy
 
     logger.info("Evaluating on SamSUM")
-    rouge_scores = compute_accuracy(
+    scores = compute_accuracy(
         args=args,
         model=model,
         tokenizer=tokenizer,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens
     )
-    return {
-        "task": "samsum",
-        "rouge1": rouge_scores["rouge1"],
-        "rouge2": rouge_scores["rouge2"],
-        "rougeL": rouge_scores["rougeL"],
-    }
+    out = {"task": "samsum"}
+    out.update(scores)
+    return out
 
 
 def evaluate_tydiqa(args, model, tokenizer) -> dict:
@@ -234,46 +237,64 @@ def evaluate_tydiqa(args, model, tokenizer) -> dict:
 
     logger.info("Evaluating on TyDiQA")
     results = compute_accuracy(args=args, model=model, tokenizer=tokenizer)
-    return {
-        "task": "tydiqa",
-        "f1_score": results["f1_score"],
-        "exact_match": results["exact_match"],
-        "n_test": results["n_test"],
-    }
+    out = {"task": "tydiqa"}
+    out.update(results)
+    return out
 
 
 def evaluate_nq_open(args, model, tokenizer) -> dict:
     """Run NQ-open closed-book QA evaluation (EM/F1)."""
     from .tasks.nq_open import compute_accuracy
     logger.info("Evaluating on NQ-open")
-    results = compute_accuracy(
+    out = {"task": "nq_open"}
+    out.update(compute_accuracy(
         args=args, model=model, tokenizer=tokenizer,
         batch_size=args.batch_size, max_new_tokens=32,
-    )
-    return {"task": "nq_open", "em": results["em"], "f1": results["f1"], "n_test": results["n_test"]}
+    ))
+    return out
 
 
 def evaluate_squad(args, model, tokenizer) -> dict:
     """Run SQuAD closed-book (no context) evaluation (EM/F1)."""
     from .tasks.squad import compute_accuracy
     logger.info("Evaluating on SQuAD (closed-book)")
-    results = compute_accuracy(
+    out = {"task": "squad"}
+    out.update(compute_accuracy(
         args=args, model=model, tokenizer=tokenizer,
         batch_size=args.batch_size, max_new_tokens=32,
-    )
-    return {"task": "squad", "em": results["em"], "f1": results["f1"], "n_test": results["n_test"]}
+    ))
+    return out
+
+
+def evaluate_triviaqa(args, model, tokenizer) -> dict:
+    """Run TriviaQA closed-book evaluation (EM/F1)."""
+    from .tasks.triviaqa import compute_accuracy
+    logger.info("Evaluating on TriviaQA (closed-book)")
+    out = {"task": "triviaqa"}
+    out.update(compute_accuracy(
+        args=args, model=model, tokenizer=tokenizer,
+        batch_size=args.batch_size, max_new_tokens=32,
+    ))
+    return out
 
 
 def get_task_from_model_name(model_name: str) -> Optional[str]:
-    """Extract the evaluation task from model name (e.g., alpaca_samsum -> samsum)."""
-    valid_tasks = ["samsum", "tydiqa", "nq_open", "squad"]
-    parts = model_name.split("-")
-    if parts:
-        train_task = parts[0].split("_")
-        if len(train_task) >= 2:
-            task = train_task[1].lower()
-            if task in valid_tasks:
-                return task
+    """Extract the evaluation task from a run-dir name. Two layouts:
+
+    Main runs:        ``<train>_<task>-<model>-...``      (e.g. ``alpaca_samsum-...``)
+    Target-only runs: ``<task>_val_<task>-<model>-...``    (e.g. ``samsum_val_samsum-...``)
+    """
+    # nq_open is two underscores ("nq_open"), so match longest known task first.
+    valid_tasks = ["nq_open", "samsum", "tydiqa", "squad", "triviaqa"]
+    head = model_name.split("-", 1)[0]
+    # Target-only: <task>_val_<task>
+    for t in valid_tasks:
+        if head == f"{t}_val_{t}":
+            return t
+    # Main: <train>_<task> — task is the suffix
+    for t in valid_tasks:
+        if head.endswith("_" + t):
+            return t
     return None
 
 
@@ -352,6 +373,14 @@ def evaluate_model(
             results["squad_f1"] = sq_results["f1"]
             with open(os.path.join(model_path, "squad_results.json"), "w") as f:
                 json.dump(sq_results, f, indent=2)
+
+        elif task == "triviaqa":
+            logger.info(f"Evaluating {model_name} on TriviaQA (closed-book)...")
+            tq_results = evaluate_triviaqa(args, model, tokenizer)
+            results["triviaqa_em"] = tq_results["em"]
+            results["triviaqa_f1"] = tq_results["f1"]
+            with open(os.path.join(model_path, "triviaqa_results.json"), "w") as f:
+                json.dump(tq_results, f, indent=2)
 
     except Exception as e:
         logger.error(f"Evaluation failed: {e}")

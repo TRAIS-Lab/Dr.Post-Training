@@ -8,13 +8,16 @@
 # Usage: bash train.sh -c <config_dir> -m <methods> [options]
 #
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ -z "$CODE_DIR" ]]; then
-    source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found."; exit 1; }
-    activate_env
-fi
+# Cluster-portable bootstrap: hardcoded path to cluster_env.sh because
+# (a) BASH_SOURCE inside the SLURM spool resolves to /var/spool/slurmd/..., and
+# (b) runpod-cluster's SLURM does not reliably propagate user env vars across
+# `--export ALL`. cluster_env.sh remains the single point of cluster config —
+# edit this path AND cluster_env.sh together when migrating clusters.
+source /workspace-vast/pbb/Dr.Post-Training/cluster_env.sh \
+    || { echo "ERROR: /workspace-vast/pbb/Dr.Post-Training/cluster_env.sh not found."; exit 1; }
+activate_env
 
-cd $CODE_DIR/Dr.Post-Training
+cd "$CODE_DIR/Dr.Post-Training"
 export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 SCRIPT_DIR="$CODE_DIR/Dr.Post-Training/SFT/train"
@@ -84,9 +87,9 @@ Optional:
 Categories: all, full-training, layer-wise-subset, global-subset, full, lora, meso
 
 Examples:
-  bash train.sh -c configs/tulu3_tydiqa -m all
-  bash train.sh -c configs/tulu3_tydiqa -m "LayerWiseSubset-Full,GlobalSubset-Full" --seed 123
-  bash train.sh -c configs/tulu3_tydiqa -m full-training --dry-run
+  bash train.sh -c configs/alpaca_samsum -m all
+  bash train.sh -c configs/less_tydiqa -m "LayerWiseSubset-LoRA,GlobalSubset-LoRA" --seed 123
+  bash train.sh -c configs/alpaca_samsum -m full-training --dry-run
 HELP
             exit 0
             ;;
@@ -134,8 +137,8 @@ reset_config() {
     cfg_subset_mode="one_pass"
 
     # LoRA
-    cfg_lora_r="32"
-    cfg_lora_alpha="1"
+    cfg_lora_r="8"
+    cfg_lora_alpha="16"
     cfg_lora_dropout="0.1"
 
     # Experiment
@@ -150,8 +153,8 @@ reset_config() {
 
     # Training hyperparameters
     cfg_max_seq_length="512"
-    cfg_lr_scheduler_type="linear"
-    cfg_warmup_ratio="0.03"
+    cfg_lr_scheduler_type="cosine"
+    cfg_warmup_ratio="0.1"
     cfg_weight_decay="0.0"
     cfg_num_train_epochs="1"
     cfg_eval_steps="50"
@@ -317,7 +320,7 @@ run_method() {
 
     # LR fallback if not specified anywhere (every YAML should set this explicitly)
     if [[ -z "$cfg_learning_rate" ]]; then
-        [[ "$use_lora" == "true" ]] && cfg_learning_rate="5e-04" || cfg_learning_rate="2e-05"
+        [[ "$use_lora" == "true" ]] && cfg_learning_rate="1e-04" || cfg_learning_rate="1e-05"
     fi
 
     local model_name=$(basename "$cfg_model")
@@ -329,7 +332,7 @@ run_method() {
     local JOB_NAME="${train_str}_${cfg_target_task}-${model_name}-${method_str}-p${cfg_percentage}-lr${cfg_learning_rate}-b${cfg_batch_size}-v${cfg_n_val}-s${cfg_seed}"
 
     local data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
-    local output_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/${JOB_NAME}"
+    local output_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/runs/${JOB_NAME}"
     mkdir -p "$output_dir"
 
     echo ""
@@ -354,7 +357,10 @@ run_method() {
     esac
 
     local DATA_SEED=$((cfg_seed + 1))
-    local PORT=$((29400 + RANDOM % 10000))
+    # Derive port from SLURM_JOB_ID (or PID fallback) so different jobs landing
+    # on the same node get distinct ports. Random ports caused C10D rendezvous
+    # collisions when slurm packed multiple jobs per node.
+    local PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 40000)))
 
     # Build command
     local cmd="torchrun --nproc_per_node 1 --nnodes 1 \

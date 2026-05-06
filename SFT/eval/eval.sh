@@ -1,20 +1,18 @@
 #!/bin/bash
 
-# Source cluster config (skip if already set by submit.sh)
-if [[ -z "$CODE_DIR" ]]; then
-    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-    source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found."; exit 1; }
-    activate_env
-fi
+# Hardcoded path to cluster_env.sh — see SFT/train/train.sh for rationale.
+source /workspace-vast/pbb/Dr.Post-Training/cluster_env.sh \
+    || { echo "ERROR: /workspace-vast/pbb/Dr.Post-Training/cluster_env.sh not found."; exit 1; }
+activate_env
 
-cd $CODE_DIR/Dr.Post-Training
+cd "$CODE_DIR/Dr.Post-Training"
 
 export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 set -e
 
 # Default values
-models_dir="$SCRATCH_DIR/Dr.Post-Training/SFT"
+models_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/runs"
 data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
 model_path=""
 train=""

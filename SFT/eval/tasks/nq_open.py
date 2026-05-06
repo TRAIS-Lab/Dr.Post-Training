@@ -11,7 +11,8 @@ import string
 from collections import Counter
 from typing import Dict, List
 
-from ..utils import generate_completions
+from SFT.data.get_val_dataset import render_chat
+from ..utils import generate_completions, get_eos_token_ids
 
 
 def normalize_answer(s: str) -> str:
@@ -69,14 +70,14 @@ def compute_accuracy(args, model, tokenizer, batch_size: int = 4, max_new_tokens
     test = load_test(data_dir, k=n_test)
     print(f"Loaded {len(test)} NQ-open test examples")
 
-    prompts = [f"<|user|>\n{r['messages'][0]['content']}\n<|assistant|>\n" for r in test]
+    prompts = [render_chat(tokenizer, r['messages'][0]['content']) for r in test]
     print("Generating answers...")
     gens = generate_completions(
         model, tokenizer, prompts,
         batch_size=batch_size,
         max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        eos_token_id=get_eos_token_ids(tokenizer),
         do_sample=False,
         temperature=1.0,
         disable_tqdm=False,
@@ -87,7 +88,7 @@ def compute_accuracy(args, model, tokenizer, batch_size: int = 4, max_new_tokens
     n = 0
     for r, g in zip(test, gens):
         out = g.strip()
-        for stop in ["<|user|>", "<|assistant|>", "\n"]:
+        for stop in ["<|im_end|>", "<|im_start|>", "\n"]:
             if stop in out:
                 out = out[:out.find(stop)]
         out = out.strip()
@@ -102,5 +103,14 @@ def compute_accuracy(args, model, tokenizer, batch_size: int = 4, max_new_tokens
     em_mean = em_total / n if n else 0.0
     f1_mean = f1_total / n if n else 0.0
     print(f"\nNQ-open Results:")
-    print(f"  EM: {em_mean:.4f}  F1: {f1_mean:.4f}  n={n}")
-    return {"accuracy": em_mean, "em": em_mean, "f1": f1_mean, "n_test": n}
+    print(f"  EM: {em_mean*100:.2f}  F1: {f1_mean*100:.2f}  n={n}")
+    # Standardized result schema: f1_score / exact_match on 0-100 scale,
+    # matching tydiqa.py. Older clients reading "f1"/"em" still work.
+    return {
+        "f1_score": f1_mean * 100.0,
+        "exact_match": em_mean * 100.0,
+        "f1": f1_mean,            # legacy 0-1 (kept for back-compat)
+        "em": em_mean,
+        "accuracy": em_mean,
+        "n_test": n,
+    }

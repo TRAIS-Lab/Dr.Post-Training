@@ -70,7 +70,7 @@ def prepare_nq_open_train(output_dir):
 def prepare_nq_open_eval(output_dir):
     """
     Prepare NaturalQuestions open (closed-book) for evaluation.
-    Splits the validation set into val/lr/test for n_val/LR-sweep/final-eval.
+    Splits the validation set into val/lr/test for n_val/extra-dev/final-eval.
     Same Q->A format as nq_open_train, with answer aliases stored in metadata.
     """
     print("Preparing NaturalQuestions (nq_open) eval splits...")
@@ -124,7 +124,7 @@ def prepare_nq_open_eval(output_dir):
 
     print(f"NQ-open eval data saved:")
     print(f"  Validation: {val_file} ({len(val_records)})")
-    print(f"  LR sweep:   {lr_file} ({len(lr_records)})")
+    print(f"  lr (dev):   {lr_file} ({len(lr_records)})")
     print(f"  Test:       {test_file} ({len(test_records)})")
     return val_file, lr_file, test_file
 
@@ -161,6 +161,68 @@ def prepare_triviaqa_train(output_dir):
             n += 1
     print(f"TriviaQA training data saved to {output_file} ({n} examples)")
     return output_file
+
+
+def prepare_triviaqa_eval(output_dir):
+    """
+    Prepare TriviaQA closed-book (rc.nocontext) eval splits.
+    Splits validation set into val/lr/test for n_val/extra-dev/final-eval.
+    Each record has metadata.aliases (the answer aliases) for best-alias scoring.
+    """
+    print("Preparing TriviaQA (rc.nocontext) eval splits...")
+    ds = shuffled_examples(load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="validation"))
+
+    output_dir_tq = os.path.join(output_dir, "eval", "triviaqa")
+    ensure_dir(output_dir_tq)
+
+    val_size, lr_size, test_size = 100, 100, 1000
+    val_records, lr_records, test_records = [], [], []
+    for ex in ds:
+        question = ex["question"]
+        ans = ex["answer"]
+        primary = ans.get("value", "") if isinstance(ans, dict) else ""
+        aliases = ans.get("aliases", []) if isinstance(ans, dict) else []
+        # de-dup, drop empties; ensure primary is included
+        seen = set()
+        clean = []
+        for a in [primary] + list(aliases):
+            if a and a not in seen:
+                seen.add(a); clean.append(a)
+        if not clean:
+            continue
+
+        if len(val_records) < val_size:
+            split, bucket = "val", val_records
+        elif len(lr_records) < lr_size:
+            split, bucket = "lr", lr_records
+        elif len(test_records) < test_size:
+            split, bucket = "test", test_records
+        else:
+            break
+
+        rec = {
+            "dataset": "triviaqa",
+            "id": f"triviaqa_{split}_{len(bucket)}",
+            "messages": [
+                {"role": "user", "content": f"Answer the following question.\nQuestion: {question}"},
+                {"role": "assistant", "content": clean[0]},
+            ],
+            "metadata": {"primary_answer": clean[0], "aliases": clean},
+        }
+        bucket.append(rec)
+
+    val_file = os.path.join(output_dir_tq, "triviaqa_validation_data.jsonl")
+    lr_file = os.path.join(output_dir_tq, "triviaqa_lr_data.jsonl")
+    test_file = os.path.join(output_dir_tq, "triviaqa_test_data.jsonl")
+    for fname, recs in [(val_file, val_records), (lr_file, lr_records), (test_file, test_records)]:
+        with open(fname, "w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"TriviaQA eval data saved:")
+    print(f"  Validation: {val_file} ({len(val_records)})")
+    print(f"  lr (dev):   {lr_file} ({len(lr_records)})")
+    print(f"  Test:       {test_file} ({len(test_records)})")
+    return val_file, lr_file, test_file
 
 
 def prepare_squad_eval(output_dir):
@@ -221,7 +283,7 @@ def prepare_squad_eval(output_dir):
 
     print(f"SQuAD (no-context) eval data saved:")
     print(f"  Validation: {val_file} ({len(val_records)})")
-    print(f"  LR sweep:   {lr_file} ({len(lr_records)})")
+    print(f"  lr (dev):   {lr_file} ({len(lr_records)})")
     print(f"  Test:       {test_file} ({len(test_records)})")
     return val_file, lr_file, test_file
 
@@ -266,14 +328,14 @@ def prepare_squad(output_dir):
 
 def prepare_tydiqa(output_dir):
     """
-    Prepare TyDiQA validation, LR sweep, and test data in unified JSONL format.
+    Prepare TyDiQA validation, lr (extra dev), and test data in unified JSONL format.
 
     Uses the HuggingFace validation split and divides into validation/lr/test.
     Preserves the few-shot prompts file (tydiqa_fewshot.json) for downstream evaluation.
 
     Output files:
     - tydiqa_validation_data.jsonl: For data selection
-    - tydiqa_lr_data.jsonl: For LR sweep evaluation
+    - tydiqa_lr_data.jsonl: Extra held-out dev split (small)
     - tydiqa_test_data.jsonl: For final evaluation
     - tydiqa_fewshot.json: One-shot prompts (preserved/renamed)
     """
@@ -293,7 +355,7 @@ def prepare_tydiqa(output_dir):
     # so the first 500 are all Arabic without this shuffle.
     all_data = shuffled_examples(dataset["validation"])
 
-    # Split: first 100 for validation, next 100 for LR sweep, rest for test
+    # Split: first 100 for validation, next 100 for the extra dev partition, rest for test
     val_size = 100
     lr_size = 100
     val_data = all_data[:val_size]
@@ -329,7 +391,7 @@ def prepare_tydiqa(output_dir):
             }
             f.write(json.dumps(data, ensure_ascii=False) + '\n')
 
-    # Write LR sweep data
+    # Write lr (dev) split
     lr_file = os.path.join(output_dir_tydiqa, "tydiqa_lr_data.jsonl")
     with open(lr_file, 'w', encoding='utf-8') as f:
         for idx, example in enumerate(tqdm(lr_data, desc="LR")):
@@ -412,7 +474,7 @@ def prepare_tydiqa(output_dir):
 
     print(f"TyDiQA data saved:")
     print(f"  Validation: {val_file} ({len(val_data)} examples)")
-    print(f"  LR sweep: {lr_file} ({len(lr_data)} examples)")
+    print(f"  lr (dev): {lr_file} ({len(lr_data)} examples)")
     print(f"  Test: {test_file} ({len(test_data)} examples)")
     return val_file, test_file
 
@@ -520,9 +582,17 @@ def prepare_flan_v2(output_dir):
 
 
 def prepare_cot(output_dir):
-    """Prepare Chain-of-Thought dataset."""
+    """Prepare Chain-of-Thought dataset.
+
+    `kaist-ai/CoT-Collection` is published as a dataset script, which `datasets`
+    versions >= 3.0 refuse to execute. Use the auto-converted parquet revision
+    (HF maintains this on `refs/convert/parquet` for any script-based dataset)
+    so loading works without enabling code execution.
+    """
     print("Preparing CoT training data...")
-    dataset = load_dataset("kaist-ai/CoT-Collection", split="train")
+    dataset = load_dataset(
+        "kaist-ai/CoT-Collection", revision="refs/convert/parquet", split="train"
+    )
 
     output_file = os.path.join(output_dir, "train", "cot", "cot_data.jsonl")
     ensure_dir(os.path.dirname(output_file))
@@ -603,7 +673,7 @@ def prepare_samsum(output_dir):
     Output files:
     - samsum_train_data.jsonl: Training data
     - samsum_validation_data.jsonl: For data selection
-    - samsum_lr_data.jsonl: For LR sweep evaluation
+    - samsum_lr_data.jsonl: Extra held-out dev split (small)
     - samsum_test_data.jsonl: For final evaluation
     """
     print("Preparing SamSUM data...")
@@ -617,7 +687,7 @@ def prepare_samsum(output_dir):
     if os.path.exists(val_file) and os.path.exists(lr_file) and os.path.exists(test_file):
         print(f"SamSUM evaluation data already exists:")
         print(f"  Validation: {val_file}")
-        print(f"  LR sweep: {lr_file}")
+        print(f"  lr (dev): {lr_file}")
         print(f"  Test: {test_file}")
 
         # Check if train data exists
@@ -638,7 +708,7 @@ def prepare_samsum(output_dir):
     val_dataset = shuffled_examples(load_dataset("knkarthick/samsum", split="validation"))
     test_dataset = shuffled_examples(load_dataset("knkarthick/samsum", split="test"))
 
-    # Split test into LR sweep (first 100) and final test (rest)
+    # Split test into lr-dev (first 100) and final test (rest)
     test_list = list(test_dataset)
     lr_size = 100
     lr_examples = test_list[:lr_size]
@@ -676,7 +746,7 @@ def prepare_samsum(output_dir):
             }
             f.write(json.dumps(data, ensure_ascii=False) + '\n')
 
-    # LR sweep data
+    # lr (dev) split
     with open(lr_file, 'w', encoding='utf-8') as f:
         for idx, example in enumerate(tqdm(lr_examples, desc="LR")):
             dialogue = example['dialogue']
@@ -711,7 +781,7 @@ def prepare_samsum(output_dir):
     print(f"SamSUM data saved:")
     print(f"  Train: {train_file}")
     print(f"  Validation: {val_file}")
-    print(f"  LR sweep: {lr_file} ({len(lr_examples)} examples)")
+    print(f"  lr (dev): {lr_file} ({len(lr_examples)} examples)")
     print(f"  Test: {test_file} ({len(test_examples)} examples)")
     return train_file
 
@@ -760,6 +830,7 @@ Available Datasets:
     samsum         - SamSUM: Dialogue summarization (includes train split)
     nq_open_eval   - NQ-open: eval splits (val/lr/test from HF nq_open validation)
     squad_eval     - SQuAD: closed-book eval splits (NO context; answer.text list)
+    triviaqa_eval  - TriviaQA: closed-book eval splits (val/lr/test from rc.nocontext validation)
 
   Training Pools:
     nq_open         - NQ-open: train pool (~88K Q->A pairs)
@@ -775,7 +846,7 @@ Available Datasets:
         nargs='+',
         required=True,
         metavar='DATASET',
-        choices=['tydiqa', 'samsum', 'nq_open_eval', 'squad_eval',
+        choices=['tydiqa', 'samsum', 'nq_open_eval', 'squad_eval', 'triviaqa_eval',
                  'nq_open', 'triviaqa_train', 'squad', 'tulu3', 'alpaca',
                  'dolly', 'flan_v2', 'cot', 'oasst1'],
         help="Datasets to prepare (see list below)"
@@ -816,6 +887,12 @@ Available Datasets:
         results['squad_validation'] = val_file
         results['squad_lr'] = lr_file
         results['squad_test'] = test_file
+
+    if 'triviaqa_eval' in datasets_to_prepare:
+        val_file, lr_file, test_file = prepare_triviaqa_eval(args.output_dir)
+        results['triviaqa_validation'] = val_file
+        results['triviaqa_lr'] = lr_file
+        results['triviaqa_test'] = test_file
 
     # Training pools
     if 'nq_open' in datasets_to_prepare:

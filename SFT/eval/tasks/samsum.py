@@ -11,23 +11,23 @@ from typing import List, Tuple
 import evaluate
 from tqdm import tqdm
 
-from ..utils import generate_completions
+from SFT.data.get_val_dataset import render_chat
+from ..utils import generate_completions, get_eos_token_ids
 
 # Load ROUGE metric
 rouge_metric = evaluate.load("rouge")
 
+# BERTScore: lazy-loaded so import doesn't pay the model-download cost.
+_bertscore_metric = None
+def _get_bertscore():
+    global _bertscore_metric
+    if _bertscore_metric is None:
+        _bertscore_metric = evaluate.load("bertscore")
+    return _bertscore_metric
 
-def load_samsum_test_data(data_dir: str, k: int = -1) -> List[Tuple[str, str]]:
-    """
-    Load SamSUM test data from unified JSONL format.
 
-    Args:
-        data_dir: Base data directory containing eval/samsum/
-        k: Number of examples to load (-1 for all)
-
-    Returns:
-        List of (prompt, reference_summary) tuples
-    """
+def load_samsum_test_data(tokenizer, data_dir: str, k: int = -1) -> List[Tuple[str, str]]:
+    """Load SamSUM test data and render prompts with the model's chat template."""
     file_path = os.path.join(data_dir, "eval", "samsum", "samsum_test_data.jsonl")
 
     if not os.path.exists(file_path):
@@ -47,9 +47,7 @@ def load_samsum_test_data(data_dir: str, k: int = -1) -> List[Tuple[str, str]]:
             user_content = messages[0]['content']
             reference = messages[1]['content']
 
-            # Format prompt with chat template
-            prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-
+            prompt = render_chat(tokenizer, user_content)
             examples.append((prompt, reference))
 
             if k > 0 and len(examples) >= k:
@@ -83,6 +81,26 @@ def compute_rouge_scores(predictions: List[str], references: List[str]) -> dict:
     }
 
 
+def compute_bertscore(predictions: List[str], references: List[str], lang: str = "en") -> dict:
+    """Mean BERTScore P/R/F1 across the corpus (rescaled with baseline).
+
+    SamSum is English; using lang="en" lets bert_score pick a sensible default
+    encoder (currently roberta-large) and the matching baseline-rescale tensor.
+    """
+    metric = _get_bertscore()
+    res = metric.compute(
+        predictions=predictions,
+        references=references,
+        lang=lang,
+        rescale_with_baseline=True,
+    )
+    return {
+        "bertscore_p":  float(sum(res["precision"]) / len(res["precision"])),
+        "bertscore_r":  float(sum(res["recall"])    / len(res["recall"])),
+        "bertscore_f1": float(sum(res["f1"])        / len(res["f1"])),
+    }
+
+
 def compute_accuracy(
     args,
     model,
@@ -106,15 +124,12 @@ def compute_accuracy(
     data_dir = getattr(args, 'data_dir', './data')
     n_test = getattr(args, 'n_test', -1)
 
-    # Load test data
-    test_data = load_samsum_test_data(data_dir, k=n_test)
+    test_data = load_samsum_test_data(tokenizer, data_dir, k=n_test)
     print(f"Loaded {len(test_data)} SamSUM test examples")
 
-    # Extract prompts and references
     prompts = [prompt for prompt, _ in test_data]
     references = [ref for _, ref in test_data]
 
-    # Generate summaries
     print("Generating summaries...")
     predictions = generate_completions(
         model,
@@ -123,19 +138,20 @@ def compute_accuracy(
         batch_size=batch_size,
         max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        eos_token_id=get_eos_token_ids(tokenizer),
         temperature=1.0,
         top_p=0.95,
         disable_tqdm=False
     )
 
-    # Clean predictions
+    # Clean predictions: strip anything past the assistant turn delimiter.
+    # Generated text is decoded with skip_special_tokens=True, so <|im_end|>
+    # / <|im_start|> won't usually appear, but keep them as defensive fallbacks
+    # in case the user happens to inspect raw outputs.
     cleaned_predictions = []
     for pred in predictions:
-        # Remove any trailing special tokens or repeated content
         pred = pred.strip()
-        # Stop at common ending patterns
-        for stop_pattern in ["<|user|>", "<|assistant|>", "</s>", "<|end|>"]:
+        for stop_pattern in ["<|im_end|>", "<|im_start|>"]:
             if stop_pattern in pred:
                 pred = pred[:pred.find(stop_pattern)]
         cleaned_predictions.append(pred.strip())
@@ -143,14 +159,25 @@ def compute_accuracy(
     # Compute ROUGE scores
     rouge_scores = compute_rouge_scores(cleaned_predictions, references)
 
-    # Print results
+    # Compute BERTScore (semantic-similarity sanity check alongside ROUGE).
+    # Failure shouldn't break the eval — fall back gracefully.
+    try:
+        bertscores = compute_bertscore(cleaned_predictions, references, lang="en")
+    except Exception as e:
+        print(f"  [warn] BERTScore failed: {e}")
+        bertscores = {"bertscore_p": None, "bertscore_r": None, "bertscore_f1": None}
+
     print(f"\nSamSUM Evaluation Results:")
-    print(f"  ROUGE-1: {rouge_scores['rouge1']:.4f}")
-    print(f"  ROUGE-2: {rouge_scores['rouge2']:.4f}")
-    print(f"  ROUGE-L: {rouge_scores['rougeL']:.4f}")
+    print(f"  ROUGE-1:       {rouge_scores['rouge1']:.4f}")
+    print(f"  ROUGE-2:       {rouge_scores['rouge2']:.4f}")
+    print(f"  ROUGE-L:       {rouge_scores['rougeL']:.4f}")
+    print(f"  ROUGE-Lsum:    {rouge_scores['rougeLsum']:.4f}")
+    if bertscores["bertscore_f1"] is not None:
+        print(f"  BERTScore F1:  {bertscores['bertscore_f1']:.4f}"
+              f"  (P={bertscores['bertscore_p']:.4f}, R={bertscores['bertscore_r']:.4f})")
     print(f"  Examples evaluated: {len(test_data)}")
 
-    return rouge_scores
+    return {**rouge_scores, **bertscores}
 
 
 def evaluate_samsum(

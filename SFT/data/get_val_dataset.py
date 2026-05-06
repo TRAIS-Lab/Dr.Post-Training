@@ -12,11 +12,76 @@ from transformers import DataCollatorForSeq2Seq, PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
 
-# llama-chat model's instruction format
-B_INST, E_INST = "[INST]", "[/INST]"
-
 # Default multiplier for max sequence length threshold (relative to avg train seq length)
 DEFAULT_SEQ_LENGTH_MULTIPLIER = 1.2
+
+
+# Open-instruct/Tulu-style fallback chat template — used when the tokenizer
+# doesn't ship its own (e.g., base models like meta-llama/Llama-3.2-1B that
+# weren't fine-tuned on chat data). The role markers (`<|user|>`, `<|assistant|>`)
+# are plaintext (not special tokens), tokenized by BPE; that's the same convention
+# the open-instruct / LESS / Tulu codebases use.
+_DEFAULT_CHAT_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{%- if message['role'] == 'system' %}"
+    "<|system|>\n{{ message['content'].strip() }}\n"
+    "{%- elif message['role'] == 'user' %}"
+    "<|user|>\n{{ message['content'].strip() }}\n"
+    "{%- elif message['role'] == 'assistant' %}"
+    "<|assistant|>\n{{ message['content'].strip() }}{{ eos_token }}\n"
+    "{%- endif %}"
+    "{%- endfor %}"
+    "{%- if add_generation_prompt %}<|assistant|>\n{% endif %}"
+)
+
+
+def ensure_chat_template(tokenizer: PreTrainedTokenizerBase) -> PreTrainedTokenizerBase:
+    """Set a default open-instruct chat template if the tokenizer doesn't have one.
+
+    Idempotent — safe to call multiple times. Lets `apply_chat_template` work
+    uniformly across base models (no native template, e.g. Llama-3.2-1B-Base)
+    and instruct/chat models (Llama-3.2-1B-Instruct, Qwen3 chat models, ...).
+    """
+    if getattr(tokenizer, "chat_template", None) in (None, ""):
+        tokenizer.chat_template = _DEFAULT_CHAT_TEMPLATE
+    return tokenizer
+
+
+def render_chat(
+        tokenizer: PreTrainedTokenizerBase,
+        user_content: str,
+        assistant_content: Optional[str] = None,
+    ):
+    """Render a single (user[, assistant]) turn with the tokenizer's chat template.
+
+    Returns the prompt string when `assistant_content is None`, otherwise
+    `(prompt, answer)` such that `prompt + answer == full_render`. Falls back
+    to the open-instruct template via `ensure_chat_template` when the tokenizer
+    doesn't have one. For Qwen3, `enable_thinking=False` is passed so the
+    prompt includes the auto-injected empty `<think></think>` block; for
+    other tokenizers the kwarg is silently ignored.
+    """
+    ensure_chat_template(tokenizer)
+    user_msg = [{"role": "user", "content": user_content}]
+    prompt = tokenizer.apply_chat_template(
+        user_msg,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    if assistant_content is None:
+        return prompt
+    full = tokenizer.apply_chat_template(
+        user_msg + [{"role": "assistant", "content": assistant_content}],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    if not full.startswith(prompt):
+        raise ValueError(
+            "Chat template inconsistency: prompt is not a prefix of full render.\n"
+            f"  prompt: {prompt!r}\n  full: {full!r}"
+        )
+    return prompt, full[len(prompt):]
 
 
 def estimate_token_length(
@@ -24,20 +89,14 @@ def estimate_token_length(
         query: str,
         completion: str,
     ) -> int:
-    """
-    Estimate the token length of a query-completion pair without truncation.
+    """Estimate the token length of a chat-template-rendered (query, completion).
 
-    Args:
-        tokenizer: The tokenizer to use.
-        query: The query/prompt string.
-        completion: The completion/answer string.
-
-    Returns:
-        The number of tokens in the full sequence.
+    Uses `add_special_tokens=False` because the chat template already emits
+    its own special tokens (`<|im_start|>` etc.), so we don't want any
+    automatic BOS/EOS injection on top.
     """
     full_prompt = query + completion
-    # Use encode without truncation to get the true length
-    tokens = tokenizer.encode(full_prompt, add_special_tokens=True)
+    tokens = tokenizer.encode(full_prompt, add_special_tokens=False)
     return len(tokens)
 
 
@@ -48,18 +107,12 @@ def tokenize(
         max_length: int,
         print_ex: bool = False
     ) -> Tuple[Tensor, Tensor, List[int]]:
-    """
-    Formats a chat conversation into input tensors for a transformer model.
+    """Tokenize a chat-template-rendered (query, completion) pair.
 
-    Args:
-        tokenizer (PreTrainedTokenizerBase): The tokenizer used to encode the input.
-        query (str): The question part of the chat conversation.
-        completion (str): The answer part of the chat conversation.
-        max_length (int): The maximum length of the input tensors.
-        print_ex (bool, optional): Whether to print the example. Defaults to False.
-
-    Returns:
-        tuple: A tuple containing the full input IDs, labels, and attention mask tensors.
+    Both pieces are expected to come from `render_chat(...)` (or equivalent),
+    which means they already contain the model's native special tokens.
+    Tokenization uses `add_special_tokens=False` to avoid double-prepending
+    BOS or similar.
     """
     full_prompt = query + completion
 
@@ -68,13 +121,11 @@ def tokenize(
         print(full_prompt)
         print("******** Example ends ********")
 
-    # Encode query without truncation to find the prompt/completion boundary
-    prompt_input_ids = tokenizer.encode(query)
-    # Encode full prompt and truncate to max_length
-    full_tokens = tokenizer.encode(full_prompt, max_length=max_length, truncation=True)
+    prompt_input_ids = tokenizer.encode(query, add_special_tokens=False)
+    full_tokens = tokenizer.encode(
+        full_prompt, max_length=max_length, truncation=True, add_special_tokens=False
+    )
 
-    # Mask prompt tokens; cap at full sequence length so completion tokens
-    # (if any survive truncation) get real labels
     prompt_len = min(len(prompt_input_ids), len(full_tokens))
 
     full_input_ids = torch.tensor(full_tokens)
@@ -97,7 +148,7 @@ def load_unified_jsonl(
 
     File naming convention:
     - Validation: {data_dir}/eval/{task}/{task}_validation_data.jsonl
-    - LR sweep: {data_dir}/eval/{task}/{task}_lr_data.jsonl
+    - lr (extra dev split): {data_dir}/eval/{task}/{task}_lr_data.jsonl
     - Test: {data_dir}/eval/{task}/{task}_test_data.jsonl
 
     Args:
@@ -136,31 +187,13 @@ def get_tydiqa_dataset(
         data_dir: str,
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
-        use_chat_format: bool = True,
-        chat_format: str = "tulu",
         split: str = "test",
         k: int = 5,
         seed: Optional[int] = None,
         max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
-    """
-    Get the TyDiQA dataset in unified JSONL format.
-
-    Args:
-        data_dir: The main data directory.
-        tokenizer: The tokenizer used to tokenize the input text.
-        max_length: The maximum length of the input sequence.
-        use_chat_format: Whether to use chat format for the input.
-        chat_format: The chat format to use.
-        split: Which split to load ("validation", "test", or "lr").
-        k: Number of examples to load.
-        seed: Optional seed for shuffling examples before selection.
-        max_seq_length_threshold: If provided, reject samples longer than this threshold.
-
-    Returns:
-        Dataset: The TyDiQA dataset containing input_ids, attention_mask, and labels.
-    """
+    """Get the TyDiQA dataset rendered with the tokenizer's native chat template."""
     # Load more examples than needed if rejection sampling is enabled
     load_k = k * 3 if max_seq_length_threshold is not None else k
     examples = load_unified_jsonl(data_dir, "tydiqa", split, load_k, seed=seed)
@@ -180,16 +213,7 @@ def get_tydiqa_dataset(
         user_content = messages[0]['content']
         assistant_content = messages[1]['content']
 
-        # Format the prompt
-        if use_chat_format:
-            if chat_format == "tulu":
-                prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-            else:
-                prompt = f"<s> {B_INST} {user_content} {E_INST} "
-        else:
-            prompt = f"{user_content}\nAnswer: "
-
-        answer = assistant_content + tokenizer.eos_token
+        prompt, answer = render_chat(tokenizer, user_content, assistant_content)
 
         # Rejection sampling based on sequence length
         if max_seq_length_threshold is not None:
@@ -259,8 +283,7 @@ def get_samsum_dataset(
         user_content = messages[0]['content']
         assistant_content = messages[1]['content']
 
-        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-        answer = assistant_content + tokenizer.eos_token
+        prompt, answer = render_chat(tokenizer, user_content, assistant_content)
 
         # Rejection sampling based on sequence length
         if max_seq_length_threshold is not None:
@@ -312,8 +335,7 @@ def get_squad_dataset(
         assistant_content = messages[1]["content"]
         if not assistant_content:
             continue
-        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-        answer = assistant_content + tokenizer.eos_token
+        prompt, answer = render_chat(tokenizer, user_content, assistant_content)
         if max_seq_length_threshold is not None:
             token_length = estimate_token_length(tokenizer, prompt, answer)
             if token_length > max_seq_length_threshold:
@@ -343,8 +365,30 @@ def get_nq_open_dataset(
         **kwargs
     ) -> Dataset:
     """NaturalQuestions-open closed-book QA loader (Q->A messages format)."""
+    return _qa_messages_dataset(
+        data_dir, tokenizer, max_length, "nq_open", split, k, seed, max_seq_length_threshold,
+    )
+
+
+def get_triviaqa_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        split: str = "test",
+        k: int = 5,
+        seed: Optional[int] = None,
+        max_seq_length_threshold: Optional[int] = None,
+        **kwargs
+    ) -> Dataset:
+    """TriviaQA closed-book loader (Q->A messages format, identical to nq_open)."""
+    return _qa_messages_dataset(
+        data_dir, tokenizer, max_length, "triviaqa", split, k, seed, max_seq_length_threshold,
+    )
+
+
+def _qa_messages_dataset(data_dir, tokenizer, max_length, dataset_name, split, k, seed, max_seq_length_threshold):
     load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "nq_open", split, load_k, seed=seed)
+    examples = load_unified_jsonl(data_dir, dataset_name, split, load_k, seed=seed)
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
     rejected_count = 0
     accepted_count = 0
@@ -358,8 +402,7 @@ def get_nq_open_dataset(
         assistant_content = messages[1]["content"]
         if not assistant_content:
             continue
-        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-        answer = assistant_content + tokenizer.eos_token
+        prompt, answer = render_chat(tokenizer, user_content, assistant_content)
         if max_seq_length_threshold is not None:
             token_length = estimate_token_length(tokenizer, prompt, answer)
             if token_length > max_seq_length_threshold:
@@ -374,7 +417,7 @@ def get_nq_open_dataset(
         dataset["attention_mask"].append(attention_mask)
         accepted_count += 1
     if rejected_count > 0:
-        logger.info(f"NQ-open: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
+        logger.info(f"{dataset_name}: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
     return Dataset.from_dict(dataset)
 
 
@@ -406,6 +449,7 @@ def get_dataset(task: str, **kwargs) -> Dataset:
         "samsum": get_samsum_dataset,
         "nq_open": get_nq_open_dataset,
         "squad": get_squad_dataset,
+        "triviaqa": get_triviaqa_dataset,
     }
 
     if task not in task_functions:

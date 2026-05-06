@@ -1,10 +1,12 @@
 #!/bin/bash
 #
-# 5-seed train + target-only + eval pipeline across all 5 SFT settings.
-# Uses fixed LRs from configs (no LR sweep). Includes target-only baselines.
+# 5-seed main + target-only + eval pipeline across the 4 final SFT settings.
+# Recipe: linear scheduler + warmup_ratio=0.03 + weight_decay=0, batch=8, n_val=16.
+# Setting 1 (alpaca → samsum) covers Full/LoRA/MeSO; the rest are LoRA-only.
 #
-# Note: target-only is per-target-task (not per-setting). E.g. tulu3_tydiqa
-# and less_tydiqa share the same target-only baseline (tydiqa).
+# Note: target-only is per-target-task (not per-setting). The two settings that share
+# the same target task (none currently — squad/tydiqa/nq_open/samsum are all distinct)
+# would share their target-only runs.
 #
 # Usage:
 #   bash SFT/train/submit_all.sh             # submit
@@ -24,19 +26,19 @@ DRY_RUN=false
 # Main training: config_dir : train_filter : task_name : main methods
 SETTINGS=(
     "alpaca_samsum:alpaca:samsum:FullTraining-Full,FullTraining-LoRA,FullTraining-MeSO,LayerWiseSubset-Full,LayerWiseSubset-LoRA,LayerWiseSubset-MeSO,GlobalSubset-Full,GlobalSubset-LoRA,GlobalSubset-MeSO"
-    "tulu3_tydiqa:tulu3:tydiqa:FullTraining-Full,FullTraining-LoRA,FullTraining-MeSO,LayerWiseSubset-Full,LayerWiseSubset-LoRA,LayerWiseSubset-MeSO,GlobalSubset-Full,GlobalSubset-LoRA,GlobalSubset-MeSO"
-    "less_tydiqa:less:tydiqa:FullTraining-Full,FullTraining-LoRA,FullTraining-MeSO,LayerWiseSubset-Full,LayerWiseSubset-LoRA,LayerWiseSubset-MeSO,GlobalSubset-Full,GlobalSubset-LoRA,GlobalSubset-MeSO"
-    "triviaqa_nq:triviaqa:nq_open:FullTraining-Full,LayerWiseSubset-Full,GlobalSubset-Full"
-    "nq_squad:nq_open_squad:squad:FullTraining-Full,LayerWiseSubset-Full,GlobalSubset-Full"
+    "less_tydiqa:less:tydiqa:FullTraining-LoRA,LayerWiseSubset-LoRA,GlobalSubset-LoRA"
+    "triviaqa_nq:triviaqa:nq_open:FullTraining-LoRA,LayerWiseSubset-LoRA,GlobalSubset-LoRA"
+    "less_squad:less:squad:FullTraining-LoRA,LayerWiseSubset-LoRA,GlobalSubset-LoRA"
 )
 
-# Target-only: task : config_dir_for_yaml : FT types
-# (target-only output dir is `${task}_val_${task}-...`, identical regardless of source dataset)
+# Target-only: task : config_dir_for_yaml : FT types : eval_steps
+# eval_steps targets ~100 ppl points across max_steps.
+# samsum: 3 fts (matches setting 1 method-flexibility demo); others: LoRA-only.
 TARGET_TASKS=(
-    "samsum:alpaca_samsum:FullTraining-Full,FullTraining-LoRA,FullTraining-MeSO"
-    "tydiqa:tulu3_tydiqa:FullTraining-Full,FullTraining-LoRA,FullTraining-MeSO"
-    "nq_open:triviaqa_nq:FullTraining-Full"
-    "squad:nq_squad:FullTraining-Full"
+    "samsum:alpaca_samsum:FullTraining-Full,FullTraining-LoRA,FullTraining-MeSO:26"
+    "tydiqa:less_tydiqa:FullTraining-LoRA:12"
+    "nq_open:triviaqa_nq:FullTraining-LoRA:11"
+    "squad:less_squad:FullTraining-LoRA:11"
 )
 
 declare -A MAIN_IDS
@@ -73,7 +75,7 @@ for entry in "${SETTINGS[@]}"; do
     for method in "${method_list[@]}"; do
         ids=""
         for seed in "${SEEDS[@]}"; do
-            jid=$(submit "main-${config}-${method}-s${seed}" "4:00:00" "" \
+            jid=$(submit "main-${config}-${method}-s${seed}" "3:00:00" "" \
                 SFT/train/train.sh -c "configs/$config" -m "$method" --seed "$seed")
             ids="${ids:+$ids:}$jid"
         done
@@ -87,7 +89,7 @@ echo "========================================================"
 echo "  Step 2: Target-only training (5 seeds × FT types × per-task)"
 echo "========================================================"
 for entry in "${TARGET_TASKS[@]}"; do
-    IFS=':' read -r task config methods <<< "$entry"
+    IFS=':' read -r task config methods eval_steps <<< "$entry"
     IFS=',' read -ra t_list <<< "$methods"
 
     for method in "${t_list[@]}"; do
@@ -95,7 +97,7 @@ for entry in "${TARGET_TASKS[@]}"; do
         for seed in "${SEEDS[@]}"; do
             jid=$(submit "target-${task}-${method}-s${seed}" "2:00:00" "" \
                 SFT/train/train_val_ablation.sh --task "$task" --config_dir "$config" \
-                --methods "$method" --seed "$seed" --eval_steps 12)
+                --methods "$method" --seed "$seed" --eval_steps "$eval_steps")
             ids="${ids:+$ids:}$jid"
         done
         TARGET_IDS["${task}:${method}"]="$ids"
@@ -115,7 +117,7 @@ for entry in "${SETTINGS[@]}"; do
         dep="${MAIN_IDS["${config}:${method}"]}"
         depend_arg=""
         [[ "$DRY_RUN" != "true" ]] && depend_arg="afterok:$dep"
-        submit "eval-${config}-${method}" "1:00:00" "$depend_arg" \
+        submit "eval-${config}-${method}" "2:00:00" "$depend_arg" \
             SFT/eval/eval.sh --train "$train_filter" --method "$method" --batch_size 64 --n_test 500 > /dev/null
         echo "  eval-${config}-${method} (dep=$dep)"
     done
@@ -126,7 +128,7 @@ echo "========================================================"
 echo "  Step 4: Eval target-only (depends on Step 2)"
 echo "========================================================"
 for entry in "${TARGET_TASKS[@]}"; do
-    IFS=':' read -r task config methods <<< "$entry"
+    IFS=':' read -r task config methods eval_steps <<< "$entry"
     IFS=',' read -ra t_list <<< "$methods"
 
     for method in "${t_list[@]}"; do
@@ -134,7 +136,7 @@ for entry in "${TARGET_TASKS[@]}"; do
         depend_arg=""
         [[ "$DRY_RUN" != "true" ]] && depend_arg="afterok:$dep"
         # target-only models: train_filter is "${task}_val"
-        submit "eval-target-${task}-${method}" "1:00:00" "$depend_arg" \
+        submit "eval-target-${task}-${method}" "2:00:00" "$depend_arg" \
             SFT/eval/eval.sh --train "${task}_val" --method "$method" --batch_size 64 --n_test 500 > /dev/null
         echo "  eval-target-${task}-${method} (dep=$dep)"
     done

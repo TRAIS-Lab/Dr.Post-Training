@@ -4,7 +4,7 @@ subset_mode: one_pass
 scoring:
   method: reduced_ghost
 finetuning: MeSO
-learning_rate: 2.00e-05
+learning_rate: 1.00e-05
 
 optimizer:
   compression: normal-512*512
