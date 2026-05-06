@@ -38,9 +38,6 @@ Fixed across all settings. No LR tuning per setting.
 | MeSO | optimizer `compression=normal-512*512` |
 | Eval | `n_eval=500`, `n_test=500`, seeds {2, 22, 42, 62, 82} |
 
-`triviaqa_nq` Full uses `lr=2e-5` instead of `1e-5` (yaml override) — the
-only per-method LR exception in the suite.
-
 ## Chat template
 
 All examples are stored as `messages` JSONL (no template baked in).
