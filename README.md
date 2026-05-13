@@ -1,10 +1,10 @@
 # Dr. Post-Training
 
-This repository implements **Dr. Post-Training** for fine-grained data curation for modern model training.
-
-The trainer of SFT and RLHF is implemented in plain PyTorch without advanced distributed training frameworks (e.g., DeepSpeed, FairScale, or Hugging Face Accelerator) to maximize clarity and ease of understanding. For large-scale training, we provide our implementation in the RLVR experiment with [Verl](https://github.com/volcengine/verl) (Ray-based distributed RL) with vLLM for fast generation.
+This is the official implementation of [Dr. Post-Training: A Data Regularization Perspective on LLM Post-Training](https://arxiv.org/abs/2605.07063).
 
 ## Getting Started
+
+The trainer of SFT and RLHF is implemented in plain PyTorch without advanced distributed training frameworks (e.g., DeepSpeed, FairScale, or Hugging Face Accelerator) to maximize clarity and ease of understanding. For large-scale training, we provide our implementation in the RLVR experiment with [Verl](https://github.com/volcengine/verl) (Ray-based distributed RL) with vLLM for fast generation.
 
 ```bash
 # Clone with submodules
