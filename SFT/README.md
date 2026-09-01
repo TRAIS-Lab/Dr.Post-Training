@@ -50,6 +50,82 @@ python SFT/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
 | `openhermes` | 1M   | OpenHermes 2.5 diverse instructions   |
 </details>
 
+## Dolci capability setting (Qwen3 + Dolci-Instruct pools)
+
+The capability experiment follows the design of `Dr.Post-Training-Next`: a Qwen3
+base model is fine-tuned on a 32K-row pool sampled from `allenai/Dolci-Instruct-SFT`,
+curation is steered by a small target set, and the final number is an official
+downstream benchmark scored by generation. The harness keeps the paper's data
+roles and knobs; only what the files *mean* changes.
+
+### Data roles
+
+| Role | Knob | File | Size | Meaning |
+|---|---|---|---:|---|
+| Train pool | `train_dataset`, `percentage: 1.0` | `train/dolci_instruction/dolci_instruction_data.jsonl` | 32,000 | Candidates; `batch_size` per step |
+| Target set D* | `n_val`, `val_batch_size` | `eval/precise_if/precise_if_validation_data.jsonl` | 16, 1 per step | Selection gradient; also the `val_loss` curve |
+| Target held-out | `n_eval` | `eval/precise_if/precise_if_test_data.jsonl` | 500 | `eval_loss` curve only |
+| Benchmark | `eval.sh --target` | `eval/ifeval/ifeval_bench_data.jsonl` | full official set | Post-hoc metric via generation + verifier |
+
+The target's `test` file is **not** the benchmark. It is a loss-only held-out
+drawn from the same source as D* (Dolci Precise-IF rows, MATH train, MBPP
+train). The benchmark is a different dataset that shares the skill (IFEval and
+IFBench, MATH500, MBPP+) and carries verifier metadata instead of reference
+answers. One target can map to several benchmarks:
+
+| Target (`target_task`) | Benchmarks | Config dirs |
+|---|---|---|
+| `precise_if` | `ifeval`, `ifbench` | `dolci_inst_if`, `dolci_mixed_if` |
+| `math` | `math500` | `dolci_reason_math`, `dolci_mixed_math` |
+| `mbpp` | `mbpp_plus` | `dolci_reason_code` |
+
+If a target file has fewer rows than `n_val`/`n_eval` request, the loader logs a
+warning and uses what exists (MBPP train has only 374 rows).
+
+### What changed in the harness
+
+- **Chat template.** `SFT/data/chat_format.py` renders every string through the
+  tokenizer's own chat template when it has one (Qwen3) and falls back to the
+  tulu markers otherwise. Training encoding for template-bearing tokenizers
+  supervises assistant turns via offset mapping; tokenizers without a template
+  (Llama-3.2-1B) keep the legacy encoder, so the paper's runs are unchanged.
+  Qwen3's empty `<think>` scaffold is treated as prompt, and evaluation prompts
+  are rendered with thinking disabled to match.
+- **Generic target loader.** Any `eval/<task>/<task>_{validation,test}_data.jsonl`
+  in `messages` format loads without code changes (`precise_if`, `math`, `mbpp`
+  are pre-registered).
+- **Knobs.** `gradient_checkpointing: true` (non-reentrant; needed for 1.7B at
+  4096 tokens on a 48 GB GPU) and `val_seq_length_multiplier` (D* length
+  rejection; `0` disables) are new `defaults.yaml` keys.
+- **Benchmarks.** `SFT/eval/tasks/{ifeval,ifbench,math500,mbpp_plus}.py`, with
+  `eval.sh --target <target>` running every benchmark of a target. Metrics are
+  task-native percentages and are never averaged across tasks.
+
+### Commands
+
+```bash
+# Benchmark files (public, pinned revisions). mbpp_plus needs `pip install evalplus==0.3.1`.
+python SFT/data/prepare_datasets.py --datasets ifeval ifbench math500 mbpp_plus
+
+# Train pools and targets: see the layout above; a prepare step will follow.
+
+# Train (Qwen3-1.7B-Base, batch 8, 4096 tokens, one epoch over the pool)
+bash SFT/train/train.sh -c configs/dolci_inst_if -m all
+bash SFT/train/train.sh -c configs/dolci_reason_math -m "Standard-Full,Layerwise-Full"
+
+# Evaluate every run of a setting on its benchmarks
+bash SFT/eval/eval.sh --train dolci_instruction --target precise_if --batch_size 16 \
+    --ifbench_repo /path/to/IFBench
+bash SFT/eval/eval.sh --train dolci_reasoning --target math --batch_size 16
+bash SFT/eval/eval.sh --train dolci_reasoning --target mbpp --batch_size 16   # apptainer if available
+```
+
+Verifier dependencies: `langdetect`, `immutabledict`, `nltk` (IFEval, vendored
+under `SFT/eval/tasks/ifeval_lib`), a checkout of
+[`allenai/IFBench`](https://github.com/allenai/IFBench) at the pinned commit
+(IFBench), `math-verify` (MATH500; regex fallback if missing), and `evalplus`
+plus apptainer/singularity for a sandboxed MBPP+ run.
+
 ## Experiment Summary
 
 The following methods have been run and can be rerun with the commands below.

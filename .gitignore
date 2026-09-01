@@ -75,3 +75,7 @@ submit.sh
 /Figures/
 # Allow archive/RLVR for reference
 /archive/*
+
+# Hillclimb hook files
+/.claude/settings.local.json
+/.claude/settings.local.json.malformed-*

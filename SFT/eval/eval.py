@@ -33,6 +33,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Benchmarks vs targets
+#
+# Legacy tasks (samsum, tydiqa, ...) are evaluated on the *test split of the
+# target dataset itself*. The Dolci capability setting separates the two: the
+# target (precise_if, math, mbpp) supplies D* and the loss-curve held-out, and a
+# *benchmark* (ifeval, ifbench, math500, mbpp_plus) is scored post hoc by
+# generation + official verifier. One target can map to several benchmarks.
+# ---------------------------------------------------------------------------
+LEGACY_TASKS = ["samsum", "tydiqa", "mmlu", "bbh", "gsm8k", "math500"]
+BENCHMARK_TASKS = ["ifeval", "ifbench", "math500", "mbpp_plus"]
+TARGET_BENCHMARKS = {
+    "precise_if": ["ifeval", "ifbench"],
+    "math": ["math500"],
+    "mbpp": ["mbpp_plus"],
+}
+# Per-task generation budgets used when --max_new_tokens is not given.
+DEFAULT_MAX_NEW_TOKENS = {
+    "ifeval": 2048,
+    "ifbench": 2048,
+    "math500": 4096,
+    "mbpp_plus": 2048,
+}
+LEGACY_DEFAULT_MAX_NEW_TOKENS = 128
+ALL_TASKS = sorted(set(LEGACY_TASKS) | set(BENCHMARK_TASKS))
+
+
 def set_seed(seed: int):
     """Set random seed for reproducibility."""
     random.seed(seed)
@@ -301,35 +328,102 @@ def evaluate_gsm8k(args, model, tokenizer) -> dict:
 
 
 def evaluate_math500(args, model, tokenizer) -> dict:
-    """Run MATH500 evaluation."""
+    """Run MATH-500 (math-verify scoring when installed; regex fallback otherwise)."""
     from .tasks.math500 import compute_accuracy
 
     logger.info("Evaluating on MATH500")
-    results = compute_accuracy(
-        args=args,
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        max_new_tokens=512
-    )
-    return {
-        "task": "math500",
-        "accuracy": results["accuracy"],
-        "n_test": results["n_test"],
-    }
+    out = {"task": "math500"}
+    out.update(compute_accuracy(
+        args=args, model=model, tokenizer=tokenizer,
+        batch_size=args.batch_size, max_new_tokens=args.max_new_tokens,
+    ))
+    return out
 
 
-def get_task_from_model_name(model_name: str) -> Optional[str]:
-    """Extract the evaluation task from model name (e.g., alpaca_samsum -> samsum)."""
-    valid_tasks = ["samsum", "tydiqa", "mmlu", "bbh", "gsm8k", "math500"]
+def evaluate_ifeval(args, model, tokenizer) -> dict:
+    """Run IFEval (official strict/loose, prompt- and instruction-level)."""
+    from .tasks.ifeval import compute_accuracy
+
+    logger.info("Evaluating on IFEval")
+    out = {"task": "ifeval"}
+    out.update(compute_accuracy(
+        args=args, model=model, tokenizer=tokenizer,
+        batch_size=args.batch_size, max_new_tokens=args.max_new_tokens,
+    ))
+    return out
+
+
+def evaluate_ifbench(args, model, tokenizer) -> dict:
+    """Run IFBench through the official AllenAI verifier checkout."""
+    from .tasks.ifbench import compute_accuracy
+
+    logger.info("Evaluating on IFBench")
+    out = {"task": "ifbench"}
+    out.update(compute_accuracy(
+        args=args, model=model, tokenizer=tokenizer,
+        batch_size=args.batch_size, max_new_tokens=args.max_new_tokens,
+    ))
+    return out
+
+
+def evaluate_mbpp_plus(args, model, tokenizer) -> dict:
+    """Run MBPP+ through EvalPlus (sandboxed when apptainer is available)."""
+    from .tasks.mbpp_plus import compute_accuracy
+
+    logger.info("Evaluating on MBPP+")
+    out = {"task": "mbpp_plus"}
+    out.update(compute_accuracy(
+        args=args, model=model, tokenizer=tokenizer,
+        batch_size=args.batch_size, max_new_tokens=args.max_new_tokens,
+    ))
+    return out
+
+
+BENCHMARK_RUNNERS = {
+    "ifeval": evaluate_ifeval,
+    "ifbench": evaluate_ifbench,
+    "math500": evaluate_math500,
+    "mbpp_plus": evaluate_mbpp_plus,
+}
+
+
+def get_target_from_model_name(model_name: str) -> Optional[str]:
+    """Extract a Dolci-style target from the run name prefix ``{train}_{target}-...``.
+
+    Train pool and target are joined by ``_`` and may themselves contain ``_``
+    (``dolci_instruction_precise_if``), so the prefix is matched by known target
+    suffix rather than split.
+    """
+    prefix = model_name.split("-")[0].lower()
+    for target in sorted(TARGET_BENCHMARKS, key=len, reverse=True):
+        if prefix.endswith("_" + target):
+            return target
+    return None
+
+
+def get_tasks_from_model_name(model_name: str) -> List[str]:
+    """Benchmarks to run for a run directory, inferred from its name.
+
+    Dolci targets map to their benchmark list (``precise_if`` -> ifeval, ifbench);
+    legacy names (``alpaca_samsum``) map to the single legacy task.
+    """
+    target = get_target_from_model_name(model_name)
+    if target is not None:
+        return list(TARGET_BENCHMARKS[target])
     parts = model_name.split("-")
     if parts:
         train_task = parts[0].split("_")
         if len(train_task) >= 2:
             task = train_task[1].lower()
-            if task in valid_tasks:
-                return task
-    return None
+            if task in LEGACY_TASKS:
+                return [task]
+    return []
+
+
+def get_task_from_model_name(model_name: str) -> Optional[str]:
+    """Backward-compatible single-task variant of ``get_tasks_from_model_name``."""
+    tasks = get_tasks_from_model_name(model_name)
+    return tasks[0] if tasks else None
 
 
 def evaluate_model(
@@ -337,24 +431,39 @@ def evaluate_model(
     data_dir: str,
     n_test: int = -1,
     batch_size: int = 1,
-    max_new_tokens: int = 128,
+    max_new_tokens: Optional[int] = None,
     base_model: Optional[str] = None,
     task_override: Optional[str] = None,
     subject: Optional[str] = None,
+    target_override: Optional[str] = None,
+    extra_args: Optional[Dict] = None,
 ) -> Dict:
-    """Evaluate a single model. Task is auto-detected from model name."""
+    """Evaluate a single model on every benchmark implied by its name (or the overrides).
+
+    ``--task`` runs exactly one task; ``--target`` runs that target's benchmark
+    list; otherwise the run-directory name decides. ``max_new_tokens=None`` uses
+    the per-benchmark default (``DEFAULT_MAX_NEW_TOKENS``) or 128 for legacy tasks.
+    """
     model_name = os.path.basename(model_path)
     results = parse_model_name(model_name)
     results["model_path"] = model_path
 
-    # Auto-detect task from model name, or use override
-    task = task_override or get_task_from_model_name(model_name)
-    if task is None:
-        logger.error(f"Could not detect task from model name: {model_name}")
+    if task_override:
+        tasks = [task_override]
+    elif target_override:
+        if target_override not in TARGET_BENCHMARKS:
+            results["error"] = f"Unknown target {target_override!r}; known: {sorted(TARGET_BENCHMARKS)}"
+            logger.error(results["error"])
+            return results
+        tasks = list(TARGET_BENCHMARKS[target_override])
+    else:
+        tasks = get_tasks_from_model_name(model_name)
+    if not tasks:
+        logger.error(f"Could not detect task from model name: {model_name} (pass --task or --target)")
         results["error"] = "Could not detect task from model name"
         return results
 
-    logger.info(f"Auto-detected task: {task}")
+    logger.info(f"Tasks for {model_name}: {tasks}")
 
     try:
         model, tokenizer = load_model_and_tokenizer(model_path, base_model)
@@ -369,10 +478,51 @@ def evaluate_model(
     args.data_dir = data_dir
     args.n_test = n_test
     args.batch_size = batch_size
-    args.max_new_tokens = max_new_tokens
     args.subject = subject  # For MMLU
     args.bbh_task = subject  # For BBH (uses same value)
     args.n_val = 5  # Few-shot examples for MMLU
+    args.output_dir = model_path  # benchmark evaluators write generations/verifier files here
+    for key, value in (extra_args or {}).items():
+        setattr(args, key, value)
+
+    errors = []
+    for task in tasks:
+        args.max_new_tokens = (
+            max_new_tokens if max_new_tokens is not None
+            else DEFAULT_MAX_NEW_TOKENS.get(task, LEGACY_DEFAULT_MAX_NEW_TOKENS)
+        )
+        try:
+            _evaluate_one_task(task, args, model, tokenizer, model_path, model_name, results)
+        except Exception as e:
+            logger.error(f"Evaluation failed on {task}: {e}", exc_info=True)
+            errors.append(f"{task}: {e}")
+    if errors:
+        results["error"] = "; ".join(errors)
+
+    del model
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except RuntimeError as e:
+            logger.warning(f"Failed to clear CUDA cache: {e}")
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
+    results["timestamp"] = datetime.now().isoformat()
+    return results
+
+
+def _evaluate_one_task(task, args, model, tokenizer, model_path, model_name, results):
+    """Run one task, record its primary metric in ``results``, and save ``<task>_results.json``."""
+    if task in BENCHMARK_RUNNERS:
+        logger.info(f"Evaluating {model_name} on {task}...")
+        task_results = BENCHMARK_RUNNERS[task](args, model, tokenizer)
+        results[f"{task}_accuracy"] = task_results["accuracy"]
+        with open(os.path.join(model_path, f"{task}_results.json"), "w") as f:
+            json.dump(task_results, f, indent=2)
+        return
 
     try:
         if task == "samsum":
@@ -418,32 +568,10 @@ def evaluate_model(
             with open(os.path.join(model_path, "gsm8k_results.json"), "w") as f:
                 json.dump(gsm8k_results, f, indent=2)
 
-        elif task == "math500":
-            logger.info(f"Evaluating {model_name} on MATH500...")
-            math500_results = evaluate_math500(args, model, tokenizer)
-            results["math500_accuracy"] = math500_results["accuracy"]
-
-            with open(os.path.join(model_path, "math500_results.json"), "w") as f:
-                json.dump(math500_results, f, indent=2)
-
-    except Exception as e:
-        logger.error(f"Evaluation failed: {e}")
-        results["error"] = str(e)
-
-    del model
-    if torch.cuda.is_available():
-        try:
-            torch.cuda.empty_cache()
-        except RuntimeError as e:
-            logger.warning(f"Failed to clear CUDA cache: {e}")
-            # Try to reset CUDA state
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-
-    results["timestamp"] = datetime.now().isoformat()
-    return results
+        else:
+            raise ValueError(f"Unknown task {task!r}")
+    except Exception:
+        raise
 
 
 def main():
@@ -460,8 +588,22 @@ def main():
     parser.add_argument("--train", type=str, default=None,
         help="Filter by training dataset (e.g., alpaca, less, tulu3, wizardlm)")
     parser.add_argument("--task", type=str, default=None,
-        choices=["samsum", "tydiqa", "mmlu", "bbh", "gsm8k", "math500"],
-        help="Override auto-detected task (optional)")
+        choices=ALL_TASKS,
+        help="Run exactly this task (legacy: samsum/tydiqa/...; benchmarks: ifeval/ifbench/math500/mbpp_plus)")
+    parser.add_argument("--target", type=str, default=None, choices=sorted(TARGET_BENCHMARKS),
+        help="Run every benchmark of this target (precise_if -> ifeval+ifbench, math -> math500, mbpp -> mbpp_plus). "
+             "Also used as the run-name filter together with --train.")
+    parser.add_argument("--ifbench_repo", type=str, default=os.environ.get("DRPT_IFBENCH_REPO"),
+        help="Local checkout of allenai/IFBench (required for ifbench)")
+    parser.add_argument("--ifbench_revision", type=str, default=None,
+        help="Expected IFBench commit (default: the pinned commit in tasks/ifbench.py)")
+    parser.add_argument("--evalplus_runner", type=str, default=None,
+        choices=["auto", "apptainer", "singularity", "host"],
+        help="How to run evalplus.evaluate for mbpp_plus (default auto: container if available, else host)")
+    parser.add_argument("--evalplus_image", type=str, default=None,
+        help="EvalPlus container image (default: pinned official image)")
+    parser.add_argument("--evalplus_dataset_path", type=str, default=None,
+        help="Local MbppPlus JSONL to bind into the container (enables offline evaluation)")
     parser.add_argument("--subject", type=str, default=None,
         help="MMLU subject or BBH task to evaluate on (default: all)")
     parser.add_argument("--method", type=str, default=None,
@@ -472,8 +614,9 @@ def main():
         help="Number of test examples (-1 for all)")
     parser.add_argument("--batch_size", type=int, default=1,
         help="Batch size for generation")
-    parser.add_argument("--max_new_tokens", type=int, default=128,
-        help="Maximum tokens to generate")
+    parser.add_argument("--max_new_tokens", type=int, default=None,
+        help="Maximum tokens to generate (default: per-task; 128 for legacy tasks, "
+             "2048 for ifeval/ifbench/mbpp_plus, 4096 for math500)")
     parser.add_argument("--base_model", type=str, default=None,
         help="Base model for LoRA adapters")
     parser.add_argument("--seed", type=int, default=42,
@@ -504,6 +647,14 @@ def main():
             base_model=args.base_model,
             task_override=args.task,
             subject=args.subject,
+            target_override=args.target,
+            extra_args={
+                "ifbench_repo": args.ifbench_repo,
+                "ifbench_revision": args.ifbench_revision,
+                "evalplus_runner": args.evalplus_runner,
+                "evalplus_image": args.evalplus_image,
+                "evalplus_dataset_path": args.evalplus_dataset_path,
+            },
         )
         print("\n" + "=" * 60)
         print("Results:")
@@ -515,7 +666,10 @@ def main():
     # Batch evaluation
     # Construct filter prefix from train, task, and subject
     filter_prefix = args.train
-    if filter_prefix and args.task:
+    if filter_prefix and args.target:
+        filter_prefix = f"{filter_prefix}_{args.target}"
+    elif filter_prefix and args.task and args.task in LEGACY_TASKS and args.task not in BENCHMARK_TASKS:
+        # Legacy run names embed the task itself (alpaca_samsum); benchmark names never appear in run names.
         filter_prefix = f"{filter_prefix}_{args.task}"
         if args.subject:
             filter_prefix = f"{filter_prefix}_{args.subject}"
@@ -543,6 +697,14 @@ def main():
             base_model=args.base_model,
             task_override=args.task,
             subject=args.subject,
+            target_override=args.target,
+            extra_args={
+                "ifbench_repo": args.ifbench_repo,
+                "ifbench_revision": args.ifbench_revision,
+                "evalplus_runner": args.evalplus_runner,
+                "evalplus_image": args.evalplus_image,
+                "evalplus_dataset_path": args.evalplus_dataset_path,
+            },
         )
         all_results.append(results)
 
@@ -601,15 +763,16 @@ def main():
             print(f"{r['model_name'][:90]:<90} "
                   f"{r['gsm8k_accuracy']:>8.4f}")
 
-    # MATH500 results
-    math500_results = [r for r in all_results if "math500_accuracy" in r]
-    if math500_results:
-        print(f"\nMATH500 Results:")
-        print(f"{'Model':<90} {'Acc':>8}")
-        print("-" * 100)
-        for r in sorted(math500_results, key=lambda x: x.get("math500_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:90]:<90} "
-                  f"{r['math500_accuracy']:>8.4f}")
+    # Generative benchmarks (percent, task-native primary metric; never averaged across tasks)
+    for task in BENCHMARK_TASKS:
+        key = f"{task}_accuracy"
+        task_results = [r for r in all_results if key in r]
+        if task_results:
+            print(f"\n{task} Results (primary metric, %):")
+            print(f"{'Model':<90} {'Score':>8}")
+            print("-" * 100)
+            for r in sorted(task_results, key=lambda x: x.get(key, 0), reverse=True):
+                print(f"{r['model_name'][:90]:<90} {r[key]:>8.2f}")
 
     errors = [r for r in all_results if r.get("error")]
     if errors:

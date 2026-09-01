@@ -670,6 +670,76 @@ def prepare_tydiqa(output_dir):
     return val_file, test_file
 
 
+def prepare_truthfulqa(output_dir):
+    """
+    Prepare TruthfulQA (domenicrosati/TruthfulQA) validation, LR sweep, and test data.
+
+    The dataset has a single 'train' split with 817 examples. We split it into:
+    - validation: first 50 examples (for data curation during training)
+    - lr: next 100 examples (for LR sweep)
+    - test: remaining ~667 examples (for final evaluation)
+
+    Each example is formatted as a Question -> Best Answer pair using the
+    unified 'messages' format. Other fields (Type, Category, Correct/Incorrect
+    Answers, Source) are preserved in metadata.
+    """
+    print("Preparing TruthfulQA validation, LR, and test data...")
+
+    output_dir_truthfulqa = os.path.join(output_dir, "eval", "truthfulqa")
+    ensure_dir(output_dir_truthfulqa)
+
+    print("Loading domenicrosati/TruthfulQA from HuggingFace...")
+    dataset = load_dataset("domenicrosati/TruthfulQA", split="train")
+    all_data = list(dataset)
+
+    val_size = 50
+    lr_size = 100
+    val_data = all_data[:val_size]
+    lr_data = all_data[val_size:val_size + lr_size]
+    test_data = all_data[val_size + lr_size:]
+
+    def format_qa(example):
+        question = example.get('Question', '')
+        answer = example.get('Best Answer', '')
+        user_content = f"Answer the following question truthfully and concisely.\n\nQuestion: {question}"
+        return user_content, answer
+
+    def write_split(file_path, data, split_name):
+        with open(file_path, 'w', encoding='utf-8') as f:
+            for idx, example in enumerate(tqdm(data, desc=split_name.capitalize())):
+                user_content, answer = format_qa(example)
+                entry = {
+                    "dataset": "truthfulqa",
+                    "id": f"truthfulqa_{split_name}_{idx}",
+                    "messages": [
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": answer}
+                    ],
+                    "metadata": {
+                        "type": example.get('Type', ''),
+                        "category": example.get('Category', ''),
+                        "correct_answers": example.get('Correct Answers', ''),
+                        "incorrect_answers": example.get('Incorrect Answers', ''),
+                        "source": example.get('Source', '')
+                    }
+                }
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+    val_file = os.path.join(output_dir_truthfulqa, "truthfulqa_validation_data.jsonl")
+    lr_file = os.path.join(output_dir_truthfulqa, "truthfulqa_lr_data.jsonl")
+    test_file = os.path.join(output_dir_truthfulqa, "truthfulqa_test_data.jsonl")
+
+    write_split(val_file, val_data, "val")
+    write_split(lr_file, lr_data, "lr")
+    write_split(test_file, test_data, "test")
+
+    print(f"TruthfulQA data saved:")
+    print(f"  Validation: {val_file} ({len(val_data)} examples)")
+    print(f"  LR sweep: {lr_file} ({len(lr_data)} examples)")
+    print(f"  Test: {test_file} ({len(test_data)} examples)")
+    return val_file, lr_file, test_file
+
+
 def prepare_alpaca(output_dir):
     """Prepare Alpaca instruction-following dataset."""
     print("Preparing Alpaca training data...")
@@ -1122,6 +1192,139 @@ def prepare_tulu3(output_dir):
     return output_file
 
 
+# =============================================================================
+# Downstream benchmarks (Dolci capability setting)
+#
+# A *benchmark* file holds prompts plus the metadata its official verifier needs.
+# It is scored by generation (SFT/eval/eval.sh) and is a different object from a
+# *target* split (validation = D*, test = loss held-out). Layout:
+#   eval/<bench>/<bench>_bench_data.jsonl
+# Revisions are pinned to the ones used by the Dr.Post-Training-Next campaigns.
+# =============================================================================
+
+BENCHMARK_PINS = {
+    "ifeval": {"repo": "google/IFEval", "revision": "966cd89545d6b6acfd7638bc708b98261ca58e84", "split": "train"},
+    "ifbench": {"repo": "allenai/IFBench_test", "revision": "2e8a48de45ff3bf41242f927254ca81b59ca3ae2", "split": "train"},
+    "math500": {"repo": "HuggingFaceH4/MATH-500", "revision": "6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be", "split": "test"},
+}
+MBPP_PLUS_DATASET_VERSION = "v0.2.0"
+
+
+def _bench_path(output_dir, task):
+    path = os.path.join(output_dir, "eval", task, f"{task}_bench_data.jsonl")
+    ensure_dir(os.path.dirname(path))
+    return path
+
+
+def _write_bench(path, rows, task):
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"{task} benchmark saved: {path} ({len(rows)} rows)")
+    return path
+
+
+def _clean_kwargs(raw):
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [{k: v for k, v in entry.items() if v is not None} if isinstance(entry, dict) else {} for entry in raw]
+
+
+def prepare_if_benchmark(output_dir, task):
+    """IFEval / IFBench: prompt + instruction_id_list + kwargs for the official verifiers."""
+    pin = BENCHMARK_PINS[task]
+    print(f"Preparing {task} benchmark from {pin['repo']}@{pin['revision'][:8]}...")
+    dataset = load_dataset(pin["repo"], split=pin["split"], revision=pin["revision"])
+    rows = []
+    for idx, example in enumerate(dataset):
+        prompt = (example.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        key = example.get("key", idx)
+        rows.append({
+            "dataset": task,
+            "id": f"{task}::{key}",
+            "messages": [{"role": "user", "content": prompt}],
+            "metadata": {
+                "key": key,
+                "prompt": prompt,
+                "instruction_id_list": list(example.get("instruction_id_list") or []),
+                "kwargs": _clean_kwargs(example.get("kwargs")),
+                "source_repo": pin["repo"],
+                "source_revision": pin["revision"],
+                "source_split": pin["split"],
+            },
+        })
+    return _write_bench(_bench_path(output_dir, task), rows, task)
+
+
+def prepare_math500_bench(output_dir):
+    """MATH-500 (all 500 problems) with the gold answer for math-verify / boxed matching."""
+    pin = BENCHMARK_PINS["math500"]
+    print(f"Preparing math500 benchmark from {pin['repo']}@{pin['revision'][:8]}...")
+    dataset = load_dataset(pin["repo"], split=pin["split"], revision=pin["revision"])
+    rows = []
+    for idx, example in enumerate(dataset):
+        problem = (example.get("problem") or "").strip()
+        if not problem:
+            continue
+        unique_id = str(example.get("unique_id") or idx)
+        rows.append({
+            "dataset": "math500",
+            "id": f"math500::{unique_id}",
+            "messages": [{"role": "user", "content": problem}],
+            "metadata": {
+                "problem": problem,
+                "answer": example.get("answer"),
+                "solution": example.get("solution"),
+                "subject": example.get("subject"),
+                "level": example.get("level"),
+                "unique_id": unique_id,
+                "source_repo": pin["repo"],
+                "source_revision": pin["revision"],
+                "source_split": pin["split"],
+            },
+        })
+    return _write_bench(_bench_path(output_dir, "math500"), rows, "math500")
+
+
+def prepare_mbpp_plus_bench(output_dir):
+    """MBPP+ tasks from the evalplus package (needs `pip install evalplus`).
+
+    ``canonical_solution`` is stored so that limited smoke runs can fill the
+    unscored tasks EvalPlus insists on receiving.
+    """
+    try:
+        from evalplus.data import get_mbpp_plus
+    except ImportError as exc:
+        raise RuntimeError("mbpp_plus preparation requires the evalplus package: pip install evalplus==0.3.1") from exc
+    import importlib.metadata
+    version = importlib.metadata.version("evalplus")
+    print(f"Preparing mbpp_plus benchmark with evalplus {version} (dataset {MBPP_PLUS_DATASET_VERSION})...")
+    tasks = get_mbpp_plus(version=MBPP_PLUS_DATASET_VERSION)
+    rows = []
+    for task_id in sorted(tasks):
+        task = dict(tasks[task_id])
+        prompt = (task.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        metadata = json.loads(json.dumps(task, ensure_ascii=False, default=str))
+        metadata.update({
+            "task_id": str(task_id),
+            "evalplus_version": version,
+            "evalplus_dataset_version": MBPP_PLUS_DATASET_VERSION,
+            "source_repo": "evalplus/mbppplus",
+            "source_revision": MBPP_PLUS_DATASET_VERSION,
+        })
+        rows.append({
+            "dataset": "mbpp_plus",
+            "id": f"mbpp_plus::{task_id}",
+            "messages": [{"role": "user", "content": prompt}],
+            "metadata": metadata,
+        })
+    return _write_bench(_bench_path(output_dir, "mbpp_plus"), rows, "mbpp_plus")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Prepare datasets for training and evaluation",
@@ -1129,10 +1332,21 @@ def main():
         epilog="""
 Available Datasets:
 
+  Downstream Benchmarks (eval/<bench>/<bench>_bench_data.jsonl; scored by SFT/eval/eval.sh):
+    ifeval    - IFEval (541 prompts; official verifier vendored)
+    ifbench   - IFBench (300 prompts; needs an allenai/IFBench checkout at eval time)
+    math500   - MATH-500 (500 problems; also writes the legacy validation/test splits)
+    mbpp_plus - MBPP+ via the evalplus package (378 tasks)
+
+  Dolci capability setting (train pools + targets): NOT built by this script yet.
+    Expected layout: train/dolci_{instruction,reasoning,mixed}/<name>_data.jsonl (32,000 rows)
+                     eval/{precise_if,math,mbpp}/<target>_{validation,test}_data.jsonl (D*, held-out)
+
   Evaluation Datasets (with validation/test splits):
     mmlu      - MMLU: Massive Multitask Language Understanding (57 subjects)
     bbh       - BBH: BIG-Bench Hard (23 reasoning tasks with CoT prompts)
     tydiqa    - TyDiQA: Typologically Diverse QA (9 languages)
+    truthfulqa - TruthfulQA: Adversarial truthfulness QA (817 examples)
     gsm8k     - GSM8K: Grade School Math (includes train split)
     math500   - MATH500: Competition math problems
     samsum    - SamSUM: Dialogue summarization (includes train split)
@@ -1154,8 +1368,9 @@ Available Datasets:
         nargs='+',
         required=True,
         metavar='DATASET',
-        choices=['mmlu', 'gsm8k', 'math500', 'bbh', 'tydiqa', 'vicuna', 'wizardlm', 'openhermes', 'tulu3',
-                 'alpaca', 'dolly', 'flan_v2', 'cot', 'oasst1', 'samsum'],
+        choices=['mmlu', 'gsm8k', 'math500', 'bbh', 'tydiqa', 'truthfulqa', 'vicuna', 'wizardlm', 'openhermes', 'tulu3',
+                 'alpaca', 'dolly', 'flan_v2', 'cot', 'oasst1', 'samsum',
+                 'ifeval', 'ifbench', 'mbpp_plus'],
         help="Datasets to prepare (see list below)"
     )
     parser.add_argument(
@@ -1191,6 +1406,17 @@ Available Datasets:
         val_file, test_file = prepare_math500(args.output_dir)
         results['math500_validation'] = val_file
         results['math500_test'] = test_file
+        results['math500_bench'] = prepare_math500_bench(args.output_dir)
+
+    # Downstream benchmarks
+    if 'ifeval' in datasets_to_prepare:
+        results['ifeval_bench'] = prepare_if_benchmark(args.output_dir, 'ifeval')
+
+    if 'ifbench' in datasets_to_prepare:
+        results['ifbench_bench'] = prepare_if_benchmark(args.output_dir, 'ifbench')
+
+    if 'mbpp_plus' in datasets_to_prepare:
+        results['mbpp_plus_bench'] = prepare_mbpp_plus_bench(args.output_dir)
 
     if 'bbh' in datasets_to_prepare:
         val_file, test_file = prepare_bbh(args.output_dir)
@@ -1201,6 +1427,12 @@ Available Datasets:
         val_file, test_file = prepare_tydiqa(args.output_dir)
         results['tydiqa_validation'] = val_file
         results['tydiqa_test'] = test_file
+
+    if 'truthfulqa' in datasets_to_prepare:
+        val_file, lr_file, test_file = prepare_truthfulqa(args.output_dir)
+        results['truthfulqa_validation'] = val_file
+        results['truthfulqa_lr'] = lr_file
+        results['truthfulqa_test'] = test_file
 
     # New training datasets
     if 'vicuna' in datasets_to_prepare:

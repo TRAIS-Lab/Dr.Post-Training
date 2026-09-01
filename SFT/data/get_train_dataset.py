@@ -45,6 +45,13 @@ def get_train_files_for_dataset(data_dir: str, dataset_name: str) -> List[str]:
         "openhermes": [f"{data_dir}/train/openhermes/openhermes_data.jsonl"],
         "tulu3": [f"{data_dir}/train/tulu3/tulu3_data.jsonl"],
         "samsum": [f"{data_dir}/train/samsum/samsum_train_data.jsonl"],
+        # Validation-only ablation: use a task's validation split as the training source
+        "truthfulqa_val": [f"{data_dir}/eval/truthfulqa/truthfulqa_validation_data.jsonl"],
+        # Dolci-Instruct 32K pools (see SFT/README.md, "Dolci capability setting").
+        # Each is a 32,000-row messages JSONL sampled from allenai/Dolci-Instruct-SFT.
+        "dolci_instruction": [f"{data_dir}/train/dolci_instruction/dolci_instruction_data.jsonl"],
+        "dolci_reasoning": [f"{data_dir}/train/dolci_reasoning/dolci_reasoning_data.jsonl"],
+        "dolci_mixed": [f"{data_dir}/train/dolci_mixed/dolci_mixed_data.jsonl"],
         # LESS mixture (flan_v2 + cot + dolly + oasst1)
         "less": [
             f"{data_dir}/train/flan_v2/flan_v2_data.jsonl",
@@ -181,7 +188,18 @@ def get_encode_function(raw_datasets, tokenizer, max_seq_length, func="encode_wi
         )
     elif "messages" in raw_datasets.column_names:
         if func == "encode_with_messages_format":
-            encode_func = encode_with_messages_format
+            from SFT.data.chat_format import (
+                encode_messages_with_chat_template, ensure_chat_template, has_native_chat_template,
+            )
+            ensure_chat_template(tokenizer)
+            if has_native_chat_template(tokenizer):
+                # Tokenizer ships its own template (e.g. Qwen3): render with it and
+                # supervise assistant turns via offset mapping. Tokenizers without
+                # a template (Llama-3.2-1B-Base) keep the legacy tulu encoder below
+                # so the paper's runs are reproduced byte-for-byte.
+                encode_func = encode_messages_with_chat_template
+            else:
+                encode_func = encode_with_messages_format
         else:
             encode_func = encode_with_messages_format_with_llama2_chat
         encode_function = partial(

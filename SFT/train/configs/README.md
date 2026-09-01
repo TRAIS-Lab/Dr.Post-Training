@@ -10,6 +10,18 @@ Each YAML file defines a training method as `{CurationMethod}-{FinetuningMethod}
 | `finetuning` | Full, LoRA, MeSO, MeSO-LoRA | Training approach |
 | `lora_r`, `lora_alpha`, `lora_dropout` | int, int, float | LoRA hyperparameters |
 
+## Dolci capability settings
+
+`dolci_inst_if`, `dolci_reason_math`, `dolci_reason_code`, `dolci_mixed_if`,
+`dolci_mixed_math` train Qwen3-1.7B-Base on a Dolci pool toward a target whose
+benchmark is scored post hoc (see `SFT/README.md`). Their `defaults.yaml` add these keys:
+
+| Key | Values | Description |
+|---|---|---|
+| `gradient_checkpointing` | true, false | Non-reentrant activation checkpointing (required for 4096-token sequences on a 48 GB GPU) |
+| `val_seq_length_multiplier` | float | D* rejection threshold as a multiple of the average train length; `0` disables |
+| `eval_split` | validation, lr, test | Split used for the `eval_loss` curve (default `test`; CLI `--eval_split` overrides) |
+
 ## Gradient Compression
 
 Both `score_grad_compression` and `opt_grad_compression` use the same two-stage pipeline:

@@ -23,9 +23,14 @@ subject=""
 method=""
 n_test=-1
 batch_size=1
-max_new_tokens=128
+max_new_tokens=""     # empty -> per-task default in eval.py
 seed=42
 dry_run=false
+target=""
+ifbench_repo="${DRPT_IFBENCH_REPO:-}"
+evalplus_runner=""
+evalplus_image=""
+evalplus_dataset_path=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -74,6 +79,26 @@ while [[ $# -gt 0 ]]; do
             seed="$2"
             shift 2
             ;;
+        --target)
+            target="$2"
+            shift 2
+            ;;
+        --ifbench_repo)
+            ifbench_repo="$2"
+            shift 2
+            ;;
+        --evalplus_runner)
+            evalplus_runner="$2"
+            shift 2
+            ;;
+        --evalplus_image)
+            evalplus_image="$2"
+            shift 2
+            ;;
+        --evalplus_dataset_path)
+            evalplus_dataset_path="$2"
+            shift 2
+            ;;
         --dry-run)
             dry_run=true
             shift
@@ -85,12 +110,17 @@ while [[ $# -gt 0 ]]; do
             echo "  --models_dir DIR     Models directory (default: \$SCRATCH_DIR/Dr.Post-Training/SFT)"
             echo "  --data_dir DIR       Data directory (default: \$SCRATCH_DIR/Dr.Post-Training/SFT/data)"
             echo "  --train NAME         Filter by training dataset (alpaca, less, tulu3, wizardlm)"
-            echo "  --task NAME          Override task (samsum, tydiqa, mmlu, bbh, gsm8k, math500)"
+            echo "  --task NAME          Run exactly one task (legacy: samsum tydiqa mmlu bbh gsm8k; benchmarks: ifeval ifbench math500 mbpp_plus)"
+            echo "  --target NAME        Run all benchmarks of a target (precise_if -> ifeval+ifbench, math -> math500, mbpp -> mbpp_plus)"
+            echo "  --ifbench_repo DIR   Checkout of allenai/IFBench (or set DRPT_IFBENCH_REPO); needed for ifbench"
+            echo "  --evalplus_runner R  auto|apptainer|singularity|host for mbpp_plus (default auto)"
+            echo "  --evalplus_image I   EvalPlus container image (default: pinned official image)"
+            echo "  --evalplus_dataset_path P  Local MbppPlus JSONL for offline container evaluation"
             echo "  --subject NAME       MMLU subject or BBH task to evaluate on (default: all)"
             echo "  --method NAME        Filter by method (e.g., Standard-MeSO, Layerwise-Full)"
             echo "  --n_test N           Number of test examples (-1 for all)"
             echo "  --batch_size N       Batch size for generation (default: 1)"
-            echo "  --max_new_tokens N   Max tokens to generate (default: 128)"
+            echo "  --max_new_tokens N   Max tokens to generate (default: per task; 128 legacy, 2048 IF/code, 4096 math)"
             echo "  --seed N             Random seed for reproducibility (default: 42)"
             echo "  --dry-run            Print command without executing"
             exit 0
@@ -112,12 +142,13 @@ echo ""
 echo "Filters:"
 echo "  Train:         ${train:-all}"
 echo "  Task:          ${task:-auto-detect}"
+echo "  Target:        ${target:-auto-detect}"
 echo "  Subject:       ${subject:-all}"
 echo "  Method:        ${method:-all}"
 echo ""
 echo "Generation:"
 echo "  Batch size:    $batch_size"
-echo "  Max new tokens: $max_new_tokens"
+echo "  Max new tokens: ${max_new_tokens:-per-task default}"
 echo "  N test:        $n_test (-1 = all)"
 echo "  Seed:          $seed"
 echo "========================================================"
@@ -132,8 +163,13 @@ fi
 cmd="$cmd --data_dir $data_dir"
 cmd="$cmd --n_test $n_test"
 cmd="$cmd --batch_size $batch_size"
-cmd="$cmd --max_new_tokens $max_new_tokens"
+[[ -n "$max_new_tokens" ]] && cmd="$cmd --max_new_tokens $max_new_tokens"
 cmd="$cmd --seed $seed"
+[[ -n "$target" ]] && cmd="$cmd --target $target"
+[[ -n "$ifbench_repo" ]] && cmd="$cmd --ifbench_repo $ifbench_repo"
+[[ -n "$evalplus_runner" ]] && cmd="$cmd --evalplus_runner $evalplus_runner"
+[[ -n "$evalplus_image" ]] && cmd="$cmd --evalplus_image $evalplus_image"
+[[ -n "$evalplus_dataset_path" ]] && cmd="$cmd --evalplus_dataset_path $evalplus_dataset_path"
 
 if [[ -n "$train" ]]; then
     cmd="$cmd --train $train"

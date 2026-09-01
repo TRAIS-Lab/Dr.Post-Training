@@ -114,6 +114,16 @@ class TrainingArguments(TA):
         default=500,
         metadata={"help": "Number of evaluation samples for generalization testing"},
     )
+    val_seq_length_multiplier: float = field(
+        default=1.2,
+        metadata={
+            "help": (
+                "Rejection-sampling threshold for the curation validation set (D*), as a multiple "
+                "of the average training sequence length. Validation samples longer than "
+                "multiplier * avg_train_len are skipped. Set to 0 to disable rejection. Default: 1.2"
+            )
+        },
+    )
     val_batch_size_for_selection: int = field(
         default=1,
         metadata={
@@ -251,4 +261,11 @@ class TrainingArguments(TA):
             self.fsdp_config = fsdp_config[self.fsdp_config]
         if self.train_dataset_names is not None:
             self.train_dataset_names = self.train_dataset_names.split(" ")
+        if self.gradient_checkpointing and not self.gradient_checkpointing_kwargs:
+            # The drpt hooks monkey-patch Linear/Embedding forwards with custom
+            # autograd Functions. Non-reentrant checkpointing recomputes the
+            # forward inside backward and runs each Function's backward exactly
+            # once, so per-layer scores are not double counted. Reentrant
+            # checkpointing is not supported with the hooks.
+            self.gradient_checkpointing_kwargs = {"use_reentrant": False}
         super().__post_init__()

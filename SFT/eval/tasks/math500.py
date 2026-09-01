@@ -1,246 +1,245 @@
-"""
-MATH500 evaluation module for competition-level math problems.
+"""MATH-500 greedy pass@1 evaluation.
 
-Uses accuracy on the final answer as the primary metric.
-Answers are extracted from the LaTeX format: \\boxed{answer}
+Records come from ``eval/math500/math500_bench_data.jsonl`` (build with
+``prepare_datasets.py --datasets math500``); the legacy
+``math500_test_data.jsonl`` split is accepted as a fallback. Prompts are rendered
+through the tokenizer's chat template.
+
+Scoring uses `math-verify <https://github.com/huggingface/Math-Verify>`_ when it
+is installed (the Next repo pins 0.9.0); otherwise it falls back to the original
+regex ``\\boxed{}`` extraction with light LaTeX normalisation, and says so in the
+result's provenance. Accuracy is reported in percent.
 """
+
+from __future__ import annotations
 
 import json
+import logging
 import os
 import re
-from typing import List, Tuple, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from tqdm import tqdm
+from SFT.eval.tasks.bench_data import bench_data_path, first_user_content, load_bench_records
+from SFT.eval.tasks.common import (
+    clean_model_response,
+    render_generation_chat,
+    result_provenance,
+    single_source_revision,
+)
+from ..utils import generate_completions, get_eos_token_ids
 
-from ..utils import generate_completions
+logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_NEW_TOKENS = 4096
+DATASET_REPOSITORY = "HuggingFaceH4/MATH-500"
+PREFERRED_MATH_VERIFY_VERSION = "0.9.0"
+
+_PROMPT_TEMPLATE = (
+    "Solve the following mathematics problem. Show your reasoning, then put only "
+    "the final answer inside \\boxed{{}}.\n\n{problem}"
+)
 
 
-def load_math500_test_data(data_dir: str, k: int = -1) -> List[Tuple[str, str, str, dict]]:
-    """
-    Load MATH500 test data from unified JSONL format.
-
-    Args:
-        data_dir: Base data directory containing eval/math500/
-        k: Number of examples to load (-1 for all)
-
-    Returns:
-        List of (prompt, full_solution, final_answer, metadata) tuples
-    """
-    file_path = os.path.join(data_dir, "eval", "math500", "math500_test_data.jsonl")
-
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(
-            f"MATH500 test data not found: {file_path}\n"
-            f"Please run: python SFT/data/prepare_datasets.py --datasets math500"
-        )
-
-    examples = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            example = json.loads(line.strip())
-            messages = example.get('messages', [])
-            if len(messages) < 2:
-                continue
-
-            user_content = messages[0]['content']
-            full_solution = messages[1]['content']
-            metadata = example.get('metadata', {})
-
-            # Use answer from metadata if available, otherwise extract from \boxed{} format
-            final_answer = metadata.get('answer', '')
-            if not final_answer:
-                final_answer = extract_boxed_answer(full_solution)
-            if final_answer is None:
-                continue
-
-            # Format prompt with chat template
-            prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-
-            examples.append((prompt, full_solution, final_answer, metadata))
-
-            if k > 0 and len(examples) >= k:
-                break
-
-    return examples
-
+# ---------------------------------------------------------------------------
+# Legacy regex scorer (kept as the fallback when math-verify is unavailable)
+# ---------------------------------------------------------------------------
 
 def extract_boxed_answer(text: str) -> Optional[str]:
-    """
-    Extract the answer from \\boxed{...} format.
-
-    Handles nested braces properly.
-    """
-    # Find \boxed{ pattern
-    match = re.search(r'\\boxed\{', text)
-    if not match:
+    """Extract the content of the *last* ``\\boxed{...}``, handling nested braces."""
+    matches = list(re.finditer(r"\\boxed\{", text))
+    if not matches:
         return None
-
-    start = match.end()
-    brace_count = 1
-    i = start
-
-    while i < len(text) and brace_count > 0:
-        if text[i] == '{':
-            brace_count += 1
-        elif text[i] == '}':
-            brace_count -= 1
+    start = matches[-1].end()
+    depth, i = 1, start
+    while i < len(text) and depth > 0:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
         i += 1
-
-    if brace_count == 0:
-        return text[start:i-1]
-    return None
+    return text[start:i - 1] if depth == 0 else None
 
 
-def normalize_answer(answer: str) -> str:
-    """
-    Normalize mathematical answer for comparison.
-
-    Handles common LaTeX formatting differences.
-    """
+def normalize_answer(answer: Optional[str]) -> str:
     if answer is None:
         return ""
-
-    # Remove whitespace
     answer = answer.strip()
-
-    # Remove common LaTeX formatting
-    answer = answer.replace('\\,', '')
-    answer = answer.replace('\\;', '')
-    answer = answer.replace('\\!', '')
-    answer = answer.replace('\\ ', '')
-    answer = answer.replace('\\text{', '')
-    answer = answer.replace('\\mathrm{', '')
-    answer = answer.replace('\\textbf{', '')
-    answer = answer.replace('}', '')
-
-    # Normalize fractions
-    answer = re.sub(r'\\frac\{([^}]+)\}\{([^}]+)\}', r'(\1)/(\2)', answer)
-    answer = re.sub(r'\\dfrac\{([^}]+)\}\{([^}]+)\}', r'(\1)/(\2)', answer)
-    answer = re.sub(r'\\tfrac\{([^}]+)\}\{([^}]+)\}', r'(\1)/(\2)', answer)
-
-    # Remove spaces
-    answer = answer.replace(' ', '')
-
+    for token in ("\\,", "\\;", "\\!", "\\ ", "\\text{", "\\mathrm{", "\\textbf{", "\\left", "\\right", "$"):
+        answer = answer.replace(token, "")
+    # Normalise fractions before stripping braces (the legacy code did it after,
+    # so the pattern could never match).
+    answer = re.sub(r"\\[dt]?frac\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", answer)
+    answer = answer.replace("{", "").replace("}", "")
+    answer = answer.replace(" ", "")
     return answer.lower()
 
 
-def answers_match(pred: str, ref: str) -> bool:
-    """Check if predicted answer matches reference answer."""
-    pred_norm = normalize_answer(pred)
-    ref_norm = normalize_answer(ref)
-
-    # Exact match after normalization
+def answers_match(pred: Optional[str], ref: str) -> bool:
+    pred_norm, ref_norm = normalize_answer(pred), normalize_answer(ref)
     if pred_norm == ref_norm:
         return True
-
-    # Try numeric comparison if both are numbers
     try:
-        pred_num = float(pred_norm)
-        ref_num = float(ref_norm)
-        if abs(pred_num - ref_num) < 1e-6:
-            return True
+        return abs(float(pred_norm) - float(ref_norm)) < 1e-6
     except (ValueError, TypeError):
-        pass
-
-    return False
+        return False
 
 
-def compute_accuracy(args, model, tokenizer, batch_size: int = 1, max_new_tokens: int = 512) -> dict:
-    """
-    Evaluate model on MATH500 test set.
+# ---------------------------------------------------------------------------
+# Scorer selection
+# ---------------------------------------------------------------------------
 
-    Args:
-        args: Arguments containing n_test and data_dir
-        model: The model to evaluate
-        tokenizer: The tokenizer for the model
-        batch_size: Batch size for generation
-        max_new_tokens: Maximum tokens to generate
+def _load_scorer() -> Tuple[Callable[[str, str], Dict[str, Any]], Dict[str, Any]]:
+    """Return ``score(gold, prediction) -> {correct, status, error}`` and its provenance."""
+    try:
+        import importlib.metadata
+        from math_verify import parse, verify  # type: ignore
 
-    Returns:
-        Dictionary with accuracy and level breakdown
-    """
-    data_dir = getattr(args, 'data_dir', './data')
-    n_test = getattr(args, 'n_test', -1)
-    if n_test <= 0:
-        n_test = 10000  # Load all available
+        version = importlib.metadata.version("math-verify")
+        if version != PREFERRED_MATH_VERIFY_VERSION:
+            logger.warning("math-verify %s installed; Next campaigns used %s", version, PREFERRED_MATH_VERIFY_VERSION)
 
-    # Load test data
-    test_data = load_math500_test_data(data_dir, k=n_test)
-    print(f"Loaded {len(test_data)} MATH500 test examples")
+        def score(gold: str, prediction: str) -> Dict[str, Any]:
+            try:
+                parsed_gold = parse(f"${gold}$")
+            except Exception as exc:  # noqa: BLE001
+                return {"correct": False, "status": "gold_parse_error", "error": f"{type(exc).__name__}: {exc}"}
+            if not parsed_gold:
+                return {"correct": False, "status": "gold_parse_error", "error": "empty parsed gold"}
+            try:
+                parsed_pred = parse(prediction)
+            except Exception as exc:  # noqa: BLE001
+                return {"correct": False, "status": "prediction_parse_error", "error": f"{type(exc).__name__}: {exc}"}
+            if not parsed_pred:
+                return {"correct": False, "status": "prediction_parse_error", "error": "empty parsed prediction"}
+            try:
+                correct = bool(verify(parsed_gold, parsed_pred))
+            except Exception as exc:  # noqa: BLE001
+                return {"correct": False, "status": "verification_error", "error": f"{type(exc).__name__}: {exc}"}
+            return {"correct": correct, "status": "correct" if correct else "incorrect", "error": ""}
 
-    # Extract prompts
-    prompts = [prompt for prompt, _, _, _ in test_data]
-    references = [answer for _, _, answer, _ in test_data]
-    metadata_list = [meta for _, _, _, meta in test_data]
+        return score, {"package": "math-verify", "version": version}
+    except ImportError:
+        logger.warning(
+            "math-verify is not installed; falling back to regex \\boxed{} matching. "
+            "Install math-verify==%s for the official-style scorer.", PREFERRED_MATH_VERIFY_VERSION,
+        )
 
-    # Generate solutions
-    print("Generating solutions...")
-    predictions = generate_completions(
-        model,
-        tokenizer,
-        prompts,
-        batch_size=batch_size,
-        max_new_tokens=max_new_tokens,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        temperature=1.0,
-        top_p=0.95,
-        disable_tqdm=False
+        def score(gold: str, prediction: str) -> Dict[str, Any]:
+            boxed = extract_boxed_answer(prediction)
+            if boxed is None:
+                return {"correct": False, "status": "prediction_parse_error", "error": "no \\boxed{} found"}
+            correct = answers_match(boxed, gold)
+            return {"correct": correct, "status": "correct" if correct else "incorrect", "error": ""}
+
+        return score, {"package": "regex_boxed_fallback", "version": "legacy"}
+
+
+def _load_records(data_dir: str, k: int) -> Tuple[List[Dict[str, Any]], str]:
+    """Benchmark file first; legacy ``math500_test_data.jsonl`` as fallback."""
+    if os.path.exists(bench_data_path(data_dir, "math500")):
+        return load_bench_records(data_dir, "math500", k=k), "bench"
+    legacy = os.path.join(data_dir, "eval", "math500", "math500_test_data.jsonl")
+    if not os.path.exists(legacy):
+        raise FileNotFoundError(
+            f"MATH500 data not found: {bench_data_path(data_dir, 'math500')} or {legacy}\n"
+            "Build it with: python SFT/data/prepare_datasets.py --datasets math500"
+        )
+    logger.warning("Using legacy split %s (a subset of MATH-500); build the bench file for the full set", legacy)
+    records: List[Dict[str, Any]] = []
+    with open(legacy, "r", encoding="utf-8") as handle:
+        for line in handle:
+            row = json.loads(line)
+            messages = row.get("messages", [])
+            if len(messages) < 2:
+                continue
+            metadata = dict(row.get("metadata", {}))
+            metadata.setdefault("problem", messages[0]["content"])
+            if not metadata.get("answer"):
+                metadata["answer"] = extract_boxed_answer(messages[1]["content"])
+            if metadata["answer"] is None:
+                continue
+            records.append({"id": row.get("id"), "messages": [messages[0]], "metadata": metadata})
+            if k > 0 and len(records) >= k:
+                break
+    return records, "legacy_test_split"
+
+
+def compute_accuracy(
+    args,
+    model,
+    tokenizer,
+    batch_size: int = 4,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+) -> Dict[str, Any]:
+    data_dir = getattr(args, "data_dir", "./data")
+    requested_n = getattr(args, "n_test", -1)
+    score, scorer_info = _load_scorer()
+    records, source = _load_records(data_dir, requested_n)
+    print(f"Loaded {len(records)} MATH500 problems ({source}); scorer={scorer_info['package']}")
+
+    prompts = []
+    for record in records:
+        metadata = record.get("metadata", {})
+        problem = metadata.get("problem") or first_user_content(record)
+        prompts.append(render_generation_chat(
+            tokenizer, _PROMPT_TEMPLATE.format(problem=problem), enable_thinking=False,
+        ))
+    generations = generate_completions(
+        model, tokenizer, prompts,
+        batch_size=batch_size, max_new_tokens=max_new_tokens,
+        pad_token_id=tokenizer.pad_token_id, eos_token_id=get_eos_token_ids(tokenizer),
+        do_sample=False, disable_tqdm=False,
     )
 
-    # Evaluate predictions
-    correct = 0
-    invalid_format = 0
-    level_correct = {}
-    level_total = {}
+    per_example: List[Dict[str, Any]] = []
+    level_correct: Dict[Any, int] = {}
+    level_total: Dict[Any, int] = {}
+    for record, generation in zip(records, generations):
+        metadata = record.get("metadata", {})
+        gold = metadata.get("answer")
+        if gold is None:
+            raise ValueError(f"MATH500 record has no metadata.answer: {record.get('id')}")
+        response = clean_model_response(generation)
+        scored = score(str(gold), response)
+        level = metadata.get("level", "unknown")
+        level_total[level] = level_total.get(level, 0) + 1
+        if scored["correct"]:
+            level_correct[level] = level_correct.get(level, 0) + 1
+        per_example.append({
+            "id": record.get("id"), "unique_id": metadata.get("unique_id"),
+            "gold_answer": gold, "raw_generation": generation, "response": response, **scored,
+        })
 
-    for i, (pred, ref, meta) in enumerate(zip(predictions, references, metadata_list)):
-        level = meta.get('level', 0)
+    n_correct = sum(1 for row in per_example if row["correct"])
+    n_parse_errors = sum(1 for row in per_example if "parse_error" in row["status"])
+    accuracy = n_correct / len(records) * 100.0 if records else 0.0
 
-        # Track per-level stats
-        if level not in level_correct:
-            level_correct[level] = 0
-            level_total[level] = 0
-        level_total[level] += 1
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir:
+        with open(os.path.join(output_dir, "math500_generations.jsonl"), "w", encoding="utf-8") as handle:
+            for row in per_example:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-        # Clean prediction
-        pred = pred.strip()
-        for stop_pattern in ["<|user|>", "<|assistant|>", "</s>", "<|end|>"]:
-            if stop_pattern in pred:
-                pred = pred[:pred.find(stop_pattern)]
-
-        # Extract predicted answer
-        pred_answer = extract_boxed_answer(pred)
-
-        if pred_answer is None:
-            invalid_format += 1
-            continue
-
-        # Compare answers
-        if answers_match(pred_answer, ref):
-            correct += 1
-            level_correct[level] += 1
-
-    accuracy = correct / len(test_data) if len(test_data) > 0 else 0.0
-
-    # Print results
-    print(f"\nMATH500 Evaluation Results:")
-    print(f"  Overall Accuracy: {accuracy:.4f}")
-    print(f"  Examples evaluated: {len(test_data)}")
-    print(f"  Correct: {correct}")
-    print(f"  Invalid format: {invalid_format}")
-
-    # Print per-level breakdown
+    print("\nMATH500 Results:")
+    print(f"  accuracy: {accuracy:.2f}%  ({n_correct}/{len(records)}), parse errors: {n_parse_errors}")
     if len(level_total) > 1:
-        print(f"\n  Per-level breakdown:")
-        for level in sorted(level_total.keys()):
-            level_acc = level_correct[level] / level_total[level] if level_total[level] > 0 else 0
-            print(f"    Level {level}: {level_acc:.4f} ({level_correct[level]}/{level_total[level]})")
+        for level in sorted(level_total, key=str):
+            print(f"    level {level}: {level_correct.get(level, 0)}/{level_total[level]}")
 
     return {
+        "evaluation_scope": "full" if requested_n <= 0 else "limited",
         "accuracy": accuracy,
-        "n_test": len(test_data),
-        "n_correct": correct,
-        "n_invalid_format": invalid_format,
-        "level_breakdown": {l: level_correct[l] / level_total[l] for l in level_total if level_total[l] > 0}
+        "n_test": len(records),
+        "n_correct": n_correct,
+        "n_parse_errors": n_parse_errors,
+        "level_breakdown": {
+            str(level): level_correct.get(level, 0) / level_total[level] * 100.0 for level in level_total
+        },
+        "provenance": result_provenance(
+            dataset_repository=DATASET_REPOSITORY,
+            dataset_revision=single_source_revision(records),
+            dataset_split="test",
+            evaluator={**scorer_info, "primary_metric": "accuracy", "records_source": source},
+            n_tasks=len(records), max_new_tokens=max_new_tokens, thinking=False,
+        ),
     }

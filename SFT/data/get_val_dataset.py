@@ -136,6 +136,12 @@ def load_unified_jsonl(
     if seed is not None:
         random.Random(seed).shuffle(examples)
 
+    if k is not None and k > 0 and len(examples) < k:
+        logger.warning(
+            f"{task}/{split}: requested {k} examples but the file only has {len(examples)} "
+            f"({file_path}); using all {len(examples)}."
+        )
+
     return examples[:k]
 
 
@@ -520,6 +526,75 @@ def get_samsum_dataset(
     return dataset
 
 
+def get_truthfulqa_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        split: str = "test",
+        k: int = 5,
+        seed: Optional[int] = None,
+        max_seq_length_threshold: Optional[int] = None,
+        **kwargs
+    ) -> Dataset:
+    """
+    Get the TruthfulQA dataset in unified JSONL format.
+
+    Args:
+        data_dir: The main data directory.
+        tokenizer: The tokenizer used to tokenize the input text.
+        max_length: The maximum length of the input sequence.
+        split: Which split to load ("validation", "test", or "lr").
+        k: Number of examples to use.
+        seed: Optional seed for shuffling examples before selection.
+        max_seq_length_threshold: If provided, reject samples longer than this threshold.
+
+    Returns:
+        Dataset: The TruthfulQA dataset containing input_ids, attention_mask, and labels.
+    """
+    load_k = k * 3 if max_seq_length_threshold is not None else k
+    examples = load_unified_jsonl(data_dir, "truthfulqa", split, load_k, seed=seed)
+
+    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+    rejected_count = 0
+    accepted_count = 0
+
+    for i, example in enumerate(examples):
+        if accepted_count >= k:
+            break
+
+        messages = example.get('messages', [])
+        if len(messages) < 2:
+            continue
+
+        user_content = messages[0]['content']
+        assistant_content = messages[1]['content']
+
+        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
+        answer = assistant_content + tokenizer.eos_token
+
+        if max_seq_length_threshold is not None:
+            token_length = estimate_token_length(tokenizer, prompt, answer)
+            if token_length > max_seq_length_threshold:
+                rejected_count += 1
+                continue
+
+        full_input_ids, labels, attention_mask = tokenize(
+            tokenizer, prompt, answer, max_length,
+            print_ex=True if accepted_count == 0 else False
+        )
+
+        dataset["input_ids"].append(full_input_ids)
+        dataset["labels"].append(labels)
+        dataset["attention_mask"].append(attention_mask)
+        accepted_count += 1
+
+    if rejected_count > 0:
+        logger.info(f"TruthfulQA: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
+
+    dataset = Dataset.from_dict(dataset)
+    return dataset
+
+
 # =============================================================================
 # MMLU Dataset (uses unified JSONL format)
 # =============================================================================
@@ -613,6 +688,108 @@ def get_mmlu_dataset(
 # Main Interface
 # =============================================================================
 
+# =============================================================================
+# Generic messages-format loader (Dolci targets: precise_if, math, mbpp, ...)
+# =============================================================================
+
+# Tasks whose validation/test files are plain single-turn ``messages`` JSONL and
+# need no task-specific prompt formatting. Any other task whose files exist under
+# ``eval/<task>/`` also falls back to this loader (see ``get_dataset``).
+MESSAGES_FORMAT_TASKS = ("precise_if", "math", "mbpp")
+
+
+def get_messages_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        task: str,
+        split: str = "test",
+        k: int = 5,
+        seed: Optional[int] = None,
+        max_seq_length_threshold: Optional[int] = None,
+        **kwargs
+    ) -> Dataset:
+    """
+    Load any unified ``messages`` JSONL split and render it with the tokenizer's
+    chat template (native template if the tokenizer has one, tulu fallback
+    otherwise). Loss labels cover the assistant answer plus end-of-turn marker.
+
+    The first user turn and the first assistant turn after it are used; an
+    optional leading system turn is kept.
+
+    Args:
+        data_dir: The main data directory.
+        tokenizer: The tokenizer used to tokenize the input text.
+        max_length: The maximum length of the input sequence.
+        task: Task name; files live at ``{data_dir}/eval/{task}/{task}_{split}_data.jsonl``.
+        split: Which split to load ("validation", "test", or "lr").
+        k: Number of examples to use.
+        seed: Optional seed for shuffling examples before selection.
+        max_seq_length_threshold: If provided, reject samples longer than this threshold.
+    """
+    from SFT.data.chat_format import render_prompt_and_answer
+
+    load_k = k * 3 if max_seq_length_threshold is not None else k
+    examples = load_unified_jsonl(data_dir, task, split, load_k, seed=seed)
+
+    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
+    rejected_count = 0
+    accepted_count = 0
+    skipped_count = 0
+
+    for example in examples:
+        if accepted_count >= k:
+            break
+
+        messages = example.get("messages", [])
+        system_content = None
+        user_content = None
+        assistant_content = None
+        for message in messages:
+            role = message.get("role")
+            if role == "system" and user_content is None and system_content is None:
+                system_content = message.get("content", "")
+            elif role == "user" and user_content is None:
+                user_content = message.get("content", "")
+            elif role == "assistant" and user_content is not None:
+                assistant_content = message.get("content", "")
+                break
+        if not user_content or not assistant_content:
+            skipped_count += 1
+            continue
+
+        prompt, answer = render_prompt_and_answer(
+            tokenizer, user_content, assistant_content, system_content=system_content
+        )
+
+        if max_seq_length_threshold is not None:
+            token_length = estimate_token_length(tokenizer, prompt, answer)
+            if token_length > max_seq_length_threshold:
+                rejected_count += 1
+                continue
+
+        full_input_ids, labels, attention_mask = tokenize(
+            tokenizer, prompt, answer, max_length,
+            print_ex=True if accepted_count == 0 else False
+        )
+        dataset["input_ids"].append(full_input_ids)
+        dataset["labels"].append(labels)
+        dataset["attention_mask"].append(attention_mask)
+        accepted_count += 1
+
+    if rejected_count > 0:
+        logger.info(f"{task}/{split}: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
+    if skipped_count > 0:
+        logger.info(f"{task}/{split}: Skipped {skipped_count} rows without a user/assistant pair")
+    if accepted_count < k:
+        logger.warning(
+            f"{task}/{split}: requested {k} examples but only {accepted_count} were usable "
+            f"(after length rejection and format filtering)."
+        )
+
+    return Dataset.from_dict(dataset)
+
+
 def get_dataset(task: str, **kwargs) -> Dataset:
     """
     Get the dataset for the given task.
@@ -643,11 +820,28 @@ def get_dataset(task: str, **kwargs) -> Dataset:
         "samsum": get_samsum_dataset,
         "gsm8k": get_gsm8k_dataset,
         "math500": get_math500_dataset,
+        "truthfulqa": get_truthfulqa_dataset,
     }
+    for _messages_task in MESSAGES_FORMAT_TASKS:
+        task_functions.setdefault(_messages_task, get_messages_dataset)
 
     if task not in task_functions:
-        raise ValueError(f"Invalid task name: {task}. Valid tasks: {list(task_functions.keys())}")
+        # Unknown task: accept it if its unified JSONL exists, using the generic
+        # messages-format loader. This is how new Dolci-style targets are added
+        # without touching code.
+        data_dir = kwargs.get("data_dir")
+        split = kwargs.get("split", "test")
+        candidate = os.path.join(str(data_dir), "eval", task, f"{task}_{split}_data.jsonl") if data_dir else None
+        if candidate and os.path.exists(candidate):
+            logger.info(f"Task {task!r} is not registered; using the generic messages-format loader ({candidate})")
+            return get_messages_dataset(task=task, **kwargs)
+        raise ValueError(
+            f"Invalid task name: {task}. Valid tasks: {list(task_functions.keys())}. "
+            f"Unregistered tasks are accepted if {task}/{task}_{split}_data.jsonl exists under {data_dir}/eval/."
+        )
 
+    if task_functions[task] is get_messages_dataset:
+        return get_messages_dataset(task=task, **kwargs)
     return task_functions[task](**kwargs)
 
 

@@ -166,6 +166,9 @@ reset_config() {
     cfg_record_selections="false"
     cfg_record_selections_freq="1"
     cfg_update_compressor_freq="200"
+    cfg_gradient_checkpointing="false"
+    cfg_val_seq_length_multiplier=""   # empty -> train.py default (1.2); 0 disables rejection
+    cfg_eval_split=""                  # empty -> "test"; CLI --eval_split overrides
 }
 
 parse_yaml() {
@@ -238,6 +241,9 @@ parse_yaml() {
             record_selections)                   cfg_record_selections="$val" ;;
             record_selections_freq)              cfg_record_selections_freq="$val" ;;
             update_compressor_freq)              cfg_update_compressor_freq="$val" ;;
+            gradient_checkpointing)              cfg_gradient_checkpointing="$val" ;;
+            val_seq_length_multiplier)           cfg_val_seq_length_multiplier="$val" ;;
+            eval_split)                          cfg_eval_split="$val" ;;
         esac
     done < "$file"
 }
@@ -348,6 +354,7 @@ run_method() {
     echo "Model: $cfg_model | Task: $cfg_target_task | LR: $cfg_learning_rate"
     echo "Method: $cfg_method | Finetuning: $cfg_finetuning"
     echo "Batch: $cfg_batch_size | Val: $cfg_val_batch_size | Curation: $cfg_selection_frac"
+    echo "Seq len: $cfg_max_seq_length | Grad ckpt: $cfg_gradient_checkpointing | n_val: $cfg_n_val | n_eval: $cfg_n_eval"
     echo "Output: $output_dir"
     echo "=============================================="
 
@@ -394,10 +401,12 @@ $fsdp_args \
 --val_strategy $cfg_val_strategy \
 --scoring_method $cfg_scoring_method \
 --subset_mode $cfg_subset_mode \
---use_flash_attention $cfg_use_flash_attention"
+--use_flash_attention $cfg_use_flash_attention \
+--gradient_checkpointing $cfg_gradient_checkpointing"
 
     # Optional args
     [[ -n "$cfg_subject" ]] && cmd="$cmd --subject $cfg_subject"
+    [[ -n "$cfg_val_seq_length_multiplier" ]] && cmd="$cmd --val_seq_length_multiplier $cfg_val_seq_length_multiplier"
     [[ -n "$cfg_train_dataset" ]] && cmd="$cmd --train_dataset_names $cfg_train_dataset"
     [[ -n "$cfg_val_batch_size" ]] && cmd="$cmd --val_batch_size_for_selection $cfg_val_batch_size"
 
@@ -431,14 +440,22 @@ $fsdp_args \
     [[ "$cfg_record_selections" == "true" ]] && \
         cmd="$cmd --record_selections True --record_selections_freq $cfg_record_selections_freq"
 
-    # Eval split override
-    [[ -n "$eval_split_override" ]] && cmd="$cmd --eval_split $eval_split_override"
+    # Eval split: CLI override > yaml eval_split > train.py default ("test")
+    if [[ -n "$eval_split_override" ]]; then
+        cmd="$cmd --eval_split $eval_split_override"
+    elif [[ -n "$cfg_eval_split" ]]; then
+        cmd="$cmd --eval_split $cfg_eval_split"
+    fi
 
     if [[ "$dry_run" == "true" ]]; then
         echo "[DRY-RUN] $cmd"
     else
         eval $cmd 2>&1 | tee $output_dir/train.log
-        exit ${PIPESTATUS[0]}
+        local status=${PIPESTATUS[0]}
+        if [[ $status -ne 0 ]]; then
+            echo "ERROR: $exp_name failed with exit code $status"
+            return $status
+        fi
     fi
 }
 

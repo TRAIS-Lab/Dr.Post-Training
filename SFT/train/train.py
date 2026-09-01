@@ -159,6 +159,10 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path, **model_kwargs)
+    if training_args.gradient_checkpointing:
+        # KV cache is useless during training and incompatible with checkpointing.
+        model.config.use_cache = False
+        logger.info(f"Gradient checkpointing enabled ({training_args.gradient_checkpointing_kwargs})")
     add_padding_to_tokenizer(tokenizer)
 
     # Resize embeddings if needed
@@ -345,8 +349,13 @@ def main():
     # Prepare validation dataset (used for data selection in layer-wise descent)
     # Use rejection sampling to filter out validation samples that are significantly
     # longer than the average training sequence length
-    val_seq_length_threshold = int(avg_train_seq_length * DEFAULT_SEQ_LENGTH_MULTIPLIER)
-    logger.info(f"Validation sequence length threshold: {val_seq_length_threshold} ({DEFAULT_SEQ_LENGTH_MULTIPLIER}x avg train length)")
+    val_seq_length_multiplier = getattr(training_args, "val_seq_length_multiplier", DEFAULT_SEQ_LENGTH_MULTIPLIER)
+    if val_seq_length_multiplier and val_seq_length_multiplier > 0:
+        val_seq_length_threshold = int(avg_train_seq_length * val_seq_length_multiplier)
+        logger.info(f"Validation sequence length threshold: {val_seq_length_threshold} ({val_seq_length_multiplier}x avg train length)")
+    else:
+        val_seq_length_threshold = None
+        logger.info("Validation sequence length rejection disabled (val_seq_length_multiplier <= 0)")
 
     val_dataset = get_dataset(
         task=training_args.analysis_dataset,

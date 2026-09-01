@@ -194,3 +194,16 @@ def create_prompt_with_llama2_chat_format(messages, bos="<s>", eos="</s>", add_b
     # The next line removes the bos token if add_bos is False.
     formatted_text = formatted_text[len(bos):] if not add_bos else formatted_text
     return formatted_text
+
+def get_eos_token_ids(tokenizer):
+    """Ids that should stop generation (tokenizer eos plus the chat template's end-of-turn token).
+
+    Qwen3-Base's eos is ``<|endoftext|>`` but an SFT'd model terminates assistant
+    turns with ``<|im_end|>``; both are returned so ``model.generate`` stops on either.
+    Returns an int when there is a single id, else a list (both accepted by generate).
+    """
+    from SFT.data.chat_format import get_eos_token_ids as _ids
+    ids = _ids(tokenizer)
+    if not ids:
+        return tokenizer.eos_token_id
+    return ids if len(ids) > 1 else ids[0]
