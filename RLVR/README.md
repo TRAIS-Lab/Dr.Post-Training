@@ -8,17 +8,17 @@ This directory contains the implementation for online gradient-based data curati
 # 1. Prepare data
 python verl/examples/data_preprocess/math_dataset.py --local_save_dir $DATA_DIR/math
 
-# 2. Run training with Layerwise curation (full fine-tuning)
-bash train.sh -c configs/math -m Layerwise-Full
+# 2. Run training with LayerWiseSubset curation (full fine-tuning)
+bash train.sh -c configs/math -m LayerWiseSubset-Full
 
 # 3. Or run baseline (no curation)
-bash train.sh -c configs/math -m Standard-Full
+bash train.sh -c configs/math -m FullTraining-Full
 
 # 4. Run all methods
 bash train.sh -c configs/math -m all
 
 # 5. Dry-run to verify commands
-bash train.sh -c configs/math -m Layerwise-Full --dry-run
+bash train.sh -c configs/math -m LayerWiseSubset-Full --dry-run
 ```
 
 ## Data Preparation
@@ -109,24 +109,24 @@ To switch which validation set is used, set `val_source` in the config:
 ## Running Experiments
 
 ```bash
-# Layerwise curation (full fine-tuning)
-bash train.sh -c configs/math -m Layerwise-Full
+# LayerWiseSubset curation (full fine-tuning)
+bash train.sh -c configs/math -m LayerWiseSubset-Full
 
 # Baseline (no curation)
-bash train.sh -c configs/math -m Standard-Full
+bash train.sh -c configs/math -m FullTraining-Full
 
-# Subset curation
-bash train.sh -c configs/math -m Subset-Full
+# GlobalSubset curation
+bash train.sh -c configs/math -m GlobalSubset-Full
 
 # All methods
 bash train.sh -c configs/math -m all
 
 # By category (runs all matching configs)
-bash train.sh -c configs/math -m layerwise    # all Layerwise-* configs
+bash train.sh -c configs/math -m layer-wise-subset    # all LayerWiseSubset-* configs
 bash train.sh -c configs/math -m full         # all *-Full configs
 
 # Override seed or learning rate
-bash train.sh -c configs/math -m Layerwise-Full --seed 123 --lr 5e-7
+bash train.sh -c configs/math -m LayerWiseSubset-Full --seed 123 --lr 5e-7
 
 # Dry-run to inspect generated commands
 bash train.sh -c configs/math -m all --dry-run
@@ -139,7 +139,7 @@ bash train.sh -c configs/math --list
 
 Settings live in YAML config files under `configs/`. Each config directory has:
 - `defaults.yaml`: shared settings inherited by all methods
-- Per-method configs named `Method-Finetuning.yaml` (e.g., `Standard-Full.yaml`, `Layerwise-Full.yaml`)
+- Per-method configs named `Method-Finetuning.yaml` (e.g., `FullTraining-Full.yaml`, `LayerWiseSubset-Full.yaml`)
 
 ### Config Options
 

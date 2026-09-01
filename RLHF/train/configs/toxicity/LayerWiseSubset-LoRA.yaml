@@ -1,0 +1,8 @@
+# LayerWiseSubset: per-layer, per-mini-batch curation during PPO
+#
+# scoring.method: reduced_ghost, full_ghost, direct, compress
+#
+method: LayerWiseSubset
+finetuning: LoRA
+scoring:
+  method: reduced_ghost

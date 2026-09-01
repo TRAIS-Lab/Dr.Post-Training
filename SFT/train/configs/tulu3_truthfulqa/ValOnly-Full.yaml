@@ -1,10 +1,10 @@
 # Validation-only ablation: train using ONLY the validation data.
-# Uses Standard-Full machinery but points train_dataset to the truthfulqa
+# Uses FullTraining-Full machinery but points train_dataset to the truthfulqa
 # validation split (50 examples). Step count is matched to the other configs
 # by scaling up num_train_epochs:
 #   50 examples / batch_size 8 ≈ 7 steps/epoch
 #   167 epochs × 7 ≈ 1169 steps  (matches percentage=0.01 on tulu3 → ~1175 steps)
-method: Standard
+method: FullTraining
 finetuning: Full
 learning_rate: 1.00e-06
 

@@ -17,13 +17,13 @@ import sys
 def compute_total(r, method):
     if r is None:
         return None
-    if method in ("standard", "layerwise"):
+    if method in ("full_training", "layer_wise_subset"):
         return r.get("forward", 0) + r.get("backward", 0) + r.get("optimizer", 0)
-    elif method == "subset":
+    elif method == "global_subset":
         return (r.get("pass1_forward", 0) + r.get("pass1_backward", 0) +
                 r.get("selection", 0) + r.get("pass2_forward", 0) +
                 r.get("pass2_backward", 0) + r.get("optimizer", 0))
-    elif method == "subset_one_pass":
+    elif method == "global_subset_one_pass":
         return (r.get("forward", 0) + r.get("backward", 0) +
                 r.get("selection", 0) + r.get("wgrad", 0) +
                 r.get("optimizer", 0))
@@ -83,29 +83,29 @@ def print_breakdown_table(entries, out, scoring_filter="compress"):
 """)
 
     METHOD_DISPLAY = {
-        "standard": "Standard",
-        "layerwise": "Layerwise",
-        "subset": "Subset 2P",
-        "subset_one_pass": "Subset 1P",
+        "full_training": "Full-Training",
+        "layer_wise_subset": "Layer-Wise Subset",
+        "global_subset": "Global Subset 2P",
+        "global_subset_one_pass": "Global Subset 1P",
     }
 
     for tag, label, model, combos in entries:
-        std_key = "standard/reduced_ghost"
+        std_key = "full_training/reduced_ghost"
         std_r = combos.get(std_key)
-        std_total = compute_total(std_r, "standard")
+        std_total = compute_total(std_r, "full_training")
 
         out.write(f"\n--- {model} | {label} ---\n")
         if std_total and std_r:
             mem = std_r.get("peak_memory_gb", 0)
-            out.write(f"Standard baseline: {std_total:.1f} ms | {mem:.1f} GB\n")
+            out.write(f"Full-Training baseline: {std_total:.1f} ms | {mem:.1f} GB\n")
 
         out.write("\n")
 
         methods = [
-            ("standard", "reduced_ghost"),
-            ("layerwise", scoring_filter),
-            ("subset", scoring_filter),
-            ("subset_one_pass", scoring_filter),
+            ("full_training", "reduced_ghost"),
+            ("layer_wise_subset", scoring_filter),
+            ("global_subset", scoring_filter),
+            ("global_subset_one_pass", scoring_filter),
         ]
 
         for method, scoring in methods:
@@ -119,14 +119,14 @@ def print_breakdown_table(entries, out, scoring_filter="compress"):
                 continue
 
             mem = r.get("peak_memory_gb", 0)
-            if std_total and method != "standard":
+            if std_total and method != "full_training":
                 ovh = f"+{(total / std_total - 1) * 100:.1f}%"
             else:
                 ovh = "--"
 
             optim = r.get("optimizer", 0)
 
-            if method == "subset":
+            if method == "global_subset":
                 # Two-pass: fold embedding into corresponding phases
                 p1f = r.get("pass1_forward", 0)
                 p1b = r.get("pass1_backward", 0)
@@ -156,7 +156,7 @@ def print_breakdown_table(entries, out, scoring_filter="compress"):
                 out.write(f"{'':12s}    autograd  {p2_auto:>8.1f}ms\n")
                 out.write(f"{'':12s}  optimizer   {optim:>8.1f}ms\n")
                 out.write(f"{'':12s}  TOTAL       {total:>8.1f}ms  {ovh:>9s}  {mem:>5.1f}G\n")
-            elif method == "subset_one_pass":
+            elif method == "global_subset_one_pass":
                 # Fold embedding into score/retain
                 fwd = r.get("forward", 0)
                 bwd = r.get("backward", 0)
@@ -182,7 +182,7 @@ def print_breakdown_table(entries, out, scoring_filter="compress"):
                 out.write(f"{'':12s}  optimizer   {optim:>8.1f}ms\n")
                 out.write(f"{'':12s}  TOTAL       {total:>8.1f}ms  {ovh:>9s}  {mem:>5.1f}G\n")
             else:
-                # Standard and Layerwise: fold embedding into score/select/wgrad
+                # Full-Training and LayerWiseSubset: fold embedding into score/select/wgrad
                 fwd = r.get("forward", 0)
                 bwd = r.get("backward", 0)
                 act = r.get("act_grad", 0)
@@ -220,19 +220,19 @@ def print_overhead_summary(entries, out, scoring_filter="compress"):
     out.write("=" * 90 + "\n\n")
 
     header = (f"  {'Model':<15s}  {'Config':<22s}  {'Std (ms)':>9s}  "
-              f"{'Layerwise':>11s}  {'Subset 2P':>11s}  {'Subset 1P':>11s}  "
+              f"{'Layer-Wise Subset':>11s}  {'Global Subset 2P':>11s}  {'Global Subset 1P':>11s}  "
               f"{'1P Mem':>7s}")
     out.write(header + "\n")
     out.write("  " + "-" * (len(header) - 2) + "\n")
 
     for tag, label, model, combos in entries:
-        std_r = combos.get("standard/reduced_ghost")
-        std_total = compute_total(std_r, "standard")
+        std_r = combos.get("full_training/reduced_ghost")
+        std_total = compute_total(std_r, "full_training")
         if std_total is None:
             continue
 
         parts = [f"  {model:<15s}", f"{label:<22s}", f"{std_total:>8.0f}ms"]
-        for method in ["layerwise", "subset", "subset_one_pass"]:
+        for method in ["layer_wise_subset", "global_subset", "global_subset_one_pass"]:
             key = f"{method}/{scoring_filter}"
             r = combos.get(key)
             total = compute_total(r, method)
@@ -243,7 +243,7 @@ def print_overhead_summary(entries, out, scoring_filter="compress"):
                 parts.append(f"{'OOM':>11s}")
 
         # 1P memory
-        r_1p = combos.get(f"subset_one_pass/{scoring_filter}")
+        r_1p = combos.get(f"global_subset_one_pass/{scoring_filter}")
         if r_1p:
             mem = r_1p.get("peak_memory_gb", 0)
             parts.append(f"{mem:>6.1f}G")
@@ -265,8 +265,8 @@ def print_onepass_speedup(entries, out, scoring_filter="compress"):
     out.write("  " + "-" * (len(header) - 2) + "\n")
 
     for tag, label, model, combos in entries:
-        t_2p = compute_total(combos.get(f"subset/{scoring_filter}"), "subset")
-        t_1p = compute_total(combos.get(f"subset_one_pass/{scoring_filter}"), "subset_one_pass")
+        t_2p = compute_total(combos.get(f"global_subset/{scoring_filter}"), "global_subset")
+        t_1p = compute_total(combos.get(f"global_subset_one_pass/{scoring_filter}"), "global_subset_one_pass")
         if t_2p and t_1p:
             speedup = (1 - t_1p / t_2p) * 100
             out.write(f"  {model:<15s}  {label:<22s}  {t_2p:>8.0f}ms  {t_1p:>8.0f}ms  {speedup:>7.1f}%\n")

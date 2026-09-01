@@ -20,8 +20,8 @@ Architecture overview:
     Reads compressed gradients from update_compressors via the hook.
 
   Curation (selection/)
-    Layerwise: per-layer curation in a single backward pass.
-    Subset: global curation. Two modes:
+    LayerWiseSubset: per-layer curation in a single backward pass.
+    GlobalSubset: global curation. Two modes:
       one_pass (Algorithm 4.2): score + retain during backward, post-hoc gradient assembly.
       two_pass (Algorithm 4.3): scoring pass, then gradient pass on selected subset.
     Scoring methods: reduced_ghost (default), full_ghost, direct, compress.
@@ -49,21 +49,21 @@ from .validation_cache import ValidationCache, ValidationStorageMode
 # Curation module exports (gradient-based)
 from .selection import (
     SelectionState,
-    LayerwiseState,
-    SubsetState,
+    LayerWiseSubsetState,
+    GlobalSubsetState,
     # MergedBatch strategies
     MergedBatchStrategy,
     MergedBatchNoSelectionStrategy,
-    MergedBatchLayerwiseStrategy,
-    MergedBatchSubsetStrategy,
-    MergedBatchSubsetOnePassStrategy,
+    MergedBatchLayerWiseSubsetStrategy,
+    MergedBatchGlobalSubsetStrategy,
+    MergedBatchGlobalSubsetOnePassStrategy,
     create_merged_batch_strategy,
     # SeparateBatch strategies
     SeparateBatchStrategy,
     SeparateBatchNoSelectionStrategy,
-    SeparateBatchLayerwiseStrategy,
-    SeparateBatchSubsetStrategy,
-    SeparateBatchSubsetOnePassStrategy,
+    SeparateBatchLayerWiseSubsetStrategy,
+    SeparateBatchGlobalSubsetStrategy,
+    SeparateBatchGlobalSubsetOnePassStrategy,
     create_separate_batch_strategy,
 )
 
@@ -80,20 +80,20 @@ __all__ = [
     "ValidationStorageMode",
     # Curation state classes
     "SelectionState",
-    "LayerwiseState",
-    "SubsetState",
+    "LayerWiseSubsetState",
+    "GlobalSubsetState",
     # MergedBatch strategy classes
     "MergedBatchStrategy",
     "MergedBatchNoSelectionStrategy",
-    "MergedBatchLayerwiseStrategy",
-    "MergedBatchSubsetStrategy",
-    "MergedBatchSubsetOnePassStrategy",
+    "MergedBatchLayerWiseSubsetStrategy",
+    "MergedBatchGlobalSubsetStrategy",
+    "MergedBatchGlobalSubsetOnePassStrategy",
     "create_merged_batch_strategy",
     # SeparateBatch strategy classes
     "SeparateBatchStrategy",
     "SeparateBatchNoSelectionStrategy",
-    "SeparateBatchLayerwiseStrategy",
-    "SeparateBatchSubsetStrategy",
-    "SeparateBatchSubsetOnePassStrategy",
+    "SeparateBatchLayerWiseSubsetStrategy",
+    "SeparateBatchGlobalSubsetStrategy",
+    "SeparateBatchGlobalSubsetOnePassStrategy",
     "create_separate_batch_strategy",
 ]

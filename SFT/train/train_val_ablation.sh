@@ -6,20 +6,29 @@
 # task's validation split and evaluate on the test split. Uses percentage-based
 # sampling to select ~n_val samples. Optimization steps match the original experiment.
 #
-# Only Standard methods (no curation): Standard-Full, Standard-LoRA, Standard-MeSO.
+# Only Standard methods (no curation): FullTraining-Full, FullTraining-LoRA, FullTraining-MeSO.
 #
 # Usage:
 #   bash SFT/train/train_val_ablation.sh --task tydiqa --methods all --seed 42
 #   bash SFT/train/train_val_ablation.sh --task samsum --methods all --seed 42
+#   bash SFT/train/train_val_ablation.sh --task truthfulqa --methods all --seed 42
 #   bash SFT/train/train_val_ablation.sh --task tydiqa --methods all --lr 5e-05 --dry-run
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ -z "$CODE_DIR" ]]; then
-    source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found."; exit 1; }
-    activate_env
-fi
+# Hardcoded path to cluster_env.sh — see SFT/train/train.sh for rationale.
+# Resolution order: $DRPT_CLUSTER_ENV, the runpod path, then this checkout's own
+# cluster_env.sh (so the same scripts run on other clusters without editing).
+_drpt_env=""
+for _c in "${DRPT_CLUSTER_ENV:-}" \
+          /workspace-vast/pbb/Dr.Post-Training/cluster_env.sh \
+          "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)/cluster_env.sh"; do
+    [[ -n "$_c" && -f "$_c" ]] && { _drpt_env="$_c"; break; }
+done
+[[ -n "$_drpt_env" ]] || { echo "ERROR: cluster_env.sh not found (set DRPT_CLUSTER_ENV or create it at the repo root)."; exit 1; }
+source "$_drpt_env"
+unset _drpt_env _c
+activate_env
 
-cd $CODE_DIR/Dr.Post-Training
+cd "$CODE_DIR/Dr.Post-Training"
 
 export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
@@ -27,25 +36,8 @@ SCRIPT_DIR="$CODE_DIR/Dr.Post-Training/SFT/train"
 CONFIG_DIR="$SCRIPT_DIR/configs"
 
 # =============================================================================
-# Base training args (same as train.sh, num_train_epochs removed — we use max_steps)
+# Defaults (base_training_args is built after CLI parsing so --eval_steps takes effect)
 # =============================================================================
-
-export base_training_args="--do_train=True \
---do_eval=True \
---max_seq_length=512 \
---use_fast_tokenizer=True \
---lr_scheduler_type=linear \
---warmup_ratio=0.03 \
---weight_decay=0.0 \
---logging_steps=1 \
---eval_steps=400 \
---eval_strategy=steps \
---save_strategy=no \
---bf16=True \
---tf32=False \
---fp16=False \
---overwrite_output_dir=True \
---report_to=none"
 
 model="meta-llama/Llama-3.2-1B"
 data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
@@ -53,22 +45,22 @@ task=""
 seed=42
 
 optim="adamw_torch"
-batch_size=1
+batch_size=8
 gradient_accumulation_steps=1
 use_flash_attention=true
 
-n_val=32
+n_val=16
 n_eval=500
+eval_steps=400
 
-# LR configuration
-lr_config_file="SFT/train/lr/config.json"
+# Fixed LRs (override per-call with --lr if needed).
 lr_override=""
-default_lr_full="5e-05"
-default_lr_lora="2e-04"
+default_lr_full="1e-05"
+default_lr_lora="1e-04"
 
 # LoRA defaults
-lora_r=32
-lora_alpha=1
+lora_r=8
+lora_alpha=16
 lora_dropout=0.1
 
 # Compressor update frequency
@@ -79,26 +71,43 @@ methods=""
 dry_run=false
 max_steps_override=""
 
+# Optional override: config subdirectory (relative to SFT/train/configs).
+# If unset, derived from --task via LR_CONFIG_KEYS.
+config_dir_override=""
+
+# Optional eval_split override (e.g., --eval_split lr to evaluate on the
+# extra held-out dev split instead of test).
+eval_split_override=""
+
+# Optional schedule overrides (for blow-up dynamics studies).
+lr_scheduler_override=""
+warmup_ratio_override=""
+weight_decay_override=""
+
 # Target optimization steps: match total sample-passes of main experiments
 # main_steps * main_batch_size / val_ablation_batch_size = main_steps * 8
 declare -A TARGET_STEPS=(
-    ["tydiqa"]=9392   # 1174 * 8 = 9392 sample-passes
-    ["samsum"]=20800  # 2600 * 8 = 20800 sample-passes
+    ["tydiqa"]=1174       # less_tydiqa main: ~1225 steps at bs=8
+    ["samsum"]=2600       # alpaca_samsum main: 2600 steps at bs=8
+    ["nq_open"]=1100      # triviaqa_nq main: ~1107 steps at bs=8
+    ["squad"]=1100        # less_squad main: ~1225 steps at bs=8
 )
 declare -A LR_CONFIG_KEYS=(
-    ["tydiqa"]="tulu3_tydiqa"
+    ["tydiqa"]="less_tydiqa"
     ["samsum"]="alpaca_samsum"
+    ["nq_open"]="triviaqa_nq"
+    ["squad"]="less_squad"
 )
 
 # =============================================================================
 # Category mappings (Standard methods only)
 # =============================================================================
 declare -A CATEGORY_METHODS=(
-    ["all"]="Standard-Full,Standard-LoRA,Standard-MeSO"
-    ["baseline"]="Standard-Full,Standard-LoRA"
-    ["full"]="Standard-Full"
-    ["lora"]="Standard-LoRA"
-    ["compression"]="Standard-MeSO"
+    ["all"]="FullTraining-Full,FullTraining-LoRA,FullTraining-MeSO"
+    ["baseline"]="FullTraining-Full,FullTraining-LoRA"
+    ["full"]="FullTraining-Full"
+    ["lora"]="FullTraining-LoRA"
+    ["compression"]="FullTraining-MeSO"
 )
 
 # =============================================================================
@@ -107,14 +116,19 @@ declare -A CATEGORY_METHODS=(
 while [[ $# -gt 0 ]]; do
     case $1 in
         --task)           task="$2"; shift 2 ;;
+        --config_dir|-c)  config_dir_override="$2"; shift 2 ;;
         --methods)        methods="$2"; shift 2 ;;
         --max_steps)      max_steps_override="$2"; shift 2 ;;
         --model)          model="$2"; shift 2 ;;
         --batch_size)     batch_size="$2"; shift 2 ;;
         --n_val)          n_val="$2"; shift 2 ;;
         --n_eval)         n_eval="$2"; shift 2 ;;
+        --eval_steps)     eval_steps="$2"; shift 2 ;;
         --lr)             lr_override="$2"; shift 2 ;;
-        --lr_config)      lr_config_file="$2"; shift 2 ;;
+        --eval_split)     eval_split_override="$2"; shift 2 ;;
+        --lr_scheduler_type) lr_scheduler_override="$2"; shift 2 ;;
+        --warmup_ratio)   warmup_ratio_override="$2"; shift 2 ;;
+        --weight_decay)   weight_decay_override="$2"; shift 2 ;;
         --seed)           seed="$2"; shift 2 ;;
         --data_dir)       data_dir="$2"; shift 2 ;;
         --gradient_accumulation_steps) gradient_accumulation_steps="$2"; shift 2 ;;
@@ -124,18 +138,19 @@ while [[ $# -gt 0 ]]; do
 Usage: bash train_val_ablation.sh --task <task> --methods <methods> [options]
 
 Ablation: Standard training on ~n_val validation samples.
-Matches optimization steps to the original tulu3->tydiqa / alpaca->samsum experiments.
+Matches optimization steps to the original tulu3->tydiqa / alpaca->samsum / less->truthfulqa experiments.
 
 Required:
-  --task <task>          Task: tydiqa or samsum
+  --task <task>          Task: tydiqa, samsum, or truthfulqa
   --methods <list>       Methods: all, baseline, full, lora, compression,
-                         or specific names (Standard-Full, Standard-LoRA, Standard-MeSO)
+                         or specific names (FullTraining-Full, FullTraining-LoRA, FullTraining-MeSO)
 
 Optional:
   --max_steps <n>        Override target optimization steps
-  --batch_size <n>       Batch size (default: 1)
-  --n_val <n>            Number of val samples to train on (default: 32)
+  --batch_size <n>       Batch size (default: 8)
+  --n_val <n>            Number of val samples to train on (default: 16)
   --n_eval <n>           Evaluation examples (default: 500)
+  --eval_steps <n>       Evaluate every N steps (default: 400; set to ~max_steps/100 for ~100 ppl points)
   --lr <lr>              Learning rate override
   --seed <seed>          Random seed (default: 42)
   --dry-run              Print commands without executing
@@ -162,6 +177,29 @@ if [[ -z "$methods" ]]; then
     exit 1
 fi
 
+# Build base_training_args after CLI parsing so --eval_steps takes effect.
+# Schedule defaults (overridable via --lr_scheduler_type / --warmup_ratio / --weight_decay).
+sched="${lr_scheduler_override:-linear}"
+warmup="${warmup_ratio_override:-0.03}"
+wdecay="${weight_decay_override:-0.0}"
+
+export base_training_args="--do_train=True \
+--do_eval=True \
+--max_seq_length=512 \
+--use_fast_tokenizer=True \
+--lr_scheduler_type=$sched \
+--warmup_ratio=$warmup \
+--weight_decay=$wdecay \
+--logging_steps=1 \
+--eval_steps=$eval_steps \
+--eval_strategy=steps \
+--save_strategy=no \
+--bf16=True \
+--tf32=False \
+--fp16=False \
+--overwrite_output_dir=True \
+--report_to=none"
+
 val_file="${data_dir}/eval/${task}/${task}_validation_data.jsonl"
 if [[ ! -f "$val_file" ]]; then
     echo "ERROR: Validation file not found: $val_file"
@@ -175,6 +213,28 @@ elif [[ -n "${TARGET_STEPS[$task]}" ]]; then
     max_steps="${TARGET_STEPS[$task]}"
 else
     echo "ERROR: No target steps defined for task '$task'. Use --max_steps to specify."
+    exit 1
+fi
+
+# Resolve task-specific config directory.
+# Priority: --config_dir override > LR_CONFIG_KEYS[task] > error
+if [[ -n "$config_dir_override" ]]; then
+    if [[ "$config_dir_override" = /* ]]; then
+        task_config_dir="$config_dir_override"
+    else
+        task_config_dir="$CONFIG_DIR/$config_dir_override"
+        # Strip leading "configs/" if user passed "configs/foo"
+        task_config_dir="${task_config_dir/configs\/configs\//configs/}"
+    fi
+elif [[ -n "${LR_CONFIG_KEYS[$task]}" ]]; then
+    task_config_dir="$CONFIG_DIR/${LR_CONFIG_KEYS[$task]}"
+else
+    echo "ERROR: No config directory mapped for task '$task'. Use --config_dir to specify."
+    exit 1
+fi
+
+if [[ ! -d "$task_config_dir" ]]; then
+    echo "ERROR: Config directory not found: $task_config_dir"
     exit 1
 fi
 
@@ -198,7 +258,7 @@ n_epochs=$(( (max_steps + steps_per_epoch - 1) / steps_per_epoch ))
 read_yaml() {
     local config_file="$1"
 
-    cfg_method="Standard"
+    cfg_method="FullTraining"
     cfg_finetuning="Full"
     cfg_score_sparsifier=""
     cfg_score_projector=""
@@ -252,39 +312,17 @@ read_yaml() {
 }
 
 # =============================================================================
-# Helper: Look up LR from config file
+# Helper: Pick fixed LR (CLI override > LoRA default > Full default)
 # =============================================================================
 lookup_lr() {
-    local config_key="$1"
-    local exp_name="$2"
+    local _config_key="$1"   # legacy unused arg
+    local _exp_name="$2"     # legacy unused arg
     local is_lora="$3"
 
     if [[ -n "$lr_override" ]]; then
         echo "$lr_override"
         return
     fi
-
-    if [[ -f "$lr_config_file" ]]; then
-        local looked_up_lr
-        looked_up_lr=$(python3 -c "
-import json, sys
-try:
-    with open('$lr_config_file', 'r') as f:
-        config = json.load(f)
-    lr_val = config.get('$config_key', {}).get('$exp_name', {}).get('lr')
-    if lr_val is not None:
-        print(f'{lr_val:.0e}' if lr_val < 0.001 else f'{lr_val}')
-    else:
-        sys.exit(1)
-except:
-    sys.exit(1)
-" 2>/dev/null)
-        if [[ $? -eq 0 ]] && [[ -n "$looked_up_lr" ]]; then
-            echo "$looked_up_lr"
-            return
-        fi
-    fi
-
     if [ "$is_lora" = true ]; then
         echo "$default_lr_lora"
     else
@@ -304,7 +342,7 @@ resolve_methods() {
         item=$(echo "$item" | xargs)
         if [[ -n "${CATEGORY_METHODS[$item]}" ]]; then
             resolved="${resolved:+$resolved,}${CATEGORY_METHODS[$item]}"
-        elif [[ -f "$CONFIG_DIR/${item}.yaml" ]]; then
+        elif [[ -f "$task_config_dir/${item}.yaml" ]]; then
             resolved="${resolved:+$resolved,}$item"
         else
             echo "ERROR: Unknown method or category: $item"
@@ -320,7 +358,7 @@ resolve_methods() {
 # =============================================================================
 run_method() {
     local exp_name="$1"
-    local config_file="$CONFIG_DIR/${exp_name}.yaml"
+    local config_file="$task_config_dir/${exp_name}.yaml"
 
     if [[ ! -f "$config_file" ]]; then
         echo "ERROR: Config not found: $config_file"
@@ -329,13 +367,19 @@ run_method() {
 
     read_yaml "$config_file"
 
-    # LR lookup: reuse LRs from the original experiment (tulu3_tydiqa / alpaca_samsum)
+    # LR lookup: reuse LRs from the matching main-experiment config
     local config_key="${LR_CONFIG_KEYS[$task]}"
     local exp_lr=$(lookup_lr "$config_key" "$exp_name" "$cfg_lora")
 
-    local JOB_NAME="${task}_val_${task}-${model_name}-${method_str:-$exp_name}-ms${max_steps}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}"
+    # Append schedule suffix when overrides differ from cosine+0.1 default — keeps
+    # blow-up-dynamics ablation runs in separate dirs from the canonical cosine ones.
+    local sched_suffix=""
+    if [[ -n "$lr_scheduler_override" || -n "$warmup_ratio_override" ]]; then
+        sched_suffix="-${sched}-w${warmup}"
+    fi
+    local JOB_NAME="${task}_val_${task}-${model_name}-${method_str:-$exp_name}-ms${max_steps}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}${sched_suffix}"
 
-    local output_dir=$SCRATCH_DIR/Dr.Post-Training/SFT/${JOB_NAME}
+    local output_dir=$SCRATCH_DIR/Dr.Post-Training/SFT/runs/${JOB_NAME}
     mkdir -p "$output_dir"
 
     echo ""
@@ -362,11 +406,24 @@ run_method() {
 
     local DATA_SEED=$((seed + 1))
     local ID=$RANDOM
-    local PORT=$((29400 + RANDOM % 10000))
+    # Deterministic port from SLURM_JOB_ID (or PID fallback) — see train.sh.
+    local PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 40000)))
 
     local header="torchrun --nproc_per_node 1 --nnodes 1 \
 --rdzv_id=$ID --rdzv_backend c10d --rdzv_endpoint=localhost:$PORT \
 -m SFT.train.train"
+
+    # For tasks whose test split has no gold responses (e.g. hhrlhf →
+    # CategoricalHarmfulQA), point the trainer's eval_dataset to the lr split.
+    # Explicit --eval_split overrides this default.
+    local eval_split_arg=""
+    if [[ -n "$eval_split_override" ]]; then
+        eval_split_arg="--eval_split $eval_split_override"
+    else
+        case "$task" in
+            hhrlhf) eval_split_arg="--eval_split lr" ;;
+        esac
+    fi
 
     local training_args="$exp_base_training_args \
 --model_name_or_path $model \
@@ -385,7 +442,7 @@ run_method() {
 --learning_rate $exp_lr \
 --gradient_accumulation_steps $gradient_accumulation_steps \
 --seed $seed \
---optim $optim \
+--optim $optim $eval_split_arg \
 --use_flash_attention $use_flash_attention"
 
     # LoRA

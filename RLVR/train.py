@@ -5,7 +5,7 @@ This script implements the full gradient-based selection pipeline:
 1. Generates fresh rollouts for validation prompts using current policy
 2. Computes rewards on validation responses
 3. Captures validation gradients for selection
-4. Applies Layerwise or Subset selection during training
+4. Applies LayerWiseSubset or GlobalSubset selection during training
 
 This matches the intended design from RLHF/train/trainer.py.
 
@@ -13,7 +13,7 @@ Usage:
     python train.py \
         data.train_files=/path/to/train.parquet \
         selection.enable=True \
-        selection.method=Layerwise \
+        selection.method=LayerWiseSubset \
         selection.frac=0.5 \
         selection.val_prompts_path=/path/to/val_prompts.parquet
 """
@@ -190,7 +190,7 @@ class SelectionTaskRunner(BaseTaskRunner):
             # Build selection trainer config
             selection_trainer_config = SelectionTrainerConfig(
                 enable=True,
-                method=selection_cfg.get("method", "Layerwise"),
+                method=selection_cfg.get("method", "LayerWiseSubset"),
                 frac=selection_cfg.get("frac", 0.5),
                 use_second_order=selection_cfg.get("use_second_order", False),
                 val_prompts_path=selection_cfg.get("val_prompts_path"),

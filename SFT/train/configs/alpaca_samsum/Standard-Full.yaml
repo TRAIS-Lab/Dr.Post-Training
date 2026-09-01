@@ -1,4 +1,0 @@
-# Standard full fine-tuning (no data curation)
-method: Standard
-finetuning: Full
-learning_rate: 1.00e-06

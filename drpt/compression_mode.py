@@ -14,7 +14,7 @@ class CompressionMode(Enum):
 
     Score compression and update compression are configured independently:
       - Score compression: compresses gradients for influence score computation
-        (used by Layerwise/Subset curation methods)
+        (used by LayerWiseSubset/GlobalSubset curation methods)
       - Update compression: compresses gradients for memory-efficient optimizer
         updates (MeSO optimizer)
 

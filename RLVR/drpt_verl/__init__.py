@@ -4,7 +4,7 @@ Gradient-based selection module for RLVR with Verl.
 This module provides gradient-based data selection for PPO training with Verl.
 
 Key features:
-- Layerwise and Subset selection methods
+- LayerWiseSubset and GlobalSubset selection methods
 - Online validation rollout generation
 - Zero-variance handling for validation gradients
 - FSDP-compatible gradient capture
@@ -19,13 +19,13 @@ Usage:
     # Create trainer with selection
     trainer = SelectionRayPPOTrainerWithOnlineVal(
         config=config,
-        selection_config=SelectionTrainerConfig(enable=True, method="Layerwise"),
+        selection_config=SelectionTrainerConfig(enable=True, method="LayerWiseSubset"),
         ...
     )
 """
 
 from .hook import GradientHookVerl
-from .selection_state import SelectionStateVerl, LayerwiseStateVerl, SubsetStateVerl
+from .selection_state import SelectionStateVerl, LayerWiseSubsetStateVerl, GlobalSubsetStateVerl
 from .validation import (
     normalize_rewards_for_validation,
     VAR_THRESHOLD,
@@ -71,8 +71,8 @@ __all__ = [
     "GradientHookVerl",
     # Selection states
     "SelectionStateVerl",
-    "LayerwiseStateVerl",
-    "SubsetStateVerl",
+    "LayerWiseSubsetStateVerl",
+    "GlobalSubsetStateVerl",
     # Validation utilities
     "normalize_rewards_for_validation",
     "VAR_THRESHOLD",

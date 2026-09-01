@@ -1,10 +1,10 @@
 # Dr. Post-Training
 
-This repository implements **Dr. Post-Training** for fine-grained data curation for modern model training.
-
-The trainer of SFT and RLHF is implemented in plain PyTorch without advanced distributed training frameworks (e.g., DeepSpeed, FairScale, or Hugging Face Accelerator) to maximize clarity and ease of understanding. For large-scale training, we provide our implementation in the RLVR experiment with [Verl](https://github.com/volcengine/verl) (Ray-based distributed RL) with vLLM for fast generation.
+This is the official implementation of [Dr. Post-Training: A Data Regularization Perspective on LLM Post-Training](https://arxiv.org/abs/2605.07063).
 
 ## Getting Started
+
+The trainer of SFT and RLHF is implemented in plain PyTorch without advanced distributed training frameworks (e.g., DeepSpeed, FairScale, or Hugging Face Accelerator) to maximize clarity and ease of understanding. For large-scale training, we provide our implementation in the RLVR experiment with [Verl](https://github.com/volcengine/verl) (Ray-based distributed RL) with vLLM for fast generation.
 
 ```bash
 # Clone with submodules
@@ -134,8 +134,8 @@ GPUS=1 TIME=1:00:00 MEM=64g ./submit.sh SFT/eval/eval.sh --task samsum
 
 | Experiment | Environment | Description                                                             | Documentation                    |
 | ---------- | ----------- | ----------------------------------------------------------------------- | -------------------------------- |
-| **SFT**    | `drpt`      | Supervised Fine-Tuning with layerwise data curation                     | [SFT/README.md](SFT/README.md)   |
-| **RLHF**   | `drpt`      | Reinforcement Learning from Human Feedback with layerwise data curation | [RLHF/README.md](RLHF/README.md) |
+| **SFT**    | `drpt`      | Supervised Fine-Tuning with layer-wise-subset data curation                     | [SFT/README.md](SFT/README.md)   |
+| **RLHF**   | `drpt`      | Reinforcement Learning from Human Feedback with layer-wise-subset data curation | [RLHF/README.md](RLHF/README.md) |
 | **RLVR**   | `drpt_rlvr` | Reinforcement Learning with Verifiable Rewards (VERL + vLLM)            | [RLVR/README.md](RLVR/README.md) |
 
 ## TODOs

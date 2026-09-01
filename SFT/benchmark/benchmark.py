@@ -2,12 +2,12 @@
 """
 Timing Benchmark for Dr. Post-Training.
 
-One subprocess per method (Standard / Layerwise / Subset).
+One subprocess per method (Full-Training / Layer-Wise Subset / Global Subset).
 CUDA events at every component boundary — no residual decomposition.
 
 Usage:
   python benchmark.py --batch-size 8 --seq-length 512
-  python benchmark.py --method standard  # single method (subprocess mode)
+  python benchmark.py --method full_training  # single method (subprocess mode)
 """
 
 import argparse
@@ -36,7 +36,7 @@ from SFT.benchmark.utils import (
 )
 from drpt import GradientHook
 
-METHODS = ["standard", "layerwise", "subset", "subset_one_pass"]
+METHODS = ["full_training", "layer_wise_subset", "global_subset", "global_subset_one_pass"]
 
 
 # =============================================================================
@@ -70,11 +70,11 @@ def _warmup_and_measure(step_fn, train_batches, val_batches, config, rec):
 
 
 # =============================================================================
-# Measurement: Standard
+# Measurement: Full-Training
 # =============================================================================
 
-def measure_standard(model, optimizer, grad_hook, train_batches, config):
-    """Measure Standard training with per-layer act_grad / w.grad breakdown."""
+def measure_full_training(model, optimizer, grad_hook, train_batches, config):
+    """Measure Full-Training training with per-layer act_grad / w.grad breakdown."""
     N = config.num_iterations
     timer = CUDAEventTimer(["forward", "backward", "optimizer"], N)
     rec = EventRecorder()
@@ -138,11 +138,11 @@ def measure_standard(model, optimizer, grad_hook, train_batches, config):
 
 
 # =============================================================================
-# Measurement: Layerwise
+# Measurement: LayerWiseSubset
 # =============================================================================
 
-def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, config, tokenizer):
-    """Measure Layerwise with full backward breakdown: act_grad, compress, score, select, w.grad."""
+def measure_layer_wise_subset(model, optimizer, grad_hook, train_batches, val_batches, config, tokenizer):
+    """Measure LayerWiseSubset with full backward breakdown: act_grad, compress, score, select, w.grad."""
     import drpt.selection.backward as _bwd
     from drpt.selection.backward import (
         augment_input_for_bias, split_train_val_batch,
@@ -155,8 +155,8 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
     pad_token_id = tokenizer.pad_token_id or 0
 
     # Save originals
-    _orig_backward = _bwd.LayerwiseLinearBackward.backward
-    _orig_compressed = _bwd.LayerwiseLinearBackward._backward_compressed
+    _orig_backward = _bwd.LayerWiseSubsetLinearBackward.backward
+    _orig_compressed = _bwd.LayerWiseSubsetLinearBackward._backward_compressed
 
     # Patched backward: times act_grad
     @staticmethod
@@ -176,10 +176,10 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
         usv = state is not None and getattr(state, '_use_stored_val', False)
         with torch.no_grad():
             if sc is not None:
-                gw, gb = _bwd.LayerwiseLinearBackward._backward_compressed(
+                gw, gb = _bwd.LayerWiseSubsetLinearBackward._backward_compressed(
                     hm, sc, uc, state, layer_idx, input, grad_output, bias, cvm, usv)
             else:
-                gw, gb = _bwd.LayerwiseLinearBackward._backward_full(
+                gw, gb = _bwd.LayerWiseSubsetLinearBackward._backward_full(
                     hm, uc, state, layer_idx, input, bias, grad_output, cvm, usv)
         return grad_input, gw, gb, None, None
 
@@ -226,7 +226,7 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             state.num_selected = si.shape[0]
             rec.mark('wgrad')
             return None, None
-        # select: top-k only (apple-to-apple with Subset selection)
+        # select: top-k only (apple-to-apple with GlobalSubset selection)
         rec.mark('select')
         si = _do_selection(state, lidx, scores, sim)
         rec.mark('select')
@@ -258,14 +258,13 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             return gw, gb
 
     # Patched _backward_full: times score, select, wgrad (no compression step)
-    _orig_full = _bwd.LayerwiseLinearBackward._backward_full
+    _orig_full = _bwd.LayerWiseSubsetLinearBackward._backward_full
 
     @staticmethod
     def timed_full(hm, uc, state, lidx, inp, bias, go, cvm, usv):
         from drpt.selection.backward import (
             _get_val_components, _dispatch_scoring, _do_selection as _do_sel,
             _produce_gradient_update as _produce_gu,
-            _produce_gradient_update_with_val as _produce_gu_val,
         )
         hb = bias is not None
         if cvm:
@@ -294,8 +293,7 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
             scorr = state.score_correction
         sm = getattr(state, 'scoring_method', 'reduced_ghost')
         dbs = getattr(state, 'direct_batch_size', 0)
-        include_val = (getattr(state, 'include_val_in_update', False) and not usv)
-        want_mat = (sm == "direct" and uc is None and not include_val)
+        want_mat = (sm == "direct" and uc is None)
         scores, sim, G = _dispatch_scoring(
             sm, tgo, ti, vgo, vinp, vgt, state.use_second_order,
             direct_batch_size=dbs, return_materialized=want_mat)
@@ -312,20 +310,17 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
         rec.mark('select')
         # Wgrad
         rec.mark('wgrad')
-        if include_val:
-            gw, gb = _produce_gu_val(state, si, tgo, ti, vgo, vinp, hb)
-        else:
-            gw, gb = _produce_gu(hm, uc, state, lidx, tgo, ti, si, hb,
-                                 materialized_grads=G)
+        gw, gb = _produce_gu(hm, uc, state, lidx, tgo, ti, si, hb,
+                             materialized_grads=G)
         rec.mark('wgrad')
         return gw, gb
 
-    _bwd.LayerwiseLinearBackward.backward = timed_backward
-    _bwd.LayerwiseLinearBackward._backward_compressed = timed_compressed
-    _bwd.LayerwiseLinearBackward._backward_full = timed_full
+    _bwd.LayerWiseSubsetLinearBackward.backward = timed_backward
+    _bwd.LayerWiseSubsetLinearBackward._backward_compressed = timed_compressed
+    _bwd.LayerWiseSubsetLinearBackward._backward_full = timed_full
 
     # --- Embedding timing patch ---
-    _orig_emb_backward = _bwd.LayerwiseEmbeddingBackward.backward
+    _orig_emb_backward = _bwd.LayerWiseSubsetEmbeddingBackward.backward
 
     @staticmethod
     def timed_emb_backward(ctx, grad_output):
@@ -399,13 +394,13 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
 
         return None, grad_weight, None, None, None
 
-    _bwd.LayerwiseEmbeddingBackward.backward = timed_emb_backward
+    _bwd.LayerWiseSubsetEmbeddingBackward.backward = timed_emb_backward
 
     def step(batch, val_batch, i=None):
         train_bs = batch['input_ids'].shape[0]
         merged = pad_and_merge_batches(batch, val_batch, pad_token_id=pad_token_id)
         grad_hook.setup_selection(
-            train_batch_size=train_bs, selection_method="Layerwise",
+            train_batch_size=train_bs, selection_method="LayerWiseSubset",
             frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
             selection_mode="topk", use_second_order=config.use_second_order,
             scoring_method=getattr(config, 'scoring_method', 'reduced_ghost'),
@@ -429,10 +424,10 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
 
     comp = _warmup_and_measure(step, train_batches, val_batches, config, rec)
 
-    _bwd.LayerwiseLinearBackward.backward = _orig_backward
-    _bwd.LayerwiseLinearBackward._backward_compressed = _orig_compressed
-    _bwd.LayerwiseLinearBackward._backward_full = _orig_full
-    _bwd.LayerwiseEmbeddingBackward.backward = _orig_emb_backward
+    _bwd.LayerWiseSubsetLinearBackward.backward = _orig_backward
+    _bwd.LayerWiseSubsetLinearBackward._backward_compressed = _orig_compressed
+    _bwd.LayerWiseSubsetLinearBackward._backward_full = _orig_full
+    _bwd.LayerWiseSubsetEmbeddingBackward.backward = _orig_emb_backward
 
     result = timer.mean_elapsed()
     result.update(comp)
@@ -440,14 +435,14 @@ def measure_layerwise(model, optimizer, grad_hook, train_batches, val_batches, c
 
 
 # =============================================================================
-# Measurement: Subset
+# Measurement: GlobalSubset
 # =============================================================================
 
-def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, config, tokenizer):
-    """Measure Subset with pass-1 breakdown (act_grad, compress, score) and pass-2 phases."""
+def measure_global_subset(model, optimizer, grad_hook, train_batches, val_batches, config, tokenizer):
+    """Measure GlobalSubset with pass-1 breakdown (act_grad, compress, score) and pass-2 phases."""
     import drpt.selection.backward as _bwd
     from drpt.selection.backward import augment_input_for_bias, split_train_val_batch
-    from drpt.selection.state import SubsetState
+    from drpt.selection.state import GlobalSubsetState
 
     N = config.num_iterations
     phases = ["pass1_forward", "pass1_backward", "selection",
@@ -489,9 +484,9 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
             _p2_patches.append((module, module._original_forward, _make(module)))
 
     # Save originals
-    _orig_backward = _bwd.SubsetLinearBackward.backward
-    _orig_accum = _bwd.SubsetLinearBackward._accumulate_compressed
-    _orig_accum_full = _bwd.SubsetLinearBackward._accumulate_full
+    _orig_backward = _bwd.GlobalSubsetLinearBackward.backward
+    _orig_accum = _bwd.GlobalSubsetLinearBackward._accumulate_compressed
+    _orig_accum_full = _bwd.GlobalSubsetLinearBackward._accumulate_full
 
     # Patched backward: times act_grad
     @staticmethod
@@ -511,10 +506,10 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
         usv = getattr(state, '_use_stored_val', False)
         with torch.no_grad():
             if sc is not None:
-                _bwd.SubsetLinearBackward._accumulate_compressed(
+                _bwd.GlobalSubsetLinearBackward._accumulate_compressed(
                     hm, sc, state, layer_idx, input, grad_output, bias, usv)
             else:
-                _bwd.SubsetLinearBackward._accumulate_full(
+                _bwd.GlobalSubsetLinearBackward._accumulate_full(
                     hm, state, layer_idx, input, grad_output, bias, usv)
         return grad_input, None, None, None, None
 
@@ -540,12 +535,12 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
         _orig_accum_full(hm, state, lidx, inp, go, bias, usv)
         rec.mark('score')
 
-    _bwd.SubsetLinearBackward.backward = timed_backward
-    _bwd.SubsetLinearBackward._accumulate_compressed = timed_accum
-    _bwd.SubsetLinearBackward._accumulate_full = timed_accum_full
+    _bwd.GlobalSubsetLinearBackward.backward = timed_backward
+    _bwd.GlobalSubsetLinearBackward._accumulate_compressed = timed_accum
+    _bwd.GlobalSubsetLinearBackward._accumulate_full = timed_accum_full
 
     # --- Embedding timing patch (two-pass subset: score only, no wgrad in pass 1) ---
-    _orig_emb_backward = _bwd.SubsetEmbeddingBackward.backward
+    _orig_emb_backward = _bwd.GlobalSubsetEmbeddingBackward.backward
 
     @staticmethod
     def timed_emb_backward(ctx, grad_output):
@@ -592,7 +587,7 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
 
         return None, None, None, None, None
 
-    _bwd.SubsetEmbeddingBackward.backward = timed_emb_backward
+    _bwd.GlobalSubsetEmbeddingBackward.backward = timed_emb_backward
 
     # Disable score compressors unless scoring_method is "compress"
     scoring_method = getattr(config, 'scoring_method', 'reduced_ghost')
@@ -606,7 +601,7 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
 
         # Pass 1
         grad_hook.setup_selection(
-            train_batch_size=train_bs, selection_method="Subset",
+            train_batch_size=train_bs, selection_method="GlobalSubset",
             frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
             selection_mode="topk", use_second_order=config.use_second_order,
             scoring_method=scoring_method,
@@ -677,10 +672,10 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
         rec.accumulate(p1_accum)
         p2_rec.accumulate(p2_accum)
 
-    _bwd.SubsetLinearBackward.backward = _orig_backward
-    _bwd.SubsetLinearBackward._accumulate_compressed = _orig_accum
-    _bwd.SubsetLinearBackward._accumulate_full = _orig_accum_full
-    _bwd.SubsetEmbeddingBackward.backward = _orig_emb_backward
+    _bwd.GlobalSubsetLinearBackward.backward = _orig_backward
+    _bwd.GlobalSubsetLinearBackward._accumulate_compressed = _orig_accum
+    _bwd.GlobalSubsetLinearBackward._accumulate_full = _orig_accum_full
+    _bwd.GlobalSubsetEmbeddingBackward.backward = _orig_emb_backward
     grad_hook.score_compressors = saved_score_compressors
 
     result = timer.mean_elapsed()
@@ -692,14 +687,14 @@ def measure_subset(model, optimizer, grad_hook, train_batches, val_batches, conf
 
 
 # =============================================================================
-# Measurement: Subset One-Pass
+# Measurement: GlobalSubset One-Pass
 # =============================================================================
 
-def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batches, config, tokenizer):
-    """Measure one-pass Subset (Algorithm 4.2): score + retain during backward, post-hoc assembly."""
+def measure_global_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batches, config, tokenizer):
+    """Measure one-pass GlobalSubset (Algorithm 4.2): score + retain during backward, post-hoc assembly."""
     import drpt.selection.backward as _bwd
     from drpt.selection.backward import augment_input_for_bias, split_train_val_batch
-    from drpt.selection.state import SubsetState
+    from drpt.selection.state import GlobalSubsetState
 
     N = config.num_iterations
     phases = ["forward", "backward", "selection", "wgrad", "optimizer"]
@@ -710,9 +705,9 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
     scoring_method = getattr(config, 'scoring_method', 'reduced_ghost')
 
     # Save originals
-    _orig_backward = _bwd.SubsetLinearBackward.backward
-    _orig_accum_full = _bwd.SubsetLinearBackward._accumulate_full
-    _orig_accum_compressed = _bwd.SubsetLinearBackward._accumulate_compressed
+    _orig_backward = _bwd.GlobalSubsetLinearBackward.backward
+    _orig_accum_full = _bwd.GlobalSubsetLinearBackward._accumulate_full
+    _orig_accum_compressed = _bwd.GlobalSubsetLinearBackward._accumulate_compressed
 
     # Patched backward: times act_grad + retain
     @staticmethod
@@ -732,10 +727,10 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
         usv = getattr(state, '_use_stored_val', False)
         with torch.no_grad():
             if sc is not None:
-                _bwd.SubsetLinearBackward._accumulate_compressed(
+                _bwd.GlobalSubsetLinearBackward._accumulate_compressed(
                     hm, sc, state, layer_idx, input, grad_output, bias, usv)
             else:
-                _bwd.SubsetLinearBackward._accumulate_full(
+                _bwd.GlobalSubsetLinearBackward._accumulate_full(
                     hm, state, layer_idx, input, grad_output, bias, usv)
             # One-pass: retain data
             if state.one_pass:
@@ -771,12 +766,12 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
             state.process_layer_gradients(tg, vg, lidx, scorr)
         rec.mark('score')
 
-    _bwd.SubsetLinearBackward.backward = timed_backward
-    _bwd.SubsetLinearBackward._accumulate_full = timed_accum_full
-    _bwd.SubsetLinearBackward._accumulate_compressed = timed_accum_compressed
+    _bwd.GlobalSubsetLinearBackward.backward = timed_backward
+    _bwd.GlobalSubsetLinearBackward._accumulate_full = timed_accum_full
+    _bwd.GlobalSubsetLinearBackward._accumulate_compressed = timed_accum_compressed
 
     # --- Embedding timing patch (one-pass: score + retain) ---
-    _orig_emb_backward = _bwd.SubsetEmbeddingBackward.backward
+    _orig_emb_backward = _bwd.GlobalSubsetEmbeddingBackward.backward
 
     @staticmethod
     def timed_emb_backward(ctx, grad_output):
@@ -835,7 +830,7 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
 
         return None, None, None, None, None
 
-    _bwd.SubsetEmbeddingBackward.backward = timed_emb_backward
+    _bwd.GlobalSubsetEmbeddingBackward.backward = timed_emb_backward
 
     # Disable score compressors for one-pass — use exact scoring
     saved_score_compressors = grad_hook.score_compressors
@@ -847,7 +842,7 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
         merged = pad_and_merge_batches(batch, val_batch, pad_token_id=pad_token_id)
 
         grad_hook.setup_selection(
-            train_batch_size=train_bs, selection_method="Subset",
+            train_batch_size=train_bs, selection_method="GlobalSubset",
             frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
             selection_mode="topk", use_second_order=config.use_second_order,
             scoring_method=scoring_method,
@@ -877,7 +872,7 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
             scale_factor = state._compute_scale_factor_for_assembly(selected)
             # No model.zero_grad() here — non-linear layers retain their autograd
             # gradients from backward, and hooked linear layers have None grad
-            # (SubsetLinearBackward suppresses weight/bias grads).
+            # (GlobalSubsetLinearBackward suppresses weight/bias grads).
             grad_hook.assemble_gradients_from_retained(selected, scale_factor)
         else:
             grad_hook.clear_retained_data()
@@ -904,10 +899,10 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
         torch.cuda.synchronize()
         rec.accumulate(comp_accum)
 
-    _bwd.SubsetLinearBackward.backward = _orig_backward
-    _bwd.SubsetLinearBackward._accumulate_full = _orig_accum_full
-    _bwd.SubsetLinearBackward._accumulate_compressed = _orig_accum_compressed
-    _bwd.SubsetEmbeddingBackward.backward = _orig_emb_backward
+    _bwd.GlobalSubsetLinearBackward.backward = _orig_backward
+    _bwd.GlobalSubsetLinearBackward._accumulate_full = _orig_accum_full
+    _bwd.GlobalSubsetLinearBackward._accumulate_compressed = _orig_accum_compressed
+    _bwd.GlobalSubsetEmbeddingBackward.backward = _orig_emb_backward
     grad_hook.score_compressors = saved_score_compressors
 
     result = timer.mean_elapsed()
@@ -920,8 +915,8 @@ def measure_subset_one_pass(model, optimizer, grad_hook, train_batches, val_batc
 # Display
 # =============================================================================
 
-def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass=None):
-    has_op = subset_one_pass is not None
+def print_results(full_training, layer_wise_subset, global_subset, config, peak_mem, global_subset_one_pass=None):
+    has_op = global_subset_one_pass is not None
     W = 130 if has_op else 110
     print()
     print("=" * W)
@@ -939,31 +934,31 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
     if has_op:
         def _row(label, s, l, sub, op):
             print(f"  {label:<30} {_v(s):>12} {_v(l):>12} {_v(sub):>12} {_v(op):>12}")
-        print(f"  {'Component':<30} {'Standard':>12} {'Layerwise':>12} {'Subset 2P':>12} {'Subset 1P':>12}")
+        print(f"  {'Component':<30} {'Full-Training':>12} {'Layer-Wise Subset':>12} {'Global Subset 2P':>12} {'Global Subset 1P':>12}")
     else:
         def _row(label, s, l, sub, op=0):
             print(f"  {label:<30} {_v(s):>12} {_v(l):>12} {_v(sub):>12}")
-        print(f"  {'Component':<30} {'Standard':>12} {'Layerwise':>12} {'Subset':>12}")
+        print(f"  {'Component':<30} {'Full-Training':>12} {'Layer-Wise Subset':>12} {'Global Subset':>12}")
     print("-" * W)
 
-    s_fwd, s_bwd, s_opt = standard['forward'], standard['backward'], standard['optimizer']
-    l_fwd, l_bwd, l_opt = layerwise['forward'], layerwise['backward'], layerwise['optimizer']
-    sub_p1f = subset['pass1_forward']
-    sub_p1b = subset['pass1_backward']
-    sub_sel = subset['selection']
-    sub_p2f = subset['pass2_forward']
-    sub_p2b = subset['pass2_backward']
-    sub_opt = subset['optimizer']
+    s_fwd, s_bwd, s_opt = full_training['forward'], full_training['backward'], full_training['optimizer']
+    l_fwd, l_bwd, l_opt = layer_wise_subset['forward'], layer_wise_subset['backward'], layer_wise_subset['optimizer']
+    sub_p1f = global_subset['pass1_forward']
+    sub_p1b = global_subset['pass1_backward']
+    sub_sel = global_subset['selection']
+    sub_p2f = global_subset['pass2_forward']
+    sub_p2b = global_subset['pass2_backward']
+    sub_opt = global_subset['optimizer']
     s_total = s_fwd + s_bwd + s_opt
     l_total = l_fwd + l_bwd + l_opt
     sub_total = sub_p1f + sub_p1b + sub_sel + sub_p2f + sub_p2b + sub_opt
 
     if has_op:
-        op_fwd = subset_one_pass['forward']
-        op_bwd = subset_one_pass['backward']
-        op_sel = subset_one_pass['selection']
-        op_asm = subset_one_pass['wgrad']
-        op_opt = subset_one_pass['optimizer']
+        op_fwd = global_subset_one_pass['forward']
+        op_bwd = global_subset_one_pass['backward']
+        op_sel = global_subset_one_pass['selection']
+        op_asm = global_subset_one_pass['wgrad']
+        op_opt = global_subset_one_pass['optimizer']
         op_total = op_fwd + op_bwd + op_sel + op_asm + op_opt
     else:
         op_fwd = op_bwd = op_sel = op_asm = op_opt = op_total = 0
@@ -978,13 +973,13 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
     if has_op: totals += f"  {op_total:>11.1f}"
     print(totals)
 
-    mem_line = (f"  {'Peak Memory':<30} {peak_mem.get('standard',0):>10.2f} GB"
-                f" {peak_mem.get('layerwise',0):>10.2f} GB"
-                f" {peak_mem.get('subset',0):>10.2f} GB")
-    if has_op: mem_line += f" {peak_mem.get('subset_one_pass',0):>10.2f} GB"
+    mem_line = (f"  {'Peak Memory':<30} {peak_mem.get('full_training',0):>10.2f} GB"
+                f" {peak_mem.get('layer_wise_subset',0):>10.2f} GB"
+                f" {peak_mem.get('global_subset',0):>10.2f} GB")
+    if has_op: mem_line += f" {peak_mem.get('global_subset_one_pass',0):>10.2f} GB"
     print(mem_line)
 
-    ovh = f"  {'Overhead vs Standard':<30} {'':>12} {(l_total/s_total-1)*100:>10.1f}%  {(sub_total/s_total-1)*100:>10.1f}%"
+    ovh = f"  {'Overhead vs Full-Training':<30} {'':>12} {(l_total/s_total-1)*100:>10.1f}%  {(sub_total/s_total-1)*100:>10.1f}%"
     if has_op: ovh += f"  {(op_total/s_total-1)*100:>10.1f}%"
     print(ovh)
 
@@ -1007,22 +1002,22 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
                 print(f"    {name:<33} {val:>8.1f} ms")
         print(f"    {'total backward':<33} {total:>8.1f} ms")
 
-    # Standard
-    s_act = standard.get('act_grad', 0)
-    s_wg = standard.get('wgrad', 0)
+    # Full-Training
+    s_act = full_training.get('act_grad', 0)
+    s_wg = full_training.get('wgrad', 0)
     s_items = []
     if s_act > 0.01:
         s_items = [("act_grad (chain rule)", s_act), ("w.grad", s_wg),
                    ("autograd overhead", s_bwd - s_act - s_wg)]
-    _bkd("Standard", s_items, s_bwd)
+    _bkd("FullTraining", s_items, s_bwd)
 
-    # Layerwise (fold embedding into corresponding phases)
-    l_act = layerwise.get('act_grad', 0)
-    l_comp = layerwise.get('compress', 0)
-    l_score = layerwise.get('score', 0) + layerwise.get('emb_score', 0)
-    l_sel = layerwise.get('select', 0) + layerwise.get('emb_select', 0)
-    l_wg = layerwise.get('wgrad', 0) + layerwise.get('emb_wgrad', 0)
-    l_sw = layerwise.get('select_wgrad', 0)
+    # LayerWiseSubset (fold embedding into corresponding phases)
+    l_act = layer_wise_subset.get('act_grad', 0)
+    l_comp = layer_wise_subset.get('compress', 0)
+    l_score = layer_wise_subset.get('score', 0) + layer_wise_subset.get('emb_score', 0)
+    l_sel = layer_wise_subset.get('select', 0) + layer_wise_subset.get('emb_select', 0)
+    l_wg = layer_wise_subset.get('wgrad', 0) + layer_wise_subset.get('emb_wgrad', 0)
+    l_sw = layer_wise_subset.get('select_wgrad', 0)
     l_measured = l_act + l_comp + l_score + l_sel + l_wg + l_sw
     l_items = [("act_grad (chain rule)", l_act),
                ("compress (sparsifier.forward)", l_comp),
@@ -1032,12 +1027,12 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
     else:
         l_items += [("select (top-k)", l_sel), ("w.grad (selected gradients)", l_wg)]
     l_items.append(("autograd overhead", l_bwd - l_measured))
-    _bkd("Layerwise", l_items, l_bwd)
+    _bkd("LayerWiseSubset", l_items, l_bwd)
 
-    # Subset two-pass (fold embedding into score)
-    p1_act = subset.get('p1_act_grad', 0)
-    p1_comp = subset.get('p1_compress', 0)
-    p1_score = subset.get('p1_score', 0) + subset.get('p1_emb_score', 0)
+    # GlobalSubset two-pass (fold embedding into score)
+    p1_act = global_subset.get('p1_act_grad', 0)
+    p1_comp = global_subset.get('p1_compress', 0)
+    p1_score = global_subset.get('p1_score', 0) + global_subset.get('p1_emb_score', 0)
     p1_measured = p1_act + p1_comp + p1_score
     p1_total = sub_p1b + sub_sel
     p1_items = [("act_grad (chain rule)", p1_act),
@@ -1045,12 +1040,12 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
                 ("score (accumulate)", p1_score),
                 ("selection (top-k)", sub_sel),
                 ("autograd overhead", sub_p1b - p1_measured)]
-    _bkd("Subset two-pass: pass 1 (scoring)", p1_items, p1_total)
-    p2_act = subset.get('p2_act_grad', 0)
-    p2_wg = subset.get('p2_wgrad', 0)
+    _bkd("GlobalSubset two-pass: pass 1 (scoring)", p1_items, p1_total)
+    p2_act = global_subset.get('p2_act_grad', 0)
+    p2_wg = global_subset.get('p2_wgrad', 0)
     p2_measured = p2_act + p2_wg
     p2_overhead = sub_p2b - p2_measured if p2_measured > 0.01 else 0
-    print(f"  Subset two-pass: pass 2 (w.grad on selected):")
+    print(f"  GlobalSubset two-pass: pass 2 (w.grad on selected):")
     print(f"    {'forward':<33} {sub_p2f:>8.1f} ms")
     if p2_act > 0.01:
         print(f"    {'act_grad (chain rule)':<33} {p2_act:>8.1f} ms")
@@ -1058,12 +1053,12 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
         print(f"    {'autograd overhead':<33} {p2_overhead:>8.1f} ms")
     print(f"    {'backward':<33} {sub_p2b:>8.1f} ms")
 
-    # Subset one-pass (fold embedding into score/retain)
+    # GlobalSubset one-pass (fold embedding into score/retain)
     if has_op:
-        op_act = subset_one_pass.get('act_grad', 0)
-        op_comp = subset_one_pass.get('compress', 0)
-        op_score = subset_one_pass.get('score', 0) + subset_one_pass.get('emb_score', 0)
-        op_retain = subset_one_pass.get('retain', 0) + subset_one_pass.get('emb_retain', 0)
+        op_act = global_subset_one_pass.get('act_grad', 0)
+        op_comp = global_subset_one_pass.get('compress', 0)
+        op_score = global_subset_one_pass.get('score', 0) + global_subset_one_pass.get('emb_score', 0)
+        op_retain = global_subset_one_pass.get('retain', 0) + global_subset_one_pass.get('emb_retain', 0)
         op_measured = op_act + op_comp + op_score + op_retain
         op_items = [("act_grad (chain rule)", op_act),
                     ("compress (sparsifier.forward)", op_comp),
@@ -1072,7 +1067,7 @@ def print_results(standard, layerwise, subset, config, peak_mem, subset_one_pass
                     ("selection (top-k)", op_sel),
                     ("assembly (w.grad from retained)", op_asm),
                     ("autograd overhead", op_bwd - op_measured)]
-        _bkd("Subset one-pass (score+retain+assemble)", op_items,
+        _bkd("GlobalSubset one-pass (score+retain+assemble)", op_items,
              op_bwd + op_sel + op_asm)
 
     print("=" * W)
@@ -1096,16 +1091,16 @@ def run_method(method, config):
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
-    if method == "standard":
-        result = measure_standard(model, optimizer, grad_hook, train_batches, config)
-    elif method == "layerwise":
-        result = measure_layerwise(model, optimizer, grad_hook,
+    if method == "full_training":
+        result = measure_full_training(model, optimizer, grad_hook, train_batches, config)
+    elif method == "layer_wise_subset":
+        result = measure_layer_wise_subset(model, optimizer, grad_hook,
                                    train_batches, val_batches, config, tokenizer)
-    elif method == "subset":
-        result = measure_subset(model, optimizer, grad_hook,
+    elif method == "global_subset":
+        result = measure_global_subset(model, optimizer, grad_hook,
                                 train_batches, val_batches, config, tokenizer)
-    elif method == "subset_one_pass":
-        result = measure_subset_one_pass(model, optimizer, grad_hook,
+    elif method == "global_subset_one_pass":
+        result = measure_global_subset_one_pass(model, optimizer, grad_hook,
                                          train_batches, val_batches, config, tokenizer)
     else:
         raise ValueError(f"Unknown method: {method}")
@@ -1217,12 +1212,12 @@ def main():
         peak_mem[method] = result.get("peak_memory_gb", 0)
         print(f"  Done. Peak memory: {peak_mem[method]:.2f} GB")
 
-    required = ["standard", "layerwise", "subset"]
+    required = ["full_training", "layer_wise_subset", "global_subset"]
     if all(m in all_results for m in required):
         print_results(
-            all_results["standard"], all_results["layerwise"],
-            all_results["subset"], config, peak_mem,
-            subset_one_pass=all_results.get("subset_one_pass"),
+            all_results["full_training"], all_results["layer_wise_subset"],
+            all_results["global_subset"], config, peak_mem,
+            global_subset_one_pass=all_results.get("global_subset_one_pass"),
         )
         if args.output:
             with open(args.output, 'w') as f:

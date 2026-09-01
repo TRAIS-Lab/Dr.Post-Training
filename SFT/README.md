@@ -1,62 +1,31 @@
 # SFT Experiments
 
-This folder contains the training and evaluation code and method configurations for Supervised Fine-Tuning.
+Training and evaluation code for Supervised Fine-Tuning experiments.
+See `PROGRESS.md` for the live run inventory and status.
 
-## Data Preparation
+## Scope (4 active settings)
 
-Download and prepare datasets using the unified data preparation script:
+3 LoRA-only train→target settings + 1 multi-finetuning setting
+(`alpaca → samsum`, covering Full/LoRA/MeSO), each at 5 seeds. Per-task
+target-only baselines train directly on `n_val=16` validation samples.
 
-```bash
-# See available datasets and options
-python SFT/data/prepare_datasets.py -h
+| # | Config dir       | Train pool | Target task | Step budget | `eval_steps` | Methods                  |
+|---|------------------|------------|-------------|-------------|--------------|--------------------------|
+| 1 | `alpaca_samsum`  | alpaca     | samsum      | 2600        | 26           | 9 (Full+LoRA+MeSO × 3 curations) |
+| 2 | `less_tydiqa`    | less mix   | tydiqa      | 1225        | 12           | 3 (LoRA × 3 curations)   |
+| 3 | `triviaqa_nq`    | triviaqa   | nq_open     | 1107        | 11           | 3 (LoRA × 3 curations)   |
+| 4 | `less_squad`     | less mix   | squad       | 1225        | 12           | 3 (LoRA × 3 curations)   |
 
-# Download specific datasets
-python SFT/data/prepare_datasets.py --datasets mmlu bbh tydiqa
-
-# Download all evaluation datasets
-python SFT/data/prepare_datasets.py --datasets mmlu bbh tydiqa gsm8k math500 samsum
-
-# Download training datasets
-python SFT/data/prepare_datasets.py --datasets alpaca dolly flan_v2 cot oasst1
-```
-
-<details>
-  <summary>Available Datasets</summary>
-
-### Evaluation Datasets
-
-| Dataset   | Task Type          | Description                                              |
-| --------- | ------------------ | -------------------------------------------------------- |
-| `samsum`  | Summarization      | SamSUM dialogue summarization                            |
-| `tydiqa`  | Question Answering | Typologically Diverse QA (9 languages)                   |
-| `mmlu`    | Multiple Choice    | Massive Multitask Language Understanding (57 subjects)   |
-| `bbh`     | Reasoning          | BIG-Bench Hard (23 challenging reasoning tasks with CoT) |
-| `gsm8k`   | Math               | Grade School Math (8K problems)                          |
-| `math500` | Math               | MATH benchmark (500 competition problems)                |
-
-### Training Datasets
-
-| Dataset      | Size | Description                           |
-| ------------ | ---- | ------------------------------------- |
-| `less`       | 1M   | LESS-selected instruction data        |
-| `alpaca`     | 52K  | Stanford Alpaca instruction-following |
-| `tulu3`      | 939K | Tulu-3 SFT mixture                    |
-| `dolly`      | 15K  | Databricks Dolly 2.0                  |
-| `flan_v2`    | 100K | FLAN v2 instruction tuning mixture    |
-| `cot`        | 100K | Chain-of-Thought reasoning examples   |
-| `oasst1`     | 88K  | OpenAssistant conversations           |
-| `vicuna`     | 125K | ShareGPT-based conversations          |
-| `wizardlm`   | 196K | WizardLM evolved instructions         |
-| `openhermes` | 1M   | OpenHermes 2.5 diverse instructions   |
-</details>
+LESS mix = `flan_v2 + cot + dolly + oasst1` (~1.96M). Run-dir prefix is
+`{train}_{task}` so setting 3 produces `triviaqa_nq_open-...`.
 
 ## Dolci capability setting (Qwen3 + Dolci-Instruct pools)
 
-The capability experiment follows the design of `Dr.Post-Training-Next`: a Qwen3
+A fifth family of settings follows the design of `Dr.Post-Training-Next`: a Qwen3
 base model is fine-tuned on a 32K-row pool sampled from `allenai/Dolci-Instruct-SFT`,
 curation is steered by a small target set, and the final number is an official
-downstream benchmark scored by generation. The harness keeps the paper's data
-roles and knobs; only what the files *mean* changes.
+downstream benchmark scored by generation. The harness keeps the data roles and
+knobs above; only what the files *mean* changes.
 
 ### Data roles
 
@@ -82,18 +51,18 @@ answers. One target can map to several benchmarks:
 If a target file has fewer rows than `n_val`/`n_eval` request, the loader logs a
 warning and uses what exists (MBPP train has only 374 rows).
 
-### What changed in the harness
+### What the harness adds
 
 - **Chat template.** `SFT/data/chat_format.py` renders every string through the
-  tokenizer's own chat template when it has one (Qwen3) and falls back to the
-  tulu markers otherwise. Training encoding for template-bearing tokenizers
-  supervises assistant turns via offset mapping; tokenizers without a template
-  (Llama-3.2-1B) keep the legacy encoder, so the paper's runs are unchanged.
-  Qwen3's empty `<think>` scaffold is treated as prompt, and evaluation prompts
-  are rendered with thinking disabled to match.
+  tokenizer's own chat template when it has one (Qwen3) and the tulu-style
+  fallback otherwise (Llama-3.2-1B). Training supervision of assistant turns is
+  computed from the fast tokenizer's offset mapping, which stays correct on Qwen3
+  multi-turn data (the empty `<think>` scaffold is only injected on the final
+  assistant turn). The scaffold is treated as prompt, and evaluation prompts are
+  rendered with thinking disabled to match.
 - **Generic target loader.** Any `eval/<task>/<task>_{validation,test}_data.jsonl`
-  in `messages` format loads without code changes (`precise_if`, `math`, `mbpp`
-  are pre-registered).
+  in `messages` format loads without code changes (`precise_if`, `math`, `mbpp`,
+  `truthfulqa` are pre-registered).
 - **Knobs.** `gradient_checkpointing: true` (non-reentrant; needed for 1.7B at
   4096 tokens on a 48 GB GPU) and `val_seq_length_multiplier` (D* length
   rejection; `0` disables) are new `defaults.yaml` keys.
@@ -111,7 +80,7 @@ python SFT/data/prepare_datasets.py --datasets ifeval ifbench math500 mbpp_plus
 
 # Train (Qwen3-1.7B-Base, batch 8, 4096 tokens, one epoch over the pool)
 bash SFT/train/train.sh -c configs/dolci_inst_if -m all
-bash SFT/train/train.sh -c configs/dolci_reason_math -m "Standard-Full,Layerwise-Full"
+bash SFT/train/train.sh -c configs/dolci_reason_math -m "FullTraining-Full,LayerWiseSubset-Full"
 
 # Evaluate every run of a setting on its benchmarks
 bash SFT/eval/eval.sh --train dolci_instruction --target precise_if --batch_size 16 \
@@ -123,169 +92,149 @@ bash SFT/eval/eval.sh --train dolci_reasoning --target mbpp --batch_size 16   # 
 Verifier dependencies: `langdetect`, `immutabledict`, `nltk` (IFEval, vendored
 under `SFT/eval/tasks/ifeval_lib`), a checkout of
 [`allenai/IFBench`](https://github.com/allenai/IFBench) at the pinned commit
-(IFBench), `math-verify` (MATH500; regex fallback if missing), and `evalplus`
-plus apptainer/singularity for a sandboxed MBPP+ run.
+(IFBench), `math-verify` (MATH500; boxed-answer fallback if missing), and
+`evalplus` plus apptainer/singularity for a sandboxed MBPP+ run.
 
-## Experiment Summary
+## Hyperparameters
 
-The following methods have been run and can be rerun with the commands below.
+Fixed across all settings. No LR tuning per setting.
 
-| Train Dataset | Eval Task | Percentage | Batch | Val Size | LoRA Rank |
-| ------------- | --------- | ---------- | ----- | -------- | --------- |
-| Alpaca        | SamSUM    | 0.4        | 8     | 16       | 32        |
-| Tulu3         | TydiQA    | 0.01       | 8     | 16       | 32        |
+| Setting | Value |
+|---|---|
+| Model | `meta-llama/Llama-3.2-1B` |
+| LR (Full / MeSO) | `1e-5` |
+| LR (LoRA) | `1e-4` |
+| Scheduler | linear, `warmup_ratio=0.03` |
+| Optimizer | AdamW (`weight_decay=0.0`) |
+| Precision | bf16, flash-attention-2 |
+| LoRA | `r=8`, `alpha=16`, `dropout=0.1`, `target_modules=all-linear` |
+| Batch size | `per_device=8`, `gradient_accumulation=1` |
+| Seq length | `max_seq_length=512` |
+| Curation | `selection_frac=0.5`, `n_val=16`, `val_strategy=merged_batch`, `scoring.method=reduced_ghost` (LayerWiseSubset uses `compress` with `compression=normal-64*64`) |
+| MeSO | optimizer `compression=normal-512*512` |
+| Eval | `n_eval=500`, `n_test=500`, seeds {2, 22, 42, 62, 82} |
 
-### Experiment Configurations
+## Chat template
 
-We consider the following 9 methods for each of the training datasets above. Each method has a YAML config in `SFT/train/configs/`:
+All examples are stored as `messages` JSONL (no template baked in).
+Llama-3.2-1B-Base ships without a chat template, so we install an
+open-instruct-style fallback (`<|user|>` / `<|assistant|>` plaintext
+markers) via `SFT/data/chat_format.py:ensure_chat_template` (re-exported from
+`get_val_dataset.py`). Tokenizers that ship a template (Qwen3) use their own.
+Both training and eval call `tokenizer.apply_chat_template(...)`; loss is
+computed only on the assistant-content tokens.
 
-| Config           | Curation  | Description                          |
-| ---------------- | --------- | ------------------------------------ |
-| `Standard-Full`  | NA        | Baseline full fine-tuning            |
-| `Standard-LoRA`  | NA        | Baseline LoRA fine-tuning            |
-| `Standard-MeSO`  | NA        | Baseline MeSO fine-tuning            |
-| `Layerwise-Full` | Layerwise | Per-layer curation, full fine-tuning |
-| `Layerwise-LoRA` | Layerwise | Per-layer curation, LoRA fine-tuning |
-| `Layerwise-MeSO` | Layerwise | Per-layer curation + MeSO            |
-| `Subset-Full`    | Subset    | Global curation, full fine-tuning    |
-| `Subset-LoRA`    | Subset    | Global curation, LoRA fine-tuning    |
-| `Subset-MeSO`    | Subset    | Global curation + MeSO               |
-
-> Experiments follow the pattern: `{train}_{task}-{model}-{Method}-{FinetuningMethod}-p{pct}-lr{lr}-b{batch}-v{nval}-s{seed}`
-
-### LR Sweep
-
-The `SFT/train/lr/` folder contains tools for finding optimal learning rates. Best LRs are written directly into each method's YAML config file (the `learning_rate:` field).
-
-#### Three-Way Data Split
-
-Evaluation data is split into three parts to prevent contamination:
-
-| Split | File | Purpose |
-|-------|------|---------|
-| `validation` | `{task}_validation_data.jsonl` | Data curation (during training) |
-| `lr` | `{task}_lr_data.jsonl` | LR sweep evaluation |
-| `test` | `{task}_test_data.jsonl` | Final evaluation only |
-
-Regenerate splits with: `python SFT/data/prepare_datasets.py --datasets tydiqa samsum`
-
-#### Parallel Sweep (Recommended)
-
-Uses SLURM to submit all LR trials as parallel 1-GPU jobs. Each job trains 1 epoch with the method's full config and evaluates on the `lr` split.
+## Data preparation
 
 ```bash
-# Step 1: Submit all trials (9 methods x 20 LRs = 180 jobs per config)
-bash SFT/train/lr/lr_sweep_submit.sh -c configs/tulu3_tydiqa -m all
-bash SFT/train/lr/lr_sweep_submit.sh -c configs/alpaca_samsum -m all
+# Eval splits (val/lr/test) for the 4 active target tasks
+python SFT/data/prepare_datasets.py --datasets samsum tydiqa nq_open_eval squad_eval
 
-# Step 2: After all jobs complete, collect results and update YAML configs
-bash SFT/train/lr/lr_sweep_collect.sh -c configs/tulu3_tydiqa -m all
-bash SFT/train/lr/lr_sweep_collect.sh -c configs/alpaca_samsum -m all
+# Training pools
+python SFT/data/prepare_datasets.py --datasets alpaca triviaqa_train dolly oasst1 flan_v2 cot
 ```
 
-The grid uses 20 log-spaced LR values:
-- **Full/MeSO**: `1e-7` to `1e-3`
-- **LoRA**: `1e-5` to `1e-1`
+`cot` (`kaist-ai/CoT-Collection`) is loaded via
+`revision="refs/convert/parquet"` because the script form is rejected by
+`datasets >= 3.0`.
 
-The collect script picks the smallest LR within 1% of the best eval_loss (stability margin), writes it back to the method YAML, and cleans up model weights.
+| Dataset    | Role  | Lines (post-prep)        | Description                                         |
+| ---------- | ----- | ------------------------ | --------------------------------------------------- |
+| `samsum`   | eval  | 818 / 100 / 719          | Dialogue summarization (val/lr/test)                |
+| `tydiqa`   | eval  | 100 / 100 / 4877         | Multilingual extractive QA (val/lr/test)            |
+| `nq_open`  | eval  | val/lr/test from HF validation (~3.6K) | Closed-book factoid QA               |
+| `squad`    | eval  | val/lr/test from HF validation         | Closed-book reading-comprehension QA |
+| `alpaca`   | train | 52,002                   | Stanford Alpaca instruction-following               |
+| `triviaqa` | train | ~138K                    | TriviaQA closed-book Q→A pairs (rc.nocontext)       |
+| `flan_v2`  | train | 100,000 (subset)         | LESS-mix component                                  |
+| `cot`      | train | 1,837,928                | LESS-mix component (CoT-Collection, parquet rev.)   |
+| `dolly`    | train | 15,011                   | LESS-mix component                                  |
+| `oasst1`   | train | 9,846                    | LESS-mix component (multi-turn unrolled)            |
 
-Options:
-```bash
-# Customize grid density
-bash SFT/train/lr/lr_sweep_submit.sh -c configs/tulu3_tydiqa -m all --n_lrs 10
+## Methods (per setting)
 
-# Dry run (print commands without submitting)
-bash SFT/train/lr/lr_sweep_submit.sh -c configs/tulu3_tydiqa -m Standard-Full --dry-run
+| Config                  | Curation       | Finetuning |
+|-------------------------|----------------|------------|
+| `FullTraining-Full`     | none           | Full       |
+| `FullTraining-LoRA`     | none           | LoRA r=8   |
+| `FullTraining-MeSO`     | none           | MeSO       |
+| `LayerWiseSubset-Full`  | per-layer top-k| Full       |
+| `LayerWiseSubset-LoRA`  | per-layer top-k| LoRA r=8   |
+| `LayerWiseSubset-MeSO`  | per-layer top-k| MeSO       |
+| `GlobalSubset-Full`     | global top-k   | Full       |
+| `GlobalSubset-LoRA`     | global top-k   | LoRA r=8   |
+| `GlobalSubset-MeSO`     | global top-k   | MeSO       |
 
-# Adjust stability margin
-bash SFT/train/lr/lr_sweep_collect.sh -c configs/tulu3_tydiqa -m all --lr_margin 0.02
-```
+Setting 1 (`alpaca_samsum`) runs all 9; settings 2–4 run only the 3 LoRA
+variants. Per-task target-only baselines (`FullTraining-{Full,LoRA,MeSO}`
+via `train_val_ablation.sh`) train directly on the `n_val=16` task
+validation samples.
 
-#### Sequential Sweep (Single GPU)
+> Run dirs: `{train}_{task}-{model}-{Method}-p{pct}-lr{lr}-b{batch}-v{nval}-s{seed}`
 
-For local/interactive use without SLURM. Runs trials sequentially on the current machine:
-
-```bash
-bash SFT/train/lr/lr_sweep.sh -c configs/tulu3_tydiqa -m all
-bash SFT/train/lr/lr_sweep.sh -c configs/tulu3_tydiqa -m Standard-Full --mode grid
-```
-
-### Training Commands
-
-All methods are launched using `train.sh` with a config directory. Each config directory is self-contained: a `defaults.yaml` for shared experiment settings (model, dataset, batch size, LR scheduler, etc.) and one YAML per method (curation type, LR, compression).
-
-```bash
-# Alpaca -> SamSUM (all 9 methods)
-bash SFT/train/train.sh -c configs/alpaca_samsum -m all
-
-# Tulu3 -> TydiQA (all 9 methods)
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m all
-```
-
-#### Seed Sweeps and CLI Overrides
-
-The `--seed` and `--lr` flags override the corresponding config values, useful for sweeps:
+## Submitting the full sweep
 
 ```bash
-# Run all methods with 3 different seeds
-for s in 42 123 456; do
-  bash SFT/train/train.sh -c configs/tulu3_tydiqa -m all --seed $s
-done
-
-# Quick LR test on a single method
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m Layerwise-Full --lr 1e-04
+# 90 main + 30 target-only + 18 eval-main + 6 eval-target = 144 jobs
+bash SFT/train/submit_all.sh             # submit
+bash SFT/train/submit_all.sh --dry-run   # print sbatch commands only
 ```
 
-#### Running by Category
+Layout:
+- Stage 1: 90 main training jobs (3h walltime)
+- Stage 2: 30 target-only jobs (2h walltime)
+- Stage 3: 18 main-eval jobs (2h, depends on Stage 1)
+- Stage 4: 6 target-eval jobs (2h, depends on Stage 2)
+
+## Single-job training
 
 ```bash
-# Run by category
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m standard    # All Standard-* variants
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m layerwise   # All Layerwise-* variants
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m subset      # All Subset-* variants
-
-# Run specific methods
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m "Layerwise-Full,Subset-Full"
-
-# Dry run (print commands without executing)
-bash SFT/train/train.sh -c configs/tulu3_tydiqa -m all --dry-run
-
-# List available methods in a config directory
-bash SFT/train/train.sh -c configs/tulu3_tydiqa --list
+bash SFT/train/train.sh -c configs/<setting> -m all
+bash SFT/train/train.sh -c configs/<setting> -m FullTraining-Full --seed 42
+bash SFT/train/train.sh -c configs/<setting> --list
 ```
 
-| Category    | Matches                            |
-| ----------- | ---------------------------------- |
-| `all`       | All methods in the config directory|
-| `standard`  | `Standard-*`                       |
-| `layerwise` | `Layerwise-*`                      |
-| `subset`    | `Subset-*`                         |
-| `full`      | `*-Full`                           |
-| `lora`      | `*-LoRA`                           |
-| `meso`      | `*-MeSO`                           |
+Categories: `all`, `full-training`, `layer-wise-subset`, `global-subset`,
+`full`, `lora`, `meso`.
 
-<details>
-  <summary>Config Directory Structure</summary>
-
-#### Layout
-
-Each config directory contains a `defaults.yaml` and one YAML per method:
-
-```
-configs/tulu3_tydiqa/
-  defaults.yaml          # shared: model, dataset, training hyperparams
-  Standard-Full.yaml     # method + learning_rate
-  Layerwise-Full.yaml    # method + learning_rate + compression
-  ...
+```bash
+bash SFT/train/train_val_ablation.sh \
+    --task <target_task> --config_dir <setting> \
+    --methods FullTraining-Full --eval_steps <n> --seed <seed>
 ```
 
-#### defaults.yaml (shared experiment settings)
+## Evaluation
 
+```bash
+# n_test=500 matches the during-training perplexity sample for direct comparison
+bash SFT/eval/eval.sh --train <train> --task <task> --batch_size 64 --n_test 500
+```
+
+Supported tasks: `samsum`, `tydiqa`, `nq_open`, `squad`, `triviaqa`, plus the
+Dolci benchmarks `ifeval`, `ifbench`, `math500`, `mbpp_plus` (see above).
+
+`evaluate` and `rouge_score` Python packages must be installed in the
+active env (`pip install evaluate rouge_score`).
+
+## Config directory structure
+
+Each config dir has `defaults.yaml` (shared) and one YAML per method:
+
+```
+configs/<setting>/
+  defaults.yaml              # model, dataset, scheduler, etc.
+  FullTraining-{Full,LoRA,MeSO}.yaml
+  GlobalSubset-{Full,LoRA,MeSO}.yaml
+  LayerWiseSubset-{Full,LoRA,MeSO}.yaml
+```
+
+`defaults.yaml`:
 ```yaml
 model: meta-llama/Llama-3.2-1B
-train_dataset: tulu3
-target_task: tydiqa
-percentage: 0.01
+train_dataset: <pool>
+target_task: <task>
+percentage: <pct>
+
 seed: 42
 batch_size: 8
 gradient_accumulation_steps: 1
@@ -295,55 +244,24 @@ lr_scheduler_type: linear
 warmup_ratio: 0.03
 weight_decay: 0.0
 num_train_epochs: 1
-eval_steps: 50
+eval_steps: <n>          # ~100 ppl points across max_steps
 use_flash_attention: true
+
 n_eval: 500
 selection_frac: 0.5
 selection_mode: topk
 n_val: 16
 val_batch_size: 1
 val_strategy: merged_batch
+scoring:
+  method: reduced_ghost
 ```
 
-#### Method config (method-specific settings)
+Load order: defaults → `defaults.yaml` → method YAML → CLI (`--seed`, `--lr`).
 
-Method configs only need to specify what differs from defaults. Example (`Layerwise-Full.yaml`):
+#### Adding a new setting
 
-```yaml
-method: Layerwise
-finetuning: Full
-learning_rate: 3.36e-05
-
-score_grad_compression:
-  sparsifier: normal-64*64
-  projector: none
-```
-
-Values in the method config override `defaults.yaml`. The load order is: `reset_config()` defaults → `defaults.yaml` → method config → CLI overrides (`--seed`, `--lr`).
-
-#### Creating a New Experiment
-
-To set up a new dataset combination:
-
-1. Create a new folder under `configs/` (e.g., `configs/less_mmlu_sociology/`)
-2. Copy a `defaults.yaml` from an existing experiment and update dataset, percentage, subject, etc.
-3. Copy method configs (learning rates will be placeholder values)
-4. Prepare data splits: `python SFT/data/prepare_datasets.py --datasets <task>`
-5. Run LR sweep: `bash SFT/train/lr/lr_sweep_submit.sh -c configs/<new_config> -m all`
-6. Collect results: `bash SFT/train/lr/lr_sweep_collect.sh -c configs/<new_config> -m all`
-
-</details>
-
-### Evaluation Commands
-Evaluation commands for each experiment:
-
-```bash
-# Alpaca -> SamSUM
-bash SFT/eval/eval.sh --train alpaca --task samsum --batch_size 64
-
-# Tulu3 -> TyDiQA
-bash SFT/eval/eval.sh --train tulu3 --task tydiqa --batch_size 64 --n_test 500
-
-# LESS -> MMLU/BBH
-bash SFT/eval/eval.sh --train less --task mmlu --subject sociology --batch_size 64
-```
+1. Create `configs/<new_setting>/` with a `defaults.yaml`.
+2. Copy method YAMLs (3 if LoRA-only, 9 if Full+LoRA+MeSO) — LRs are fixed (`1e-5` / `1e-4`).
+3. Prep data: `python SFT/data/prepare_datasets.py --datasets <pool> <task>`.
+4. Add the setting (and any new target task) to `submit_all.sh`.

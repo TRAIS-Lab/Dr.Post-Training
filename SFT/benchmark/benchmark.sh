@@ -5,7 +5,7 @@
 #
 # Usage:
 #   bash benchmark.sh [OPTIONS]
-#   bash benchmark.sh --method standard --batch-size 8 --seq-length 512
+#   bash benchmark.sh --method full_training --batch-size 8 --seq-length 512
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"

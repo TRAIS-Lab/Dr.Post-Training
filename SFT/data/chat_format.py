@@ -9,9 +9,12 @@ Two rendering regimes are supported through one interface:
   reproduces ``get_train_dataset.concat_messages`` byte-for-byte, so the
   legacy Llama experiments are unaffected.
 
-Training encoding (``encode_messages_with_chat_template``) is used only when
-the tokenizer has a *native* template. Tokenizers without one keep the legacy
-``encode_with_messages_format`` path, which is what the paper's runs used.
+Training encoding (``encode_messages_with_chat_template``) is the single encoder
+behind ``get_train_dataset.encode_with_messages_format``. It supervises assistant
+turns via the fast tokenizer's offset mapping, so it stays correct on Qwen3
+multi-turn data where prefix renders are not byte-prefixes of the full render.
+Like the rest of the repo it tokenizes with ``add_special_tokens=False``: the
+chat template already emits every special token the model should see.
 """
 
 from __future__ import annotations
@@ -24,18 +27,21 @@ from transformers import PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
 
-# Reproduces SFT/data/get_train_dataset.py::concat_messages exactly.
+# Open-instruct/Tulu-style fallback chat template (same text upstream used in
+# get_val_dataset.py). Used when the tokenizer doesn't ship its own (e.g. base
+# models like meta-llama/Llama-3.2-1B). The role markers are plaintext, tokenized
+# by BPE, the convention of the open-instruct / LESS / Tulu codebases.
 TULU_CHAT_TEMPLATE = (
-    "{% for message in messages %}"
-    "{% if message['role'] == 'system' %}"
-    "{{ '<|system|>\\n' + message['content'] | trim + '\\n' }}"
-    "{% elif message['role'] == 'user' %}"
-    "{{ '<|user|>\\n' + message['content'] | trim + '\\n' }}"
-    "{% elif message['role'] == 'assistant' %}"
-    "{{ '<|assistant|>\\n' + message['content'] | trim + eos_token + '\\n' }}"
-    "{% endif %}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}{{ '<|assistant|>\\n' }}{% endif %}"
+    "{%- for message in messages %}"
+    "{%- if message['role'] == 'system' %}"
+    "<|system|>\n{{ message['content'].strip() }}\n"
+    "{%- elif message['role'] == 'user' %}"
+    "<|user|>\n{{ message['content'].strip() }}\n"
+    "{%- elif message['role'] == 'assistant' %}"
+    "<|assistant|>\n{{ message['content'].strip() }}{{ eos_token }}\n"
+    "{%- endif %}"
+    "{%- endfor %}"
+    "{%- if add_generation_prompt %}<|assistant|>\n{% endif %}"
 )
 
 _NATIVE_TEMPLATE_FLAG = "_drpt_native_chat_template"
@@ -287,6 +293,7 @@ def encode_messages_with_chat_template(
     encoded = tokenizer(
         full_text,
         return_offsets_mapping=True,
+        add_special_tokens=False,  # the template already emitted BOS/EOS-equivalents
         max_length=max_seq_length,
         truncation=True,
     )
@@ -296,7 +303,7 @@ def encode_messages_with_chat_template(
     span_index = 0
     for position, (char_start, char_end) in enumerate(offsets):
         if char_end <= char_start:
-            continue  # special tokens (BOS) report (0, 0)
+            continue  # zero-width entries (e.g. injected special tokens) carry no text
         while span_index < len(spans) and spans[span_index][1] <= char_start:
             span_index += 1
         if span_index < len(spans):

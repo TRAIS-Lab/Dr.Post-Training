@@ -1,8 +1,0 @@
-# TEST: Layerwise with score compression only (no MeSO)
-# Expected: compressed scoring, full gradient updates via AdamW
-method: Layerwise
-finetuning: Full
-
-scoring:
-  method: compress
-  compression: normal-64*64

@@ -4,11 +4,12 @@ Unified evaluation script for SFT experiments.
 
 Supports:
 - SamSUM: Dialogue summarization (ROUGE-1, ROUGE-2, ROUGE-L)
-- TyDiQA: Multilingual QA (F1 score)
-- MMLU: Multiple-choice QA (Accuracy)
-- BBH: Big Bench Hard reasoning tasks (Accuracy)
-- GSM8K: Grade school math (Accuracy)
-- MATH500: Competition math (Accuracy)
+- TyDiQA: Multilingual QA (F1, EM)
+- NQ-open: Closed-book factoid QA (EM, F1)
+- SQuAD: Closed-book reading-comprehension QA, no context (EM, F1)
+- TriviaQA: Closed-book QA (EM, F1)
+- Dolci benchmarks, scored by generation + official verifier (see SFT/eval/tasks):
+  IFEval, IFBench, MATH500, MBPP+
 """
 
 import argparse
@@ -16,6 +17,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -32,24 +34,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
-# Benchmarks vs targets
+# Tasks vs targets vs benchmarks
 #
-# Legacy tasks (samsum, tydiqa, ...) are evaluated on the *test split of the
-# target dataset itself*. The Dolci capability setting separates the two: the
-# target (precise_if, math, mbpp) supplies D* and the loss-curve held-out, and a
-# *benchmark* (ifeval, ifbench, math500, mbpp_plus) is scored post hoc by
-# generation + official verifier. One target can map to several benchmarks.
+# Legacy tasks (samsum, tydiqa, nq_open, squad, triviaqa) are evaluated on the
+# *test split of the target dataset itself*. The Dolci capability setting
+# separates the two: the target (precise_if, math, mbpp) supplies D* and the
+# loss-curve held-out during training, and a *benchmark* (ifeval, ifbench,
+# math500, mbpp_plus) is scored post hoc by generation + official verifier.
+# One target can map to several benchmarks.
 # ---------------------------------------------------------------------------
-LEGACY_TASKS = ["samsum", "tydiqa", "mmlu", "bbh", "gsm8k", "math500"]
+LEGACY_TASKS = ["nq_open", "samsum", "tydiqa", "squad", "triviaqa"]
 BENCHMARK_TASKS = ["ifeval", "ifbench", "math500", "mbpp_plus"]
 TARGET_BENCHMARKS = {
     "precise_if": ["ifeval", "ifbench"],
     "math": ["math500"],
     "mbpp": ["mbpp_plus"],
 }
-# Per-task generation budgets used when --max_new_tokens is not given.
+# Generation budgets used when --max_new_tokens is not given.
 DEFAULT_MAX_NEW_TOKENS = {
     "ifeval": 2048,
     "ifbench": 2048,
@@ -92,6 +94,8 @@ def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None):
             tokenizer_path = adapter_config.get("base_model_name_or_path", model_path)
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    from SFT.data.get_val_dataset import ensure_chat_template
+    ensure_chat_template(tokenizer)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -144,61 +148,75 @@ def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None):
     return model, tokenizer
 
 
+# Output dir naming convention:
+#   main:         {train}_{task}-{model}-{curation}-{finetuning}-p{pct}-lr{lr}-b{bs}-v{nv}-s{seed}
+#   target-only:  {task}_val_{task}-{model}-{curation}-{finetuning}-ms{steps}-lr{lr}-b{bs}-v{nv}-s{seed}
+# Both {model} (e.g. "Llama-3.2-1B") and {curation}-{finetuning} (e.g. "FullTraining-LoRA")
+# contain hyphens, so positional split-on-"-" parsing is wrong. Anchor on the
+# fixed suffix tokens (-p|-ms, -lr, -b, -v, -s) instead.
+_NAME_RE = re.compile(
+    r"^"
+    r"(?P<prefix>[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)"
+    r"-(?P<model>.+?)"
+    r"-(?P<curation>FullTraining|GlobalSubset|LayerWiseSubset|Standard)"
+    r"-(?P<finetuning>MeSO-LoRA|Full|LoRA|MeSO)"
+    r"-(?:p(?P<percentage>[\d.]+)|ms(?P<max_steps>\d+))"
+    r"-lr(?P<learning_rate>[\d.]+e-?\d+)"
+    r"-b(?P<batch_size>\d+)"
+    r"-v(?P<n_val>\d+)"
+    r"-s(?P<seed>\d+)"
+    r"$"
+)
+
+
 def parse_model_name(model_name: str) -> Dict[str, str]:
-    """Parse model name to extract experiment configuration."""
+    """Parse a model output-dir name into experiment fields. Cosmetic — used
+    only for the printed eval summary and the master log row.
+    """
     config = {
         "model_name": model_name,
-        "train_dataset": "",
-        "eval_task": "",
-        "selection": "",
-        "compression": "",
+        "train_dataset": "", "eval_task": "",
         "model": "",
-        "training_type": "",
-        "percentage": "",
-        "learning_rate": "",
-        "batch_size": "",
-        "n_val": "",
-        "seed": "",
+        "selection": "", "training_type": "",
+        "percentage": "", "max_steps": "",
+        "learning_rate": "", "batch_size": "", "n_val": "", "seed": "",
     }
+    m = _NAME_RE.match(model_name)
+    if not m:
+        return config
+    g = m.groupdict()
 
-    parts = model_name.split("-")
-    if len(parts) >= 6:
-        train_task = parts[0].split("_")
-        if len(train_task) >= 2:
-            config["train_dataset"] = train_task[0]
-            config["eval_task"] = train_task[1]
+    # Prefix splits as "{train}_{task}" (main), "{task}_val_{task}" (target-only),
+    # or "{pool}_{target}" where both halves contain underscores (Dolci settings).
+    prefix_parts = g["prefix"].split("_")
+    target = get_target_from_model_name(model_name)
+    if target is not None and g["prefix"].endswith("_" + target):
+        config["train_dataset"] = g["prefix"][: -len(target) - 1]
+        config["eval_task"] = target
+    elif len(prefix_parts) == 3 and prefix_parts[1] == "val":
+        config["train_dataset"] = f"{prefix_parts[0]}_val"
+        config["eval_task"] = prefix_parts[2]
+    elif len(prefix_parts) == 2:
+        config["train_dataset"] = prefix_parts[0]
+        config["eval_task"] = prefix_parts[1]
+    else:
+        # e.g. triviaqa_nq_open: the task itself contains an underscore.
+        legacy = get_tasks_from_model_name(model_name)
+        if legacy and g["prefix"].endswith("_" + legacy[0]):
+            config["train_dataset"] = g["prefix"][: -len(legacy[0]) - 1]
+            config["eval_task"] = legacy[0]
         else:
-            config["train_dataset"] = parts[0]
+            config["train_dataset"] = g["prefix"]
 
-        config["selection"] = parts[1]
-
-        idx = 2
-        if parts[idx] == "LoGra" and len(parts) > idx + 1 and parts[idx + 1] == "2nd":
-            config["compression"] = "LoGra-2nd"
-            idx = 4
-        else:
-            config["compression"] = parts[idx]
-            idx = 3
-
-        if idx < len(parts):
-            config["model"] = parts[idx]
-            idx += 1
-        if idx < len(parts):
-            config["training_type"] = parts[idx]
-            idx += 1
-
-        for part in parts[idx:]:
-            if part.startswith("p") and "." in part:
-                config["percentage"] = part[1:]
-            elif part.startswith("lr"):
-                config["learning_rate"] = part[2:]
-            elif part.startswith("b") and part[1:].isdigit():
-                config["batch_size"] = part[1:]
-            elif part.startswith("v") and part[1:].isdigit():
-                config["n_val"] = part[1:]
-            elif part.startswith("s") and part[1:].isdigit():
-                config["seed"] = part[1:]
-
+    config["model"] = g["model"]
+    config["selection"] = g["curation"]
+    config["training_type"] = g["finetuning"]
+    config["percentage"] = g["percentage"] or ""
+    config["max_steps"] = g["max_steps"] or ""
+    config["learning_rate"] = g["learning_rate"]
+    config["batch_size"] = g["batch_size"]
+    config["n_val"] = g["n_val"]
+    config["seed"] = g["seed"]
     return config
 
 
@@ -207,8 +225,8 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None, method: Op
 
     Args:
         models_dir: Directory containing model directories
-        train_dataset: Filter prefix (e.g., "tulu3_tydiqa")
-        method: Method filter (e.g., "Standard-MeSO", "Layerwise-Full")
+        train_dataset: Filter prefix (e.g., "alpaca_samsum")
+        method: Method filter (e.g., "FullTraining-MeSO", "LayerWiseSubset-Full")
     """
     model_paths = []
     for entry in os.listdir(models_dir):
@@ -225,10 +243,10 @@ def find_models(models_dir: str, train_dataset: Optional[str] = None, method: Op
                 if not (entry.startswith(train_dataset + "-") or entry.startswith(train_dataset + "_")):
                     continue
 
-            # Check method filter (e.g., "Standard-MeSO" matches "-Standard-MeSO-")
+            # Check method filter (e.g., "FullTraining-MeSO" matches "-FullTraining-MeSO-")
             if method is not None:
                 # Method appears in directory name as -{method}-{finetuning}-
-                # e.g., tulu3_tydiqa-Llama-3.2-1B-Standard-MeSO-p0.01-...
+                # e.g., alpaca_samsum-Llama-3.2-1B-FullTraining-MeSO-p0.4-...
                 method_pattern = f"-{method}-"
                 if method_pattern not in entry:
                     continue
@@ -242,19 +260,16 @@ def evaluate_samsum(args, model, tokenizer) -> dict:
     from .tasks.samsum import compute_accuracy
 
     logger.info("Evaluating on SamSUM")
-    rouge_scores = compute_accuracy(
+    scores = compute_accuracy(
         args=args,
         model=model,
         tokenizer=tokenizer,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens
     )
-    return {
-        "task": "samsum",
-        "rouge1": rouge_scores["rouge1"],
-        "rouge2": rouge_scores["rouge2"],
-        "rougeL": rouge_scores["rougeL"],
-    }
+    out = {"task": "samsum"}
+    out.update(scores)
+    return out
 
 
 def evaluate_tydiqa(args, model, tokenizer) -> dict:
@@ -263,79 +278,43 @@ def evaluate_tydiqa(args, model, tokenizer) -> dict:
 
     logger.info("Evaluating on TyDiQA")
     results = compute_accuracy(args=args, model=model, tokenizer=tokenizer)
-    return {
-        "task": "tydiqa",
-        "f1_score": results["f1_score"],
-        "exact_match": results["exact_match"],
-        "n_test": results["n_test"],
-    }
+    out = {"task": "tydiqa"}
+    out.update(results)
+    return out
 
 
-def evaluate_mmlu(args, model, tokenizer) -> dict:
-    """Run MMLU evaluation."""
-    from .tasks.mmlu import compute_accuracy
-
-    logger.info("Evaluating on MMLU")
-    results = compute_accuracy(
-        args=args,
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size
-    )
-    return {
-        "task": "mmlu",
-        "accuracy": results["accuracy"],
-        "n_test": results["n_test"],
-    }
-
-
-def evaluate_bbh(args, model, tokenizer) -> dict:
-    """Run BBH (Big Bench Hard) evaluation."""
-    from .tasks.bbh import compute_accuracy
-
-    logger.info("Evaluating on BBH")
-    results = compute_accuracy(
-        args=args,
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        max_new_tokens=512  # Chain-of-thought requires more tokens
-    )
-    return {
-        "task": "bbh",
-        "accuracy": results["accuracy"],
-        "n_test": results["n_test"],
-    }
-
-
-def evaluate_gsm8k(args, model, tokenizer) -> dict:
-    """Run GSM8K evaluation."""
-    from .tasks.gsm8k import compute_accuracy
-
-    logger.info("Evaluating on GSM8K")
-    results = compute_accuracy(
-        args=args,
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        max_new_tokens=256
-    )
-    return {
-        "task": "gsm8k",
-        "accuracy": results["accuracy"],
-        "n_test": results["n_test"],
-    }
-
-
-def evaluate_math500(args, model, tokenizer) -> dict:
-    """Run MATH-500 (math-verify scoring when installed; regex fallback otherwise)."""
-    from .tasks.math500 import compute_accuracy
-
-    logger.info("Evaluating on MATH500")
-    out = {"task": "math500"}
+def evaluate_nq_open(args, model, tokenizer) -> dict:
+    """Run NQ-open closed-book QA evaluation (EM/F1)."""
+    from .tasks.nq_open import compute_accuracy
+    logger.info("Evaluating on NQ-open")
+    out = {"task": "nq_open"}
     out.update(compute_accuracy(
         args=args, model=model, tokenizer=tokenizer,
-        batch_size=args.batch_size, max_new_tokens=args.max_new_tokens,
+        batch_size=args.batch_size, max_new_tokens=32,
+    ))
+    return out
+
+
+def evaluate_squad(args, model, tokenizer) -> dict:
+    """Run SQuAD closed-book (no context) evaluation (EM/F1)."""
+    from .tasks.squad import compute_accuracy
+    logger.info("Evaluating on SQuAD (closed-book)")
+    out = {"task": "squad"}
+    out.update(compute_accuracy(
+        args=args, model=model, tokenizer=tokenizer,
+        batch_size=args.batch_size, max_new_tokens=32,
+    ))
+    return out
+
+
+def evaluate_triviaqa(args, model, tokenizer) -> dict:
+    """Run TriviaQA closed-book evaluation (EM/F1)."""
+    from .tasks.triviaqa import compute_accuracy
+    logger.info("Evaluating on TriviaQA (closed-book)")
+    out = {"task": "triviaqa"}
+    out.update(compute_accuracy(
+        args=args, model=model, tokenizer=tokenizer,
+        batch_size=args.batch_size, max_new_tokens=32,
     ))
     return out
 
@@ -366,6 +345,19 @@ def evaluate_ifbench(args, model, tokenizer) -> dict:
     return out
 
 
+def evaluate_math500(args, model, tokenizer) -> dict:
+    """Run MATH-500 (math-verify scoring when installed; boxed-answer fallback otherwise)."""
+    from .tasks.math500 import compute_accuracy
+
+    logger.info("Evaluating on MATH500")
+    out = {"task": "math500"}
+    out.update(compute_accuracy(
+        args=args, model=model, tokenizer=tokenizer,
+        batch_size=args.batch_size, max_new_tokens=args.max_new_tokens,
+    ))
+    return out
+
+
 def evaluate_mbpp_plus(args, model, tokenizer) -> dict:
     """Run MBPP+ through EvalPlus (sandboxed when apptainer is available)."""
     from .tasks.mbpp_plus import compute_accuracy
@@ -388,35 +380,39 @@ BENCHMARK_RUNNERS = {
 
 
 def get_target_from_model_name(model_name: str) -> Optional[str]:
-    """Extract a Dolci-style target from the run name prefix ``{train}_{target}-...``.
+    """Extract a Dolci-style target from the run-name prefix ``{pool}_{target}-...``.
 
-    Train pool and target are joined by ``_`` and may themselves contain ``_``
+    Pool and target are joined by ``_`` and may themselves contain ``_``
     (``dolci_instruction_precise_if``), so the prefix is matched by known target
     suffix rather than split.
     """
-    prefix = model_name.split("-")[0].lower()
+    head = model_name.split("-", 1)[0].lower()
     for target in sorted(TARGET_BENCHMARKS, key=len, reverse=True):
-        if prefix.endswith("_" + target):
+        if head.endswith("_" + target):
             return target
     return None
 
 
 def get_tasks_from_model_name(model_name: str) -> List[str]:
-    """Benchmarks to run for a run directory, inferred from its name.
+    """Benchmarks/tasks to run for a run directory, inferred from its name.
 
-    Dolci targets map to their benchmark list (``precise_if`` -> ifeval, ifbench);
-    legacy names (``alpaca_samsum``) map to the single legacy task.
+    Dolci targets map to their benchmark list (``precise_if`` -> ifeval, ifbench).
+    Legacy layouts map to one task:
+
+    Main runs:        ``<train>_<task>-<model>-...``      (e.g. ``alpaca_samsum-...``)
+    Target-only runs: ``<task>_val_<task>-<model>-...``    (e.g. ``samsum_val_samsum-...``)
     """
     target = get_target_from_model_name(model_name)
     if target is not None:
         return list(TARGET_BENCHMARKS[target])
-    parts = model_name.split("-")
-    if parts:
-        train_task = parts[0].split("_")
-        if len(train_task) >= 2:
-            task = train_task[1].lower()
-            if task in LEGACY_TASKS:
-                return [task]
+    head = model_name.split("-", 1)[0]
+    # nq_open has an underscore, so match the longest known task first.
+    for t in sorted(LEGACY_TASKS, key=len, reverse=True):
+        if head == f"{t}_val_{t}":
+            return [t]
+    for t in sorted(LEGACY_TASKS, key=len, reverse=True):
+        if head.endswith("_" + t):
+            return [t]
     return []
 
 
@@ -438,7 +434,7 @@ def evaluate_model(
     target_override: Optional[str] = None,
     extra_args: Optional[Dict] = None,
 ) -> Dict:
-    """Evaluate a single model on every benchmark implied by its name (or the overrides).
+    """Evaluate a single model on every task implied by its name (or the overrides).
 
     ``--task`` runs exactly one task; ``--target`` runs that target's benchmark
     list; otherwise the run-directory name decides. ``max_new_tokens=None`` uses
@@ -478,9 +474,7 @@ def evaluate_model(
     args.data_dir = data_dir
     args.n_test = n_test
     args.batch_size = batch_size
-    args.subject = subject  # For MMLU
-    args.bbh_task = subject  # For BBH (uses same value)
-    args.n_val = 5  # Few-shot examples for MMLU
+    args.subject = subject  # legacy arg; unused in current scope
     args.output_dir = model_path  # benchmark evaluators write generations/verifier files here
     for key, value in (extra_args or {}).items():
         setattr(args, key, value)
@@ -505,6 +499,7 @@ def evaluate_model(
             torch.cuda.empty_cache()
         except RuntimeError as e:
             logger.warning(f"Failed to clear CUDA cache: {e}")
+            # Try to reset CUDA state
             try:
                 torch.cuda.synchronize()
             except Exception:
@@ -515,7 +510,7 @@ def evaluate_model(
 
 
 def _evaluate_one_task(task, args, model, tokenizer, model_path, model_name, results):
-    """Run one task, record its primary metric in ``results``, and save ``<task>_results.json``."""
+    """Run one task, record its primary metric(s) in ``results``, and save ``<task>_results.json``."""
     if task in BENCHMARK_RUNNERS:
         logger.info(f"Evaluating {model_name} on {task}...")
         task_results = BENCHMARK_RUNNERS[task](args, model, tokenizer)
@@ -524,54 +519,49 @@ def _evaluate_one_task(task, args, model, tokenizer, model_path, model_name, res
             json.dump(task_results, f, indent=2)
         return
 
-    try:
-        if task == "samsum":
-            logger.info(f"Evaluating {model_name} on SamSUM...")
-            samsum_results = evaluate_samsum(args, model, tokenizer)
-            results["samsum_rouge1"] = samsum_results["rouge1"]
-            results["samsum_rouge2"] = samsum_results["rouge2"]
-            results["samsum_rougeL"] = samsum_results["rougeL"]
+    if task == "samsum":
+        logger.info(f"Evaluating {model_name} on SamSUM...")
+        samsum_results = evaluate_samsum(args, model, tokenizer)
+        results["samsum_rouge1"] = samsum_results["rouge1"]
+        results["samsum_rouge2"] = samsum_results["rouge2"]
+        results["samsum_rougeL"] = samsum_results["rougeL"]
+        with open(os.path.join(model_path, "samsum_results.json"), "w") as f:
+            json.dump(samsum_results, f, indent=2)
 
-            with open(os.path.join(model_path, "samsum_results.json"), "w") as f:
-                json.dump(samsum_results, f, indent=2)
+    elif task == "tydiqa":
+        logger.info(f"Evaluating {model_name} on TyDiQA...")
+        tydiqa_results = evaluate_tydiqa(args, model, tokenizer)
+        results["tydiqa_f1"] = tydiqa_results["f1_score"]
+        results["tydiqa_em"] = tydiqa_results["exact_match"]
+        with open(os.path.join(model_path, "tydiqa_results.json"), "w") as f:
+            json.dump(tydiqa_results, f, indent=2)
 
-        elif task == "tydiqa":
-            logger.info(f"Evaluating {model_name} on TyDiQA...")
-            tydiqa_results = evaluate_tydiqa(args, model, tokenizer)
-            results["tydiqa_f1"] = tydiqa_results["f1_score"]
-            results["tydiqa_em"] = tydiqa_results["exact_match"]
+    elif task == "nq_open":
+        logger.info(f"Evaluating {model_name} on NQ-open...")
+        nq_results = evaluate_nq_open(args, model, tokenizer)
+        results["nq_open_em"] = nq_results["em"]
+        results["nq_open_f1"] = nq_results["f1"]
+        with open(os.path.join(model_path, "nq_open_results.json"), "w") as f:
+            json.dump(nq_results, f, indent=2)
 
-            with open(os.path.join(model_path, "tydiqa_results.json"), "w") as f:
-                json.dump(tydiqa_results, f, indent=2)
+    elif task == "squad":
+        logger.info(f"Evaluating {model_name} on SQuAD (closed-book)...")
+        sq_results = evaluate_squad(args, model, tokenizer)
+        results["squad_em"] = sq_results["em"]
+        results["squad_f1"] = sq_results["f1"]
+        with open(os.path.join(model_path, "squad_results.json"), "w") as f:
+            json.dump(sq_results, f, indent=2)
 
-        elif task == "mmlu":
-            logger.info(f"Evaluating {model_name} on MMLU...")
-            mmlu_results = evaluate_mmlu(args, model, tokenizer)
-            results["mmlu_accuracy"] = mmlu_results["accuracy"]
+    elif task == "triviaqa":
+        logger.info(f"Evaluating {model_name} on TriviaQA (closed-book)...")
+        tq_results = evaluate_triviaqa(args, model, tokenizer)
+        results["triviaqa_em"] = tq_results["em"]
+        results["triviaqa_f1"] = tq_results["f1"]
+        with open(os.path.join(model_path, "triviaqa_results.json"), "w") as f:
+            json.dump(tq_results, f, indent=2)
 
-            with open(os.path.join(model_path, "mmlu_results.json"), "w") as f:
-                json.dump(mmlu_results, f, indent=2)
-
-        elif task == "bbh":
-            logger.info(f"Evaluating {model_name} on BBH...")
-            bbh_results = evaluate_bbh(args, model, tokenizer)
-            results["bbh_accuracy"] = bbh_results["accuracy"]
-
-            with open(os.path.join(model_path, "bbh_results.json"), "w") as f:
-                json.dump(bbh_results, f, indent=2)
-
-        elif task == "gsm8k":
-            logger.info(f"Evaluating {model_name} on GSM8K...")
-            gsm8k_results = evaluate_gsm8k(args, model, tokenizer)
-            results["gsm8k_accuracy"] = gsm8k_results["accuracy"]
-
-            with open(os.path.join(model_path, "gsm8k_results.json"), "w") as f:
-                json.dump(gsm8k_results, f, indent=2)
-
-        else:
-            raise ValueError(f"Unknown task {task!r}")
-    except Exception:
-        raise
+    else:
+        raise ValueError(f"Unknown task {task!r}")
 
 
 def main():
@@ -589,10 +579,11 @@ def main():
         help="Filter by training dataset (e.g., alpaca, less, tulu3, wizardlm)")
     parser.add_argument("--task", type=str, default=None,
         choices=ALL_TASKS,
-        help="Run exactly this task (legacy: samsum/tydiqa/...; benchmarks: ifeval/ifbench/math500/mbpp_plus)")
+        help="Run exactly this task (legacy: samsum/tydiqa/nq_open/squad/triviaqa; "
+             "benchmarks: ifeval/ifbench/math500/mbpp_plus)")
     parser.add_argument("--target", type=str, default=None, choices=sorted(TARGET_BENCHMARKS),
-        help="Run every benchmark of this target (precise_if -> ifeval+ifbench, math -> math500, mbpp -> mbpp_plus). "
-             "Also used as the run-name filter together with --train.")
+        help="Run every benchmark of this target (precise_if -> ifeval+ifbench, math -> math500, "
+             "mbpp -> mbpp_plus). Also used as the run-name filter together with --train.")
     parser.add_argument("--ifbench_repo", type=str, default=os.environ.get("DRPT_IFBENCH_REPO"),
         help="Local checkout of allenai/IFBench (required for ifbench)")
     parser.add_argument("--ifbench_revision", type=str, default=None,
@@ -605,9 +596,9 @@ def main():
     parser.add_argument("--evalplus_dataset_path", type=str, default=None,
         help="Local MbppPlus JSONL to bind into the container (enables offline evaluation)")
     parser.add_argument("--subject", type=str, default=None,
-        help="MMLU subject or BBH task to evaluate on (default: all)")
+        help="(legacy; unused in current scope)")
     parser.add_argument("--method", type=str, default=None,
-        help="Filter by method (e.g., Standard-MeSO, Layerwise-Full)")
+        help="Filter by method (e.g., FullTraining-MeSO, LayerWiseSubset-Full)")
     parser.add_argument("--data_dir", type=str, default=None,
         help="Data directory (default: auto-detect)")
     parser.add_argument("--n_test", type=int, default=-1,
@@ -615,7 +606,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1,
         help="Batch size for generation")
     parser.add_argument("--max_new_tokens", type=int, default=None,
-        help="Maximum tokens to generate (default: per-task; 128 for legacy tasks, "
+        help="Maximum tokens to generate (default: per task; 128 for legacy tasks, "
              "2048 for ifeval/ifbench/mbpp_plus, 4096 for math500)")
     parser.add_argument("--base_model", type=str, default=None,
         help="Base model for LoRA adapters")
@@ -668,11 +659,9 @@ def main():
     filter_prefix = args.train
     if filter_prefix and args.target:
         filter_prefix = f"{filter_prefix}_{args.target}"
-    elif filter_prefix and args.task and args.task in LEGACY_TASKS and args.task not in BENCHMARK_TASKS:
+    elif filter_prefix and args.task and args.task in LEGACY_TASKS:
         # Legacy run names embed the task itself (alpaca_samsum); benchmark names never appear in run names.
         filter_prefix = f"{filter_prefix}_{args.task}"
-        if args.subject:
-            filter_prefix = f"{filter_prefix}_{args.subject}"
     model_paths = find_models(args.models_dir, filter_prefix, args.method)
     logger.info(f"Found {len(model_paths)} models to evaluate")
     if args.method:
@@ -733,37 +722,27 @@ def main():
             print(f"{r['model_name'][:80]:<80} "
                   f"{r['tydiqa_f1']:>8.4f} {r.get('tydiqa_em', 0):>8.4f}")
 
-    # MMLU results
-    mmlu_results = [r for r in all_results if "mmlu_accuracy" in r]
-    if mmlu_results:
-        print(f"\nMMLU Results:")
-        print(f"{'Model':<90} {'Acc':>8}")
+    # NQ-open results
+    nq_results = [r for r in all_results if "nq_open_em" in r]
+    if nq_results:
+        print(f"\nNQ-open Results:")
+        print(f"{'Model':<80} {'EM':>8} {'F1':>8}")
         print("-" * 100)
-        for r in sorted(mmlu_results, key=lambda x: x.get("mmlu_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:90]:<90} "
-                  f"{r['mmlu_accuracy']:>8.4f}")
+        for r in sorted(nq_results, key=lambda x: x.get("nq_open_em", 0), reverse=True):
+            print(f"{r['model_name'][:80]:<80} "
+                  f"{r['nq_open_em']:>8.4f} {r.get('nq_open_f1', 0):>8.4f}")
 
-    # BBH results
-    bbh_results = [r for r in all_results if "bbh_accuracy" in r]
-    if bbh_results:
-        print(f"\nBBH Results:")
-        print(f"{'Model':<90} {'Acc':>8}")
+    # SQuAD (closed-book) results
+    squad_results = [r for r in all_results if "squad_em" in r]
+    if squad_results:
+        print(f"\nSQuAD (closed-book) Results:")
+        print(f"{'Model':<80} {'EM':>8} {'F1':>8}")
         print("-" * 100)
-        for r in sorted(bbh_results, key=lambda x: x.get("bbh_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:90]:<90} "
-                  f"{r['bbh_accuracy']:>8.4f}")
+        for r in sorted(squad_results, key=lambda x: x.get("squad_em", 0), reverse=True):
+            print(f"{r['model_name'][:80]:<80} "
+                  f"{r['squad_em']:>8.4f} {r.get('squad_f1', 0):>8.4f}")
 
-    # GSM8K results
-    gsm8k_results = [r for r in all_results if "gsm8k_accuracy" in r]
-    if gsm8k_results:
-        print(f"\nGSM8K Results:")
-        print(f"{'Model':<90} {'Acc':>8}")
-        print("-" * 100)
-        for r in sorted(gsm8k_results, key=lambda x: x.get("gsm8k_accuracy", 0), reverse=True):
-            print(f"{r['model_name'][:90]:<90} "
-                  f"{r['gsm8k_accuracy']:>8.4f}")
-
-    # Generative benchmarks (percent, task-native primary metric; never averaged across tasks)
+    # Dolci benchmarks (percent, task-native primary metric; never averaged across tasks)
     for task in BENCHMARK_TASKS:
         key = f"{task}_accuracy"
         task_results = [r for r in all_results if key in r]

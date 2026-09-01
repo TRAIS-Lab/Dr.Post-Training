@@ -12,11 +12,37 @@ from transformers import DataCollatorForSeq2Seq, PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
 
-# llama-chat model's instruction format
-B_INST, E_INST = "[INST]", "[/INST]"
-
 # Default multiplier for max sequence length threshold (relative to avg train seq length)
 DEFAULT_SEQ_LENGTH_MULTIPLIER = 1.2
+
+
+# Chat rendering lives in SFT/data/chat_format.py: the tokenizer's native
+# template when it ships one (Qwen3), the tulu-style plaintext fallback
+# otherwise (Llama-3.2-1B-Base). The names below are kept here because
+# train.py and the eval tasks import them from this module.
+from SFT.data.chat_format import (  # noqa: E402
+    TULU_CHAT_TEMPLATE as _DEFAULT_CHAT_TEMPLATE,
+    ensure_chat_template,
+    render_generation_prompt,
+    render_prompt_and_answer,
+)
+
+
+def render_chat(
+        tokenizer: PreTrainedTokenizerBase,
+        user_content: str,
+        assistant_content: Optional[str] = None,
+    ):
+    """Render a single (user[, assistant]) turn with the tokenizer's chat template.
+
+    Returns the prompt string when `assistant_content is None`, otherwise
+    `(prompt, answer)` such that `prompt + answer == full_render`. For Qwen3 the
+    prompt includes the auto-injected empty `<think></think>` block
+    (`enable_thinking=False`); other templates ignore that kwarg.
+    """
+    if assistant_content is None:
+        return render_generation_prompt(tokenizer, user_content, enable_thinking=False)
+    return render_prompt_and_answer(tokenizer, user_content, assistant_content)
 
 
 def estimate_token_length(
@@ -24,20 +50,14 @@ def estimate_token_length(
         query: str,
         completion: str,
     ) -> int:
-    """
-    Estimate the token length of a query-completion pair without truncation.
+    """Estimate the token length of a chat-template-rendered (query, completion).
 
-    Args:
-        tokenizer: The tokenizer to use.
-        query: The query/prompt string.
-        completion: The completion/answer string.
-
-    Returns:
-        The number of tokens in the full sequence.
+    Uses `add_special_tokens=False` because the chat template already emits
+    its own special tokens (`<|im_start|>` etc.), so we don't want any
+    automatic BOS/EOS injection on top.
     """
     full_prompt = query + completion
-    # Use encode without truncation to get the true length
-    tokens = tokenizer.encode(full_prompt, add_special_tokens=True)
+    tokens = tokenizer.encode(full_prompt, add_special_tokens=False)
     return len(tokens)
 
 
@@ -48,18 +68,12 @@ def tokenize(
         max_length: int,
         print_ex: bool = False
     ) -> Tuple[Tensor, Tensor, List[int]]:
-    """
-    Formats a chat conversation into input tensors for a transformer model.
+    """Tokenize a chat-template-rendered (query, completion) pair.
 
-    Args:
-        tokenizer (PreTrainedTokenizerBase): The tokenizer used to encode the input.
-        query (str): The question part of the chat conversation.
-        completion (str): The answer part of the chat conversation.
-        max_length (int): The maximum length of the input tensors.
-        print_ex (bool, optional): Whether to print the example. Defaults to False.
-
-    Returns:
-        tuple: A tuple containing the full input IDs, labels, and attention mask tensors.
+    Both pieces are expected to come from `render_chat(...)` (or equivalent),
+    which means they already contain the model's native special tokens.
+    Tokenization uses `add_special_tokens=False` to avoid double-prepending
+    BOS or similar.
     """
     full_prompt = query + completion
 
@@ -68,13 +82,11 @@ def tokenize(
         print(full_prompt)
         print("******** Example ends ********")
 
-    # Encode query without truncation to find the prompt/completion boundary
-    prompt_input_ids = tokenizer.encode(query)
-    # Encode full prompt and truncate to max_length
-    full_tokens = tokenizer.encode(full_prompt, max_length=max_length, truncation=True)
+    prompt_input_ids = tokenizer.encode(query, add_special_tokens=False)
+    full_tokens = tokenizer.encode(
+        full_prompt, max_length=max_length, truncation=True, add_special_tokens=False
+    )
 
-    # Mask prompt tokens; cap at full sequence length so completion tokens
-    # (if any survive truncation) get real labels
     prompt_len = min(len(prompt_input_ids), len(full_tokens))
 
     full_input_ids = torch.tensor(full_tokens)
@@ -90,7 +102,6 @@ def load_unified_jsonl(
         task: str,
         split: str = "test",
         k: int = 5,
-        subject: str = None,
         seed: Optional[int] = None
     ) -> List[dict]:
     """
@@ -98,15 +109,14 @@ def load_unified_jsonl(
 
     File naming convention:
     - Validation: {data_dir}/eval/{task}/{task}_validation_data.jsonl
-    - LR sweep: {data_dir}/eval/{task}/{task}_lr_data.jsonl
+    - lr (extra dev split): {data_dir}/eval/{task}/{task}_lr_data.jsonl
     - Test: {data_dir}/eval/{task}/{task}_test_data.jsonl
 
     Args:
         data_dir: Base data directory
-        task: Task name (mmlu, bbh, tydiqa, gsm8k, math500, samsum)
+        task: Task name (tydiqa, samsum, nq_open, or any eval/<task>/ directory)
         split: Which split to load ("validation", "test", or "lr")
         k: Number of examples to load
-        subject: Optional subject filter (for MMLU and BBH with multiple subtasks)
         seed: Optional seed for shuffling examples before selecting first k
 
     Returns:
@@ -124,11 +134,6 @@ def load_unified_jsonl(
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
             example = json.loads(line.strip())
-            # Filter by subject/task if specified (for BBH and MMLU)
-            if subject is not None:
-                example_subject = example.get('task') or example.get('subject')
-                if example_subject != subject:
-                    continue
             examples.append(example)
             if seed is None and len(examples) >= k:
                 break
@@ -145,120 +150,17 @@ def load_unified_jsonl(
     return examples[:k]
 
 
-def get_bbh_dataset(
-        data_dir: str,
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int,
-        use_chat_format: bool = True,
-        chat_format: str = "tulu",
-        split: str = "test",
-        k: int = 5,
-        subject: str = None,
-        seed: Optional[int] = None,
-        max_seq_length_threshold: Optional[int] = None,
-        **kwargs
-    ) -> Dataset:
-    """
-    Get the BBH dataset in unified JSONL format.
-
-    Args:
-        data_dir: The main data directory.
-        tokenizer: The tokenizer used to tokenize the input text.
-        max_length: The maximum length of the input sequence.
-        use_chat_format: Whether to use chat format for the input.
-        chat_format: The chat format to use ("tulu" or "llama2").
-        split: Which split to load ("validation", "test", or "lr").
-        k: Number of examples to load.
-        subject: Optional BBH task name to filter by (e.g., "boolean_expressions").
-        seed: Optional seed for shuffling examples before selection.
-        max_seq_length_threshold: If provided, reject samples longer than this threshold.
-
-    Returns:
-        Dataset: The BBH dataset containing input_ids, attention_mask, and labels.
-    """
-    # Load more examples than needed if rejection sampling is enabled
-    load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "bbh", split, load_k, subject, seed=seed)
-
-    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
-    rejected_count = 0
-    accepted_count = 0
-
-    for i, example in enumerate(examples):
-        if accepted_count >= k:
-            break
-
-        messages = example.get('messages', [])
-        if len(messages) < 2:
-            continue
-
-        user_content = messages[0]['content']
-        assistant_content = messages[1]['content']
-
-        # Format the prompt
-        if use_chat_format:
-            if chat_format == "tulu":
-                prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-            else:
-                prompt = f"<s> {B_INST} {user_content} {E_INST} "
-        else:
-            prompt = f"{user_content}\nAnswer: "
-
-        answer = assistant_content + tokenizer.eos_token
-
-        # Rejection sampling based on sequence length
-        if max_seq_length_threshold is not None:
-            token_length = estimate_token_length(tokenizer, prompt, answer)
-            if token_length > max_seq_length_threshold:
-                rejected_count += 1
-                continue
-
-        full_input_ids, labels, attention_mask = tokenize(
-            tokenizer, prompt, answer, max_length,
-            print_ex=True if accepted_count == 0 else False
-        )
-
-        dataset["input_ids"].append(full_input_ids)
-        dataset["labels"].append(labels)
-        dataset["attention_mask"].append(attention_mask)
-        accepted_count += 1
-
-    if rejected_count > 0:
-        logger.info(f"BBH: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
-
-    dataset = Dataset.from_dict(dataset)
-    return dataset
-
-
 def get_tydiqa_dataset(
         data_dir: str,
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
-        use_chat_format: bool = True,
-        chat_format: str = "tulu",
         split: str = "test",
         k: int = 5,
         seed: Optional[int] = None,
         max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
-    """
-    Get the TyDiQA dataset in unified JSONL format.
-
-    Args:
-        data_dir: The main data directory.
-        tokenizer: The tokenizer used to tokenize the input text.
-        max_length: The maximum length of the input sequence.
-        use_chat_format: Whether to use chat format for the input.
-        chat_format: The chat format to use.
-        split: Which split to load ("validation", "test", or "lr").
-        k: Number of examples to load.
-        seed: Optional seed for shuffling examples before selection.
-        max_seq_length_threshold: If provided, reject samples longer than this threshold.
-
-    Returns:
-        Dataset: The TyDiQA dataset containing input_ids, attention_mask, and labels.
-    """
+    """Get the TyDiQA dataset rendered with the tokenizer's native chat template."""
     # Load more examples than needed if rejection sampling is enabled
     load_k = k * 3 if max_seq_length_threshold is not None else k
     examples = load_unified_jsonl(data_dir, "tydiqa", split, load_k, seed=seed)
@@ -278,16 +180,7 @@ def get_tydiqa_dataset(
         user_content = messages[0]['content']
         assistant_content = messages[1]['content']
 
-        # Format the prompt
-        if use_chat_format:
-            if chat_format == "tulu":
-                prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-            else:
-                prompt = f"<s> {B_INST} {user_content} {E_INST} "
-        else:
-            prompt = f"{user_content}\nAnswer: "
-
-        answer = assistant_content + tokenizer.eos_token
+        prompt, answer = render_chat(tokenizer, user_content, assistant_content)
 
         # Rejection sampling based on sequence length
         if max_seq_length_threshold is not None:
@@ -308,148 +201,6 @@ def get_tydiqa_dataset(
 
     if rejected_count > 0:
         logger.info(f"TyDiQA: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
-
-    dataset = Dataset.from_dict(dataset)
-    return dataset
-
-
-def get_gsm8k_dataset(
-        data_dir: str,
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int,
-        split: str = "test",
-        k: int = 5,
-        seed: Optional[int] = None,
-        max_seq_length_threshold: Optional[int] = None,
-        **kwargs
-    ) -> Dataset:
-    """
-    Get the GSM8K dataset in unified JSONL format.
-
-    Args:
-        data_dir: The main data directory.
-        tokenizer: The tokenizer used to tokenize the input text.
-        max_length: The maximum length of the input sequence.
-        split: Which split to load ("validation", "test", or "lr").
-        k: Number of examples to use.
-        seed: Optional seed for shuffling examples before selection.
-        max_seq_length_threshold: If provided, reject samples longer than this threshold.
-
-    Returns:
-        Dataset: The GSM8K dataset containing input_ids, attention_mask, and labels.
-    """
-    # Load more examples than needed if rejection sampling is enabled
-    load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "gsm8k", split, load_k, seed=seed)
-
-    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
-    rejected_count = 0
-    accepted_count = 0
-
-    for i, example in enumerate(examples):
-        if accepted_count >= k:
-            break
-
-        messages = example.get('messages', [])
-        if len(messages) < 2:
-            continue
-
-        user_content = messages[0]['content']
-        assistant_content = messages[1]['content']
-
-        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-        answer = assistant_content + tokenizer.eos_token
-
-        # Rejection sampling based on sequence length
-        if max_seq_length_threshold is not None:
-            token_length = estimate_token_length(tokenizer, prompt, answer)
-            if token_length > max_seq_length_threshold:
-                rejected_count += 1
-                continue
-
-        full_input_ids, labels, attention_mask = tokenize(
-            tokenizer, prompt, answer, max_length,
-            print_ex=True if accepted_count == 0 else False
-        )
-
-        dataset["input_ids"].append(full_input_ids)
-        dataset["labels"].append(labels)
-        dataset["attention_mask"].append(attention_mask)
-        accepted_count += 1
-
-    if rejected_count > 0:
-        logger.info(f"GSM8K: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
-
-    dataset = Dataset.from_dict(dataset)
-    return dataset
-
-
-def get_math500_dataset(
-        data_dir: str,
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int,
-        split: str = "test",
-        k: int = 5,
-        seed: Optional[int] = None,
-        max_seq_length_threshold: Optional[int] = None,
-        **kwargs
-    ) -> Dataset:
-    """
-    Get the MATH500 dataset in unified JSONL format.
-
-    Args:
-        data_dir: The main data directory.
-        tokenizer: The tokenizer used to tokenize the input text.
-        max_length: The maximum length of the input sequence.
-        split: Which split to load ("validation", "test", or "lr").
-        k: Number of examples to use.
-        seed: Optional seed for shuffling examples before selection.
-        max_seq_length_threshold: If provided, reject samples longer than this threshold.
-
-    Returns:
-        Dataset: The MATH500 dataset containing input_ids, attention_mask, and labels.
-    """
-    # Load more examples than needed if rejection sampling is enabled
-    load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "math500", split, load_k, seed=seed)
-
-    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
-    rejected_count = 0
-    accepted_count = 0
-
-    for i, example in enumerate(examples):
-        if accepted_count >= k:
-            break
-
-        messages = example.get('messages', [])
-        if len(messages) < 2:
-            continue
-
-        user_content = messages[0]['content']
-        assistant_content = messages[1]['content']
-
-        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-        answer = assistant_content + tokenizer.eos_token
-
-        # Rejection sampling based on sequence length
-        if max_seq_length_threshold is not None:
-            token_length = estimate_token_length(tokenizer, prompt, answer)
-            if token_length > max_seq_length_threshold:
-                rejected_count += 1
-                continue
-
-        full_input_ids, labels, attention_mask = tokenize(
-            tokenizer, prompt, answer, max_length,
-            print_ex=True if accepted_count == 0 else False
-        )
-
-        dataset["input_ids"].append(full_input_ids)
-        dataset["labels"].append(labels)
-        dataset["attention_mask"].append(attention_mask)
-        accepted_count += 1
-
-    if rejected_count > 0:
-        logger.info(f"MATH500: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
 
     dataset = Dataset.from_dict(dataset)
     return dataset
@@ -499,8 +250,7 @@ def get_samsum_dataset(
         user_content = messages[0]['content']
         assistant_content = messages[1]['content']
 
-        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-        answer = assistant_content + tokenizer.eos_token
+        prompt, answer = render_chat(tokenizer, user_content, assistant_content)
 
         # Rejection sampling based on sequence length
         if max_seq_length_threshold is not None:
@@ -526,7 +276,7 @@ def get_samsum_dataset(
     return dataset
 
 
-def get_truthfulqa_dataset(
+def get_squad_dataset(
         data_dir: str,
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
@@ -536,166 +286,77 @@ def get_truthfulqa_dataset(
         max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
-    """
-    Get the TruthfulQA dataset in unified JSONL format.
-
-    Args:
-        data_dir: The main data directory.
-        tokenizer: The tokenizer used to tokenize the input text.
-        max_length: The maximum length of the input sequence.
-        split: Which split to load ("validation", "test", or "lr").
-        k: Number of examples to use.
-        seed: Optional seed for shuffling examples before selection.
-        max_seq_length_threshold: If provided, reject samples longer than this threshold.
-
-    Returns:
-        Dataset: The TruthfulQA dataset containing input_ids, attention_mask, and labels.
-    """
+    """SQuAD closed-book QA loader (Q->A messages format, no context)."""
     load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "truthfulqa", split, load_k, seed=seed)
-
+    examples = load_unified_jsonl(data_dir, "squad", split, load_k, seed=seed)
     dataset = {"input_ids": [], "attention_mask": [], "labels": []}
     rejected_count = 0
     accepted_count = 0
-
-    for i, example in enumerate(examples):
+    for example in examples:
         if accepted_count >= k:
             break
-
-        messages = example.get('messages', [])
+        messages = example.get("messages", [])
         if len(messages) < 2:
             continue
-
-        user_content = messages[0]['content']
-        assistant_content = messages[1]['content']
-
-        prompt = f"<|user|>\n{user_content}\n<|assistant|>\n"
-        answer = assistant_content + tokenizer.eos_token
-
+        user_content = messages[0]["content"]
+        assistant_content = messages[1]["content"]
+        if not assistant_content:
+            continue
+        prompt, answer = render_chat(tokenizer, user_content, assistant_content)
         if max_seq_length_threshold is not None:
             token_length = estimate_token_length(tokenizer, prompt, answer)
             if token_length > max_seq_length_threshold:
                 rejected_count += 1
                 continue
-
         full_input_ids, labels, attention_mask = tokenize(
             tokenizer, prompt, answer, max_length,
-            print_ex=True if accepted_count == 0 else False
+            print_ex=True if accepted_count == 0 else False,
         )
-
         dataset["input_ids"].append(full_input_ids)
         dataset["labels"].append(labels)
         dataset["attention_mask"].append(attention_mask)
         accepted_count += 1
-
     if rejected_count > 0:
-        logger.info(f"TruthfulQA: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
-
-    dataset = Dataset.from_dict(dataset)
-    return dataset
+        logger.info(f"SQuAD: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
+    return Dataset.from_dict(dataset)
 
 
-# =============================================================================
-# MMLU Dataset (uses unified JSONL format)
-# =============================================================================
-
-def get_mmlu_dataset(
+def get_nq_open_dataset(
         data_dir: str,
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
-        use_chat_format: bool = True,
-        chat_format: str = "tulu",
         split: str = "test",
         k: int = 5,
-        subject: str = None,
         seed: Optional[int] = None,
         max_seq_length_threshold: Optional[int] = None,
         **kwargs
     ) -> Dataset:
-    """
-    Get the MMLU dataset in unified JSONL format.
-
-    Args:
-        data_dir: The main data directory.
-        tokenizer: The tokenizer used to tokenize the input text.
-        max_length: The maximum length of the input sequence.
-        use_chat_format: Whether to use chat format for the prompts.
-        chat_format: The chat format to use.
-        split: Which split to load ("validation", "test", or "lr").
-        k: Number of examples to load.
-        subject: Optional MMLU subject to filter by (e.g., "sociology").
-        seed: Optional seed for shuffling examples before selection.
-        max_seq_length_threshold: If provided, reject samples longer than this threshold.
-
-    Returns:
-        Dataset: The MMLU dataset containing input_ids, attention_mask, and labels.
-    """
-    # Load more examples than needed if rejection sampling is enabled
-    load_k = k * 3 if max_seq_length_threshold is not None else k
-    examples = load_unified_jsonl(data_dir, "mmlu", split, load_k, subject, seed=seed)
-
-    dataset = {"input_ids": [], "attention_mask": [], "labels": []}
-    rejected_count = 0
-    accepted_count = 0
-
-    for i, example in enumerate(examples):
-        if accepted_count >= k:
-            break
-
-        messages = example.get('messages', [])
-        if len(messages) < 2:
-            continue
-
-        user_content = messages[0]['content']
-        assistant_content = messages[1]['content']
-
-        # Format the prompt
-        if use_chat_format:
-            if chat_format == "tulu":
-                prompt = f"<|user|>\n{user_content}\n<|assistant|>\nThe answer is:"
-            else:
-                prompt = f"<s> {B_INST} {user_content} {E_INST} The answer is:"
-        else:
-            prompt = f"{user_content} The answer is:"
-
-        answer = " " + assistant_content + tokenizer.eos_token
-
-        # Rejection sampling based on sequence length
-        if max_seq_length_threshold is not None:
-            token_length = estimate_token_length(tokenizer, prompt, answer)
-            if token_length > max_seq_length_threshold:
-                rejected_count += 1
-                continue
-
-        full_input_ids, labels, attention_mask = tokenize(
-            tokenizer, prompt, answer, max_length,
-            print_ex=True if accepted_count == 0 else False
-        )
-
-        dataset["input_ids"].append(full_input_ids)
-        dataset["labels"].append(labels)
-        dataset["attention_mask"].append(attention_mask)
-        accepted_count += 1
-
-    if rejected_count > 0:
-        logger.info(f"MMLU: Rejected {rejected_count} samples exceeding length threshold {max_seq_length_threshold}")
-
-    dataset = Dataset.from_dict(dataset)
-    return dataset
+    """NaturalQuestions-open closed-book QA loader (Q->A messages format)."""
+    return _qa_messages_dataset(
+        data_dir, tokenizer, max_length, "nq_open", split, k, seed, max_seq_length_threshold,
+    )
 
 
-# =============================================================================
-# Main Interface
-# =============================================================================
+def get_triviaqa_dataset(
+        data_dir: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        split: str = "test",
+        k: int = 5,
+        seed: Optional[int] = None,
+        max_seq_length_threshold: Optional[int] = None,
+        **kwargs
+    ) -> Dataset:
+    """TriviaQA closed-book loader (Q->A messages format, identical to nq_open)."""
+    return _qa_messages_dataset(
+        data_dir, tokenizer, max_length, "triviaqa", split, k, seed, max_seq_length_threshold,
+    )
 
-# =============================================================================
-# Generic messages-format loader (Dolci targets: precise_if, math, mbpp, ...)
-# =============================================================================
 
 # Tasks whose validation/test files are plain single-turn ``messages`` JSONL and
-# need no task-specific prompt formatting. Any other task whose files exist under
+# need no task-specific formatting. Any other task whose files exist under
 # ``eval/<task>/`` also falls back to this loader (see ``get_dataset``).
-MESSAGES_FORMAT_TASKS = ("precise_if", "math", "mbpp")
+MESSAGES_FORMAT_TASKS = ("precise_if", "math", "mbpp", "truthfulqa")
 
 
 def get_messages_dataset(
@@ -711,8 +372,7 @@ def get_messages_dataset(
     ) -> Dataset:
     """
     Load any unified ``messages`` JSONL split and render it with the tokenizer's
-    chat template (native template if the tokenizer has one, tulu fallback
-    otherwise). Loss labels cover the assistant answer plus end-of-turn marker.
+    chat template. Loss labels cover the assistant answer plus end-of-turn marker.
 
     The first user turn and the first assistant turn after it are used; an
     optional leading system turn is kept.
@@ -727,8 +387,6 @@ def get_messages_dataset(
         seed: Optional seed for shuffling examples before selection.
         max_seq_length_threshold: If provided, reject samples longer than this threshold.
     """
-    from SFT.data.chat_format import render_prompt_and_answer
-
     load_k = k * 3 if max_seq_length_threshold is not None else k
     examples = load_unified_jsonl(data_dir, task, split, load_k, seed=seed)
 
@@ -770,7 +428,7 @@ def get_messages_dataset(
 
         full_input_ids, labels, attention_mask = tokenize(
             tokenizer, prompt, answer, max_length,
-            print_ex=True if accepted_count == 0 else False
+            print_ex=True if accepted_count == 0 else False,
         )
         dataset["input_ids"].append(full_input_ids)
         dataset["labels"].append(labels)
@@ -790,12 +448,20 @@ def get_messages_dataset(
     return Dataset.from_dict(dataset)
 
 
+def _qa_messages_dataset(data_dir, tokenizer, max_length, dataset_name, split, k, seed, max_seq_length_threshold):
+    """Closed-book QA loaders (nq_open, triviaqa) share the generic messages loader."""
+    return get_messages_dataset(
+        data_dir, tokenizer, max_length, task=dataset_name, split=split, k=k, seed=seed,
+        max_seq_length_threshold=max_seq_length_threshold,
+    )
+
+
 def get_dataset(task: str, **kwargs) -> Dataset:
     """
     Get the dataset for the given task.
 
     Args:
-        task: The name of the task (bbh, tydiqa, mmlu, samsum, gsm8k, math500).
+        task: The name of the task (tydiqa, samsum, nq_open).
         **kwargs: Additional arguments passed to the task-specific function.
             Common kwargs:
             - data_dir: Base data directory
@@ -814,13 +480,11 @@ def get_dataset(task: str, **kwargs) -> Dataset:
         ValueError: If the task name is not valid.
     """
     task_functions = {
-        "bbh": get_bbh_dataset,
         "tydiqa": get_tydiqa_dataset,
-        "mmlu": get_mmlu_dataset,
         "samsum": get_samsum_dataset,
-        "gsm8k": get_gsm8k_dataset,
-        "math500": get_math500_dataset,
-        "truthfulqa": get_truthfulqa_dataset,
+        "nq_open": get_nq_open_dataset,
+        "squad": get_squad_dataset,
+        "triviaqa": get_triviaqa_dataset,
     }
     for _messages_task in MESSAGES_FORMAT_TASKS:
         task_functions.setdefault(_messages_task, get_messages_dataset)
@@ -837,7 +501,7 @@ def get_dataset(task: str, **kwargs) -> Dataset:
             return get_messages_dataset(task=task, **kwargs)
         raise ValueError(
             f"Invalid task name: {task}. Valid tasks: {list(task_functions.keys())}. "
-            f"Unregistered tasks are accepted if {task}/{task}_{split}_data.jsonl exists under {data_dir}/eval/."
+            f"Unregistered tasks are accepted if eval/{task}/{task}_{split}_data.jsonl exists under {data_dir}."
         )
 
     if task_functions[task] is get_messages_dataset:

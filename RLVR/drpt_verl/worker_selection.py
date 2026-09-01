@@ -2,7 +2,7 @@
 Selection-aware FSDP worker for verl.
 
 This module provides a modified ActorRolloutRefWorker that uses
-DataParallelPPOActorWithSelection for Layerwise/Subset gradient-based selection.
+DataParallelPPOActorWithSelection for LayerWiseSubset/GlobalSubset gradient-based selection.
 
 Usage:
     In your training script, use SelectionActorRolloutRefWorker instead of
@@ -10,7 +10,7 @@ Usage:
     setup_selection() with the selection config dict.
 
 Selection config keys (passed via setup_selection):
-    - method: "Layerwise", "Subset", or "NA" (default)
+    - method: "LayerWiseSubset", "GlobalSubset", or "NA" (default)
     - frac: Fraction of training samples to select (default 0.5)
     - use_second_order: Use similarity matrix for greedy selection (default False)
 """
@@ -43,7 +43,7 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
 
     This worker uses DataParallelPPOActorWithSelection instead of
     DataParallelPPOActor when selection is enabled. The selection-aware
-    actor handles Layerwise/Subset selection internally in update_policy().
+    actor handles LayerWiseSubset/GlobalSubset selection internally in update_policy().
 
     Usage:
     1. Create worker as usual
@@ -70,7 +70,7 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
 
         Args:
             selection_config: Dict with keys:
-                - method: "Layerwise", "Subset", or "NA"
+                - method: "LayerWiseSubset", "GlobalSubset", or "NA"
                 - frac: Selection fraction (0.0-1.0)
                 - use_second_order: Use similarity matrix for greedy selection
         """
@@ -80,7 +80,7 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
         self._selection_config = selection_config
         method = selection_config.get("method", "NA")
 
-        if method not in ["Layerwise", "Subset"]:
+        if method not in ["LayerWiseSubset", "GlobalSubset"]:
             self._selection_enabled = False
             return
 

@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Single Process Actor with Layerwise/Subset Online Data Selection.
+Single Process Actor with LayerWiseSubset/GlobalSubset Online Data Selection.
 
 This extends DataParallelPPOActor to support gradient-based selection:
-- Layerwise: Per-layer selection during backward using gradient similarity
-- Subset: Two-pass global selection using accumulated gradient similarity
+- LayerWiseSubset: Per-layer selection during backward using gradient similarity
+- GlobalSubset: Two-pass global selection using accumulated gradient similarity
 
 The validation gradients are captured from a fixed validation set (reward objective)
 and used to compute gradient similarity scores for training sample selection.
@@ -78,19 +78,19 @@ def get_trainable_linear_layers(model: nn.Module, skip_grad_check: bool = False)
 
 class DataParallelPPOActorWithSelection(DataParallelPPOActor):
     """
-    PPO Actor with Layerwise/Subset online data selection.
+    PPO Actor with LayerWiseSubset/GlobalSubset online data selection.
 
     Inherits from DataParallelPPOActor and adds:
     1. GradientHook for gradient-based selection
     2. External validation gradient capture (reward/train-loss)
-    3. Layerwise: Per-layer selection during backward
-    4. Subset: Two-pass global selection per mini-batch
+    3. LayerWiseSubset: Per-layer selection during backward
+    4. GlobalSubset: Two-pass global selection per mini-batch
 
     Flow:
     1. Before training: capture_validation_gradients_external() with fixed val set
     2. During update_policy():
-       - Layerwise: Per-layer selection during backward
-       - Subset: Pass 1 accumulates scores, Pass 2 trains on selected samples
+       - LayerWiseSubset: Per-layer selection during backward
+       - GlobalSubset: Pass 1 accumulates scores, Pass 2 trains on selected samples
     """
 
     def __init__(
@@ -116,8 +116,8 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         # Selection statistics
         self.selection_stats: Dict[str, Any] = {}
 
-        # Initialize hook if Layerwise or Subset is enabled
-        if self.selection_method in ['Layerwise', 'Subset']:
+        # Initialize hook if LayerWiseSubset or GlobalSubset is enabled
+        if self.selection_method in ['LayerWiseSubset', 'GlobalSubset']:
             self._initialize_grad_hook()
 
     def _initialize_grad_hook(self) -> None:
@@ -151,7 +151,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
     def _is_selection_enabled(self) -> bool:
         """Check if gradient-based selection is enabled."""
-        return self.selection_method in ['Layerwise', 'Subset'] and self._hook_initialized
+        return self.selection_method in ['LayerWiseSubset', 'GlobalSubset'] and self._hook_initialized
 
     def has_external_validation_gradients(self) -> bool:
         """Check if validation gradients were captured externally."""
@@ -485,14 +485,14 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         if self._is_selection_enabled():
             self.grad_hook.clear_val_buffer()
 
-    def _setup_layerwise(
+    def _setup_layer_wise_subset(
         self,
         batch_size: int,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None
     ) -> None:
         """
-        Setup Layerwise selection state before forward pass.
+        Setup LayerWiseSubset selection state before forward pass.
 
         IMPORTANT: This should be called per micro-batch, not per full batch.
         The batch_size should be the micro-batch size to ensure:
@@ -512,14 +512,14 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         # Note: Removed verbose per-micro-batch logging to reduce noise
         # Log only on first setup or at DEBUG level
         logger.debug(
-            f"[Layerwise] Setting up Layerwise selection: "
+            f"[LayerWiseSubset] Setting up LayerWiseSubset selection: "
             f"micro_batch_size={batch_size}, frac={self.train_selection_ratio}, "
             f"num_val_layers={num_val_layers}"
         )
 
         self.grad_hook.setup_selection_with_stored_val(
             train_batch_size=batch_size,
-            selection_method='Layerwise',
+            selection_method='LayerWiseSubset',
             frac=self.train_selection_ratio,
             lr=1.0,
             compute_scores_only=False,
@@ -531,9 +531,9 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         if labels is not None:
             self.grad_hook.set_token_counts(labels, batch_size, attention_mask)
 
-    def _cleanup_layerwise(self) -> None:
+    def _cleanup_layer_wise_subset(self) -> None:
         """
-        Cleanup after layerwise backward for a single micro-batch.
+        Cleanup after layer_wise_subset backward for a single micro-batch.
 
         This is called per micro-batch. Stats are tracked but not logged
         per micro-batch to avoid overhead.
@@ -565,7 +565,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         temperature: float,
     ) -> torch.Tensor:
         """
-        Select training samples using Subset (global gradient-based selection).
+        Select training samples using GlobalSubset (global gradient-based selection).
 
         Pass 1: Forward/backward to accumulate per-sample scores across all layers.
         The actual training (Pass 2) happens in the caller with selected indices.
@@ -591,10 +591,10 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         if not self._is_selection_enabled():
             return torch.arange(batch_size, device=input_ids.device)
 
-        # Setup Subset state for Pass 1 (score accumulation)
+        # Setup GlobalSubset state for Pass 1 (score accumulation)
         self.grad_hook.setup_selection_with_stored_val(
             train_batch_size=batch_size,
-            selection_method='Subset',
+            selection_method='GlobalSubset',
             frac=self.train_selection_ratio,
             lr=1.0,
             compute_scores_only=True,
@@ -697,10 +697,10 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
     def update_policy(self, data: DataProto):
         """
-        Update policy with Layerwise/Subset data selection.
+        Update policy with LayerWiseSubset/GlobalSubset data selection.
 
-        - Layerwise: Per-layer selection during backward (hooks intercept gradients)
-        - Subset: Two-pass per micro-batch (Pass 1: score, Pass 2: train on selected)
+        - LayerWiseSubset: Per-layer selection during backward (hooks intercept gradients)
+        - GlobalSubset: Two-pass per micro-batch (Pass 1: score, Pass 2: train on selected)
 
         If selection is not enabled or no validation gradients captured,
         falls back to parent implementation.
@@ -714,17 +714,17 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             logger.warning("No validation gradients captured, using baseline update_policy")
             return super().update_policy(data)
 
-        # For Layerwise, use custom implementation with hooks
-        if self.selection_method == 'Layerwise':
-            return self._update_policy_layerwise(data)
-        elif self.selection_method == 'Subset':
+        # For LayerWiseSubset, use custom implementation with hooks
+        if self.selection_method == 'LayerWiseSubset':
+            return self._update_policy_layer_wise_subset(data)
+        elif self.selection_method == 'GlobalSubset':
             return self._update_policy_subset(data)
         else:
             return super().update_policy(data)
 
-    def _update_policy_layerwise(self, data: DataProto):
+    def _update_policy_layer_wise_subset(self, data: DataProto):
         """
-        Update policy with Layerwise selection (per-layer during backward).
+        Update policy with LayerWiseSubset selection (per-layer during backward).
 
         Unlike the previous implementation that called super().update_policy(),
         this version handles micro-batches explicitly to ensure selection state
@@ -810,9 +810,9 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     labels[:, -response_length:] = responses * response_mask.long() + (-100) * (~response_mask.bool()).long()
 
                     try:
-                        # Setup layerwise selection for THIS micro-batch
+                        # Setup layer_wise_subset selection for THIS micro-batch
                         # This ensures tokens_per_sample and cu_seqlens match the micro-batch
-                        self._setup_layerwise(current_micro_batch_size, labels, attention_mask)
+                        self._setup_layer_wise_subset(current_micro_batch_size, labels, attention_mask)
                         # Forward pass with hooks enabled
                         with torch.autocast(device_type='cuda', dtype=self.param_dtype):
                             if self.use_remove_padding and unpad_input is not None:
@@ -932,8 +932,8 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                             total_samples += current_micro_batch_size
 
                     finally:
-                        # Cleanup layerwise state after each micro-batch
-                        self._cleanup_layerwise()
+                        # Cleanup layer_wise_subset state after each micro-batch
+                        self._cleanup_layer_wise_subset()
                         self.grad_hook.disable_hooks()
 
                 # Optimizer step after accumulating gradients
@@ -954,7 +954,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
     def _update_policy_subset(self, data: DataProto):
         """
-        Update policy with Subset selection (two-phase per mini-batch).
+        Update policy with GlobalSubset selection (two-phase per mini-batch).
 
         Phase 1 (Scoring): Score ALL micro-batches to determine selected indices.
                            Uses zero_grad freely — no gradient accumulation needed.
@@ -1049,7 +1049,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     if len(selected_indices) == 0:
                         # CRITICAL: Even with no samples selected, we must do a forward/backward
                         # to keep FSDP ranks synchronized. Use first sample with zero weight.
-                        logger.warning("Subset: No samples selected, using dummy backward for FSDP sync")
+                        logger.warning("GlobalSubset: No samples selected, using dummy backward for FSDP sync")
                         selected_indices = torch.tensor([0], device=input_ids.device)
                         use_zero_weight = True
                     else:
@@ -1150,7 +1150,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
 
                         # Compute loss scale factor (must be before loss computation)
                         # Use original micro_batch_size, not selected count, to preserve
-                        # gradient magnitude (consistent with Layerwise and fixed-batch path)
+                        # gradient magnitude (consistent with LayerWiseSubset and fixed-batch path)
                         if self.config.use_dynamic_bsz:
                             loss_scale_factor = micro_batch_size / self.config.ppo_mini_batch_size
                         else:

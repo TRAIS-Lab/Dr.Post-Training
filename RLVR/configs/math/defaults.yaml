@@ -23,7 +23,7 @@ gpu_memory_utilization: 0.6
 test_freq: 3
 save_freq: 1000
 
-# Curation defaults (used by Layerwise/Subset methods)
+# Curation defaults (used by LayerWiseSubset/GlobalSubset methods)
 # Selection mode is negative filtering (hardcoded in dp_actor_selection.py):
 #   frac=1.0 → drop ALL negative-influence samples (keep only positive)
 #   frac=0.5 → drop 50% of negative-influence samples

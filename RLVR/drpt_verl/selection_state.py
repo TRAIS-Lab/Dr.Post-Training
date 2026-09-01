@@ -139,9 +139,9 @@ class SelectionStateVerl(ABC):
         pass
 
 
-class LayerwiseStateVerl(SelectionStateVerl):
+class LayerWiseSubsetStateVerl(SelectionStateVerl):
     """
-    Layerwise (layer-wise descent) method state for RLVR/Verl.
+    LayerWiseSubset (layer_wise_subset descent) method state for RLVR/Verl.
 
     Per-layer selection, single-pass with packed sequence support.
     """
@@ -152,12 +152,12 @@ class LayerwiseStateVerl(SelectionStateVerl):
         self._layer_selections: list = []
 
     def get_final_selection(self) -> Tensor:
-        raise NotImplementedError("LayerwiseState uses per-layer selection.")
+        raise NotImplementedError("LayerWiseSubsetState uses per-layer selection.")
 
 
-class SubsetStateVerl(SelectionStateVerl):
+class GlobalSubsetStateVerl(SelectionStateVerl):
     """
-    Subset method state for RLVR/Verl.
+    GlobalSubset method state for RLVR/Verl.
 
     Global selection, two-pass with packed sequence support.
     """

@@ -1,0 +1,11 @@
+# GlobalSubset data curation with LoRA fine-tuning (exact scoring)
+method: GlobalSubset
+subset_mode: one_pass
+scoring:
+  method: reduced_ghost
+finetuning: LoRA
+learning_rate: 1.00e-04
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.1
+

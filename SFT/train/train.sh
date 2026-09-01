@@ -8,13 +8,25 @@
 # Usage: bash train.sh -c <config_dir> -m <methods> [options]
 #
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ -z "$CODE_DIR" ]]; then
-    source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found."; exit 1; }
-    activate_env
-fi
+# Cluster-portable bootstrap: hardcoded path to cluster_env.sh because
+# (a) BASH_SOURCE inside the SLURM spool resolves to /var/spool/slurmd/..., and
+# (b) runpod-cluster's SLURM does not reliably propagate user env vars across
+# `--export ALL`. cluster_env.sh remains the single point of cluster config —
+# edit this path AND cluster_env.sh together when migrating clusters.
+# Resolution order: $DRPT_CLUSTER_ENV, the runpod path, then this checkout's own
+# cluster_env.sh (so the same scripts run on other clusters without editing).
+_drpt_env=""
+for _c in "${DRPT_CLUSTER_ENV:-}" \
+          /workspace-vast/pbb/Dr.Post-Training/cluster_env.sh \
+          "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)/cluster_env.sh"; do
+    [[ -n "$_c" && -f "$_c" ]] && { _drpt_env="$_c"; break; }
+done
+[[ -n "$_drpt_env" ]] || { echo "ERROR: cluster_env.sh not found (set DRPT_CLUSTER_ENV or create it at the repo root)."; exit 1; }
+source "$_drpt_env"
+unset _drpt_env _c
+activate_env
 
-cd $CODE_DIR/Dr.Post-Training
+cd "$CODE_DIR/Dr.Post-Training"
 export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 SCRIPT_DIR="$CODE_DIR/Dr.Post-Training/SFT/train"
@@ -60,7 +72,7 @@ while [[ $# -gt 0 ]]; do
                 [[ "$name" != "defaults" ]] && echo "  $name"
             done
             echo ""
-            echo "Categories: all, standard, layerwise, subset, full, lora, meso"
+            echo "Categories: all, full-training, layer-wise-subset, global-subset, full, lora, meso"
             exit 0
             ;;
         --help|-h)
@@ -81,12 +93,12 @@ Optional:
   --dry-run               Print commands without executing
   --list                  List available methods and exit
 
-Categories: all, standard, layerwise, subset, full, lora, meso
+Categories: all, full-training, layer-wise-subset, global-subset, full, lora, meso
 
 Examples:
-  bash train.sh -c configs/tulu3_tydiqa -m all
-  bash train.sh -c configs/tulu3_tydiqa -m "Layerwise-Full,Subset-Full" --seed 123
-  bash train.sh -c configs/tulu3_tydiqa -m standard --dry-run
+  bash train.sh -c configs/alpaca_samsum -m all
+  bash train.sh -c configs/less_tydiqa -m "LayerWiseSubset-LoRA,GlobalSubset-LoRA" --seed 123
+  bash train.sh -c configs/alpaca_samsum -m full-training --dry-run
 HELP
             exit 0
             ;;
@@ -114,7 +126,7 @@ fi
 # =============================================================================
 reset_config() {
     # Method
-    cfg_method="Standard"
+    cfg_method="FullTraining"
     cfg_finetuning="Full"
 
     # Scoring (nested under scoring: in YAML)
@@ -134,8 +146,8 @@ reset_config() {
     cfg_subset_mode="one_pass"
 
     # LoRA
-    cfg_lora_r="32"
-    cfg_lora_alpha="1"
+    cfg_lora_r="8"
+    cfg_lora_alpha="16"
     cfg_lora_dropout="0.1"
 
     # Experiment
@@ -150,8 +162,8 @@ reset_config() {
 
     # Training hyperparameters
     cfg_max_seq_length="512"
-    cfg_lr_scheduler_type="linear"
-    cfg_warmup_ratio="0.03"
+    cfg_lr_scheduler_type="cosine"
+    cfg_warmup_ratio="0.1"
     cfg_weight_decay="0.0"
     cfg_num_train_epochs="1"
     cfg_eval_steps="50"
@@ -159,7 +171,6 @@ reset_config() {
     # Dataset
     cfg_train_dataset=""
     cfg_target_task=""
-    cfg_subject=""
     cfg_percentage=""
 
     # Extras
@@ -236,7 +247,6 @@ parse_yaml() {
             eval_steps)                          cfg_eval_steps="$val" ;;
             train_dataset)                       cfg_train_dataset="$val" ;;
             target_task)                         cfg_target_task="$val" ;;
-            subject)                             cfg_subject="$val" ;;
             percentage)                          cfg_percentage="$val" ;;
             record_selections)                   cfg_record_selections="$val" ;;
             record_selections_freq)              cfg_record_selections_freq="$val" ;;
@@ -269,9 +279,9 @@ resolve_methods() {
         item=$(echo "$item" | xargs)
         case "$item" in
             all)            for m in "${available[@]}"; do resolved="${resolved:+$resolved,}$m"; done ;;
-            standard)       for m in "${available[@]}"; do [[ "$m" == Standard-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            layerwise)      for m in "${available[@]}"; do [[ "$m" == Layerwise-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
-            subset)         for m in "${available[@]}"; do [[ "$m" == Subset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            full-training)       for m in "${available[@]}"; do [[ "$m" == FullTraining-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            layer-wise-subset)      for m in "${available[@]}"; do [[ "$m" == LayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            global-subset)         for m in "${available[@]}"; do [[ "$m" == GlobalSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             full)           for m in "${available[@]}"; do [[ "$m" == *-Full ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             lora)           for m in "${available[@]}"; do [[ "$m" == *-LoRA ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             meso)           for m in "${available[@]}"; do [[ "$m" == *-MeSO ]] && resolved="${resolved:+$resolved,}$m"; done ;;
@@ -318,14 +328,14 @@ run_method() {
 
     # Derived values
     local internal_method="NA"
-    [[ "$cfg_method" != "Standard" ]] && internal_method="$cfg_method"
+    [[ "$cfg_method" != "FullTraining" ]] && internal_method="$cfg_method"
 
     local use_lora="false"
     [[ "$cfg_finetuning" == "LoRA" || "$cfg_finetuning" == "MeSO-LoRA" ]] && use_lora="true"
 
-    # LR fallback if not specified anywhere
+    # LR fallback if not specified anywhere (every YAML should set this explicitly)
     if [[ -z "$cfg_learning_rate" ]]; then
-        [[ "$use_lora" == "true" ]] && cfg_learning_rate="2e-04" || cfg_learning_rate="5e-05"
+        [[ "$use_lora" == "true" ]] && cfg_learning_rate="1e-04" || cfg_learning_rate="1e-05"
     fi
 
     local model_name=$(basename "$cfg_model")
@@ -334,15 +344,10 @@ run_method() {
 
     # Build job name
     local train_str="${cfg_train_dataset:-default}"
-    local JOB_NAME
-    if [[ -n "$cfg_subject" ]]; then
-        JOB_NAME="${train_str}_${cfg_target_task}_${cfg_subject}-${model_name}-${method_str}-p${cfg_percentage}-lr${cfg_learning_rate}-b${cfg_batch_size}-v${cfg_n_val}-s${cfg_seed}"
-    else
-        JOB_NAME="${train_str}_${cfg_target_task}-${model_name}-${method_str}-p${cfg_percentage}-lr${cfg_learning_rate}-b${cfg_batch_size}-v${cfg_n_val}-s${cfg_seed}"
-    fi
+    local JOB_NAME="${train_str}_${cfg_target_task}-${model_name}-${method_str}-p${cfg_percentage}-lr${cfg_learning_rate}-b${cfg_batch_size}-v${cfg_n_val}-s${cfg_seed}"
 
     local data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
-    local output_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/${JOB_NAME}"
+    local output_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/runs/${JOB_NAME}"
     mkdir -p "$output_dir"
 
     echo ""
@@ -368,7 +373,10 @@ run_method() {
     esac
 
     local DATA_SEED=$((cfg_seed + 1))
-    local PORT=$((29400 + RANDOM % 10000))
+    # Derive port from SLURM_JOB_ID (or PID fallback) so different jobs landing
+    # on the same node get distinct ports. Random ports caused C10D rendezvous
+    # collisions when slurm packed multiple jobs per node.
+    local PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 40000)))
 
     # Build command
     local cmd="torchrun --nproc_per_node 1 --nnodes 1 \
@@ -405,7 +413,6 @@ $fsdp_args \
 --gradient_checkpointing $cfg_gradient_checkpointing"
 
     # Optional args
-    [[ -n "$cfg_subject" ]] && cmd="$cmd --subject $cfg_subject"
     [[ -n "$cfg_val_seq_length_multiplier" ]] && cmd="$cmd --val_seq_length_multiplier $cfg_val_seq_length_multiplier"
     [[ -n "$cfg_train_dataset" ]] && cmd="$cmd --train_dataset_names $cfg_train_dataset"
     [[ -n "$cfg_val_batch_size" ]] && cmd="$cmd --val_batch_size_for_selection $cfg_val_batch_size"

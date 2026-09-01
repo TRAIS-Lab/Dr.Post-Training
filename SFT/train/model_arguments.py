@@ -82,8 +82,8 @@ class ModelArguments:
         metadata={"help": "LoRA dropout"},
     )
     lora_target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"],
-        metadata={"help": "Target modules for LoRA"},
+        default_factory=lambda: ["all-linear"],
+        metadata={"help": "Target modules for LoRA. Either explicit module-name suffixes (e.g. ['q_proj','k_proj','v_proj','o_proj']), or the single-element list ['all-linear'] which is unwrapped to the string 'all-linear' so PEFT applies LoRA to every nn.Linear except lm_head."},
     )
 
     # Flash attention

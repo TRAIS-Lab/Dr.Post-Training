@@ -75,6 +75,10 @@ submit.sh
 /Figures/
 # Allow archive/RLVR for reference
 /archive/*
+**/runs*/
+
+# Local-only notebook scaffolding (regenerates result.ipynb)
+SFT/_build_result_nb.py
 
 # Hillclimb hook files
 /.claude/settings.local.json

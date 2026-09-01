@@ -1,20 +1,27 @@
 #!/bin/bash
 
-# Source cluster config (skip if already set by submit.sh)
-if [[ -z "$CODE_DIR" ]]; then
-    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-    source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found."; exit 1; }
-    activate_env
-fi
+# Hardcoded path to cluster_env.sh — see SFT/train/train.sh for rationale.
+# Resolution order: $DRPT_CLUSTER_ENV, the runpod path, then this checkout's own
+# cluster_env.sh (so the same scripts run on other clusters without editing).
+_drpt_env=""
+for _c in "${DRPT_CLUSTER_ENV:-}" \
+          /workspace-vast/pbb/Dr.Post-Training/cluster_env.sh \
+          "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)/cluster_env.sh"; do
+    [[ -n "$_c" && -f "$_c" ]] && { _drpt_env="$_c"; break; }
+done
+[[ -n "$_drpt_env" ]] || { echo "ERROR: cluster_env.sh not found (set DRPT_CLUSTER_ENV or create it at the repo root)."; exit 1; }
+source "$_drpt_env"
+unset _drpt_env _c
+activate_env
 
-cd $CODE_DIR/Dr.Post-Training
+cd "$CODE_DIR/Dr.Post-Training"
 
 export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 set -e
 
 # Default values
-models_dir="$SCRATCH_DIR/Dr.Post-Training/SFT"
+models_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/runs"
 data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
 model_path=""
 train=""
@@ -117,7 +124,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --evalplus_image I   EvalPlus container image (default: pinned official image)"
             echo "  --evalplus_dataset_path P  Local MbppPlus JSONL for offline container evaluation"
             echo "  --subject NAME       MMLU subject or BBH task to evaluate on (default: all)"
-            echo "  --method NAME        Filter by method (e.g., Standard-MeSO, Layerwise-Full)"
+            echo "  --method NAME        Filter by method (e.g., FullTraining-MeSO, LayerWiseSubset-Full)"
             echo "  --n_test N           Number of test examples (-1 for all)"
             echo "  --batch_size N       Batch size for generation (default: 1)"
             echo "  --max_new_tokens N   Max tokens to generate (default: per task; 128 legacy, 2048 IF/code, 4096 math)"

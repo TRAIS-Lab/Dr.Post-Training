@@ -2,8 +2,8 @@
 Curation state classes for gradient-based data curation.
 
 This module provides two distinct state classes:
-- LayerwiseState: Per-layer curation (layer-wise descent), single-pass
-- SubsetState: Global curation (subset descent), two-pass score accumulation
+- LayerWiseSubsetState: Per-layer curation (layer_wise_subset descent), single-pass
+- GlobalSubsetState: Global curation (subset descent), two-pass score accumulation
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ class SelectionState(ABC):
     Abstract base class for curation state management during backward pass.
 
     Subclasses implement different curation strategies:
-    - LayerwiseState: Per-layer curation (layer-wise descent), immediate gradient aggregation
-    - SubsetState: Score accumulation (subset descent), global curation after all layers
+    - LayerWiseSubsetState: Per-layer curation (layer_wise_subset descent), immediate gradient aggregation
+    - GlobalSubsetState: Score accumulation (subset descent), global curation after all layers
     """
 
     def __init__(
@@ -163,25 +163,6 @@ class SelectionState(ABC):
         scale = self.batch_total_tokens_tensor / selected_tokens
         return torch.where(selected_tokens == 0, torch.ones_like(scale), scale)
 
-    def _compute_scale_factor_with_val(self, selected_indices: Tensor) -> Tensor:
-        """
-        Compute token-based scale factor for selected train + all val samples.
-
-        Returns batch_total_tokens / (selected_train_tokens + val_tokens).
-        When selection_frac=1.0, this returns 1.0 (matching baseline).
-        """
-        if self.tokens_per_sample is None or self.batch_total_tokens_tensor is None:
-            raise RuntimeError(
-                "Token counts not set. Call set_token_counts() before curation."
-            )
-        if selected_indices.numel() == 0:
-            return torch.tensor(1.0, device=self.device, dtype=self.dtype)
-        selected_train_tokens = self.tokens_per_sample[selected_indices].sum()
-        val_tokens = self.batch_total_tokens_tensor - self.train_total_tokens_tensor
-        effective_tokens = selected_train_tokens + val_tokens
-        scale = self.batch_total_tokens_tensor / effective_tokens
-        return torch.where(effective_tokens == 0, torch.ones_like(scale), scale)
-
     @abstractmethod
     def process_layer_gradients(
         self,
@@ -203,7 +184,7 @@ class SelectionState(ABC):
 
         Returns:
             For Streaming: (reduced_grad, num_selected) tuple
-            For Subset: None (scores accumulated internally)
+            For GlobalSubset: None (scores accumulated internally)
         """
         pass
 
@@ -213,20 +194,20 @@ class SelectionState(ABC):
         Get final selected indices.
 
         For Streaming: Raises NotImplementedError (curation is per-layer)
-        For Subset: Returns globally selected indices after all layers
+        For GlobalSubset: Returns globally selected indices after all layers
         """
         pass
 
 
-class LayerwiseState(SelectionState):
+class LayerWiseSubsetState(SelectionState):
     """
-    State for layer-wise descent: per-layer curation, single-pass.
+    State for layer_wise_subset descent: per-layer curation, single-pass.
 
     At each layer, immediately computes scores, selects samples,
     and aggregates gradients. No global accumulation needed.
     """
 
-    def __init__(self, include_val_in_update: bool = False, scoring_method: str = "reduced_ghost", direct_batch_size: int = 0, **kwargs):
+    def __init__(self, scoring_method: str = "reduced_ghost", direct_batch_size: int = 0, **kwargs):
         super().__init__(**kwargs)
         self.scoring_method = scoring_method
         self.direct_batch_size = direct_batch_size
@@ -235,10 +216,6 @@ class LayerwiseState(SelectionState):
 
         # Track curation stats across all layers
         self._layer_selections: list = []  # (layer_idx, n_selected) tuples
-
-        # Whether to include validation gradient in the parameter update
-        # Used by LayerwiseWithVal to train on both selected train + val samples
-        self.include_val_in_update = include_val_in_update
 
     def process_layer_gradients(
         self,
@@ -305,16 +282,16 @@ class LayerwiseState(SelectionState):
         return reduced_grad, num_selected
 
     def get_final_selection(self) -> Tensor:
-        """Layer-wise descent uses per-layer curation, not global."""
+        """Layer-Wise Subset descent uses per-layer curation, not global."""
         raise NotImplementedError(
-            "LayerwiseState uses per-layer curation. "
+            "LayerWiseSubsetState uses per-layer curation. "
             "Use process_layer_gradients() at each layer instead."
         )
 
 
-class SubsetState(SelectionState):
+class GlobalSubsetState(SelectionState):
     """
-    State for Subset method: global curation, two-pass.
+    State for GlobalSubset method: global curation, two-pass.
 
     Pass 1: Accumulates scores across all layers
     Pass 2: Uses global curation for gradient computation on selected samples

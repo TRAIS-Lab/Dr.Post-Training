@@ -44,7 +44,7 @@ class DataArguments:
     )
     eval_split: str = field(
         default="test",
-        metadata={"help": "Split to use for evaluation: 'test' (default) or 'lr' (for LR sweep)."},
+        metadata={"help": "Split to use for evaluation: 'test' (default) or 'lr' (extra held-out dev split)."},
     )
 
 
