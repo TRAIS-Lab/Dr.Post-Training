@@ -77,6 +77,7 @@ class GradientHookVerl:
         model: nn.Module,
         layer_names: List[str],
         device: str = 'cuda',
+        loss_agg_mode: str = "seq-mean-token-mean",
     ) -> None:
         """
         Initialize the hook manager.
@@ -85,10 +86,19 @@ class GradientHookVerl:
             model: The model to hook
             layer_names: Names of layers to hook (only Linear layers supported)
             device: Device for tensors
+            loss_agg_mode: verl ``actor.loss_agg_mode`` of the policy loss the actor
+                backpropagates. It decides what one "item" of the batch loss is (see
+                ``drpt.losses``): the ``seq-mean-*`` modes average per-sequence losses
+                over sequences, so every sample is one item and the curated update is
+                a plain mean over the kept samples (``item_convention == "sample"``);
+                ``token-mean`` averages over response tokens, so an item is a token and
+                samples are weighted by length (legacy, ``item_convention == "token"``).
         """
         self.model = model
         self.layer_names = layer_names
         self.device = device
+        self.loss_agg_mode = loss_agg_mode
+        self.item_convention = "sample" if loss_agg_mode.startswith("seq-mean") else "token"
 
         self.layer_name_to_idx: Dict[str, int] = {name: idx for idx, name in enumerate(layer_names)}
         self.layer_name_to_module: Dict[str, nn.Module] = {}
@@ -114,7 +124,10 @@ class GradientHookVerl:
         # Register hooks
         self._register_hooks()
 
-        logger.info(f"Initialized GradientHookVerl with {len(layer_names)} layers")
+        logger.info(
+            f"Initialized GradientHookVerl with {len(layer_names)} layers "
+            f"(loss_agg_mode={loss_agg_mode}, item={self.item_convention})"
+        )
 
     def _register_hooks(self) -> None:
         """Monkey-patch Linear layers to use our custom Function."""
@@ -250,7 +263,15 @@ class GradientHookVerl:
         attention_mask: Optional[Tensor] = None
     ) -> None:
         """
-        Set token counts for proper gradient scaling.
+        Set per-sample item counts for gradient scaling (and cu_seqlens for packing).
+
+        Item counts follow ``self.item_convention``: one per response under the
+        ``seq-mean-*`` loss modes (a row counts as soon as it has a valid position),
+        the response token count under ``token-mean``. The curated-update scale in
+        the state is train_total / selected in these units (n/k for samples).
+
+        cu_seqlens (where each sample's tokens live in the packed sequence) always
+        come from the attention mask — that is a layout question, not a loss one.
 
         Args:
             labels: Label tensor [batch_size, seq_length] with -100 for ignored
@@ -258,7 +279,11 @@ class GradientHookVerl:
             attention_mask: Attention mask for cu_seqlens computation
         """
         valid_mask = (labels != -100)
-        tokens_per_sample = valid_mask.sum(dim=1)
+        response_tokens = valid_mask.sum(dim=1)
+        if self.item_convention == "sample":
+            tokens_per_sample = valid_mask.any(dim=1).long()
+        else:
+            tokens_per_sample = response_tokens
         self.total_tokens = tokens_per_sample.sum()
 
         if train_batch_size is not None and self.selection_state is not None:
@@ -269,7 +294,7 @@ class GradientHookVerl:
             if attention_mask is not None:
                 packed_tokens = attention_mask[:train_batch_size].sum(dim=1)
             else:
-                packed_tokens = train_tokens
+                packed_tokens = response_tokens[:train_batch_size]
 
             self.selection_state.set_token_counts(
                 train_tokens, total_train_tokens, packed_tokens
@@ -308,9 +333,9 @@ class GradientHookVerl:
         different data shards. For consistent gradient-based selection, all ranks
         must have the same validation gradient (sum of all shards).
 
-        Since validation loss is normalized by GLOBAL token count (synced before
-        capture), the all-reduce SUM directly gives us the correct global gradient.
-        No division by world_size is needed.
+        Since validation loss is normalized by the GLOBAL item count (responses or
+        tokens, synced before capture), the all-reduce SUM directly gives us the
+        correct global gradient. No division by world_size is needed.
 
         This should be called after end_val_capture() and before using the
         validation gradients for selection.
@@ -323,7 +348,7 @@ class GradientHookVerl:
 
         for layer_idx, val_grad in self._val_grad_cache.items():
             # All-reduce to sum gradients across all ranks
-            # Since each rank's gradient is already normalized by global token count,
+            # Since each rank's gradient is already normalized by the global item count,
             # the sum gives us the correct global gradient (no averaging needed)
             dist.all_reduce(val_grad, op=dist.ReduceOp.SUM)
 

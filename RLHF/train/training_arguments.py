@@ -158,9 +158,26 @@ class TrainingArguments(TA):
             "help": (
                 "Validation loss type for data curation gradient computation. "
                 "Options: "
-                "'reward' (default) - -E[normalized_reward * log_prob], "
-                "'token-pg' - token-level REINFORCE: -mean(sum_t(log_prob_t * A_t * mask_t)), "
-                "'train-loss' - actual training objective (clipped surrogate + value loss)."
+                "'reward' (default) - per-token loss -normalized_reward * log_prob_t, "
+                "'token-pg' - token-level REINFORCE, per-token loss -A_t * log_prob_t, "
+                "'train-loss' - actual training objective (clipped surrogate + value loss). "
+                "All are reduced per --loss_reduction (per-example token mean, averaged over the "
+                "validation batch, under 'sample_mean')."
+            )
+        },
+    )
+    loss_reduction: str = field(
+        default="sample_mean",
+        metadata={
+            "help": (
+                "Batch-loss convention shared by the PPO training loss, the validation target and the "
+                "curation scale factors (see drpt.losses). "
+                "'sample_mean' (default): every response is one item; policy and value losses are "
+                "per-example token means averaged over the (mini-)batch, so per-sample gradients are "
+                "gradients of per-example losses and curated updates are plain means over the kept "
+                "samples, as in the paper. "
+                "'token_mean': token mean over the micro-batch (policy/value) and per-sequence token "
+                "sums for the 'reward'/'token-pg' targets — the legacy behaviour of runs before 2026-09-11."
             )
         },
     )
@@ -469,6 +486,9 @@ class TrainingArguments(TA):
             raise ValueError(
                 f"val_loss_type must be one of {valid_val_loss_types}, got {self.val_loss_type}"
             )
+
+        from drpt.losses import validate_loss_reduction
+        validate_loss_reduction(self.loss_reduction)
 
         # Validate kl_estimator (matching TRL experimental PPO)
         valid_kl_estimators = ["k1", "k2", "k3"]

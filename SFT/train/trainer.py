@@ -18,6 +18,7 @@ from transformers import Trainer
 
 from drpt.optimizer import MeSOAdamW
 from drpt.hook import GradientHook
+from drpt.losses import causal_lm_loss, validate_loss_reduction
 from drpt.selection import create_separate_batch_strategy, create_merged_batch_strategy, SELECTION_METHODS
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,18 @@ class LayerWiseSubsetTrainer(Trainer):
         self.grad_hook = grad_hook
         self.val_dataset = val_dataset
         self.eval_dataset_custom = eval_dataset
+
+        # Loss convention (see drpt.losses). The curation hook reads per-sample
+        # gradients off the batch loss, so its item counts must match what this
+        # trainer backpropagates: "sample_mean" = mean over examples of per-example
+        # token-mean losses (every example is one item); "token_mean" = HF default.
+        self.loss_reduction = validate_loss_reduction(getattr(self.args, 'loss_reduction', 'sample_mean'))
+        if self.grad_hook is not None and self.grad_hook.loss_reduction != self.loss_reduction:
+            raise ValueError(
+                f"grad_hook.loss_reduction={self.grad_hook.loss_reduction!r} does not match "
+                f"args.loss_reduction={self.loss_reduction!r}; the curation scale factors are only "
+                f"exact when the hook's item counts follow the loss the trainer backpropagates."
+            )
 
         # Set selection_frac to 1.0 when no curation method is specified (consistency)
         # This means we "select" all samples when not doing data curation
@@ -141,6 +154,7 @@ class LayerWiseSubsetTrainer(Trainer):
         selection_frac = getattr(self.args, 'selection_frac', None)
         logger.info(f"  Method: {self.args.method} (curation fraction: {selection_frac})")
         logger.info(f"  Validation strategy: {self.val_strategy}")
+        logger.info(f"  Loss reduction: {self.loss_reduction}")
         logger.info(f"  Compression: {self.has_compression}")
         logger.info(f"  Validation set size: {len(val_dataset) if val_dataset is not None else 0}")
         logger.info(f"  Evaluation set size: {len(eval_dataset) if eval_dataset is not None else 0}")
@@ -403,11 +417,31 @@ class LayerWiseSubsetTrainer(Trainer):
         else:
             return self._training_step_baseline(model, inputs)
 
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        Batch loss under ``self.loss_reduction``.
+
+        ``"sample_mean"``: mean over examples of per-example token-mean losses
+        (``drpt.losses.causal_lm_loss``), computed from the logits so the model's
+        built-in token mean is bypassed. This is the loss used for curation scoring,
+        for the curated update (one-pass assembly / two-pass pass 2) and for the
+        full-training baseline, so all arms share one objective.
+
+        ``"token_mean"``: Hugging Face's default token mean over the batch (legacy).
+        """
+        if self.loss_reduction != "sample_mean":
+            return super().compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
+        labels = inputs["labels"]
+        outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
+        loss = causal_lm_loss(outputs.logits, labels, reduction="sample_mean")
+        return (loss, outputs) if return_outputs else loss
+
     def _compute_loss_for_selection(self, model, batch):
         """Compute loss for curation (handles multi-GPU and grad accumulation)."""
         with self.compute_loss_context_manager():
-            outputs = model(**batch)
-            loss = outputs.loss
+            loss = self.compute_loss(model, batch)
 
         if self.args.n_gpu > 1:
             loss = loss.mean()
@@ -617,6 +651,10 @@ class LayerWiseSubsetTrainer(Trainer):
     def _evaluate_on_dataset(self, dataset, description="Evaluation"):
         """
         Evaluate model on a given dataset and compute loss and perplexity.
+
+        Reports the model's built-in (token-mean) loss per batch regardless of
+        ``loss_reduction`` so the val/eval perplexity curves stay comparable
+        across runs; only the training objective follows ``loss_reduction``.
 
         Args:
             dataset: Dataset to evaluate on

@@ -13,6 +13,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 from drpt.hook import GradientHook
+from drpt.losses import per_example_mean, reduce_masked_loss, validate_loss_reduction
 from drpt.selection import create_separate_batch_strategy
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,15 @@ class LayerWiseSubsetPPOTrainer:
         self.filter_frac = args.filter_frac
         self.use_second_order = args.use_second_order
 
+        # Loss convention (see drpt.losses): what the PPO loss and the validation
+        # target average over. The curation hook's item counts must match it.
+        self.loss_reduction = validate_loss_reduction(getattr(args, 'loss_reduction', 'sample_mean'))
+        if self.grad_hook is not None and self.grad_hook.loss_reduction != self.loss_reduction:
+            raise ValueError(
+                f"grad_hook.loss_reduction={self.grad_hook.loss_reduction!r} does not match "
+                f"args.loss_reduction={self.loss_reduction!r}"
+            )
+
         # Create curation strategy for clean separation of curation methods
         # RLHF uses filtering mode: keep positive + drop bottom frac of negative
         # Note: For IIF, we use NA strategy since IIF does pre-filtering at rollout level,
@@ -279,6 +289,7 @@ class LayerWiseSubsetPPOTrainer:
             else:
                 logger.info(f"  Validation: self-reference (training buffer)")
             logger.info(f"  Second-order curation: {self.use_second_order}")
+        logger.info(f"  Loss reduction: {self.loss_reduction}")
         logger.info(f"  KL coefficient: {self.kl_ctl.value} ({'adaptive' if self.adap_kl_ctrl else 'fixed'})")
         logger.info(f"  KL estimator: {self.kl_estimator}")
         logger.info(f"  Clip range: {self.cliprange}")
@@ -548,6 +559,37 @@ class LayerWiseSubsetPPOTrainer:
             values = values_full[:, start_idx:end_idx]
         return token_log_probs, values
 
+    # -------------------------------------------------------------------------
+    # Loss reduction helpers (see drpt.losses)
+    # -------------------------------------------------------------------------
+
+    def _reduce_train_loss(self, per_token_loss: Tensor, mask: Tensor) -> Tensor:
+        """
+        Reduce a [B, T] masked per-token training loss to a scalar.
+
+        "sample_mean": mean over responses of the per-response token mean, so every
+        response is one item (per-sample gradient = grad of its own loss / B).
+        "token_mean": token mean over the micro-batch (legacy).
+        """
+        return reduce_masked_loss(per_token_loss, mask, self.loss_reduction)
+
+    def _val_loss_contribution(self, per_token_loss: Tensor, mask: Tensor, full_batch_size: int) -> Tensor:
+        """
+        Mini-batch contribution to the validation target loss.
+
+        The target is captured mini-batch by mini-batch (gradients accumulate in the
+        hook's cache), so each contribution is normalised by the FULL validation batch:
+        the accumulated gradient is the gradient of the mean over all validation
+        responses. "sample_mean": per-response token mean; "token_mean" (legacy):
+        per-response token sum.
+        """
+        mask = mask.to(per_token_loss.dtype)
+        if self.loss_reduction == "sample_mean":
+            per_seq = per_example_mean(per_token_loss, mask)
+        else:
+            per_seq = (per_token_loss * mask).sum(dim=1)
+        return per_seq.sum() / full_batch_size
+
     def _capture_validation_gradients_core(
         self,
         full_ids: Tensor,
@@ -594,12 +636,11 @@ class LayerWiseSubsetPPOTrainer:
                 mb_full_ids, mb_full_mask, mb_response_ids, query_len,
             )
 
-            # Sequence log probability (sum over response tokens)
-            seq_log_probs = (token_log_probs * mb_response_mask.float()).sum(dim=1)
-
-            # Compute validation loss: -E[log π_θ(y|x) * A(x,y)]
-            per_seq_loss = -(mb_seq_advantages * seq_log_probs)
-            mb_val_loss = per_seq_loss.sum() / full_batch_size
+            # Validation loss: -E[A(x,y) * log π_θ(y|x)] with the per-response log
+            # probability reduced per loss_reduction (token mean under "sample_mean",
+            # token sum under legacy "token_mean"), averaged over the full val batch.
+            per_token_loss = -(mb_seq_advantages.unsqueeze(1) * token_log_probs)
+            mb_val_loss = self._val_loss_contribution(per_token_loss, mb_response_mask, full_batch_size)
 
             # Backward - hooks accumulate gradients into validation cache
             mb_val_loss.backward()
@@ -621,7 +662,9 @@ class LayerWiseSubsetPPOTrainer:
         """
         Capture validation gradients using token-level policy gradient loss.
 
-        Loss: L = -(token_log_probs * per_token_advantages * mask).sum() / N
+        Per-token loss -A_t * log_prob_t, reduced per loss_reduction (per-response
+        token mean under "sample_mean", token sum under legacy "token_mean") and
+        averaged over the N validation responses.
 
         Unlike the sequence-level losses, this uses per-token GAE advantages,
         matching the actual PPO policy gradient direction more closely.
@@ -656,7 +699,8 @@ class LayerWiseSubsetPPOTrainer:
             )
 
             # Token-level policy gradient loss
-            mb_val_loss = -(token_log_probs * mb_advantages * mb_response_mask.float()).sum() / full_batch_size
+            per_token_loss = -(token_log_probs * mb_advantages)
+            mb_val_loss = self._val_loss_contribution(per_token_loss, mb_response_mask, full_batch_size)
 
             mb_val_loss.backward()
             total_val_loss += mb_val_loss.item()
@@ -744,7 +788,6 @@ class LayerWiseSubsetPPOTrainer:
             pg_loss1 = -mb_advantages * ratio
             pg_loss2 = -mb_advantages * clipped_ratio
             pg_loss = torch.max(pg_loss1, pg_loss2)
-            pg_loss = (pg_loss * mb_response_mask).sum() / mb_response_mask.sum().clamp(min=1)
 
             # Value loss (clipped)
             seq_lens = mb_response_mask.sum(dim=1) - 1
@@ -758,10 +801,19 @@ class LayerWiseSubsetPPOTrainer:
             vf_loss1 = (values - mb_returns) ** 2
             vf_loss2 = (values_clipped - mb_returns) ** 2
             vf_loss = 0.5 * torch.max(vf_loss1, vf_loss2)
-            vf_loss = (vf_loss * value_mask).sum() / value_mask.sum().clamp(min=1)
 
-            # Total PPO loss (same as training)
-            mb_val_loss = (pg_loss + self.vf_coef * vf_loss) / (full_batch_size / batch_size)
+            # Total PPO loss, same reduction as training (compute_ppo_loss)
+            if self.loss_reduction == "sample_mean":
+                # per-response token means, averaged over the full validation batch
+                mb_val_loss = (
+                    per_example_mean(pg_loss, mb_response_mask)
+                    + self.vf_coef * per_example_mean(vf_loss, value_mask)
+                ).sum() / full_batch_size
+            else:
+                # legacy: token means over the mini-batch, averaged over mini-batches
+                pg_loss = (pg_loss * mb_response_mask).sum() / mb_response_mask.sum().clamp(min=1)
+                vf_loss = (vf_loss * value_mask).sum() / value_mask.sum().clamp(min=1)
+                mb_val_loss = (pg_loss + self.vf_coef * vf_loss) / (full_batch_size / batch_size)
 
             mb_val_loss.backward()
             total_val_loss += mb_val_loss.item()
@@ -1656,8 +1708,13 @@ class LayerWiseSubsetPPOTrainer:
                 selection_mode="filtering",
             )
 
-            # Set token counts for this mini-batch
-            mb_tokens = response_mask[mb_start:mb_end].sum(dim=1)
+            # Set item counts for this mini-batch (ones under "sample_mean": one item per
+            # response; response token counts under legacy "token_mean"). Only the
+            # scores are read here, so this is for consistency with the hook's convention.
+            if self.loss_reduction == "sample_mean":
+                mb_tokens = torch.ones(mb_size, device=response_mask.device, dtype=torch.long)
+            else:
+                mb_tokens = response_mask[mb_start:mb_end].sum(dim=1)
             mb_total_tokens = mb_tokens.sum()  # Keep as tensor for set_token_counts
             mb_state.set_token_counts(mb_tokens, mb_total_tokens, mb_total_tokens)
 
@@ -1817,7 +1874,10 @@ class LayerWiseSubsetPPOTrainer:
         pg_loss1 = -advantages * ratio
         pg_loss2 = -advantages * clipped_ratio
         pg_loss = torch.max(pg_loss1, pg_loss2)
-        pg_loss = (pg_loss * response_mask).sum() / response_mask.sum().clamp(min=1)
+        # Reduced per loss_reduction: "sample_mean" = per-response token mean averaged
+        # over responses (every response is one item for curation), "token_mean" =
+        # token mean over the micro-batch (legacy).
+        pg_loss = self._reduce_train_loss(pg_loss, response_mask)
 
         # TRL 0.26.1: Values use padding_mask_p1 which has one extra valid position
         # compared to logprobs' padding_mask. This is because V(s_t) at the terminal
@@ -1840,7 +1900,7 @@ class LayerWiseSubsetPPOTrainer:
         vf_loss1 = (values - returns) ** 2
         vf_loss2 = (values_clipped - returns) ** 2
         vf_loss = 0.5 * torch.max(vf_loss1, vf_loss2)
-        vf_loss = (vf_loss * value_mask).sum() / value_mask.sum().clamp(min=1)
+        vf_loss = self._reduce_train_loss(vf_loss, value_mask)
 
         # Total loss (no KL term - it's in the rewards/advantages already)
         total_loss = pg_loss + self.vf_coef * vf_loss
@@ -1931,7 +1991,9 @@ class LayerWiseSubsetPPOTrainer:
                 )
             return filtered_compute_loss_fn
 
-        # Create pseudo-labels for token-based gradient scaling.
+        # Create pseudo-labels for the hook's item counts (drpt.losses.item_counts_from_labels).
+        # Under "sample_mean" every response is one item (a row counts 1 as soon as it has
+        # a valid position), so the mask choice below only matters for legacy "token_mean":
         # TRL 0.26.1: Value loss uses padding_mask_p1 (one extra valid position),
         # while policy loss uses response_mask. Since gradients from both flow through
         # LoRA layers, we use value_mask (the superset) for token counting.
@@ -1955,7 +2017,7 @@ class LayerWiseSubsetPPOTrainer:
             compute_loss_fn=compute_loss_fn,
             lr=lr,
             filter_batch_fn=filter_batch_fn,
-            labels=labels,  # Pass labels for token-based gradient scaling
+            labels=labels,  # Pass labels for item-count gradient scaling
         )
 
         # Record curation statistics (for logging via stats dict)

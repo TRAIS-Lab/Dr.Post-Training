@@ -140,6 +140,10 @@ reset_config() {
     cfg_kl_loss_coef="0.001"
     cfg_rollout_n="8"
     cfg_gpu_memory_utilization="0.6"
+    # Loss aggregation: seq-mean-token-mean makes every response one item (the
+    # paper's convention: curated update = mean over kept samples). token-mean is
+    # verl's default and the legacy behaviour (samples weighted by length).
+    cfg_loss_agg_mode="seq-mean-token-mean"
 
     # Evaluation & checkpointing
     cfg_test_freq="3"
@@ -190,6 +194,7 @@ parse_yaml() {
             ppo_mini_batch_size)             cfg_ppo_mini_batch_size="$val" ;;
             ppo_micro_batch_size_per_gpu)    cfg_ppo_micro_batch_size_per_gpu="$val" ;;
             kl_loss_coef)                    cfg_kl_loss_coef="$val" ;;
+            loss_agg_mode)                   cfg_loss_agg_mode="$val" ;;
             rollout_n)                       cfg_rollout_n="$val" ;;
             gpu_memory_utilization)          cfg_gpu_memory_utilization="$val" ;;
             test_freq)                       cfg_test_freq="$val" ;;
@@ -356,6 +361,7 @@ run_method() {
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=$cfg_kl_loss_coef \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.loss_agg_mode=$cfg_loss_agg_mode \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.seed=$cfg_seed \

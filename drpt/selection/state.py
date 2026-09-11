@@ -70,13 +70,20 @@ class SelectionState(ABC):
         # Number of samples to select (for top-k mode)
         self.num_selected = max(1, int(train_batch_size * frac))
 
-        # Token-based scaling (set via set_token_counts)
+        # Item-count scaling (set via set_token_counts). An item is whatever the
+        # batch loss averages over — a sample under the "sample_mean" convention,
+        # a supervised token under the legacy "token_mean" one (see drpt.losses).
+        # Attribute names keep the historical "tokens" wording.
         self.tokens_per_sample: Optional[Tensor] = None
         self.train_total_tokens_tensor: Optional[Tensor] = None
+        self.batch_total_tokens_tensor: Optional[Tensor] = None
 
-        # Precomputed score correction for joint batch mode (1.0 = no correction)
-        # Stored as Tensor to avoid D2H memory copies during backward
+        # Precomputed corrections for joint (merged) batch mode (1.0 = no correction).
+        # Stored as Tensors to avoid D2H memory copies during backward.
+        #   score_correction      = N_batch² / (N_train · N_val)   for <g_b, g_val>
+        #   similarity_correction = (N_batch / N_train)²           for <g_b, g_b'>
         self.score_correction: Optional[Tensor] = None
+        self.similarity_correction: Optional[Tensor] = None
 
         # Curation recording for case study analysis
         self._record_selections = record_selections
@@ -89,31 +96,62 @@ class SelectionState(ABC):
         batch_total_tokens: Tensor,
     ) -> None:
         """
-        Set token counts for gradient scaling and score correction.
+        Set item counts for gradient scaling and the merged-batch score correction.
+
+        The batch loss is a mean over items, so grad_output carries 1/batch_total.
+        With per-sample item counts c_b (ones under "sample_mean", token counts under
+        "token_mean"):
+
+          score correction   batch_total² / (train_total · val_total)
+                             turns <g_b, g_val> from the merged batch into the value
+                             the train batch alone and the val batch alone would give
+          similarity corr.   (batch_total / train_total)²  — the train-side rescale
+                             squared, for <g_b, g_b'>
+          assembly scale     batch_total / Σ_{b∈S} c_b     — the loss restricted to
+                             the selected samples; (1/k) Σ_S grad lbar_b under
+                             "sample_mean"
 
         Args:
-            tokens_per_sample: Response token count per training sample [train_batch_size].
-                              Used for gradient scaling (sum over selected samples).
-            total_train_tokens: Sum of response tokens in training samples (scalar Tensor)
-            batch_total_tokens: Sum of tokens in entire batch (train + val for joint batch, scalar Tensor)
+            tokens_per_sample: Item count per training sample [train_batch_size].
+            total_train_tokens: Sum of item counts over the training samples (scalar Tensor)
+            batch_total_tokens: Sum of item counts over the entire batch
+                (train + val for a merged batch, scalar Tensor)
         """
-        # Store for gradient scaling: train_total_tokens / selected_tokens
+        # Store for gradient scaling: batch_total / selected
         self.tokens_per_sample = tokens_per_sample
         self.train_total_tokens_tensor = total_train_tokens.to(dtype=self.dtype)
         self.batch_total_tokens_tensor = batch_total_tokens.to(dtype=self.dtype)
 
-        # Precompute score correction for joint batch mode
-        # All operations kept on device as Tensors to avoid D2H memcpy
+        # Precompute corrections for joint batch mode.
+        # All operations kept on device as Tensors to avoid D2H memcpy;
+        # torch.where handles the conditionals without branching on CPU values.
+        one = torch.ones((), device=tokens_per_sample.device, dtype=self.dtype)
+        batch_total = batch_total_tokens.to(self.dtype)
+        train_total = total_train_tokens.to(self.dtype)
         val_tokens = batch_total_tokens - total_train_tokens
-        # Use torch.where to handle the conditional without branching on CPU values
-        correction = (batch_total_tokens.to(self.dtype) ** 2) / (total_train_tokens.to(self.dtype) * val_tokens.to(self.dtype))
-        # Set to 1.0 if val_tokens <= 0 or total_train_tokens <= 0
+
+        correction = (batch_total ** 2) / (train_total * val_tokens.to(self.dtype))
+        # 1.0 if val_tokens <= 0 (no val samples in the batch) or total_train_tokens <= 0
         valid_mask = (val_tokens > 0) & (total_train_tokens > 0)
-        self.score_correction = torch.where(
-            valid_mask,
-            correction,
-            torch.ones((), device=tokens_per_sample.device, dtype=self.dtype)
+        self.score_correction = torch.where(valid_mask, correction, one)
+
+        train_rescale = batch_total / train_total
+        self.similarity_correction = torch.where(
+            total_train_tokens > 0, train_rescale ** 2, one
         )
+
+    def _similarity_correction_for(self, score_correction: Optional[Tensor]) -> Optional[Tensor]:
+        """
+        Correction to apply to a train-train similarity matrix when ``score_correction``
+        is applied to the scores (None in cached-val mode, where no correction is needed).
+
+        Not ``score_correction ** 2``: the score correction is the product of the
+        train-side and the val-side rescale, while a similarity only involves two
+        train gradients.
+        """
+        if score_correction is None:
+            return None
+        return self.similarity_correction
 
     def _select_indices(
         self,
@@ -144,14 +182,15 @@ class SelectionState(ABC):
 
     def _compute_scale_factor(self, selected_indices: Tensor) -> Tensor:
         """
-        Compute token-based gradient scale factor for selected samples.
+        Compute the item-count gradient scale factor for selected samples.
 
-        Returns batch_total_tokens / selected_tokens so the curated gradient
-        matches the magnitude of a forward/backward on only the selected samples.
+        Returns batch_total / selected so the curated gradient equals the gradient of
+        the batch loss restricted to the selected samples (a forward/backward on only
+        those samples): (1/k) Σ_{b∈S} grad lbar_b under "sample_mean".
 
-        Uses batch_total_tokens (not train_total_tokens) because grad_output from
-        autograd is normalized by 1/batch_total_tokens. In separate-batch mode,
-        batch_total == train_total, so this is equivalent.
+        Uses batch_total (not train_total) because grad_output from autograd is
+        normalized by 1/batch_total. In separate-batch mode, batch_total == train_total,
+        so this is equivalent.
         """
         if self.tokens_per_sample is None or self.batch_total_tokens_tensor is None:
             raise RuntimeError(
@@ -181,7 +220,8 @@ class SelectionState(ABC):
             val_grad: Total validation gradient [feature_dim] (sum over val samples)
             layer_idx: Index of the current layer
             score_correction: Correction factor for joint batch mode (scalar Tensor).
-                For joint batch: T_total²/(T_train × T_val) to convert to standalone scaling.
+                For joint batch: N_batch²/(N_train × N_val) in item counts, converting
+                <g_b, g_val> to what the train batch alone and the val batch alone give.
                 For cached mode: None (no correction needed).
 
         Returns:
@@ -248,8 +288,9 @@ class LayerWiseSubsetState(SelectionState):
         similarity = None
         if self.use_second_order:
             similarity = train_grads @ train_grads.T
-            if score_correction is not None:
-                similarity = similarity * (score_correction ** 2)
+            similarity_correction = self._similarity_correction_for(score_correction)
+            if similarity_correction is not None:
+                similarity = similarity * similarity_correction
 
         # Step 3: Select indices
         selected_indices = self._select_indices(scores, similarity)
@@ -275,7 +316,7 @@ class LayerWiseSubsetState(SelectionState):
         selected_grads = train_grads[selected_indices]
         reduced_grad = selected_grads.sum(dim=0, keepdim=True)
 
-        # Step 5: Apply token-based gradient scaling
+        # Step 5: Apply item-count gradient scaling
         # _compute_scale_factor handles empty curation internally (returns 1.0)
         scale_factor = self._compute_scale_factor(selected_indices)
         reduced_grad = reduced_grad * scale_factor
@@ -360,8 +401,9 @@ class GlobalSubsetState(SelectionState):
         # Accumulate similarity matrix if second-order
         if self.similarity_matrix is not None:
             layer_sim = torch.mm(train_grads, train_grads.t())
-            if score_correction is not None:
-                layer_sim = layer_sim * (score_correction ** 2)
+            similarity_correction = self._similarity_correction_for(score_correction)
+            if similarity_correction is not None:
+                layer_sim = layer_sim * similarity_correction
             self.similarity_matrix.add_(layer_sim)
 
         return None
@@ -386,11 +428,11 @@ class GlobalSubsetState(SelectionState):
             layer_idx: Index of the layer these scores came from. Ignored here;
                 used by GroupWiseSubsetState to route scores to the layer's group.
         """
-        # Apply score correction
+        # Apply corrections (joint batch mode only)
         if score_correction is not None:
             scores = scores * score_correction
             if similarity is not None:
-                similarity = similarity * (score_correction ** 2)
+                similarity = similarity * self._similarity_correction_for(score_correction)
 
         # Accumulate to state
         self.grad_dot_scores += scores.to(self.dtype)
@@ -453,13 +495,14 @@ class GlobalSubsetState(SelectionState):
         """
         Compute scale factor for one-pass gradient assembly (exact parity with two-pass).
 
-        Uses batch_total_tokens (not train_total_tokens) to correct for merged-batch
-        normalization. In two-pass mode, pass 2 computes loss on selected samples only,
-        giving grad = (1/selected_tokens) * raw_grad. In one-pass, grad_output is scaled
-        by 1/batch_total_tokens, so we need scale = batch_total_tokens / selected_tokens.
+        Uses batch_total (not train_total) item counts to correct for merged-batch
+        normalization. In two-pass mode, pass 2 computes the loss on the selected samples
+        only, giving grad = (1/selected_items) * raw_grad. In one-pass, grad_output is
+        scaled by 1/batch_total, so we need scale = batch_total / selected_items
+        (= N/k under "sample_mean").
 
-        For SeparateBatch, batch_total_tokens == train_total_tokens, so this is equivalent
-        to the standard scale factor.
+        For SeparateBatch, batch_total == train_total, so this is equivalent to the
+        standard scale factor.
         """
         if self.tokens_per_sample is None or self.batch_total_tokens_tensor is None:
             raise RuntimeError(
@@ -585,7 +628,7 @@ class GroupWiseSubsetState(GlobalSubsetState):
         if score_correction is not None:
             scores = scores * score_correction
             if similarity is not None:
-                similarity = similarity * (score_correction ** 2)
+                similarity = similarity * self._similarity_correction_for(score_correction)
 
         acc_scores, acc_sim = self._accumulators(key)
         acc_scores.add_(scores.to(self.dtype))

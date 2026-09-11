@@ -243,6 +243,7 @@ def main():
             model=model,
             layer_names=layer_names,
             device=str(training_args.device),
+            loss_reduction=training_args.loss_reduction,
         )
         if training_args.method == 'GroupWiseSubset':
             # Partition the hooked layers into selection groups (per block, per

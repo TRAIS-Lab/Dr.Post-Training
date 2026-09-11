@@ -33,6 +33,9 @@ from .compression_mode import CompressionMode
 # Validation gradient cache
 from .validation_cache import ValidationCache
 
+# Loss-reduction convention (what counts as one item in the batch loss)
+from .losses import item_counts_from_labels, validate_loss_reduction
+
 # Curation module
 from .selection.state import SelectionState, LayerWiseSubsetState, GlobalSubsetState, GroupWiseSubsetState
 from .selection.backward import (
@@ -56,7 +59,12 @@ class GradientHook:
     2. Compression configuration (via CompressionMode)
     3. Curation state management (LayerWiseSubset/GlobalSubset)
     4. Validation gradient caching (for separate-batch strategies)
-    5. Token count tracking for proper gradient scaling
+    5. Item count tracking for gradient scaling. An "item" is whatever the
+       batch loss averages over (see ``loss_reduction`` and ``drpt.losses``):
+       one sample under ``"sample_mean"``, one supervised token under the
+       legacy ``"token_mean"``. The score correction and the curated-update
+       scale are exact for either convention as long as the loss the trainer
+       backpropagates matches ``loss_reduction``.
     """
 
     def __init__(
@@ -65,6 +73,7 @@ class GradientHook:
         layer_names: List[str],
         device: str = 'cpu',
         layer_groups: Optional[List[Any]] = None,
+        loss_reduction: str = "sample_mean",
     ) -> None:
         """
         Initialize the hook manager.
@@ -77,10 +86,19 @@ class GradientHook:
                 layer_names) for GroupWiseSubset curation. See
                 drpt.selection.grouping.build_layer_groups. Can also be set
                 later via set_layer_groups().
+            loss_reduction: Convention of the batch loss the trainer backpropagates
+                through the hooked model (``drpt.losses.LOSS_REDUCTIONS``):
+                ``"sample_mean"`` (default) — mean over examples of per-example
+                token-mean losses; every example is one item, per-sample gradients
+                are gradients of per-example losses and curated updates are plain
+                means over the selected samples, as in the paper.
+                ``"token_mean"`` — Hugging Face's token mean over the batch; an
+                item is a supervised token (legacy behaviour).
         """
         self.model: nn.Module = model
         self.layer_names: List[str] = layer_names
         self.device: str = device
+        self.loss_reduction: str = validate_loss_reduction(loss_reduction)
 
         # Group key per hooked layer (GroupWiseSubset only)
         self.layer_groups: Optional[List[Any]] = None
@@ -111,7 +129,8 @@ class GradientHook:
         # Validation gradient cache (consolidated from three separate buffers)
         self._val_cache: ValidationCache = ValidationCache(len(layer_names))
 
-        # Token count tracking for proper gradient scaling
+        # Item count tracking for gradient scaling (samples or tokens, see
+        # loss_reduction). Attribute names keep the historical "tokens" wording.
         # Kept as Tensors to avoid D2H memory copies during backward
         self.total_tokens: Optional[Tensor] = None
         self.tokens_per_sample: Optional[Tensor] = None
@@ -133,7 +152,10 @@ class GradientHook:
         # Register hooks
         self._register_hooks()
 
-        logger.info(f"Initialized GradientHook with {len(layer_names)} layers")
+        logger.info(
+            f"Initialized GradientHook with {len(layer_names)} layers "
+            f"(loss_reduction={self.loss_reduction})"
+        )
 
     # =========================================================================
     # Compression Mode Configuration
@@ -422,7 +444,7 @@ class GradientHook:
         return self.layer_groups
 
     # =========================================================================
-    # Token Count Tracking
+    # Item Count Tracking
     # =========================================================================
 
     def set_token_counts(
@@ -431,15 +453,20 @@ class GradientHook:
         train_batch_size: Optional[int] = None,
     ) -> None:
         """
-        Set token counts for proper gradient scaling.
+        Set per-sample item counts for gradient scaling and score correction.
+
+        The counts follow ``self.loss_reduction`` (see ``drpt.losses.item_counts_from_labels``):
+        under ``"sample_mean"`` every row with at least one supervised position is one
+        item (a vector of ones), under ``"token_mean"`` a row counts its supervised tokens.
+        The method keeps its historical name; ``tokens_per_sample`` / ``total_tokens``
+        hold item counts.
 
         Args:
             labels: Label tensor [batch_size, seq_length] with -100 for ignored positions.
-                    Used for gradient scaling (only response tokens count).
-            train_batch_size: If provided, only count tokens for first train_batch_size samples
+            train_batch_size: If provided, the first train_batch_size rows are the training
+                samples and the rest are validation samples (merged-batch mode).
         """
-        valid_mask = (labels != -100)
-        tokens_per_sample = valid_mask.sum(dim=1)
+        tokens_per_sample = item_counts_from_labels(labels, self.loss_reduction)
 
         # Keep as Tensor to avoid D2H memory copy
         self.total_tokens = tokens_per_sample.sum()
@@ -452,10 +479,10 @@ class GradientHook:
                 train_tokens, total_train_tokens, self.total_tokens
             )
 
-        logger.debug(f"Set token counts: total={self.total_tokens}")
+        logger.debug(f"Set item counts ({self.loss_reduction}): total={self.total_tokens}")
 
     def clear_token_counts(self) -> None:
-        """Clear token counts after forward/backward."""
+        """Clear item counts after forward/backward."""
         self.total_tokens = None
         self.tokens_per_sample = None
 
@@ -709,13 +736,18 @@ class GradientHook:
         and assigns to param.grad (adding if .grad already exists, e.g. for
         tied embedding / lm_head weights).
 
+        grad_output carries the batch loss's 1/batch_total_items, so with
+        scale_factor = batch_total_items / selected_items the result is the
+        gradient of the loss restricted to the selected samples — under
+        "sample_mean" the plain mean (1/k) Σ_{i∈S} grad lbar_i.
+
         For MeSO (update compression), compresses selected gradients instead.
 
         Retained data is released as each layer is assembled.
 
         Args:
             selected_indices: Selected sample indices [K]
-            scale_factor: Scaling factor (batch_total_tokens / selected_tokens)
+            scale_factor: Scaling factor (batch_total_items / selected_items)
             layer_indices: Restrict assembly to these hooked layer indices
                 (GroupWiseSubset: the layers of one group). None = all layers.
         """

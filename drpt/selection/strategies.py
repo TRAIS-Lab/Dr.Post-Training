@@ -22,6 +22,12 @@ transformer block — see drpt.selection.grouping):
        * full_ghost: Stores [V, S, O] and [V, S, I] components (for pairwise scoring).
        More memory-efficient during training as it avoids materializing [B_train, O, I].
        Better when validation batch is small (e.g., external validation set in SFT).
+
+Loss convention: ``compute_loss_fn`` must follow ``grad_hook.loss_reduction``
+(see ``drpt.losses``). The strategies hand the batch labels to
+``grad_hook.set_token_counts`` so the per-sample item counts (ones under
+``"sample_mean"``, token counts under ``"token_mean"``) match the loss, which
+makes the score correction and the curated-update scale exact.
 """
 
 from __future__ import annotations
@@ -225,7 +231,7 @@ class MergedBatchLayerWiseSubsetStrategy(MergedBatchStrategy):
         # Set up streaming state
         self._setup_state(train_batch_size, lr)
 
-        # Set token counts for proper gradient scaling
+        # Set item counts for gradient scaling and the merged-batch score correction
         if 'labels' in merged_batch:
             self.grad_hook.set_token_counts(merged_batch['labels'], train_batch_size)
 
@@ -335,7 +341,7 @@ class MergedBatchGlobalSubsetStrategy(MergedBatchStrategy):
         if not self.has_update_compression:
             self.grad_hook.disable_hooks()
         else:
-            # For MeSO, set token counts for selected batch
+            # For MeSO, set item counts for selected batch
             self.grad_hook.set_token_counts(filtered_inputs['labels'])
 
         model.zero_grad()
@@ -742,13 +748,13 @@ class SeparateBatchLayerWiseSubsetStrategy(SeparateBatchStrategy):
             compute_loss_fn: Zero-arg function that computes loss and returns (loss, stats)
             lr: Learning rate for score scaling
             **kwargs:
-                labels: Optional label tensor for token-based gradient scaling.
-                        If provided, enables proper score scaling across modes.
+                labels: Label tensor [batch_size, seq_len] (-100 = ignored) used to
+                        derive per-sample item counts for the curated-update scale.
         """
         # Set up streaming state with stored validation gradients
         self._setup_state(batch_size, lr)
 
-        # Set token counts for gradient scaling (if labels provided)
+        # Set item counts for gradient scaling (if labels provided)
         # In SeparateBatch mode, entire batch is train, so pass batch_size as train_batch_size
         labels = kwargs.get('labels')
         if labels is not None:
@@ -820,6 +826,13 @@ class SeparateBatchGlobalSubsetStrategy(SeparateBatchStrategy):
         # === PASS 1: Score Accumulation ===
         self._setup_state(batch_size, lr)
 
+        # Item counts (not needed for pass-1 scoring in cached-val mode, where no
+        # correction applies; kept uniform with the one-pass strategies so the state
+        # is fully populated for stats / MeSO pass 2)
+        labels = kwargs.get('labels')
+        if labels is not None:
+            self.grad_hook.set_token_counts(labels, batch_size)
+
         model.zero_grad()
         loss_for_scoring, _ = compute_loss_fn()
         loss_for_scoring.backward()
@@ -863,6 +876,8 @@ class SeparateBatchGlobalSubsetStrategy(SeparateBatchStrategy):
             return zero_loss, stats
 
         # === PASS 2: Gradient Computation on Selected ===
+        # The loss on the selected batch (same convention as pass 1) already is the
+        # update we want: under "sample_mean" the mean over the k selected samples.
         # Disable hooks only if no update compression (standard optimizer for selected samples).
         # With MeSO, keep hooks enabled so CompressedLinearBackward stores
         # compressed gradients for the optimizer.
@@ -902,6 +917,7 @@ class SeparateBatchGlobalSubsetStrategy(SeparateBatchStrategy):
     def _cleanup(self) -> None:
         """Clean up after training step."""
         self.grad_hook.clear_selection()
+        self.grad_hook.clear_token_counts()
 
 
 class SeparateBatchGlobalSubsetOnePassStrategy(SeparateBatchStrategy):
@@ -909,7 +925,7 @@ class SeparateBatchGlobalSubsetOnePassStrategy(SeparateBatchStrategy):
     One-pass subset strategy with separate val batch (Algorithm 4.2).
 
     Recommended one-pass mode: exact scale factor parity with two-pass since
-    batch_total_tokens == train_total_tokens in separate batch mode.
+    batch_total == train_total (item counts) in separate batch mode.
     """
 
     def execute_training_step(
@@ -993,7 +1009,7 @@ class SeparateBatchGroupWiseSubsetStrategy(SeparateBatchStrategy):
     accumulates scores over its layers and, once all of them have run, selects
     and assembles the curated gradient for exactly those layers. Exact scale
     factor parity with LayerWiseSubset/GlobalSubset since
-    batch_total_tokens == train_total_tokens in separate batch mode.
+    batch_total == train_total (item counts) in separate batch mode.
     """
 
     def execute_training_step(

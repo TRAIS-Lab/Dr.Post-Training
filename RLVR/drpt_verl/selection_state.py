@@ -69,7 +69,9 @@ class SelectionStateVerl(ABC):
 
         self.num_selected = max(1, int(train_batch_size * frac))
 
-        # Token-based scaling
+        # Item-count scaling (one item per sample under the seq-mean loss modes,
+        # response token counts under token-mean; see GradientHookVerl.set_token_counts).
+        # Attribute names keep the historical "tokens" wording.
         self.tokens_per_sample: Optional[Tensor] = None
         self.train_total_tokens_tensor: Optional[Tensor] = None
 
@@ -83,12 +85,15 @@ class SelectionStateVerl(ABC):
         packed_tokens_per_sample: Optional[Tensor] = None
     ) -> None:
         """
-        Set token counts for gradient scaling.
+        Set item counts for gradient scaling and cu_seqlens for packed sequences.
 
         Args:
-            tokens_per_sample: Response token count per training sample [train_batch_size]
-            total_train_tokens: Sum of response tokens in training samples
-            packed_tokens_per_sample: Total token count per sample for packed sequences
+            tokens_per_sample: Item count per training sample [train_batch_size]
+                (ones under the seq-mean loss modes, response token counts under token-mean)
+            total_train_tokens: Sum of item counts over the training samples
+            packed_tokens_per_sample: Token count per sample in the packed sequence
+                (from the attention mask). Falls back to ``tokens_per_sample`` if None,
+                which is only meaningful when those are token counts.
         """
         # Move all tensors to the correct device to avoid CPU/GPU mismatches
         self.tokens_per_sample = tokens_per_sample.to(self.device)
@@ -119,7 +124,11 @@ class SelectionStateVerl(ABC):
             return topk_selection(scores_scaled, self.num_selected)
 
     def _compute_scale_factor(self, selected_indices: Tensor) -> Tensor:
-        """Compute token-based gradient scale factor."""
+        """
+        Item-count gradient scale factor: train_total / selected, so the curated
+        gradient is the batch loss restricted to the kept samples ((1/k) Σ_S grad l_b
+        under the seq-mean modes).
+        """
         if self.tokens_per_sample is None or self.train_total_tokens_tensor is None:
             raise RuntimeError("Token counts not set. Call set_token_counts() first.")
         if selected_indices.numel() == 0:

@@ -1,6 +1,10 @@
 """
 Parity tests for GroupWiseSubset curation (drpt.selection).
 
+All runs use the "sample_mean" loss convention (drpt.losses.causal_lm_loss: mean over
+examples of per-example token-mean losses), which is the GradientHook default; see
+tests/test_loss_convention.py for the convention itself and the legacy "token_mean".
+
 Runs on CPU with a tiny randomly initialised Qwen3 model, so it can be executed
 without a GPU allocation:
 
@@ -33,7 +37,7 @@ import torch.nn as nn
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 warnings.filterwarnings("ignore")
 
-from drpt import GradientHook  # noqa: E402
+from drpt import GradientHook, causal_lm_loss  # noqa: E402
 from drpt.selection import (  # noqa: E402
     build_layer_groups,
     create_merged_batch_strategy,
@@ -75,12 +79,20 @@ def hooked_layer_names(model):
     return [n for n, m in model.named_modules() if isinstance(m, (nn.Linear, nn.Embedding))]
 
 
+# Trailing positions masked per row: uneven response lengths (5..10 supervised tokens),
+# so the "sample_mean" and legacy "token_mean" conventions give different scores.
+RESPONSE_CUTS = [3, 0, 5, 1, 4, 2]
+
+
 def make_batch(bsz, seed):
     g = torch.Generator().manual_seed(seed)
     ids = torch.randint(1, VOCAB, (bsz, SEQ), generator=g)
     labels = ids.clone()
     labels[:, :2] = -100                      # prompt tokens are not trained on
-    labels[0, -3:] = -100                     # uneven response lengths
+    for i in range(bsz):
+        cut = RESPONSE_CUTS[i % len(RESPONSE_CUTS)]
+        if cut:
+            labels[i, -cut:] = -100           # uneven response lengths
     attn = torch.ones_like(ids)
     return {"input_ids": ids, "attention_mask": attn, "labels": labels}
 
@@ -90,6 +102,13 @@ VAL = make_batch(B_VAL, 2)
 
 
 def loss_of(model, batch):
+    """Sample-mean loss: mean over examples of per-example token-mean CE (the drpt default)."""
+    logits = model(**{k: v for k, v in batch.items() if k != "labels"}).logits
+    return causal_lm_loss(logits, batch["labels"], reduction="sample_mean")
+
+
+def hf_loss_of(model, batch):
+    """Hugging Face's token mean over the batch (legacy "token_mean" convention)."""
     return model(**batch).loss
 
 

@@ -80,12 +80,21 @@ parameters that produced the rollouts). The target is defined by two knobs:
 | --- | --- | --- |
 | `n_val` | `0` | Self-referencing: the target is computed on the training rollouts themselves |
 | | `>0` | Held-out: `n_val` prompts from the RTP test split; each step regenerates one `val_batch_size` batch from the current policy |
-| `val_loss_type` | `reward` (dir: `rew`) | $-\mathbb{E}[\text{normalize}(R)\,\log\pi_\theta(y\mid x)]$, sequence-level |
-| | `token-pg` (dir: `tpg`) | $-\sum_t A_t \log\pi_\theta(y_t\mid\cdot)$, token-level policy gradient with GAE advantages |
+| `val_loss_type` | `reward` (dir: `rew`) | $-\mathbb{E}_i[\text{normalize}(R_i)\,\overline{\log\pi_\theta}(y_i\mid x_i)]$, sequence-level reward weighting |
+| | `token-pg` (dir: `tpg`) | $-\mathbb{E}_i[\overline{A_t \log\pi_\theta(y_t\mid\cdot)}]$, token-level policy gradient with GAE advantages |
 | | `train-loss` (dir: `tloss`) | the PPO training objective: clipped surrogate + `vf_coef` × clipped value loss |
 
+Here $\overline{\cdot}$ is the per-response token mean (`loss_reduction=sample_mean`, the default
+since 2026-09-11): every response is one item, the target is the mean over validation
+responses, and the PPO training loss is likewise the mean over responses of per-response
+token-mean policy/value losses, so per-sample gradients are gradients of per-response losses
+and the curated update is the plain mean over the kept responses (see `drpt.losses`).
+`loss_reduction=token_mean` restores the legacy behaviour (token mean over the micro-batch
+for training, per-response token *sums* for `reward`/`token-pg`), where responses are
+weighted by length in scores and updates.
+
 Because the target is captured at the rollout parameters, the PPO ratio is 1 and the clipping
-is inactive, so `train-loss` equals `token-pg` plus the value-loss term (up to normalization).
+is inactive, so `train-loss` equals `token-pg` plus the value-loss term.
 Clipping only affects the *training-side* per-sample gradients inside the PPO epochs.
 
 Run directories are named

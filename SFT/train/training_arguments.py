@@ -246,6 +246,22 @@ class TrainingArguments(TA):
             )
         },
     )
+    loss_reduction: str = field(
+        default="sample_mean",
+        metadata={
+            "help": (
+                "Batch-loss convention shared by curation scoring, the curated update and the "
+                "full-training baseline (see drpt.losses). "
+                "'sample_mean' (default): mean over examples of per-example token-mean losses; every "
+                "example is one item, so per-sample gradients are gradients of per-example losses, "
+                "scores are <grad l_b, grad L_val> and updates are plain means over samples (1/n, 1/k) "
+                "as in the paper. "
+                "'token_mean': Hugging Face default, one token mean over the batch; an item is a "
+                "supervised token, so scores carry a factor of the sample's token count and selected "
+                "samples enter the update weighted by length (legacy behaviour of runs before 2026-09-11)."
+            )
+        },
+    )
 
     # Curation Recording (Case Study)
     record_selections: bool = field(
@@ -302,6 +318,8 @@ class TrainingArguments(TA):
                 )
             if self.selection_granularity == "custom" and self.selection_groups is None:
                 raise ValueError("selection_granularity='custom' requires --selection_groups")
+        from drpt.losses import validate_loss_reduction
+        validate_loss_reduction(self.loss_reduction)
         if isinstance(self.fsdp_config, str):
             self.fsdp_config = fsdp_config[self.fsdp_config]
         if self.train_dataset_names is not None:

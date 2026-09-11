@@ -20,6 +20,14 @@ This extends DataParallelPPOActor to support gradient-based selection:
 
 The validation gradients are captured from a fixed validation set (reward objective)
 and used to compute gradient similarity scores for training sample selection.
+
+Loss convention: the actor's ``loss_agg_mode`` decides what one item of the loss is.
+With the default ``seq-mean-token-mean`` every response is one item — per-sample
+gradients are gradients of per-response token-mean losses, the validation target is
+the mean over validation responses, and the curated update is the plain mean over the
+kept responses (train_total/selected = n/k). ``token-mean`` (legacy) makes an item a
+response token, weighting samples by length in scores and updates. The hook, the
+validation normalisation and the training loss all follow the same mode.
 """
 
 from __future__ import annotations
@@ -34,7 +42,6 @@ from verl import DataProto
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.device import get_device_id
-from verl.trainer.ppo.core_algos import agg_loss
 
 try:
     from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
@@ -139,11 +146,14 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             self.selection_method = 'NA'
             return
 
-        # Create GradientHook
+        # Create GradientHook. Item counts follow the actor's loss aggregation mode
+        # (verl default "token-mean"; the RLVR launcher sets "seq-mean-token-mean").
+        loss_agg_mode = getattr(self.config, 'loss_agg_mode', 'token-mean')
         self.grad_hook = GradientHookVerl(
             model=unwrapped_module,
             layer_names=layer_names,
             device='cuda',
+            loss_agg_mode=loss_agg_mode,
         )
 
         self._hook_initialized = True
@@ -158,6 +168,27 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         if not self._is_selection_enabled():
             return False
         return self.grad_hook._val_cache.get_num_captured() > 0
+
+    def _per_sequence_loss(self, loss_mat: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Reduce a [B, T] per-token loss over tokens the way ``config.loss_agg_mode`` does
+        inside verl's ``agg_loss``, returning one value per sequence [B]:
+          token-mean               -> token sum (the mean over tokens is taken globally)
+          seq-mean-token-mean      -> mean over the sequence's response tokens
+          seq-mean-token-sum       -> sum over the sequence's response tokens
+          seq-mean-token-sum-norm  -> token sum / response_length
+        Summing the result over sequences and dividing by the global item count
+        (tokens for token-mean, sequences otherwise) gives the batch loss.
+        """
+        mode = self.grad_hook.loss_agg_mode
+        mask = loss_mask.to(loss_mat.dtype)
+        seq_sum = (loss_mat * mask).sum(dim=-1)
+        if mode == "seq-mean-token-mean":
+            return seq_sum / mask.sum(dim=-1).clamp(min=1)
+        if mode == "seq-mean-token-sum-norm":
+            return seq_sum / loss_mask.shape[-1]
+        # token-mean and seq-mean-token-sum: per-sequence token sum
+        return seq_sum
 
     def capture_validation_gradients_external(
         self,
@@ -257,19 +288,26 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                 # Fallback to batch_size or a default
                 micro_batch_size = min(batch_size, 8)  # Default to 8 or batch_size
 
-        # Pre-compute total response tokens for token-mean normalization
-        # This ensures validation gradient uses the same normalization as training (loss_agg_mode="token-mean")
+        # Normalisation of the validation target follows the actor's loss_agg_mode
+        # (same convention as the training loss and the hook's item counts):
+        #   seq-mean-* : every response is one item -> mean over all validation responses
+        #   token-mean : every response token is one item -> mean over all response tokens
+        # Counts are GLOBAL (all-reduced) so every rank normalises identically and
+        # sync_val_grads() can simply SUM the per-rank gradients.
         full_response_mask = val_response_mask if val_response_mask is not None else val_attention_mask[:, -response_length:]
-        local_response_tokens = full_response_mask.sum().to(dtype=torch.float32)
-
-        # For distributed training, sync token counts to get GLOBAL total
-        # This ensures all ranks use the same normalization factor for consistent gradient scales
+        local_counts = torch.stack([
+            full_response_mask.sum().to(dtype=torch.float32),
+            torch.tensor(float(batch_size), device=val_input_ids.device),
+        ])
         if world_size > 1:
-            global_response_tokens = local_response_tokens.clone()
-            dist.all_reduce(global_response_tokens, op=dist.ReduceOp.SUM)
-            total_response_tokens_tensor = global_response_tokens
+            global_counts = local_counts.clone()
+            dist.all_reduce(global_counts, op=dist.ReduceOp.SUM)
         else:
-            total_response_tokens_tensor = local_response_tokens
+            global_counts = local_counts
+        total_response_tokens_tensor = global_counts[0]
+        total_response_samples_tensor = global_counts[1]
+        item_is_sample = self.grad_hook.item_convention == "sample"
+        total_items_tensor = total_response_samples_tensor if item_is_sample else total_response_tokens_tensor
 
         # For train-loss: Pre-compute GRPO advantages for the full batch
         # This matches training's advantage computation exactly
@@ -388,22 +426,16 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
                     # seq_scores is [mb_batch_size], broadcast to [mb_batch_size, response_length]
                     per_token_loss = -(mb_seq_scores.unsqueeze(1) * token_log_probs)
 
-                # Use verl's agg_loss with token-mean normalization
-                # - dp_size=1: We do explicit all-reduce SUM, not relying on optimizer's averaging
-                # - batch_num_tokens: Pre-synced GLOBAL token count for correct gradient scaling
-                val_loss = agg_loss(
-                    loss_mat=per_token_loss,
-                    loss_mask=mb_response_mask,
-                    loss_agg_mode="token-mean",
-                    dp_size=1,
-                    batch_num_tokens=total_response_tokens_tensor,
-                )
+                # Reduce per response as config.loss_agg_mode does, then divide by the
+                # pre-synced GLOBAL item count: the gradients accumulated over
+                # micro-batches (and summed across ranks) form the mean over all items.
+                mb_loss_sum = self._per_sequence_loss(per_token_loss, mb_response_mask).sum()
+                val_loss = mb_loss_sum / total_items_tensor
 
                 # Backward to capture gradients
                 val_loss.backward()
 
-            # Track raw loss sum for statistics (will normalize by total tokens later)
-            mb_loss_sum = (per_token_loss * mb_response_mask.float()).sum()
+            # Track raw loss sum for statistics (normalised by the global item count later)
             total_val_loss += mb_loss_sum.detach()
 
             # Zero optimizer gradients but keep val cache accumulating
@@ -421,34 +453,30 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         self.grad_hook.sync_val_grads()
 
         # Synchronize loss across ranks for consistent stats
-        # total_val_loss is now the raw sum of per-token losses (before normalization)
-        # Note: total_response_tokens_tensor is already the GLOBAL token count (synced above)
+        # total_val_loss is the raw sum of per-item losses (before normalization);
+        # the item counts are already GLOBAL (synced above).
         global_total_tokens = total_response_tokens_tensor.item()
+        global_total_items = total_items_tensor.item()
+        total_samples = int(total_response_samples_tensor.item())
 
         if world_size > 1:
-            # Sync: [raw_loss_sum, num_samples]
-            sync_tensor = torch.stack([
-                total_val_loss,
-                torch.tensor(float(batch_size), device=val_input_ids.device)
-            ])
-            dist.all_reduce(sync_tensor, op=dist.ReduceOp.SUM)
-
-            global_loss_sum = sync_tensor[0].item()
-            total_samples = int(sync_tensor[1].item())
-
-            # Token-mean average loss
-            avg_val_loss = global_loss_sum / global_total_tokens if global_total_tokens > 0 else 0.0
+            global_loss_sum = total_val_loss.clone()
+            dist.all_reduce(global_loss_sum, op=dist.ReduceOp.SUM)
+            global_loss_sum = global_loss_sum.item()
         else:
-            total_samples = batch_size
-            avg_val_loss = total_val_loss.item() / global_total_tokens if global_total_tokens > 0 else 0.0
+            global_loss_sum = total_val_loss.item()
+
+        # Mean loss per item (per response under seq-mean modes, per token under token-mean)
+        avg_val_loss = global_loss_sum / global_total_items if global_total_items > 0 else 0.0
 
         # Get stats
         num_layers_captured = self.grad_hook._val_cache.get_num_captured()
 
         stats = {
             'val/num_samples': total_samples,  # Total across all ranks after sync
-            'val/num_tokens': global_total_tokens,  # Total response tokens (for token-mean normalization)
-            'val/loss': avg_val_loss,  # Token-mean average loss across all ranks
+            'val/num_tokens': global_total_tokens,  # Total response tokens across all ranks
+            'val/num_items': global_total_items,  # Normaliser of the target (samples or tokens)
+            'val/loss': avg_val_loss,  # Mean loss per item across all ranks
             'val/num_layers_captured': num_layers_captured,
             'val/num_micro_batches': num_micro_batches,
             'val/rank': rank,
@@ -497,7 +525,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         IMPORTANT: This should be called per micro-batch, not per full batch.
         The batch_size should be the micro-batch size to ensure:
         1. Selection indices are relative to the micro-batch
-        2. tokens_per_sample matches the micro-batch for correct scale factor
+        2. the per-sample item counts match the micro-batch for the correct scale factor
         3. cu_seqlens matches the micro-batch for packed sequence handling
         """
         if not self._is_selection_enabled():

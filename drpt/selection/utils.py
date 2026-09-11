@@ -70,10 +70,11 @@ def compute_total_gradient(
     where grad_b[o,i] = Σ_s grad_output[b,s,o] × input[b,s,i].
 
     Note on scaling:
-    - The grad_output already has loss function scaling (1/total_tokens for
-      token-averaged loss).
-    - We sum (not average) to be consistent with token-weighted loss semantics.
-    - Samples with more tokens naturally contribute more through gradient magnitude.
+    - The grad_output already carries the loss function's 1/batch_total, where
+      an item is a sample ("sample_mean", default) or a supervised token
+      ("token_mean", legacy) — see drpt.losses.
+    - We sum (not average) so the result is the gradient of the batch loss; the
+      caller rescales by item counts (see SelectionState.set_token_counts).
 
     Args:
         grad_output: Gradient of output [B, S, O] or [B, O]

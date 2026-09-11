@@ -33,6 +33,16 @@ Architecture overview:
 
   ValidationCache (validation_cache.py)
     Stores validation gradients in factorized, full, or compressed form.
+
+  Loss convention (losses.py)
+    drpt reads per-sample gradients off the backward pass of one batch loss, so
+    what that loss averages over defines "an item" in every score and update.
+    GradientHook(loss_reduction="sample_mean") (default) expects the trainer to
+    backpropagate the mean over examples of per-example token-mean losses
+    (causal_lm_loss / reduce_masked_loss): every example is one item, scores are
+    <grad lbar_b, grad L_val> and curated updates are plain means over the
+    selected samples, as in the paper. "token_mean" is the legacy Hugging Face
+    token mean, where an item is a supervised token.
 """
 
 from .hook import GradientHook
@@ -45,6 +55,16 @@ from .compression_mode import CompressionMode
 
 # Validation gradient cache
 from .validation_cache import ValidationCache, ValidationStorageMode
+
+# Loss-reduction conventions shared by trainers and the hook
+from .losses import (
+    LOSS_REDUCTIONS,
+    validate_loss_reduction,
+    causal_lm_loss,
+    reduce_masked_loss,
+    per_example_mean,
+    item_counts_from_labels,
+)
 
 # Curation module exports (gradient-based)
 from .selection import (
@@ -84,6 +104,13 @@ __all__ = [
     # Validation cache
     "ValidationCache",
     "ValidationStorageMode",
+    # Loss convention
+    "LOSS_REDUCTIONS",
+    "validate_loss_reduction",
+    "causal_lm_loss",
+    "reduce_masked_loss",
+    "per_example_mean",
+    "item_counts_from_labels",
     # Curation state classes
     "SelectionState",
     "LayerWiseSubsetState",

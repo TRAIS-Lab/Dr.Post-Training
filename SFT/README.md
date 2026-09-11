@@ -186,6 +186,23 @@ markers) via `SFT/data/chat_format.py:ensure_chat_template` (re-exported from
 Both training and eval call `tokenizer.apply_chat_template(...)`; loss is
 computed only on the assistant-content tokens.
 
+## Loss convention (`loss_reduction`)
+
+drpt reads per-sample gradients off the backward pass of one batch loss, so
+whatever that loss averages over is one "item" in every influence score and in
+the curated update. `loss_reduction=sample_mean` (default since 2026-09-11) uses
+the mean over examples of per-example token-mean losses, computed from the
+logits (`drpt.losses.causal_lm_loss`): every example is one item, the score of
+sample $b$ is $\langle\nabla\bar\ell_b, \nabla L_{\text{val}}\rangle$ with
+$L_{\text{val}}$ the mean over the target batch, and the curated update is the
+plain mean $\frac1k\sum_{b\in S}\nabla\bar\ell_b$, as in the paper. The
+full-training baseline uses the same loss, so all arms share one objective.
+`loss_reduction=token_mean` restores the Hugging Face token mean over the batch
+(the convention of every run before the switch), where scores carry a factor of
+the sample's response length and selected samples enter the update weighted by
+length. Reported val/eval perplexities always use the model's token-mean loss.
+`tests/test_loss_convention.py` pins both conventions.
+
 ## Data preparation
 
 ```bash

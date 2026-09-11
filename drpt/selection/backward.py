@@ -72,7 +72,7 @@ def _get_val_components(
 
 
 def _compute_scale_factor(state: LayerWiseSubsetState, selected_indices: Tensor) -> Tensor:
-    """Compute token-based gradient scale factor for selected samples."""
+    """Compute the item-count gradient scale factor for selected samples."""
     return state._compute_scale_factor(selected_indices)
 
 
@@ -471,7 +471,7 @@ class LayerWiseSubsetLinearBackward(Function):
         if state.use_second_order:
             similarity = train_grads @ train_grads.T
             if score_correction is not None:
-                similarity = similarity * (score_correction ** 2)
+                similarity = similarity * state._similarity_correction_for(score_correction)
 
 
         # --- Shared compressors: delegate to state for efficient select+reduce ---
@@ -579,7 +579,7 @@ class LayerWiseSubsetLinearBackward(Function):
         if score_correction is not None:
             scores = scores * score_correction
             if similarity is not None:
-                similarity = similarity * (score_correction ** 2)
+                similarity = similarity * state._similarity_correction_for(score_correction)
 
         # --- Select, then produce gradient update ---
         selected_indices = _do_selection(state, layer_idx, scores, similarity)
@@ -705,8 +705,10 @@ class GlobalSubsetLinearBackward(Function):
             score_correction = None
         else:
             train_grads, val_grads = split_train_val_batch(compressed_grad, state.train_batch_size)
-            val_grad = val_grads.sum(dim=0)  # Sum, not mean, for token-weighted semantics
-            # Joint batch needs correction: T_total²/(T_train × T_val)
+            # Sum: each val grad already carries the batch loss's 1/batch_total; the
+            # score correction turns the sum into the val batch's own mean gradient.
+            val_grad = val_grads.sum(dim=0)
+            # Joint batch needs correction: N_batch²/(N_train × N_val) (item counts)
             score_correction = state.score_correction  # Tensor
 
         if val_grad is not None:
@@ -736,7 +738,7 @@ class GlobalSubsetLinearBackward(Function):
             train_input, val_inp = split_train_val_batch(input, state.train_batch_size)
             val_grad_total = None
             val_bias_grad = None
-            # Joint batch needs correction: T_total²/(T_train × T_val)
+            # Joint batch needs correction: N_batch²/(N_train × N_val) (item counts)
             score_correction = state.score_correction  # Tensor
 
         # Route to scoring method based on state configuration
@@ -827,9 +829,9 @@ class TrainOnlyRMSNormBackward(Function):
         grad_input = grad_input.to(ctx.input_dtype)
 
         # grad_weight: TRAIN-ONLY slice with normalization correction.
-        # grad_output carries 1/batch_total_tokens from the merged-batch loss.
+        # grad_output carries 1/batch_total (item count) from the merged-batch loss.
         # RMSNorm effectively "selects all train samples", so we rescale by
-        # batch_total_tokens / train_total_tokens to match a train-only loss
+        # batch_total / train_total to match a train-only loss
         # (i.e., what you'd get from forward/backward on just the train samples).
         if train_bs is not None and train_bs < grad_output.shape[0]:
             train_go = grad_output_f32[:train_bs]

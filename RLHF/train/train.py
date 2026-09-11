@@ -377,6 +377,7 @@ def main():
             model=model,
             layer_names=layer_names,
             device=device,
+            loss_reduction=training_args.loss_reduction,
         )
         if training_args.method == "GroupWiseSubset":
             # Partition the hooked (LoRA) layers into selection groups; see drpt.selection.grouping
