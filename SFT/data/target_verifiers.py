@@ -14,14 +14,16 @@ recorded outcome rather than a silent pass.
 Domains
 -------
 ``math`` (``math_persona``, ``math``, ``math_pool``, ``math_ref``, ...)
-    Gold = the reference's last ``\\boxed{}``, else the Tulu-3 persona line
-    ``Final Answer: The final answer is X. I hope it is correct.``, else a loose
-    ``final answer ... X`` line. A candidate's answer is its ``\\boxed{}`` content
-    (all boxes if several), else the same final-answer patterns. Scored with the
-    pinned Math-Verify used by the MATH500 evaluator; when that fails on the
-    free-form persona answers (``"20 plots and 60 miles"``) a numeric fallback
-    requires every number of the gold answer to appear in the candidate answer,
-    and a normalised string comparison covers number-free answers.
+    Gold = the text after the reference's LAST "final answer" anchor (covers the
+    Tulu-3 line ``Final Answer: The final answer is X. I hope it is correct.`` and
+    its markdown / GSM ``#### N`` / full-sentence variants), else its last
+    ``\\boxed{}``. A candidate's answer is its ``\\boxed{}`` content (all boxes if
+    several), else the same anchor rule. Scored with the pinned Math-Verify used by
+    the MATH500 evaluator; when that fails on free-form persona golds
+    (``"20 plots and 60 miles"``) a numeric fallback accepts a candidate that states
+    no number the gold lacks and covers one gold number per boxed part (1 %
+    rounding tolerance; enumerators such as ``(2)`` / ``Part 1`` ignored), and a
+    normalised string comparison covers number-free answers.
 ``if`` (``precise_if``)
     Dolci Precise-IF prompts embed IFEval's own instruction descriptions
     verbatim, so the constraints are recovered from the prompt text and checked
@@ -116,47 +118,85 @@ def extract_all_boxed(text: str) -> List[str]:
             return out
 
 
-# Tulu 3 persona format: "Final Answer: The final answer is $X$. I hope it is correct."
-_TULU_FINAL_RE = re.compile(
-    r"Final Answer:\s*The final answer is\s*(?P<ans>.+?)\.?\s*I hope it is correct\.?\s*$",
-    re.S | re.I,
-)
-_LOOSE_FINAL_RE = re.compile(r"final answer(?:\s+is)?\s*[:=]?\s*(?P<ans>[^\n]+)", re.I)
+# Persona references end in many variants of the Tulu 3 line "Final Answer: The final answer is
+# $X$. I hope it is correct.": markdown headers (``**Final Answer:**``, ``### Final Answer``),
+# GSM-style ``Final Answer: #### 1670``, or a full sentence ("The total ... is \(4\). The ... is
+# \(24\pi\) meters."). The answer is whatever follows the LAST "final answer" anchor.
+_FINAL_ANCHOR_RE = re.compile(r"final\s+answers?", re.I)
+_HOPE_RE = re.compile(r"\.?\s*I hope it is correct\.?\s*$", re.I)
 _NUMBER_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
+# "(1) ... (2) ...", "Part 1", "Sub-problem 2", "1. ..." list markers: enumerators, not answers.
+_ENUMERATOR_RE = re.compile(
+    r"\((?:\d{1,2}|[a-z]|i{1,3}|iv)\)|\b(?:part|sub-?problems?|problems?|questions?|steps?)\s*\d{1,2}\b|(?<![\d.,])\b\d{1,2}\.\s",
+    re.I,
+)
+
+
+def _clean_answer_segment(segment: str) -> Optional[str]:
+    seg = _HOPE_RE.sub("", segment.strip())
+    seg = seg.replace("**", "").replace("####", "")
+    seg = re.sub(r"^[\s:#\-—.]+", "", seg)
+    seg = re.sub(r"^(?:is|are)\b[\s:]*", "", seg, flags=re.I)
+    seg = re.sub(r"^(?:the\s+)?final\s+answers?\s+(?:is|are)\b[\s:]*", "", seg, flags=re.I)
+    seg = re.sub(r"^[\s:#\-—.]+", "", seg)
+    seg = _HOPE_RE.sub("", seg).strip().rstrip(".").strip()
+    return seg or None
 
 
 def extract_final_answer(text: str, *, prefer: str = "boxed") -> Optional[str]:
-    """Final answer of a solution: ``\\boxed{}`` content(s) or a final-answer line.
+    """Final answer of a solution: ``\\boxed{}`` content(s) or the final-answer statement.
 
     ``prefer="boxed"`` (candidates written under a boxed instruction) looks at
     ``\\boxed{}`` first; ``prefer="final_line"`` (persona references) looks at the
-    Tulu line first. Several boxes are joined with ``" and "``.
+    text after the last "final answer" anchor first. Several boxes are joined
+    with ``" and "``.
     """
     text = text.strip()
     boxes = [b.strip() for b in extract_all_boxed(text) if b.strip()]
-    tulu = _TULU_FINAL_RE.search(text)
     boxed_answer = " and ".join(boxes) if boxes else None
-    tulu_answer = tulu.group("ans").strip() if tulu else None
-    order = (boxed_answer, tulu_answer) if prefer == "boxed" else (tulu_answer, boxed_answer)
+    line_answer = None
+    anchors = list(_FINAL_ANCHOR_RE.finditer(text))
+    if anchors:
+        line_answer = _clean_answer_segment(text[anchors[-1].end():])
+        if not line_answer and len(anchors) > 1:  # trailing header with the statement before it
+            line_answer = _clean_answer_segment(text[anchors[-2].end():anchors[-1].start()])
+    order = (boxed_answer, line_answer) if prefer == "boxed" else (line_answer, boxed_answer)
     for answer in order:
         if answer:
             return answer
-    hits = list(_LOOSE_FINAL_RE.finditer(text))
-    if hits:
-        return hits[-1].group("ans").strip().rstrip(".").strip() or None
     return None
 
 
-def answer_numbers(answer: str) -> List[str]:
-    """Normalised numbers in an answer string (``1,000`` -> ``1000``, ``2.50`` -> ``2.5``)."""
-    out = []
-    for raw in _NUMBER_RE.findall(answer):
-        raw = raw.replace(",", "")
+def answer_numbers(answer: str) -> List[float]:
+    """Numbers in an answer (``1,000`` -> 1000.0), ignoring enumerators such as ``(2)`` or ``Part 1``."""
+    cleaned = _ENUMERATOR_RE.sub(" ", answer)
+    out: List[float] = []
+    for raw in _NUMBER_RE.findall(cleaned):
         try:
-            out.append(f"{float(raw):.6g}")
+            out.append(float(raw.replace(",", "")))
         except ValueError:
-            out.append(raw)
+            continue
     return out
+
+
+def numbers_match(a: float, b: float, rel_tol: float = 1e-2) -> bool:
+    """Equal up to 1% (references and rewrites round differently: 2.4596 vs 2.46)."""
+    return abs(a - b) <= max(rel_tol * max(abs(a), abs(b)), 1e-9)
+
+
+def numeric_answer_match(gold_numbers: Sequence[float], candidate_numbers: Sequence[float], n_parts: int) -> bool:
+    """Every number the candidate states occurs in the gold, and the candidate covers at least
+    ``min(distinct gold numbers, n_parts)`` distinct gold numbers (one per boxed part)."""
+    if not gold_numbers or not candidate_numbers:
+        return False
+    covered = set()
+    for c in candidate_numbers:
+        hits = [i for i, g in enumerate(gold_numbers) if numbers_match(c, g)]
+        if not hits:
+            return False
+        covered.add(hits[0])
+    distinct_gold = len({round(g, 6) for g in gold_numbers})
+    return len(covered) >= min(distinct_gold, max(1, n_parts))
 
 
 def normalize_answer_text(answer: str) -> str:
@@ -202,11 +242,11 @@ class MathAnswerVerifier(TargetVerifier):
             if scored["correct"]:
                 return VerificationResult(True, "correct", {**detail, "method": "math_verify"})
 
-        # 2) Numeric fallback: every number of the gold answer appears in the candidate answer.
+        # 2) Numeric fallback for free-form golds: the candidate states no number the gold lacks
+        #    and covers one gold number per boxed part (1% tolerance for rounding).
         gold_numbers = context["gold_numbers"]
         if gold_numbers:
-            candidate_numbers = set(answer_numbers(candidate))
-            if all(number in candidate_numbers for number in gold_numbers):
+            if numeric_answer_match(gold_numbers, answer_numbers(candidate), max(1, len(boxes))):
                 return VerificationResult(True, "correct", {**detail, "method": "numeric_match"})
         # 3) Number-free answers: normalised string equality.
         elif normalize_answer_text(gold) == normalize_answer_text(candidate):
@@ -514,5 +554,5 @@ def build_verifier(target: str, **kwargs: Any) -> TargetVerifier:
 __all__ = [
     "IfConstraintsVerifier", "MathAnswerVerifier", "MbppVerifier", "TargetVerifier", "VerificationResult",
     "answer_numbers", "base_target_name", "build_verifier", "extract_all_boxed", "extract_boxed_answer",
-    "extract_final_answer", "recover_if_constraints",
+    "extract_final_answer", "numeric_answer_match", "recover_if_constraints",
 ]
