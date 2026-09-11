@@ -85,9 +85,11 @@ class TrainingArguments(TA):
         metadata={
             "help": (
                 "Data curation method: 'NA' (no curation), "
-                "'LayerWiseSubset' (per-layer curation), 'GlobalSubset' (global curation), or "
+                "'LayerWiseSubset' (per-layer curation), 'GlobalSubset' (global curation), "
                 "'GroupWiseSubset' (curation per layer group; granularity set by "
-                "--selection_granularity / --selection_groups). "
+                "--selection_granularity / --selection_groups), or 'RandomSubset' (control: a "
+                "uniformly random selection_frac of every batch, trained with the same loss as the "
+                "curated arms). "
                 "'BlockWiseSubset' and 'SublayerWiseSubset' are aliases for GroupWiseSubset "
                 "with selection_granularity=block / sublayer."
             )
@@ -310,6 +312,9 @@ class TrainingArguments(TA):
             self.selection_groups = None
         if self.selection_groups is not None:
             self.selection_granularity = "custom"
+        _methods = ("NA", "LayerWiseSubset", "GlobalSubset", "GroupWiseSubset", "RandomSubset")
+        if self.method not in _methods:
+            raise ValueError(f"method must be one of {_methods} (or an alias), got {self.method!r}")
         if self.method == "GroupWiseSubset":
             from drpt.selection.grouping import GRANULARITIES
             if self.selection_granularity not in GRANULARITIES:

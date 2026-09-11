@@ -203,6 +203,12 @@ the sample's response length and selected samples enter the update weighted by
 length. Reported val/eval perplexities always use the model's token-mean loss.
 `tests/test_loss_convention.py` pins both conventions.
 
+`method: RandomSubset` is the matching control: every step keeps a uniformly
+random `selection_frac` of the batch (seeded from the run seed) and trains on it
+with the same loss as the curated arms, so it isolates *which* samples are kept
+from *how many*. `SFT/train/train_v3.sh` adds `--runs_root <dir>` and forwards a
+`loss_reduction` yaml key.
+
 ## Data preparation
 
 ```bash

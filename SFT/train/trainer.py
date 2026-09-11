@@ -24,9 +24,20 @@ from drpt.selection import create_separate_batch_strategy, create_merged_batch_s
 logger = logging.getLogger(__name__)
 
 
+def random_subset_indices(n: int, frac: float, generator: torch.Generator) -> Tensor:
+    """k = max(1, int(n * frac)) distinct indices drawn uniformly (sorted), for the RandomSubset baseline."""
+    k = min(n, max(1, int(n * frac)))
+    return torch.randperm(n, generator=generator)[:k].sort()[0]
+
+
 class LayerWiseSubsetTrainer(Trainer):
     """
     SFT Trainer supporting gradient-based data curation with optional compression.
+
+    Methods: the curation methods in drpt.selection.SELECTION_METHODS, "RandomSubset"
+    (uniformly random k = selection_frac * batch samples per step, trained with the
+    same loss as the curated arms: the control that separates "fewer samples" from
+    "the right samples"), and "NA" (full training).
     """
 
     def __init__(self, grad_hook: GradientHook, val_dataset, *args, **kwargs):
@@ -72,6 +83,12 @@ class LayerWiseSubsetTrainer(Trainer):
         if not hasattr(self.args, 'selection_frac') or self.args.selection_frac is None:
             if self.args.method == 'NA':
                 self.args.selection_frac = 1.0
+
+        # RandomSubset baseline: per-step uniformly random subset of the batch, seeded
+        # from the run seed so the draws are reproducible and differ across seeds.
+        self._random_subset_generator = None
+        if self.args.method == 'RandomSubset':
+            self._random_subset_generator = torch.Generator().manual_seed(int(self.args.seed) * 7919 + 17)
 
         # Initialize results tracking
         self.evaluation_results = []
@@ -124,9 +141,12 @@ class LayerWiseSubsetTrainer(Trainer):
         val_strategy = getattr(self.args, 'val_strategy', 'separate_batch_factorized')
         scoring_method = getattr(self.args, 'scoring_method', 'reduced_ghost')
         subset_mode = getattr(self.args, 'subset_mode', 'one_pass')
+        # Only the gradient-based methods need a curation strategy; RandomSubset and NA
+        # take the plain training paths in training_step.
+        strategy_method = self.args.method if self.args.method in SELECTION_METHODS else "NA"
         if val_strategy == 'merged_batch':
             self.selection_strategy = create_merged_batch_strategy(
-                method=self.args.method,
+                method=strategy_method,
                 grad_hook=self.grad_hook,
                 frac=getattr(self.args, 'selection_frac', 0.5),
                 use_second_order=getattr(self.args, 'use_second_order', False),
@@ -138,7 +158,7 @@ class LayerWiseSubsetTrainer(Trainer):
         else:
             # separate_batch_factorized or separate_batch
             self.selection_strategy = create_separate_batch_strategy(
-                method=self.args.method,
+                method=strategy_method,
                 grad_hook=self.grad_hook,
                 frac=getattr(self.args, 'selection_frac', 0.5),
                 use_second_order=getattr(self.args, 'use_second_order', False),
@@ -173,6 +193,8 @@ class LayerWiseSubsetTrainer(Trainer):
                 logger.info(f"  Mode: {mode_name} with compression (MeSO optimizer)")
             else:
                 logger.info(f"  Mode: {mode_name} without compression (standard optimizer)")
+        elif self.args.method == 'RandomSubset':
+            logger.info(f"  Mode: RandomSubset baseline (uniformly random {selection_frac} of each batch)")
         elif self.has_compression:
             logger.info(f"  Mode: MeSO only (compressed gradients, no curation)")
         else:
@@ -318,6 +340,7 @@ class LayerWiseSubsetTrainer(Trainer):
         - LayerWiseSubset: Single-pass, per-layer curation
         - GlobalSubset: Two-pass (or one-pass), global curation
         - GroupWiseSubset: Single-pass, per-layer-group curation (block / sublayer / custom)
+        - RandomSubset: uniformly random selection_frac of each batch (control)
         - NA: Baseline (no curation)
 
         With or without compression (MeSO).
@@ -413,6 +436,10 @@ class LayerWiseSubsetTrainer(Trainer):
 
             return loss
 
+        # === RANDOM SUBSET CONTROL ===
+        elif args.method == 'RandomSubset':
+            return self._training_step_random_subset(model, inputs)
+
         # === BASELINE MODE (no data curation) ===
         else:
             return self._training_step_baseline(model, inputs)
@@ -449,6 +476,20 @@ class LayerWiseSubsetTrainer(Trainer):
             loss = loss / self.args.gradient_accumulation_steps
 
         return loss
+
+    def _training_step_random_subset(self, model, inputs):
+        """
+        RandomSubset control: train on a uniformly random k = selection_frac * n subset of
+        the batch with the same loss the curated arms use (under "sample_mean" the plain
+        mean of the k per-example losses), so it matches a curated arm in everything but
+        which samples are kept.
+        """
+        inputs = self._prepare_inputs(inputs)
+        n = inputs['input_ids'].shape[0]
+        idx = random_subset_indices(n, float(self.args.selection_frac), self._random_subset_generator)
+        idx = idx.to(inputs['input_ids'].device)
+        subset = {k: (v[idx] if torch.is_tensor(v) and v.shape[:1] == (n,) else v) for k, v in inputs.items()}
+        return self._training_step_baseline(model, subset)
 
     def _training_step_baseline(self, model, inputs):
         """Baseline training step without curation."""
