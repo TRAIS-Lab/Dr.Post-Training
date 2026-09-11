@@ -6,7 +6,9 @@ Each YAML file defines a training method as `{CurationMethod}-{FinetuningMethod}
 
 | Field | Values | Description |
 |---|---|---|
-| `method` | Standard, LayerWiseSubset, GlobalSubset | Data curation method |
+| `method` | Standard, LayerWiseSubset, GlobalSubset, GroupWiseSubset, BlockWiseSubset, SublayerWiseSubset | Data curation method (`BlockWiseSubset` / `SublayerWiseSubset` = `GroupWiseSubset` with `selection_granularity` block / sublayer) |
+| `selection_granularity` | layer, sublayer, block, global, custom | GroupWiseSubset only: which hooked layers select jointly (default block) |
+| `selection_groups` | `name=member,..;name=..` | GroupWiseSubset only: custom per-block groups (implies custom); no `:` or quotes in the value |
 | `finetuning` | Full, LoRA, MeSO, MeSO-LoRA | Training approach |
 | `lora_r`, `lora_alpha`, `lora_dropout` | int, int, float | LoRA hyperparameters |
 

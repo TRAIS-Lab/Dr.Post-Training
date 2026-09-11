@@ -1,0 +1,16 @@
+# GlobalSubset curation, top-k keeping 2 of 8 candidates — cos2 variant: cosine schedule, 10 % warmup, 2 epochs (literature recipe, 2026-09-10)
+method: GlobalSubset
+finetuning: Full
+learning_rate: 1.00e-05
+selection_frac: 0.25
+selection_mode: topk
+record_selections: true
+subset_mode: one_pass
+
+scoring:
+  method: reduced_ghost
+
+# Schedule overrides (community Qwen3-1.7B-Base recipe)
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+num_train_epochs: 2

@@ -6,7 +6,7 @@ This folder contains the training and evaluation code and method configurations 
 
 | Task     | Model        | Batch | Val Size | Epochs | LoRA Rank |
 | -------- | ------------ | ----- | -------- | ------ | --------- |
-| Toxicity | gpt-neo-2.7B | 256   | 1024     | 1      | 16        |
+| Toxicity | gpt-neo-2.7B | 256   | 0 (self-ref) or 1024 (held-out) | 1 | 16 |
 
 ### Method Configurations
 
@@ -15,15 +15,21 @@ All methods use **LoRA training** (no MeSO compression). Each method has a YAML 
 | Config                | Curation  | Description                                    |
 | --------------------- | --------- | ---------------------------------------------- |
 | `FullTraining-LoRA.yaml`    | NA        | Baseline PPO (no data curation)               |
+| `TargetOnly-LoRA.yaml`      | NA        | Baseline PPO trained only on the `n_val` held-out target prompts (28 epochs, capped at 110 steps to match FullTraining's update budget); compares against held-out curation runs |
 | `IIF-LoRA.yaml`         | IIF       | Pre-filter rollout before PPO epochs           |
 | `LayerWiseSubset-LoRA.yaml`   | LayerWiseSubset | Per-layer curation with projected scoring |
-| `GlobalSubset-LoRA.yaml`      | GlobalSubset    | Global curation with exact scoring        |
+| `GlobalSubset-LoRA.yaml`      | GlobalSubset    | Global curation with exact scoring (`subset_mode: one_pass`, single backward like LayerWiseSubset; the un-hooked value head then trains on the full mini-batch) |
+| `BlockWiseSubset-LoRA.yaml`   | GroupWiseSubset (block)    | Per-transformer-block curation: all hooked LoRA layers of a block select jointly (single backward) |
+| `SublayerWiseSubset-LoRA.yaml`| GroupWiseSubset (sublayer) | Per attention / MLP sub-block curation (single backward) |
 
 **Curation Methods:**
 - **NA**: No data curation (baseline)
 - **IIF**: Influence Function-based Filtering — pre-filter entire rollout *before* PPO epochs
 - **LayerWiseSubset**: Per-layer, per-mini-batch curation during PPO training
 - **GlobalSubset**: Global curation across all layers, per-mini-batch during PPO training
+- **GroupWiseSubset**: Per-layer-group curation (`selection_granularity: layer | sublayer | block | global`, or
+  custom per-block `selection_groups` rules — see `SFT/README.md`, "Group-wise curation");
+  `BlockWiseSubset` / `SublayerWiseSubset` are the block / sublayer aliases
 
 ### Training Commands
 
@@ -48,7 +54,8 @@ bash RLHF/train/train.sh -c configs/toxicity --list
 
 #### Seed Sweeps and CLI Overrides
 
-The `--seed`, `--lr`, `--lr_vhead`, and `--init_kl_coef` flags override config values:
+The `--seed`, `--lr`, `--lr_vhead`, `--init_kl_coef`, `--n_val`, `--val_loss_type`,
+`--val_batch_size` and `--max_steps` flags override config values:
 
 ```bash
 # Run all methods with 3 different seeds
@@ -58,6 +65,46 @@ done
 
 # Quick LR test
 bash RLHF/train/train.sh -c configs/toxicity -m LayerWiseSubset-LoRA --lr 5e-6
+
+# Held-out target with the PPO training loss as validation objective
+bash RLHF/train/train.sh -c configs/toxicity -m GlobalSubset-LoRA --n_val 1024 --val_loss_type train-loss
+```
+
+#### Validation Target (`val_loss_type`) and Run Naming
+
+The curation methods score each training sample by the alignment of its gradient with a
+*target* gradient captured once per rollout batch (before the PPO epochs, at the same
+parameters that produced the rollouts). The target is defined by two knobs:
+
+| Knob | Values | Meaning |
+| --- | --- | --- |
+| `n_val` | `0` | Self-referencing: the target is computed on the training rollouts themselves |
+| | `>0` | Held-out: `n_val` prompts from the RTP test split; each step regenerates one `val_batch_size` batch from the current policy |
+| `val_loss_type` | `reward` (dir: `rew`) | $-\mathbb{E}[\text{normalize}(R)\,\log\pi_\theta(y\mid x)]$, sequence-level |
+| | `token-pg` (dir: `tpg`) | $-\sum_t A_t \log\pi_\theta(y_t\mid\cdot)$, token-level policy gradient with GAE advantages |
+| | `train-loss` (dir: `tloss`) | the PPO training objective: clipped surrogate + `vf_coef` × clipped value loss |
+
+Because the target is captured at the rollout parameters, the PPO ratio is 1 and the clipping
+is inactive, so `train-loss` equals `token-pg` plus the value-loss term (up to normalization).
+Clipping only affects the *training-side* per-sample gradients inside the PPO epochs.
+
+Run directories are named
+`{task}-{model}-{Method}-{finetuning}-lr{lr}-b{batch}-v{n_val}-{rew|tpg|tloss}[-b{val_batch_size}]-pe{ppo_epochs}-mb{mini_batch}-kl{init_kl_coef}-s{seed}`
+under `$SCRATCH_DIR/Dr.Post-Training/RLHF/`. `FullTraining` never uses a target and is always
+filed under `v0-rew`; `result.ipynb` reuses that single run for every scenario. The same names
+(`SCENARIOS`, `VAL_TYPE_SHORT`) are used in `result.ipynb` and `train/submit_all.sh`.
+
+
+#### Full Sweep on Slurm
+
+`RLHF/train/submit_all.sh` writes one manifest line per (method, scenario, seed) and submits a
+single job array (never a loop of `sbatch` calls):
+
+```bash
+bash RLHF/train/submit_all.sh --dry-run                 # manifest + sbatch line only
+bash RLHF/train/submit_all.sh --smoke                   # one 2-step job per val_loss_type
+bash RLHF/train/submit_all.sh                           # 5 seeds x 6 scenarios x 3 methods + 5 FullTraining
+bash RLHF/train/submit_all.sh --seeds "42" --scenarios "self-ref/train-loss,held-out/train-loss"
 ```
 
 | Category    | Matches            |
@@ -67,6 +114,9 @@ bash RLHF/train/train.sh -c configs/toxicity -m LayerWiseSubset-LoRA --lr 5e-6
 | `iif`       | `IIF-*`            |
 | `layer-wise-subset` | `LayerWiseSubset-*`      |
 | `global-subset`    | `GlobalSubset-*`         |
+| `block-wise-subset` | `BlockWiseSubset-*`     |
+| `sublayer-wise-subset` | `SublayerWiseSubset-*` |
+| `group-wise-subset` | `GroupWiseSubset-*`, `BlockWiseSubset-*`, `SublayerWiseSubset-*` |
 | `lora`      | `*-LoRA`           |
 
 <details>
@@ -83,6 +133,8 @@ configs/toxicity/
   IIF-LoRA.yaml          # method + compression
   LayerWiseSubset-LoRA.yaml    # method + compression
   GlobalSubset-LoRA.yaml       # method + compression
+  BlockWiseSubset-LoRA.yaml    # group-wise curation (per block)
+  SublayerWiseSubset-LoRA.yaml # group-wise curation (per attention / MLP sub-block)
 ```
 
 #### defaults.yaml (shared experiment settings)
@@ -155,9 +207,16 @@ To ensure genuine toxicity reduction (not reward hacking), we use **different cl
 
 #### Dataset
 
-- **Source**: `allenai/real-toxicity-prompts` (train split)
-- **Filtering**: Prompts with toxicity score > 0.5
-- **Default samples**: 100 (training), 400 (post-training eval)
+- **Training prompts**: `allenai/real-toxicity-prompts`, prompt toxicity > 0.3, first 80% of the
+  filtered rows (unshuffled split), 5–15-token prefixes of prompt+continuation.
+- **Held-out 20%** of the filtered rows is split in two halves: the first half supplies the fixed
+  validation prompts for curation (`n_val`), the second half supplies the in-training evaluation
+  prompts (filtered again to toxicity > 0.5, first `n_eval`, default 500). Training, validation and
+  evaluation prompts are therefore disjoint (previously the in-training eval prompts were the
+  first rows of the *whole* dataset, i.e. inside the training set).
+- **Post-training eval** (`RLHF/eval/eval.py`): `OxAISH-AL-LLM/wiki_toxic` test split, toxic label.
+- In-training eval samples inside a forked RNG state (fixed seed), so evaluation does not perturb the
+  training trajectory and eval noise is identical across steps and methods.
 
 #### Metrics
 
@@ -165,7 +224,6 @@ To ensure genuine toxicity reduction (not reward hacking), we use **different cl
 | ------------- | ------------------------------------------- |
 | Mean Toxicity | Average toxicity score across generations   |
 | Std Toxicity  | Standard deviation of toxicity scores       |
-| Max Toxicity  | Maximum toxicity score in batch             |
 | Toxicity Rate | Fraction of generations with toxicity > 0.5 |
 
 #### Usage

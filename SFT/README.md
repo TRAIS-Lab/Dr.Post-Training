@@ -37,7 +37,7 @@ knobs above; only what the files *mean* changes.
 | Benchmark | `eval.sh --target` | `eval/ifeval/ifeval_bench_data.jsonl` | full official set | Post-hoc metric via generation + verifier |
 
 The target's `test` file is **not** the benchmark. It is a loss-only held-out
-drawn from the same source as D* (Dolci Precise-IF rows, MATH train, MBPP
+drawn from the same source as D* (Dolci Precise-IF rows, Dolci math rows, MBPP
 train). The benchmark is a different dataset that shares the skill (IFEval and
 IFBench, MATH500, MBPP+) and carries verifier metadata instead of reference
 answers. One target can map to several benchmarks:
@@ -50,6 +50,22 @@ answers. One target can map to several benchmarks:
 
 If a target file has fewer rows than `n_val`/`n_eval` request, the loader logs a
 warning and uses what exists (MBPP train has only 374 rows).
+
+### Benchmark decontamination
+
+Benchmarks (`eval/<bench>/<bench>_bench_data.jsonl`) are never loaded by
+`train.py`; they are only read by `SFT/eval/eval.sh` after training.
+`prepare_datasets.py` additionally drops any pool or target row whose normalised
+user prompt exactly matches a benchmark prompt, or shares at least 80% of its
+unique word 8-grams with one (the Dr.Post-Training-Next rule); the mbpp target
+also excludes every MBPP+ task id. `--datasets dolci_audit` re-checks the files
+on disk.
+
+Shared boilerplate is *not* leakage and is deliberately kept: IFEval's constraint
+templates ("your answer must contain a title wrapped in double angular
+brackets") appear verbatim in Dolci Precise-IF prompts, and generic code/math
+idioms share long n-grams with MBPP+/MATH500 solutions. Neither reveals a
+benchmark task. What this cannot cover is the base model's pre-training data.
 
 ### What the harness adds
 
@@ -68,7 +84,13 @@ warning and uses what exists (MBPP train has only 374 rows).
   rejection; `0` disables) are new `defaults.yaml` keys.
 - **Benchmarks.** `SFT/eval/tasks/{ifeval,ifbench,math500,mbpp_plus}.py`, with
   `eval.sh --target <target>` running every benchmark of a target. Metrics are
-  task-native percentages and are never averaged across tasks.
+  task-native percentages and are never averaged across tasks. Decoding follows
+  the Qwen3 non-thinking recommendation by default (`--temperature 0.7 --top_p 0.8
+  --top_k 20`, seeded by `--seed`); `--temperature 0` gives greedy decoding. The
+  settings are recorded under `generation` in every `<bench>_results.json`. A few
+  percent of generations never stop, so `--batch_size 64 --max_new_tokens 2048`
+  (the launcher default) is 5-8x faster than batch 16 with a 4096 cap at no cost
+  in accuracy for these models.
 
 ### Commands
 
@@ -76,9 +98,49 @@ warning and uses what exists (MBPP train has only 374 rows).
 # Benchmark files (public, pinned revisions). mbpp_plus needs `pip install evalplus==0.3.1`.
 python SFT/data/prepare_datasets.py --datasets ifeval ifbench math500 mbpp_plus
 
-# Train pools and targets: see the layout above; a prepare step will follow.
+# mbpp target (D* 128 + held-out) from MBPP train minus MBPP+ task ids, and math_ref (MATH-train
+# reference solutions; no longer a training target, but the pools were decontaminated against it).
+# Both are decontaminated against the benchmark prompts, so build the benchmark files first.
+python SFT/data/prepare_datasets.py --datasets math_ref mbpp
 
-# Train (Qwen3-1.7B-Base, batch 8, 4096 tokens, one epoch over the pool)
+# Train pools (3 x 32,000 rows from allenai/Dolci-Instruct-SFT, pinned revision) + the precise_if target
+# (Dolci Precise-IF rows, as in Dr.Post-Training-Next). Pools are uniform samples over domain groups:
+# instruction = Chat/Precise IF/Other/Multilingual/Safety, reasoning = Math/Coding/Reasoning/Science,
+# mixed = both. Tool-use and hardcoded rows, conversations that are not plain user/assistant chats, and
+# rows over 16K characters are dropped. Every pool row is decontaminated against benchmark AND target
+# prompts (exact normalised match or >= 80% shared word 8-grams, the Next rule), and the precise_if
+# target rows are additionally removed by id.
+python SFT/data/prepare_datasets.py --datasets dolci_pools --num_proc 16
+python SFT/data/prepare_datasets.py --datasets dolci_audit   # re-check: must print CLEAN
+
+# `math` target (config dirs `dolci_reason_math`, `dolci_mixed_math`): 128 D* + 500 held-out rows, half from the
+# benchmarks' own held-out sets (MATH train via math_ref, 32/125; GSM8K train, 32/125, minus problems that occur
+# in a pool) and half from the pools' four math sources (16 / 62-63 each: Tulu 3 Persona MATH, GSM, Algebra and
+# the Dolci slice of OpenMathInstruct 2, rows that are in no pool). Rows are copied verbatim. Controls:
+# `math_ref` (MATH train only, reference solutions), `math_pool` (pool-side sources only), `math_persona` (the
+# three Persona sources only).
+python SFT/data/build_math_pool_target.py --data_dir $SCRATCH_DIR/Dr.Post-Training/SFT/data --num_proc 16   # math_pool
+python SFT/data/build_math_target.py --data_dir $SCRATCH_DIR/Dr.Post-Training/SFT/data                      # math (needs math_ref + math_pool)
+python SFT/data/build_math_persona_target.py --data_dir $SCRATCH_DIR/Dr.Post-Training/SFT/data --num_proc 16
+
+# Strong-model rewritten D* (variants `<target>_gen<tag>` / `<target>_rw<tag>`; SFT/data/gen_target_candidates.py +
+# SFT/data/build_rewrite_target.py; verifiers in SFT/data/target_verifiers.py, ported from Next). Stage 1 samples 8
+# candidate answers per D* row (2 per held-out row) from a generator model, non-thinking, T 0.7 / top-p 0.8 / top-k 20:
+# `gen` = re-solved from the prompt alone (math prompts use the MATH500 boxed template), `rw` = the reference answer
+# rewritten into the requested format (constraints satisfied exactly / step-by-step boxed solution). Stage 2 keeps, per
+# row, the first (rw) or shortest (gen) candidate that passes the domain verifier: Math-Verify on the reference's final
+# answer (numeric / normalised-string fallback for free-form persona answers), IFEval constraints recovered from the
+# prompt (strict), MBPP asserts. D* rows with no verified candidate are dropped, held-out rows keep the reference, rows
+# the verifier cannot check keep the generated answer flagged `unverifiable`; eval/<name>/manifest.json has the counts.
+# eval.py maps the variants to the base target's benchmarks; config dirs dolci_inst_if_{gen,rw}32b and
+# dolci_{mixed,reason}_mathpersona_{gen,rw}32b. Stage 1 can run in a vLLM env (only transformers is imported).
+DATA=$SCRATCH_DIR/Dr.Post-Training/SFT/data
+python SFT/data/gen_target_candidates.py --data_dir $DATA --generator <Qwen3-32B path> --backend vllm --tag 32b \
+    --jobs precise_if:solve precise_if:rewrite math_persona:solve math_persona:rewrite --out_dir $DATA/candidates
+python SFT/data/build_rewrite_target.py --data_dir $DATA --source_target precise_if --name precise_if_gen32b \
+    --candidates $DATA/candidates/precise_if_gen32b.jsonl
+
+# Train (Qwen3-1.7B-Base, batch 8, 2048 tokens, one epoch over the pool)
 bash SFT/train/train.sh -c configs/dolci_inst_if -m all
 bash SFT/train/train.sh -c configs/dolci_reason_math -m "FullTraining-Full,LayerWiseSubset-Full"
 
@@ -164,9 +226,12 @@ python SFT/data/prepare_datasets.py --datasets alpaca triviaqa_train dolly oasst
 | `GlobalSubset-Full`     | global top-k   | Full       |
 | `GlobalSubset-LoRA`     | global top-k   | LoRA r=8   |
 | `GlobalSubset-MeSO`     | global top-k   | MeSO       |
+| `BlockWiseSubset-Full`  | per-block top-k (Dolci settings)    | Full |
+| `SublayerWiseSubset-Full` | per attention/MLP sub-block top-k (Dolci settings) | Full |
 
 Setting 1 (`alpaca_samsum`) runs all 9; settings 2–4 run only the 3 LoRA
-variants. Per-task target-only baselines (`FullTraining-{Full,LoRA,MeSO}`
+variants. The Dolci settings additionally run the two group-wise variants
+(see "Group-wise curation" below). Per-task target-only baselines (`FullTraining-{Full,LoRA,MeSO}`
 via `train_val_ablation.sh`) train directly on the `n_val=16` task
 validation samples.
 
@@ -174,17 +239,29 @@ validation samples.
 
 ## Submitting the full sweep
 
+`submit_all.sh` writes one manifest per stage and submits each stage as a
+single Slurm **job array** (never a loop of `sbatch` calls, which trips the
+controller's per-user RPC limit). Your `submit.sh` must honour the
+`ARRAY`/`MANIFEST`/`DEPEND` knobs described in the top-level README.
+
 ```bash
-# 90 main + 30 target-only + 18 eval-main + 6 eval-target = 144 jobs
-bash SFT/train/submit_all.sh             # submit
-bash SFT/train/submit_all.sh --dry-run   # print sbatch commands only
+# Paper suite (Llama-3.2-1B): 90 main + 30 target-only + 18 eval-main + 6 eval-target = 144 tasks, 4 arrays
+bash SFT/train/submit_all.sh --suite paper
+# Dolci suite (Qwen3-1.7B-Base): 5 settings x 3 Full methods per seed, + one benchmark eval per (setting, method)
+bash SFT/train/submit_all.sh --suite dolci --seeds 42
+bash SFT/train/submit_all.sh --suite dolci --settings dolci_inst_if --stages 1   # subset / single stage
+bash SFT/train/submit_all.sh --suite paper --dry-run                             # manifests + sbatch lines only
 ```
 
-Layout:
-- Stage 1: 90 main training jobs (3h walltime)
-- Stage 2: 30 target-only jobs (2h walltime)
-- Stage 3: 18 main-eval jobs (2h, depends on Stage 1)
-- Stage 4: 6 target-eval jobs (2h, depends on Stage 2)
+Options: `--seeds "2 22 42 62 82"`, `--stages 1,2,3,4`, `--settings a,b`,
+`--max-concurrent K` (array `%K`, default 8). `QOS` defaults to `high`
+because runs do not checkpoint, so a preempted `low` job restarts from scratch.
+
+Stages (paper suite walltimes; Dolci main runs get 16h and evals 8h):
+- Stage 1: main training array (3h)
+- Stage 2: target-only array (2h; paper suite only)
+- Stage 3: eval-main array (2h, `afterok` Stage 1)
+- Stage 4: eval-target array (2h, `afterok` Stage 2)
 
 ## Single-job training
 
@@ -195,7 +272,46 @@ bash SFT/train/train.sh -c configs/<setting> --list
 ```
 
 Categories: `all`, `full-training`, `layer-wise-subset`, `global-subset`,
-`full`, `lora`, `meso`.
+`block-wise-subset`, `sublayer-wise-subset`, `group-wise-subset`, `full`,
+`lora`, `meso`.
+
+### Group-wise curation (`GroupWiseSubset`)
+
+`LayerWiseSubset` selects a subset per hooked Linear layer and `GlobalSubset`
+selects one subset for the whole model. `GroupWiseSubset` selects per *group*
+of hooked layers for any partition in between: scores are accumulated over the
+group's layers during backward and, as soon as the last layer of the group has
+run, the group selects its samples and assembles the curated gradient for
+exactly those layers (single backward, no extra FLOPs; only one group's
+activations are retained at a time when groups are contiguous in backward
+order, which they are for the presets below).
+
+| YAML | Groups |
+|---|---|
+| `method: BlockWiseSubset` | one group per decoder block `model.layers.N` (alias for `GroupWiseSubset` + `selection_granularity: block`) |
+| `method: SublayerWiseSubset` | two groups per block: `self_attn.*` = {q,k,v,o} and `mlp.*` = {gate,up,down} (alias for `selection_granularity: sublayer`) |
+| `method: GroupWiseSubset` + `selection_granularity: layer \| sublayer \| block \| global` | presets; `layer` == `LayerWiseSubset`, `global` == one-pass `GlobalSubset` |
+| `method: GroupWiseSubset` + `selection_groups: <rules>` | custom per-block groups |
+
+Custom rules are `"<name>=<member>[,<member>..];<name>=.."`; a member matches a
+layer when its dot-separated components appear contiguously in the layer name
+after `model.layers.N.` (PEFT names such as `self_attn.q_proj.lora_A.default`
+match `q_proj`). Unmatched layers stay singletons; `embed_tokens` and `lm_head`
+are always singletons except under `global`. Example
+(`configs/dolci_reason_math/GroupWiseSubset-Full-custom4.yaml`, four groups per block):
+
+```yaml
+method: GroupWiseSubset
+selection_groups: attn.qkv=q_proj,k_proj,v_proj;attn.o=o_proj;mlp.gateup=gate_proj,up_proj;mlp.down=down_proj
+```
+
+The value must not contain `:` or quotes (it goes through the line-based YAML
+parser in `train.sh`). With `record_selections: true` the run's
+`selection_records.json` stores one entry per group (`group`, `layer_indices`,
+`selected_indices`, `scores`) and the metadata lists `layer_groups`, the group
+key of every hooked layer. `tests/test_groupwise_selection.py` checks that
+`selection_frac=1.0` reproduces plain training, `layer` == `LayerWiseSubset`
+and `global` == `GlobalSubset` exactly (CPU, tiny model).
 
 ```bash
 bash SFT/train/train_val_ablation.sh \
@@ -226,6 +342,8 @@ configs/<setting>/
   FullTraining-{Full,LoRA,MeSO}.yaml
   GlobalSubset-{Full,LoRA,MeSO}.yaml
   LayerWiseSubset-{Full,LoRA,MeSO}.yaml
+  BlockWiseSubset-Full.yaml           # Dolci settings only (group-wise curation)
+  SublayerWiseSubset-Full.yaml        # Dolci settings only
 ```
 
 `defaults.yaml`:
@@ -257,7 +375,7 @@ scoring:
   method: reduced_ghost
 ```
 
-Load order: defaults → `defaults.yaml` → method YAML → CLI (`--seed`, `--lr`).
+Load order: defaults → `defaults.yaml` → method YAML → CLI (`--seed`, `--lr`, `--n_val`).
 
 #### Adding a new setting
 

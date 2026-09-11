@@ -1,0 +1,9 @@
+# Standard full fine-tuning (no data curation) — cos2 variant: cosine schedule, 10 % warmup, 2 epochs (literature recipe, 2026-09-10)
+method: FullTraining
+finetuning: Full
+learning_rate: 1.00e-05
+
+# Schedule overrides (community Qwen3-1.7B-Base recipe)
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+num_train_epochs: 2

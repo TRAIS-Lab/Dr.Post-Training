@@ -51,6 +51,7 @@ config_dir=""
 methods=""
 seed_override=""
 lr_override=""
+n_val_override=""
 eval_split_override=""
 dry_run=false
 
@@ -60,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --methods|-m)     methods="$2"; shift 2 ;;
         --seed)           seed_override="$2"; shift 2 ;;
         --lr)             lr_override="$2"; shift 2 ;;
+        --n_val)          n_val_override="$2"; shift 2 ;;
         --eval_split)     eval_split_override="$2"; shift 2 ;;
         --dry-run)        dry_run=true; shift ;;
         --list)
@@ -72,7 +74,7 @@ while [[ $# -gt 0 ]]; do
                 [[ "$name" != "defaults" ]] && echo "  $name"
             done
             echo ""
-            echo "Categories: all, full-training, layer-wise-subset, global-subset, full, lora, meso"
+            echo "Categories: all, full-training, layer-wise-subset, global-subset, block-wise-subset, sublayer-wise-subset, group-wise-subset, full, lora, meso"
             exit 0
             ;;
         --help|-h)
@@ -89,15 +91,24 @@ Required:
 Optional:
   --seed <seed>           Override seed from config
   --lr <lr>               Override learning rate from config
+  --n_val <n>             Override the number of D* rows (n_val) from config
   --eval_split <split>    Override eval split ("test" or "lr")
   --dry-run               Print commands without executing
   --list                  List available methods and exit
 
-Categories: all, full-training, layer-wise-subset, global-subset, full, lora, meso
+Categories: all, full-training, layer-wise-subset, global-subset,
+            block-wise-subset, sublayer-wise-subset, group-wise-subset, full, lora, meso
+
+Group-wise curation (method: GroupWiseSubset, or the aliases BlockWiseSubset /
+SublayerWiseSubset) takes two extra YAML keys:
+  selection_granularity: layer | sublayer | block | global | custom
+  selection_groups:      per-block rules, e.g. "attn.qkv=q_proj,k_proj,v_proj;attn.o=o_proj;mlp=gate_proj,up_proj,down_proj"
+                         (no ':' or quotes inside; setting it implies custom)
 
 Examples:
   bash train.sh -c configs/alpaca_samsum -m all
   bash train.sh -c configs/less_tydiqa -m "LayerWiseSubset-LoRA,GlobalSubset-LoRA" --seed 123
+  bash train.sh -c configs/dolci_reason_math -m "BlockWiseSubset-Full,SublayerWiseSubset-Full"
   bash train.sh -c configs/alpaca_samsum -m full-training --dry-run
 HELP
             exit 0
@@ -144,6 +155,8 @@ reset_config() {
     cfg_val_strategy="merged_batch"
     cfg_use_second_order="false"
     cfg_subset_mode="one_pass"
+    cfg_selection_granularity=""       # GroupWiseSubset only; empty -> train.py default (block)
+    cfg_selection_groups=""            # GroupWiseSubset only; custom per-block rules (implies custom)
 
     # LoRA
     cfg_lora_r="8"
@@ -228,6 +241,8 @@ parse_yaml() {
             val_strategy)                        cfg_val_strategy="$val" ;;
             use_second_order)                    cfg_use_second_order="$val" ;;
             subset_mode)                         cfg_subset_mode="$val" ;;
+            selection_granularity)               cfg_selection_granularity="$val" ;;
+            selection_groups)                    cfg_selection_groups="$val" ;;
             lora_r)                              cfg_lora_r="$val" ;;
             lora_alpha)                          cfg_lora_alpha="$val" ;;
             lora_dropout)                        cfg_lora_dropout="$val" ;;
@@ -282,6 +297,9 @@ resolve_methods() {
             full-training)       for m in "${available[@]}"; do [[ "$m" == FullTraining-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             layer-wise-subset)      for m in "${available[@]}"; do [[ "$m" == LayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             global-subset)         for m in "${available[@]}"; do [[ "$m" == GlobalSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            block-wise-subset)     for m in "${available[@]}"; do [[ "$m" == BlockWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            sublayer-wise-subset)  for m in "${available[@]}"; do [[ "$m" == SublayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            group-wise-subset)     for m in "${available[@]}"; do [[ "$m" == GroupWiseSubset-* || "$m" == BlockWiseSubset-* || "$m" == SublayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             full)           for m in "${available[@]}"; do [[ "$m" == *-Full ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             lora)           for m in "${available[@]}"; do [[ "$m" == *-LoRA ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             meso)           for m in "${available[@]}"; do [[ "$m" == *-MeSO ]] && resolved="${resolved:+$resolved,}$m"; done ;;
@@ -319,6 +337,7 @@ run_method() {
     # CLI overrides
     [[ -n "$seed_override" ]] && cfg_seed="$seed_override"
     [[ -n "$lr_override" ]] && cfg_learning_rate="$lr_override"
+    [[ -n "$n_val_override" ]] && cfg_n_val="$n_val_override"
 
     # Validate required fields
     if [[ -z "$cfg_target_task" ]] || [[ -z "$cfg_percentage" ]]; then
@@ -358,6 +377,10 @@ run_method() {
     echo "Job: $JOB_NAME"
     echo "Model: $cfg_model | Task: $cfg_target_task | LR: $cfg_learning_rate"
     echo "Method: $cfg_method | Finetuning: $cfg_finetuning"
+    case "$cfg_method" in
+        GroupWiseSubset|BlockWiseSubset|SublayerWiseSubset)
+            echo "Grouping: granularity=${cfg_selection_granularity:-<default>} groups=${cfg_selection_groups:-<none>}" ;;
+    esac
     echo "Batch: $cfg_batch_size | Val: $cfg_val_batch_size | Curation: $cfg_selection_frac"
     echo "Seq len: $cfg_max_seq_length | Grad ckpt: $cfg_gradient_checkpointing | n_val: $cfg_n_val | n_eval: $cfg_n_eval"
     echo "Output: $output_dir"
@@ -379,8 +402,7 @@ run_method() {
     local PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 40000)))
 
     # Build command
-    local cmd="torchrun --nproc_per_node 1 --nnodes 1 \
---rdzv_id=$RANDOM --rdzv_backend c10d --rdzv_endpoint=localhost:$PORT \
+    local cmd="torchrun --standalone --nproc_per_node 1 --nnodes 1 \
 -m SFT.train.train \
 $FIXED_ARGS \
 $fsdp_args \
@@ -414,6 +436,9 @@ $fsdp_args \
 
     # Optional args
     [[ -n "$cfg_val_seq_length_multiplier" ]] && cmd="$cmd --val_seq_length_multiplier $cfg_val_seq_length_multiplier"
+    # GroupWiseSubset grouping (single-quoted: the rules string contains ';' and spaces)
+    [[ -n "$cfg_selection_granularity" ]] && cmd="$cmd --selection_granularity $cfg_selection_granularity"
+    [[ -n "$cfg_selection_groups" ]] && cmd="$cmd --selection_groups '$cfg_selection_groups'"
     [[ -n "$cfg_train_dataset" ]] && cmd="$cmd --train_dataset_names $cfg_train_dataset"
     [[ -n "$cfg_val_batch_size" ]] && cmd="$cmd --val_batch_size_for_selection $cfg_val_batch_size"
 
@@ -482,14 +507,21 @@ echo "Methods: $resolved_methods ($TOTAL total)"
 echo "========================================================"
 
 current=0
+failed=()
 for method_name in "${method_list[@]}"; do
     current=$((current + 1))
     echo ""
     echo "[$current/$TOTAL] $method_name"
-    run_method "$method_name"
+    run_method "$method_name" || failed+=("$method_name")
 done
 
 echo ""
 echo "========================================================"
-echo "  All $TOTAL methods completed!"
-echo "========================================================"
+if [[ ${#failed[@]} -eq 0 ]]; then
+    echo "  All $TOTAL methods completed!"
+    echo "========================================================"
+else
+    echo "  ${#failed[@]}/$TOTAL methods FAILED: ${failed[*]}"
+    echo "========================================================"
+    exit 1
+fi

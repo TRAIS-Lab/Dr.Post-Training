@@ -85,7 +85,38 @@ class TrainingArguments(TA):
         metadata={
             "help": (
                 "Data curation method: 'NA' (no curation), "
-                "'LayerWiseSubset' (per-layer curation), or 'GlobalSubset' (global curation)"
+                "'LayerWiseSubset' (per-layer curation), 'GlobalSubset' (global curation), or "
+                "'GroupWiseSubset' (curation per layer group; granularity set by "
+                "--selection_granularity / --selection_groups). "
+                "'BlockWiseSubset' and 'SublayerWiseSubset' are aliases for GroupWiseSubset "
+                "with selection_granularity=block / sublayer."
+            )
+        },
+    )
+    selection_granularity: str = field(
+        default="block",
+        metadata={
+            "help": (
+                "GroupWiseSubset only. Layer grouping preset: "
+                "'layer' (one group per Linear; == LayerWiseSubset), "
+                "'sublayer' (per decoder block: {q,k,v,o} and {gate,up,down}), "
+                "'block' (per decoder block, default), "
+                "'global' (one group; == GlobalSubset one_pass), "
+                "'custom' (per-block rules from --selection_groups). "
+                "Embedding and lm_head are singleton groups except under 'global'."
+            )
+        },
+    )
+    selection_groups: str = field(
+        default=None,
+        metadata={
+            "help": (
+                "GroupWiseSubset only. Custom per-block grouping rules "
+                "'<name>=<member>[,<member>..];<name>=..', e.g. "
+                "'attn.qkv=q_proj,k_proj,v_proj;attn.o=o_proj;mlp.gateup=gate_proj,up_proj;mlp.down=down_proj'. "
+                "A member matches a layer when its dot-separated components appear contiguously in the "
+                "layer name after the 'model.layers.N.' prefix. Unmatched layers stay singletons. "
+                "Setting this implies selection_granularity=custom. Must not contain ':' or quotes."
             )
         },
     )
@@ -223,6 +254,7 @@ class TrainingArguments(TA):
             "help": (
                 "Record selected sample indices and scores per step for case study analysis. "
                 "For LayerWiseSubset: records per-layer curation. For GlobalSubset: records global curation. "
+                "For GroupWiseSubset: records per-group curation. "
                 "Saves to output_dir/selection_records.json."
             )
         },
@@ -253,6 +285,23 @@ class TrainingArguments(TA):
     )
 
     def __post_init__(self):
+        # Method aliases -> GroupWiseSubset + granularity preset
+        _aliases = {"BlockWiseSubset": "block", "SublayerWiseSubset": "sublayer"}
+        if self.method in _aliases:
+            self.selection_granularity = _aliases[self.method]
+            self.method = "GroupWiseSubset"
+        if self.selection_groups is not None and self.selection_groups.strip() == "":
+            self.selection_groups = None
+        if self.selection_groups is not None:
+            self.selection_granularity = "custom"
+        if self.method == "GroupWiseSubset":
+            from drpt.selection.grouping import GRANULARITIES
+            if self.selection_granularity not in GRANULARITIES:
+                raise ValueError(
+                    f"selection_granularity must be one of {GRANULARITIES}, got {self.selection_granularity!r}"
+                )
+            if self.selection_granularity == "custom" and self.selection_groups is None:
+                raise ValueError("selection_granularity='custom' requires --selection_groups")
         if isinstance(self.fsdp_config, str):
             self.fsdp_config = fsdp_config[self.fsdp_config]
         if self.train_dataset_names is not None:

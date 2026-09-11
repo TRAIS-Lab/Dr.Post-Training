@@ -58,8 +58,15 @@ class ModelArguments:
         metadata={"help": "LoRA alpha"},
     )
     lora_dropout: float = field(
-        default=0.05,
-        metadata={"help": "LoRA dropout"},
+        default=0.0,
+        metadata={
+            "help": (
+                "LoRA dropout. Default 0: rollout log-probs are computed in eval mode while the "
+                "PPO loss and the curation target run in train mode, so any dropout makes the "
+                "PPO ratio != 1 on fresh rollouts and adds noise to the target gradient "
+                "(TRL disables dropout in the policy for the same reason)."
+            )
+        },
     )
     lora_target_modules: List[str] = field(
         default_factory=list,  # Empty = PEFT auto-detects correct modules for each model

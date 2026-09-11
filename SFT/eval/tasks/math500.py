@@ -24,6 +24,7 @@ from SFT.eval.tasks.common import (
     clean_model_response,
     render_generation_chat,
     result_provenance,
+    sampling_kwargs,
     single_source_revision,
 )
 from ..utils import generate_completions, get_eos_token_ids
@@ -188,7 +189,7 @@ def compute_accuracy(
         model, tokenizer, prompts,
         batch_size=batch_size, max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.pad_token_id, eos_token_id=get_eos_token_ids(tokenizer),
-        do_sample=False, disable_tqdm=False,
+        **sampling_kwargs(args), disable_tqdm=False,
     )
 
     per_example: List[Dict[str, Any]] = []
@@ -241,5 +242,6 @@ def compute_accuracy(
             dataset_split="test",
             evaluator={**scorer_info, "primary_metric": "accuracy", "records_source": source},
             n_tasks=len(records), max_new_tokens=max_new_tokens, thinking=False,
+            sampling=sampling_kwargs(args), seed=getattr(args, 'seed', None),
         ),
     }

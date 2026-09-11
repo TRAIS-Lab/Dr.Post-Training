@@ -114,6 +114,12 @@ SCRIPT
 chmod +x submit.sh
 ```
 
+`SFT/train/submit_all.sh` submits each sweep stage as one job array and expects
+`submit.sh` to also honour `ARRAY=<spec>` (adds `--array`), `MANIFEST=<file>`
+(array task *i* appends line *i+1* of the manifest to the script arguments) and
+`DEPEND=<spec>` (adds `--dependency`). Clusters with a per-user RPC limit should
+not fall back to one `sbatch` per run.
+
 ### 3. Submit jobs
 
 ```bash
@@ -134,8 +140,8 @@ GPUS=1 TIME=1:00:00 MEM=64g ./submit.sh SFT/eval/eval.sh --task samsum
 
 | Experiment | Environment | Description                                                             | Documentation                    |
 | ---------- | ----------- | ----------------------------------------------------------------------- | -------------------------------- |
-| **SFT**    | `drpt`      | Supervised Fine-Tuning with layer-wise-subset data curation                     | [SFT/README.md](SFT/README.md)   |
-| **RLHF**   | `drpt`      | Reinforcement Learning from Human Feedback with layer-wise-subset data curation | [RLHF/README.md](RLHF/README.md) |
+| **SFT**    | `drpt`      | Supervised Fine-Tuning with layer-wise / group-wise / global subset data curation | [SFT/README.md](SFT/README.md)   |
+| **RLHF**   | `drpt`      | Reinforcement Learning from Human Feedback with layer-wise / group-wise / global subset data curation | [RLHF/README.md](RLHF/README.md) |
 | **RLVR**   | `drpt_rlvr` | Reinforcement Learning with Verifiable Rewards (VERL + vLLM)            | [RLVR/README.md](RLVR/README.md) |
 
 ## TODOs

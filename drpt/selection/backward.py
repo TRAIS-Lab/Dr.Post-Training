@@ -600,6 +600,10 @@ class GlobalSubsetLinearBackward(Function):
             Without MeSO: hooks disabled, standard autograd gradients.
             With MeSO: hooks stay enabled, CompressedLinearBackward stores
             compressed gradients for the optimizer.
+
+    Also used by GroupWiseSubsetState (a GlobalSubsetState subclass): scores go
+    to the layer's group and ``state.on_layer_processed`` finalizes the group
+    (select + assemble .grad) as soon as all of its layers have run backward.
     """
 
     @staticmethod
@@ -673,6 +677,10 @@ class GlobalSubsetLinearBackward(Function):
                     train_inp, _ = split_train_val_batch(input, state.train_batch_size)
                     hook_manager.retain_layer_data(layer_idx, train_go, train_inp)
 
+            # GroupWiseSubset finalizes a group here once all its layers are done
+            # (no-op for GlobalSubsetState).
+            state.on_layer_processed(layer_idx, hook_manager)
+
         return grad_input, None, None, None, None
 
     @staticmethod
@@ -745,7 +753,7 @@ class GlobalSubsetLinearBackward(Function):
         )
 
         # Accumulate scores using the state method (handles correction internally)
-        state.accumulate_precomputed_scores(scores, similarity, score_correction)
+        state.accumulate_precomputed_scores(scores, similarity, score_correction, layer_idx=layer_idx)
 
 
 # =============================================================================
@@ -899,6 +907,7 @@ class GlobalSubsetEmbeddingBackward(Function):
                     # No val data for this layer — skip scoring
                     if state.one_pass:
                         hook_manager.retain_layer_data(layer_idx, grad_output, input_ids)
+                    state.on_layer_processed(layer_idx, hook_manager)
                     return None, None, None, None, None
                 score_correction = None
             else:
@@ -917,7 +926,7 @@ class GlobalSubsetEmbeddingBackward(Function):
                 scores = scores * score_correction
 
             # Accumulate into GlobalSubsetState (no similarity for embedding)
-            state.accumulate_precomputed_scores(scores, None, None)
+            state.accumulate_precomputed_scores(scores, None, None, layer_idx=layer_idx)
 
             # One-pass: retain data for post-hoc gradient assembly
             if state.one_pass:
@@ -926,6 +935,9 @@ class GlobalSubsetEmbeddingBackward(Function):
                 else:
                     # Merged batch: retain train portion only
                     hook_manager.retain_layer_data(layer_idx, train_go, train_ids)
+
+            # GroupWiseSubset finalizes a group here once all its layers are done
+            state.on_layer_processed(layer_idx, hook_manager)
 
         return None, None, None, None, None
 

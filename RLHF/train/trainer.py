@@ -467,10 +467,11 @@ class LayerWiseSubsetPPOTrainer:
             Dictionary of statistics
         """
         # Policy clip fraction
-        pg_clipfrac = ((ratio - 1).abs() > self.cliprange).float().mean().item()
+        mask_f = response_mask.float()
+        pg_clipfrac = ((((ratio - 1).abs() > self.cliprange).float() * mask_f).sum() / mask_f.sum().clamp(min=1)).item()
 
         # Value clip fraction
-        vf_clipfrac = ((values - old_values).abs() > self.cliprange_value).float().mean().item()
+        vf_clipfrac = ((((values - old_values).abs() > self.cliprange_value).float() * mask_f).sum() / mask_f.sum().clamp(min=1)).item()
 
         # Second-order KL approximation (always >= 0)
         approx_kl = (0.5 * (new_logprobs - old_logprobs) ** 2 * response_mask).sum()
@@ -496,8 +497,56 @@ class LayerWiseSubsetPPOTrainer:
             "policy/ratio": avg_ratio.item(),
             "val/clipfrac": vf_clipfrac,
             "val/ratio_var": ratio_var.item(),
-            "val/mean": values.mean().item(),
+            "val/mean": ((values * mask_f).sum() / mask_f.sum().clamp(min=1)).item(),
         }
+
+    def _val_forward_response(
+        self,
+        mb_full_ids: Tensor,
+        mb_full_mask: Tensor,
+        mb_response_ids: Tensor,
+        query_len: int,
+        need_values: bool = False,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """
+        Forward pass for validation-gradient capture, using the SAME input
+        convention as the rollout snapshot (batched_forward_pass) and the PPO
+        training loss: padded input ids zeroed, position_ids derived from the
+        attention mask (left-padded queries), use_cache=False, and the sampling
+        temperature applied to the logits.
+
+        Returns:
+            token_log_probs: [mb, response_len] log pi_theta(y_t | x, y_<t)
+            values: [mb, response_len] value-head outputs at the same positions,
+                    or None if need_values is False
+        """
+        response_len = mb_response_ids.shape[1]
+        position_ids = mb_full_mask.cumsum(1) - mb_full_mask.long()
+        input_ids_masked = torch.masked_fill(mb_full_ids, ~mb_full_mask.bool(), 0)
+
+        outputs = self.model(
+            input_ids=input_ids_masked,
+            attention_mask=mb_full_mask,
+            position_ids=position_ids,
+            use_cache=False,
+        )
+        logits, values_full = self._extract_model_outputs(outputs, need_values=need_values)
+
+        start_idx, end_idx = self._get_response_slice_indices(query_len, response_len)
+        logits_for_probs = logits[:, start_idx:end_idx, :]
+        temperature = getattr(self.args, 'temperature', 1.0)
+        token_log_probs = self._compute_token_logprobs(
+            logits_for_probs, mb_response_ids, temperature=temperature
+        )
+
+        values = None
+        if need_values:
+            if values_full is None:
+                values_full = torch.zeros(
+                    mb_full_ids.shape[0], mb_full_ids.shape[1], device=self.device
+                )
+            values = values_full[:, start_idx:end_idx]
+        return token_log_probs, values
 
     def _capture_validation_gradients_core(
         self,
@@ -540,17 +589,10 @@ class LayerWiseSubsetPPOTrainer:
             mb_response_mask = response_mask[i:end_idx]
             mb_seq_advantages = seq_advantages[i:end_idx]
 
-            # Forward pass (log π_θ(y|x))
-            outputs = self.model(
-                input_ids=mb_full_ids,
-                attention_mask=mb_full_mask,
+            # Forward pass (log π_θ(y|x)), same input convention as training
+            token_log_probs, _ = self._val_forward_response(
+                mb_full_ids, mb_full_mask, mb_response_ids, query_len,
             )
-
-            logits, _ = self._extract_model_outputs(outputs, need_values=False)
-
-            # Log probs for response tokens
-            logits = logits[:, query_len - 1:-1, :]
-            token_log_probs = self._compute_token_logprobs(logits, mb_response_ids)
 
             # Sequence log probability (sum over response tokens)
             seq_log_probs = (token_log_probs * mb_response_mask.float()).sum(dim=1)
@@ -608,17 +650,10 @@ class LayerWiseSubsetPPOTrainer:
             mb_response_mask = response_mask[i:end_idx]
             mb_advantages = advantages[i:end_idx]
 
-            # Forward pass
-            outputs = self.model(
-                input_ids=mb_full_ids,
-                attention_mask=mb_full_mask,
+            # Forward pass, same input convention as training
+            token_log_probs, _ = self._val_forward_response(
+                mb_full_ids, mb_full_mask, mb_response_ids, query_len,
             )
-
-            logits, _ = self._extract_model_outputs(outputs, need_values=False)
-
-            # Log probs for response tokens
-            logits = logits[:, query_len - 1:-1, :]
-            token_log_probs = self._compute_token_logprobs(logits, mb_response_ids)
 
             # Token-level policy gradient loss
             mb_val_loss = -(token_log_probs * mb_advantages * mb_response_mask.float()).sum() / full_batch_size
@@ -646,7 +681,12 @@ class LayerWiseSubsetPPOTrainer:
         "which direction reduces the PPO objective."
 
         This requires rollout_data with old_logprobs, old_values, advantages,
-        and returns — only available in self-referencing (buffer) mode.
+        and returns. In self-referencing mode these are the training rollout's;
+        in held-out mode they are computed from the fresh validation rollouts
+        (under the current policy, so with dropout disabled — the default,
+        lora_dropout=0 — the ratio is 1 at capture time and the clipping is
+        inactive; the loss then equals the token-level policy gradient plus the
+        value loss).
 
         Args:
             full_ids: Full sequence (query + response) [N, seq_len]
@@ -663,8 +703,8 @@ class LayerWiseSubsetPPOTrainer:
         """
         if rollout_data is None:
             raise ValueError(
-                "PPO validation loss requires rollout_data (self-referencing mode). "
-                "Set n_val=0 or use a different val_loss_type for fixed validation."
+                "PPO validation loss requires rollout_data with old_logprobs, "
+                "old_values, advantages and returns."
             )
 
         old_logprobs = rollout_data["old_logprobs"]
@@ -688,28 +728,9 @@ class LayerWiseSubsetPPOTrainer:
             mb_advantages = advantages[i:end_idx]
             mb_returns = returns[i:end_idx]
 
-            # Forward pass
-            position_ids = mb_full_mask.cumsum(1) - mb_full_mask.long()
-            input_ids_masked = torch.masked_fill(mb_full_ids, ~mb_full_mask.bool(), 0)
-
-            outputs = self.model(
-                input_ids=input_ids_masked,
-                attention_mask=mb_full_mask,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-
-            logits, values_full = self._extract_model_outputs(outputs)
-            if values_full is None:
-                values_full = torch.zeros(end_idx - i, mb_full_ids.shape[1], device=self.device)
-
-            start_idx, end_idx_slice = self._get_response_slice_indices(query_len, response_len)
-            values = values_full[:, start_idx:end_idx_slice]
-
-            logits_for_probs = logits[:, start_idx:end_idx_slice, :]
-            temperature = getattr(self.args, 'temperature', 1.0)
-            new_logprobs = self._compute_token_logprobs(
-                logits_for_probs, mb_response_ids, temperature=temperature
+            # Forward pass, same input convention as training
+            new_logprobs, values = self._val_forward_response(
+                mb_full_ids, mb_full_mask, mb_response_ids, query_len, need_values=True,
             )
 
             # Mask invalid positions
@@ -795,26 +816,18 @@ class LayerWiseSubsetPPOTrainer:
         input_ids = torch.cat([query_ids, response_ids], dim=1)
         attention_mask = torch.cat([query_mask, response_mask], dim=1)
 
-        # Forward pass to get current logprobs and values
+        # Forward pass with the same input convention as training/rollouts
         self.model.eval()
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
+        new_logprobs, values = self._val_forward_response(
+            input_ids, attention_mask, response_ids, query_len, need_values=True,
         )
+        new_logprobs = torch.masked_fill(new_logprobs, response_mask == 0, INVALID_LOGPROB)
 
-        # Extract model outputs
-        logits, values_full = self._extract_model_outputs(outputs)
-        if values_full is None:
-            values_full = torch.zeros(batch_size, input_ids.shape[1], device=self.device)
-
-        # Extract values and logits for response tokens
-        start_idx, end_idx = self._get_response_slice_indices(query_len, response_len)
-        values = values_full[:, start_idx:end_idx]
-
-        # Compute new log probs
-        logits_for_probs = logits[:, start_idx:end_idx, :]
-        new_logprobs = self._compute_token_logprobs(logits_for_probs, response_ids)
+        # Value mask: one extra position past the last response token (TRL padding_mask_p1)
+        seq_lens_p1 = (response_mask.sum(dim=1)).clamp(max=response_len - 1)
+        response_idxs = torch.arange(response_len, device=response_mask.device).unsqueeze(0)
+        value_mask = (response_idxs <= seq_lens_p1.unsqueeze(1)).long()
+        values = values * value_mask
 
         # PPO policy loss computation (without backward)
         logprob_diff = new_logprobs - old_logprobs
@@ -835,17 +848,18 @@ class LayerWiseSubsetPPOTrainer:
         vf_loss1 = (values - returns) ** 2
         vf_loss2 = (values_clipped - returns) ** 2
         vf_loss = 0.5 * torch.max(vf_loss1, vf_loss2)
-        vf_loss = (vf_loss * response_mask).sum() / response_mask.sum().clamp(min=1)
+        vf_loss = (vf_loss * value_mask).sum() / value_mask.sum().clamp(min=1)
 
         # Total loss
         total_loss = pg_loss + self.vf_coef * vf_loss
 
         # Stats for logging (TRL 0.26.1 naming conventions)
         # Policy clip fraction
-        pg_clipfrac = ((ratio - 1).abs() > self.cliprange).float().mean().item()
+        mask_f = response_mask.float()
+        pg_clipfrac = ((((ratio - 1).abs() > self.cliprange).float() * mask_f).sum() / mask_f.sum().clamp(min=1)).item()
 
         # Value clip fraction
-        vf_clipfrac = ((values - old_values).abs() > self.cliprange_value).float().mean().item()
+        vf_clipfrac = ((((values - old_values).abs() > self.cliprange_value).float() * mask_f).sum() / mask_f.sum().clamp(min=1)).item()
 
         # KL approximations
         approx_kl = (0.5 * (new_logprobs - old_logprobs) ** 2 * response_mask).sum()
@@ -882,7 +896,7 @@ class LayerWiseSubsetPPOTrainer:
             # Value metrics
             "val/clipfrac": vf_clipfrac,
             "val/ratio_var": ratio_var.item(),
-            "val/mean": values.mean().item(),
+            "val/mean": ((values * mask_f).sum() / mask_f.sum().clamp(min=1)).item(),
             # Objective metrics (TRL style)
             "objective/kl": mean_kl,
             "objective/kl_coef": self.kl_ctl.value,
@@ -898,7 +912,9 @@ class LayerWiseSubsetPPOTrainer:
         # Number of EOS tokens
         eos_token_id = self.tokenizer.eos_token_id
         if eos_token_id is not None:
-            stats["val/num_eos_tokens"] = (response_ids == eos_token_id).sum().item()
+            # Number of responses that contain an EOS inside the valid region
+            # (positions after EOS are pad == eos, so a raw count is meaningless).
+            stats["val/num_eos_tokens"] = ((response_ids == eos_token_id) & response_mask.bool()).sum().item()
 
         # Toxicity evaluation stats
         if self.evaluator is not None and getattr(self.args, 'eval_on_step_generations', True):
@@ -1002,11 +1018,18 @@ class LayerWiseSubsetPPOTrainer:
                 response_ids,
             )
 
-        # Compute sequence lengths using first_true_indices
-        # sequence_length is the position of first pad token minus 1
-        sequence_lengths = first_true_indices(response_ids == self.tokenizer.pad_token_id) - 1
-        # Clamp to valid range (at least 0, at most response_len - 1)
-        sequence_lengths = sequence_lengths.clamp(min=0, max=response_ids.size(1) - 1)
+        # Sequence length = index of the last valid token, INCLUDING the EOS token.
+        # GPT-Neo has no pad token, so pad_token == eos_token; TRL's
+        # "first pad index - 1" recipe would then drop the EOS itself from the mask
+        # (no policy gradient / KL / reward on the stop decision). Use the first EOS
+        # position (inclusive) instead; positions after it are pad by construction.
+        row_len = response_ids.size(1)
+        if self.tokenizer.eos_token_id is not None:
+            first_eos = first_true_indices(response_ids == self.tokenizer.eos_token_id)  # row_len if none
+            sequence_lengths = torch.clamp(first_eos, max=row_len - 1)
+        else:
+            sequence_lengths = first_true_indices(response_ids == self.tokenizer.pad_token_id) - 1
+        sequence_lengths = sequence_lengths.clamp(min=0, max=row_len - 1)
 
         # Create padding mask: True for positions > sequence_length (to be masked out)
         response_idxs = torch.arange(response_ids.size(1), device=response_ids.device)
@@ -1214,7 +1237,10 @@ class LayerWiseSubsetPPOTrainer:
                 )
 
             # Compute log probs
-            batch_logprobs = self._compute_token_logprobs(logits_for_probs, batch_response_ids)
+            batch_logprobs = self._compute_token_logprobs(
+                logits_for_probs, batch_response_ids,
+                temperature=getattr(self.args, 'temperature', 1.0),
+            )
 
             all_logprobs.append(batch_logprobs)
             all_logits.append(logits_for_probs)
@@ -1355,9 +1381,10 @@ class LayerWiseSubsetPPOTrainer:
         1. Self-referencing (buffer): Pass query_ids, query_mask, and rollout_data
            - Reuses training rollout data where advantages are already computed
         2. Fixed validation: Pass None for all arguments
-           - Uses held-out validation dataset
-           - Generates responses from REFERENCE POLICY (π^ref) for stable target
-           - Computes fresh rewards and advantages
+           - Uses held-out validation dataset (one batch per step)
+           - Generates responses from the CURRENT policy (π_θ), then computes
+             fresh rewards, log-probs, values, GAE advantages and returns
+             exactly as _generate_rollout_data does for training
 
         The validation loss formula depends on val_loss_type:
         - 'reward': L_val = -E[log π_θ(y|x) * normalize(R(x,y))]
@@ -1367,10 +1394,15 @@ class LayerWiseSubsetPPOTrainer:
         - 'train-loss': Actual PPO loss (clipped surrogate + value loss)
 
         Where:
-        - y ~ π^ref: Responses generated from reference policy (frozen)
+        - y ~ π_θ: Responses generated from the current policy (both modes)
         - log π_θ(y|x): Sequence-level log probability under current policy
-        - Â_{-1}: Advantage at the LAST token (from GAE with KL-penalized rewards)
+        - A_t: Per-token GAE advantage (KL-penalized rewards, whitened)
         - R(x,y): Raw reward from reward model
+
+        Note: in both modes the gradient is captured at the same parameters
+        that produced the rollouts, so for 'train-loss' the PPO ratio is 1 and
+        clipping is inactive; 'train-loss' differs from 'token-pg' only by the
+        value-loss term and by normalization (per-token mean vs per-sequence).
 
         Args:
             query_ids: Query token IDs [batch, query_len] (for buffer mode)
@@ -1435,7 +1467,8 @@ class LayerWiseSubsetPPOTrainer:
             batch_size = query_ids.shape[0]
             response_len = response_ids.shape[1]
 
-            # Compute log probs and values
+            # Compute log probs and values (these play the role of
+            # old_logprobs / old_values for the 'train-loss' target)
             self.model.eval()
             with torch.no_grad():
                 logprobs, _, values = self.batched_forward_pass(
@@ -1446,6 +1479,16 @@ class LayerWiseSubsetPPOTrainer:
                     query_ids, response_ids, query_mask, response_mask,
                     batch_size=self.mini_batch_size,
                 )
+
+            # Same padding conventions as _generate_rollout_data
+            padding_mask = (response_mask == 0)
+            logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
+            ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
+            seq_lens = response_mask.sum(dim=1) - 1
+            seq_lens_p1 = (seq_lens + 1).clamp(max=response_len - 1)
+            response_idxs = torch.arange(response_len, device=response_mask.device).unsqueeze(0)
+            padding_mask_p1 = response_idxs > seq_lens_p1.unsqueeze(1)
+            values = torch.masked_fill(values, padding_mask_p1, 0)
 
             # Create token-level rewards (outcome-based: reward only at last token)
             token_level_rewards = torch.zeros(batch_size, response_len, device=self.device)
@@ -1460,11 +1503,22 @@ class LayerWiseSubsetPPOTrainer:
             non_score_rewards = -self.kl_ctl.value * kl_penalty
             rewards = token_level_rewards + non_score_rewards * response_mask.float()
 
-            # Compute GAE advantages (with whitening)
-            advantages, _ = compute_gae(
+            # Compute GAE advantages and returns (with whitening)
+            advantages, returns = compute_gae(
                 rewards, values, response_mask.float(),
                 self.gamma, self.gae_lambda
             )
+
+            # Snapshot for the 'train-loss' target (mirrors _generate_rollout_data)
+            rollout_data = {
+                "response_ids": response_ids,
+                "response_mask": response_mask,
+                "raw_rewards": raw_rewards,
+                "old_logprobs": logprobs,
+                "old_values": values,
+                "advantages": advantages,
+                "returns": returns,
+            }
 
         # Common path: capture gradients
         full_ids = torch.cat([query_ids, response_ids], dim=1)
@@ -1831,6 +1885,7 @@ class LayerWiseSubsetPPOTrainer:
         - NA: Standard PPO update
         - LayerWiseSubset: Per-layer curation during backward (uses stored val grads)
         - GlobalSubset: Global curation (two-pass for training)
+        - GroupWiseSubset: Per-layer-group curation during backward (block / sublayer / custom)
 
         Args:
             query_ids, response_ids: Token IDs
@@ -1907,7 +1962,7 @@ class LayerWiseSubsetPPOTrainer:
         if self.method != "NA" and self.grad_hook is not None:
             sel_state = getattr(self.grad_hook, 'selection_state', None)
             if sel_state is not None:
-                if self.method == "LayerWiseSubset":
+                if self.method in ("LayerWiseSubset", "GroupWiseSubset"):
                     if hasattr(sel_state, '_layer_selections') and sel_state._layer_selections:
                         n_selected_list = [n for _, n in sel_state._layer_selections]
                         stats["selection/avg_selected"] = sum(n_selected_list) / len(n_selected_list)
@@ -2078,6 +2133,15 @@ class LayerWiseSubsetPPOTrainer:
 
         self.model.train()
 
+        if batch_size == 0:
+            # Nothing to train on (e.g. IIF filtered every sample). Return placeholder
+            # stats so logging / history stay well-formed; no optimizer step happens.
+            return {
+                "loss/total": 0.0, "loss/policy": 0.0, "loss/value": 0.0,
+                "policy/clipfrac": 0.0, "policy/policykl": 0.0, "policy/approxkl": 0.0,
+                "ppo/early_stopped": 0.0, "ppo/skipped": 1.0,
+            }
+
         early_stopped = False
         for ppo_epoch in range(self.ppo_epochs):
             if early_stopped:
@@ -2177,7 +2241,9 @@ class LayerWiseSubsetPPOTrainer:
         # Number of EOS tokens in responses (TRL line 719)
         eos_token_id = self.tokenizer.eos_token_id
         if eos_token_id is not None:
-            stats["val/num_eos_tokens"] = (response_ids == eos_token_id).sum().item()
+            # Number of responses that contain an EOS inside the valid region
+            # (positions after EOS are pad == eos, so a raw count is meaningless).
+            stats["val/num_eos_tokens"] = ((response_ids == eos_token_id) & response_mask.bool()).sum().item()
 
         # Legacy reward stats (for backwards compatibility)
         stats["reward/mean"] = raw_rewards.mean().item()
@@ -2231,9 +2297,11 @@ class LayerWiseSubsetPPOTrainer:
         """
         Check if early stopping should be triggered based on policy KL.
 
-        If the policy KL exceeds 1.5 * target_kl, zero the gradients and skip
-        the optimization step. This prevents the policy from diverging too far
-        from the reference model.
+        Legacy-TRL semantics: checked after every mini-batch update. If the
+        mini-batch policy KL (masked mean of old - new logprobs) exceeds
+        1.5 * target_kl, the remaining mini-batches and PPO epochs for this
+        rollout are skipped. The optimizer step of the offending mini-batch has
+        already been applied; the zero_grad() here only clears leftovers.
 
         Args:
             policy_kl: The current policy KL divergence
@@ -2342,18 +2410,24 @@ class LayerWiseSubsetPPOTrainer:
                         self.capture_validation_gradients(query_ids, query_mask, rollout_data)
 
                 # IIF: Pre-filter rollouts BEFORE PPO epochs (different from GlobalSubset/LayerWiseSubset)
-                # IIF filters the entire rollout once, then runs standard PPO on filtered data
+                # IIF filters the entire rollout once, then runs standard PPO on filtered data.
+                # Only the PPO update sees the subset: step statistics, the KL controller and
+                # step-generation toxicity are computed on the FULL rollout so that IIF curves
+                # are comparable with the other methods.
+                train_query_ids, train_query_mask, train_rollout_data = query_ids, query_mask, rollout_data
                 if self.method == "IIF":
                     original_batch_size = query_ids.shape[0]
                     selected_indices = self.iif_pre_select(query_ids, query_mask, rollout_data)
+                    if len(selected_indices) == 0:
+                        logger.warning("IIF selected 0 of %d samples; skipping the PPO update for this batch",
+                                       original_batch_size)
 
-                    # Filter query tensors
-                    query_ids = query_ids[selected_indices]
-                    query_mask = query_mask[selected_indices]
-                    response_mask = response_mask[selected_indices]
+                    # Filter query tensors (training copies only)
+                    train_query_ids = query_ids[selected_indices]
+                    train_query_mask = query_mask[selected_indices]
 
-                    # Filter rollout data
-                    rollout_data = {
+                    # Filter rollout data (training copy only)
+                    train_rollout_data = {
                         "response_ids": rollout_data["response_ids"][selected_indices],
                         "response_mask": rollout_data["response_mask"][selected_indices],
                         "old_logprobs": rollout_data["old_logprobs"][selected_indices],
@@ -2373,7 +2447,7 @@ class LayerWiseSubsetPPOTrainer:
                     history["iif/selection_rate"].append(len(selected_indices) / original_batch_size)
 
                 # Run PPO training epochs
-                ppo_stats = self._run_ppo_epochs(query_ids, query_mask, rollout_data)
+                ppo_stats = self._run_ppo_epochs(train_query_ids, train_query_mask, train_rollout_data)
 
                 # Clear validation gradient buffers to free GPU memory before next rollout
                 # This prevents OOM during generation by releasing stored gradient tensors

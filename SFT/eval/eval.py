@@ -45,17 +45,42 @@ logger = logging.getLogger(__name__)
 # One target can map to several benchmarks.
 # ---------------------------------------------------------------------------
 LEGACY_TASKS = ["nq_open", "samsum", "tydiqa", "squad", "triviaqa"]
-BENCHMARK_TASKS = ["ifeval", "ifbench", "math500", "mbpp_plus"]
+BENCHMARK_TASKS = ["ifeval", "ifbench", "math500", "gsm8k", "mbpp_plus"]
 TARGET_BENCHMARKS = {
     "precise_if": ["ifeval", "ifbench"],
-    "math": ["math500"],
+    "math": ["math500", "gsm8k"],       # MATH train + GSM8K train (benchmark held-out) + the pools' four math sources
+    "math_persona": ["math500", "gsm8k"],  # held-out Dolci Persona MATH/Algebra/GSM rows (the pool's own math style)
+    "math_pool": ["math500", "gsm8k"],  # pool-side sources only (control)
+    "math_v2": ["math500", "gsm8k"],    # GSM8K train + the three Persona sources
+    "math_bench": ["math500", "gsm8k"], # MATH train + GSM8K train only
     "mbpp": ["mbpp_plus"],
 }
+# Rewritten / regenerated D* variants (SFT/data/build_rewrite_target.py): ``<base>_gen<tag>`` (answers
+# re-solved by a generator model and verified) and ``<base>_rw<tag>`` (reference answers rewritten by a
+# generator model and verified) share the base target's prompts and benchmarks.
+_TARGET_VARIANT_RE = re.compile(r"_(gen|rw)[a-z0-9]*$")
+
+
+def base_target_name(target: str) -> str:
+    return _TARGET_VARIANT_RE.sub("", target)
+
+
+def target_benchmarks(target: Optional[str]) -> Optional[List[str]]:
+    """Benchmarks of a target or of a ``_gen*`` / ``_rw*`` variant of a known target; None if unknown."""
+    if not target:
+        return None
+    if target in TARGET_BENCHMARKS:
+        return list(TARGET_BENCHMARKS[target])
+    base = base_target_name(target)
+    if base in TARGET_BENCHMARKS:
+        return list(TARGET_BENCHMARKS[base])
+    return None
 # Generation budgets used when --max_new_tokens is not given.
 DEFAULT_MAX_NEW_TOKENS = {
     "ifeval": 2048,
     "ifbench": 2048,
     "math500": 4096,
+    "gsm8k": 1024,
     "mbpp_plus": 2048,
 }
 LEGACY_DEFAULT_MAX_NEW_TOKENS = 128
@@ -158,8 +183,9 @@ _NAME_RE = re.compile(
     r"^"
     r"(?P<prefix>[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)"
     r"-(?P<model>.+?)"
-    r"-(?P<curation>FullTraining|GlobalSubset|LayerWiseSubset|Standard)"
+    r"-(?P<curation>FullTraining|GlobalSubset|LayerWiseSubset|GroupWiseSubset|BlockWiseSubset|SublayerWiseSubset|Standard)"
     r"-(?P<finetuning>MeSO-LoRA|Full|LoRA|MeSO)"
+    r"(?:-(?P<variant>[A-Za-z0-9.-]+?))?"   # optional method-yaml suffix, e.g. -f75, -filter, -b16-e2, -2nd
     r"-(?:p(?P<percentage>[\d.]+)|ms(?P<max_steps>\d+))"
     r"-lr(?P<learning_rate>[\d.]+e-?\d+)"
     r"-b(?P<batch_size>\d+)"
@@ -179,7 +205,7 @@ def parse_model_name(model_name: str) -> Dict[str, str]:
         "model": "",
         "selection": "", "training_type": "",
         "percentage": "", "max_steps": "",
-        "learning_rate": "", "batch_size": "", "n_val": "", "seed": "",
+        "learning_rate": "", "batch_size": "", "n_val": "", "seed": "", "variant": "",
     }
     m = _NAME_RE.match(model_name)
     if not m:
@@ -217,6 +243,7 @@ def parse_model_name(model_name: str) -> Dict[str, str]:
     config["batch_size"] = g["batch_size"]
     config["n_val"] = g["n_val"]
     config["seed"] = g["seed"]
+    config["variant"] = g.get("variant") or ""
     return config
 
 
@@ -358,6 +385,16 @@ def evaluate_math500(args, model, tokenizer) -> dict:
     return out
 
 
+def evaluate_gsm8k(args, model, tokenizer) -> dict:
+    """Run GSM8K (math-verify scoring against the gold number)."""
+    from .tasks.gsm8k import compute_accuracy
+
+    logger.info("Evaluating on GSM8K")
+    out = {"task": "gsm8k"}
+    out.update(compute_accuracy(args=args, model=model, tokenizer=tokenizer, batch_size=args.batch_size, max_new_tokens=args.max_new_tokens))
+    return out
+
+
 def evaluate_mbpp_plus(args, model, tokenizer) -> dict:
     """Run MBPP+ through EvalPlus (sandboxed when apptainer is available)."""
     from .tasks.mbpp_plus import compute_accuracy
@@ -375,6 +412,7 @@ BENCHMARK_RUNNERS = {
     "ifeval": evaluate_ifeval,
     "ifbench": evaluate_ifbench,
     "math500": evaluate_math500,
+    "gsm8k": evaluate_gsm8k,
     "mbpp_plus": evaluate_mbpp_plus,
 }
 
@@ -387,9 +425,13 @@ def get_target_from_model_name(model_name: str) -> Optional[str]:
     suffix rather than split.
     """
     head = model_name.split("-", 1)[0].lower()
+    # ``dolci_instruction_precise_if_gen32b`` -> base head ``dolci_instruction_precise_if`` + suffix ``_gen32b``
+    variant = _TARGET_VARIANT_RE.search(head)
+    suffix = variant.group(0) if variant else ""
+    base_head = head[: len(head) - len(suffix)] if suffix else head
     for target in sorted(TARGET_BENCHMARKS, key=len, reverse=True):
-        if head.endswith("_" + target):
-            return target
+        if base_head.endswith("_" + target):
+            return target + suffix
     return None
 
 
@@ -404,7 +446,7 @@ def get_tasks_from_model_name(model_name: str) -> List[str]:
     """
     target = get_target_from_model_name(model_name)
     if target is not None:
-        return list(TARGET_BENCHMARKS[target])
+        return target_benchmarks(target) or []
     head = model_name.split("-", 1)[0]
     # nq_open has an underscore, so match the longest known task first.
     for t in sorted(LEGACY_TASKS, key=len, reverse=True):
@@ -447,11 +489,12 @@ def evaluate_model(
     if task_override:
         tasks = [task_override]
     elif target_override:
-        if target_override not in TARGET_BENCHMARKS:
-            results["error"] = f"Unknown target {target_override!r}; known: {sorted(TARGET_BENCHMARKS)}"
+        tasks = target_benchmarks(target_override)
+        if tasks is None:
+            results["error"] = (f"Unknown target {target_override!r}; known: {sorted(TARGET_BENCHMARKS)} "
+                                f"or a <base>_gen*/<base>_rw* variant of one of them")
             logger.error(results["error"])
             return results
-        tasks = list(TARGET_BENCHMARKS[target_override])
     else:
         tasks = get_tasks_from_model_name(model_name)
     if not tasks:
@@ -581,9 +624,10 @@ def main():
         choices=ALL_TASKS,
         help="Run exactly this task (legacy: samsum/tydiqa/nq_open/squad/triviaqa; "
              "benchmarks: ifeval/ifbench/math500/mbpp_plus)")
-    parser.add_argument("--target", type=str, default=None, choices=sorted(TARGET_BENCHMARKS),
+    parser.add_argument("--target", type=str, default=None,
         help="Run every benchmark of this target (precise_if -> ifeval+ifbench, math -> math500, "
-             "mbpp -> mbpp_plus). Also used as the run-name filter together with --train.")
+             "mbpp -> mbpp_plus; <base>_gen*/<base>_rw* rewritten-D* variants map to the base target's "
+             "benchmarks). Also used as the run-name filter together with --train.")
     parser.add_argument("--ifbench_repo", type=str, default=os.environ.get("DRPT_IFBENCH_REPO"),
         help="Local checkout of allenai/IFBench (required for ifbench)")
     parser.add_argument("--ifbench_revision", type=str, default=None,
@@ -608,6 +652,11 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=None,
         help="Maximum tokens to generate (default: per task; 128 for legacy tasks, "
              "2048 for ifeval/ifbench/mbpp_plus, 4096 for math500)")
+    parser.add_argument("--temperature", type=float, default=0.7,
+        help="Sampling temperature for the benchmark tasks (ifeval/ifbench/math500/mbpp_plus); "
+             "0 = greedy. Default 0.7 with top_p 0.8 / top_k 20 (Qwen3 non-thinking recommendation).")
+    parser.add_argument("--top_p", type=float, default=0.8, help="Nucleus sampling top-p (default 0.8)")
+    parser.add_argument("--top_k", type=int, default=20, help="Top-k sampling cutoff (default 20)")
     parser.add_argument("--base_model", type=str, default=None,
         help="Base model for LoRA adapters")
     parser.add_argument("--seed", type=int, default=42,
@@ -640,6 +689,10 @@ def main():
             subject=args.subject,
             target_override=args.target,
             extra_args={
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+                "seed": args.seed,
                 "ifbench_repo": args.ifbench_repo,
                 "ifbench_revision": args.ifbench_revision,
                 "evalplus_runner": args.evalplus_runner,
@@ -688,6 +741,10 @@ def main():
             subject=args.subject,
             target_override=args.target,
             extra_args={
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+                "seed": args.seed,
                 "ifbench_repo": args.ifbench_repo,
                 "ifbench_revision": args.ifbench_revision,
                 "evalplus_runner": args.evalplus_runner,

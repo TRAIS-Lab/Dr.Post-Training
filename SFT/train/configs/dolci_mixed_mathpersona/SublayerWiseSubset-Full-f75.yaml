@@ -1,0 +1,14 @@
+# SublayerWiseSubset = GroupWiseSubset curation per attention / MLP sub-block ({q,k,v,o} and {gate,up,down} select separately).
+# Same scoring / fraction / recording as the LayerWiseSubset config; embed_tokens and
+# lm_head are singleton groups. See drpt/selection/grouping.py for other granularities
+# (selection_granularity: layer|sublayer|block|global|custom, selection_groups: <rules>).
+# SublayerWiseSubset curation, top-k keeping 6 of 8 candidates
+method: SublayerWiseSubset
+finetuning: Full
+learning_rate: 1.00e-05
+selection_frac: 0.75
+selection_mode: topk
+record_selections: true
+
+scoring:
+  method: reduced_ghost

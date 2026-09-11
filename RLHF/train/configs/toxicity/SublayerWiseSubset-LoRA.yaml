@@ -1,0 +1,8 @@
+# SublayerWiseSubset: GroupWiseSubset curation per attention / MLP sub-block of every
+# transformer block, per-mini-batch during PPO. Single backward like LayerWiseSubset.
+# scoring.method: reduced_ghost, full_ghost, direct, compress
+#
+method: SublayerWiseSubset
+finetuning: LoRA
+scoring:
+  method: reduced_ghost

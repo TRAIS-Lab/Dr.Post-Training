@@ -1,0 +1,16 @@
+# GroupWiseSubset with custom per-block groups: four selections per decoder block
+#   <block>.attn.qkv    = {q_proj, k_proj, v_proj}
+#   <block>.attn.o      = {o_proj}
+#   <block>.mlp.gateup  = {gate_proj, up_proj}
+#   <block>.mlp.down    = {down_proj}
+# embed_tokens and lm_head stay singleton groups. Rule syntax (drpt/selection/grouping.py):
+# "<name>=<member>[,<member>..];<name>=..", members match dot-separated components of the
+# layer name after "model.layers.N." — no ':' or quotes inside the value.
+method: GroupWiseSubset
+selection_groups: attn.qkv=q_proj,k_proj,v_proj;attn.o=o_proj;mlp.gateup=gate_proj,up_proj;mlp.down=down_proj
+finetuning: Full
+learning_rate: 1.00e-05
+record_selections: true
+
+scoring:
+  method: reduced_ghost

@@ -1,0 +1,11 @@
+# BlockWiseSubset: GroupWiseSubset curation per transformer block, per-mini-batch during PPO.
+# All hooked LoRA layers of model.layers.N score jointly and select once; single backward
+# like LayerWiseSubset (the un-hooked value head trains on the full mini-batch).
+# Other granularities: selection_granularity: layer|sublayer|block|global|custom,
+# selection_groups: <per-block rules> (see drpt/selection/grouping.py).
+# scoring.method: reduced_ghost, full_ghost, direct, compress
+#
+method: BlockWiseSubset
+finetuning: LoRA
+scoring:
+  method: reduced_ghost

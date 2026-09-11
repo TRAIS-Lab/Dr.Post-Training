@@ -19,6 +19,7 @@ from SFT.eval.tasks.common import (
     clean_model_response,
     render_generation_chat,
     result_provenance,
+    sampling_kwargs,
     single_source_revision,
 )
 from SFT.eval.tasks.ifeval_scoring import aggregate, evaluate_instruction_following
@@ -59,7 +60,7 @@ def compute_accuracy(
         max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=get_eos_token_ids(tokenizer),
-        do_sample=False,
+        **sampling_kwargs(args),
         disable_tqdm=False,
     )
 
@@ -134,5 +135,6 @@ def compute_accuracy(
             n_tasks=len(records),
             max_new_tokens=max_new_tokens,
             thinking=False,
+        sampling=sampling_kwargs(args), seed=getattr(args, 'seed', None),
         ),
     }

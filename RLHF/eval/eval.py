@@ -31,6 +31,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
+from RLHF.train.evaluator import _toxic_class_index
 from peft import PeftModel
 from tqdm import tqdm
 from transformers import (
@@ -233,12 +234,14 @@ def score_toxicity(
 
             for sample_output in outputs:
                 # sample_output is a list of dicts with 'label' and 'score' keys
+                # (pipeline built with function_to_apply="none": scores are logits)
                 logits = torch.tensor([d["score"] for d in sample_output])
                 probs = F.softmax(logits, dim=-1)
 
-                # Class 1 is the toxic/offensive class
-                toxic_logit = logits[1].item()
-                toxic_prob = probs[1].item()
+                # Toxic class by label name, not list position
+                toxic_idx = _toxic_class_index([d["label"] for d in sample_output])
+                toxic_logit = logits[toxic_idx].item()
+                toxic_prob = probs[toxic_idx].item()
 
                 all_logits.append(toxic_logit)
                 all_probs.append(toxic_prob)

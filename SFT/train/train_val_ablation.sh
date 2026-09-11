@@ -79,6 +79,11 @@ config_dir_override=""
 # extra held-out dev split instead of test).
 eval_split_override=""
 
+# Model/sequence knobs for the Dolci (Qwen3) settings.
+max_seq_length=512
+gradient_checkpointing=false
+val_seq_length_multiplier=""     # empty -> train.py default (1.2x avg train length); 0 disables
+
 # Optional schedule overrides (for blow-up dynamics studies).
 lr_scheduler_override=""
 warmup_ratio_override=""
@@ -91,12 +96,18 @@ declare -A TARGET_STEPS=(
     ["samsum"]=2600       # alpaca_samsum main: 2600 steps at bs=8
     ["nq_open"]=1100      # triviaqa_nq main: ~1107 steps at bs=8
     ["squad"]=1100        # less_squad main: ~1225 steps at bs=8
+    ["math"]=4000         # dolci_reason_math main: 32,000 rows / bs=8, 1 epoch
+    ["mbpp"]=4000         # dolci_reason_code main
+    ["precise_if"]=4000   # dolci_inst_if main
 )
 declare -A LR_CONFIG_KEYS=(
     ["tydiqa"]="less_tydiqa"
     ["samsum"]="alpaca_samsum"
     ["nq_open"]="triviaqa_nq"
     ["squad"]="less_squad"
+    ["math"]="dolci_reason_math"
+    ["mbpp"]="dolci_reason_code"
+    ["precise_if"]="dolci_inst_if"
 )
 
 # =============================================================================
@@ -132,6 +143,9 @@ while [[ $# -gt 0 ]]; do
         --seed)           seed="$2"; shift 2 ;;
         --data_dir)       data_dir="$2"; shift 2 ;;
         --gradient_accumulation_steps) gradient_accumulation_steps="$2"; shift 2 ;;
+        --max_seq_length) max_seq_length="$2"; shift 2 ;;
+        --gradient_checkpointing) gradient_checkpointing="$2"; shift 2 ;;
+        --val_seq_length_multiplier) val_seq_length_multiplier="$2"; shift 2 ;;
         --dry-run)        dry_run=true; shift ;;
         --help|-h)
             cat <<'HELP'
@@ -150,6 +164,10 @@ Optional:
   --batch_size <n>       Batch size (default: 8)
   --n_val <n>            Number of val samples to train on (default: 16)
   --n_eval <n>           Evaluation examples (default: 500)
+  --model <name>         Base model (default: meta-llama/Llama-3.2-1B)
+  --max_seq_length <n>   Sequence length (default: 512; Dolci settings use 2048)
+  --gradient_checkpointing <bool>      Non-reentrant activation checkpointing (default: false)
+  --val_seq_length_multiplier <x>      D* length-rejection multiplier; 0 disables (default: train.py's 1.2)
   --eval_steps <n>       Evaluate every N steps (default: 400; set to ~max_steps/100 for ~100 ppl points)
   --lr <lr>              Learning rate override
   --seed <seed>          Random seed (default: 42)
@@ -185,7 +203,7 @@ wdecay="${weight_decay_override:-0.0}"
 
 export base_training_args="--do_train=True \
 --do_eval=True \
---max_seq_length=512 \
+--max_seq_length=$max_seq_length \
 --use_fast_tokenizer=True \
 --lr_scheduler_type=$sched \
 --warmup_ratio=$warmup \
@@ -409,8 +427,7 @@ run_method() {
     # Deterministic port from SLURM_JOB_ID (or PID fallback) — see train.sh.
     local PORT=$((20000 + (${SLURM_JOB_ID:-$$} % 40000)))
 
-    local header="torchrun --nproc_per_node 1 --nnodes 1 \
---rdzv_id=$ID --rdzv_backend c10d --rdzv_endpoint=localhost:$PORT \
+    local header="torchrun --standalone --nproc_per_node 1 --nnodes 1 \
 -m SFT.train.train"
 
     # For tasks whose test split has no gold responses (e.g. hhrlhf →
@@ -443,7 +460,9 @@ run_method() {
 --gradient_accumulation_steps $gradient_accumulation_steps \
 --seed $seed \
 --optim $optim $eval_split_arg \
---use_flash_attention $use_flash_attention"
+--use_flash_attention $use_flash_attention \
+--gradient_checkpointing $gradient_checkpointing"
+    [[ -n "$val_seq_length_multiplier" ]] && training_args="$training_args --val_seq_length_multiplier $val_seq_length_multiplier"
 
     # LoRA
     if [ "$cfg_lora" = true ]; then

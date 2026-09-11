@@ -902,6 +902,7 @@ BENCHMARK_PINS = {
     "ifeval": {"repo": "google/IFEval", "revision": "966cd89545d6b6acfd7638bc708b98261ca58e84", "split": "train"},
     "ifbench": {"repo": "allenai/IFBench_test", "revision": "2e8a48de45ff3bf41242f927254ca81b59ca3ae2", "split": "train"},
     "math500": {"repo": "HuggingFaceH4/MATH-500", "revision": "6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be", "split": "test"},
+    "gsm8k": {"repo": "openai/gsm8k", "revision": "740312add88f781978c0658806c59bc2815b9866", "split": "test", "config": "main"},
 }
 MBPP_PLUS_DATASET_VERSION = "v0.2.0"
 
@@ -984,6 +985,23 @@ def prepare_math500_bench(output_dir):
     return _write_bench(_bench_path(output_dir, "math500"), rows, "math500")
 
 
+def prepare_gsm8k_bench(output_dir):
+    """GSM8K test (1319 problems); gold answer = the number after '####' in the reference solution."""
+    pin = BENCHMARK_PINS["gsm8k"]
+    print(f"Preparing gsm8k benchmark from {pin['repo']}@{pin['revision'][:8]}...")
+    dataset = load_dataset(pin["repo"], pin["config"], split=pin["split"], revision=pin["revision"])
+    rows = []
+    for idx, example in enumerate(dataset):
+        problem = (example.get("question") or "").strip(); solution = (example.get("answer") or "").strip()
+        if not problem or "####" not in solution:
+            continue
+        answer = solution.rsplit("####", 1)[1].strip().replace(",", "")
+        rows.append({"dataset": "gsm8k", "id": f"gsm8k::{idx}", "messages": [{"role": "user", "content": problem}],
+                     "metadata": {"problem": problem, "answer": answer, "solution": solution, "source_repo": pin["repo"],
+                                  "source_revision": pin["revision"], "source_split": pin["split"]}})
+    return _write_bench(_bench_path(output_dir, "gsm8k"), rows, "gsm8k")
+
+
 def prepare_mbpp_plus_bench(output_dir):
     """MBPP+ tasks from the evalplus package (needs `pip install evalplus`).
 
@@ -1021,6 +1039,416 @@ def prepare_mbpp_plus_bench(output_dir):
     return _write_bench(_bench_path(output_dir, "mbpp_plus"), rows, "mbpp_plus")
 
 
+# =============================================================================
+# Dolci capability setting: train pools + targets
+#
+# Follows the Dr.Post-Training-Next `dolci32k` design: benchmarks are reserved
+# first, targets second, general pools last.
+#   * Pools are 32,000-row uniform samples from allenai/Dolci-Instruct-SFT over a
+#     domain group (DOLCI_POOL_DOMAINS), restricted to plain user/assistant chats
+#     (no tool-use payloads) of <= DOLCI_MAX_CHARS characters.
+#   * Targets are small "messages" splits: `validation` = D* (n_val rows drive
+#     selection + the val_loss curve), `test` = loss-only held-out (n_eval rows).
+#     precise_if comes from the Dolci "Precise IF" source (as in Next), math from
+#     MATH train, mbpp from MBPP train minus every MBPP+ task id.
+#   * Decontamination (ported from Next): a row is dropped if its normalised user
+#     prompt equals a reference prompt, or if >= DECONTAM_THRESHOLD of its word
+#     8-grams are shared with one reference prompt. Targets are decontaminated
+#     against the four benchmarks; pools against the benchmarks AND all targets,
+#     and precise_if target rows are additionally excluded from pools by id.
+# =============================================================================
+
+DOLCI_PIN = {
+    "repo": "allenai/Dolci-Instruct-SFT",
+    "revision": "bd3c8f3a9b2cc5a9682e44b96ddd0bb2ff027221",
+    "split": "train",
+}
+MATH_TRAIN_PIN = {
+    "repo": "EleutherAI/hendrycks_math",
+    "revision": "21a5633873b6a120296cce3e2df9d5550074f4a3",
+    "configs": ["algebra", "counting_and_probability", "geometry", "intermediate_algebra",
+                "number_theory", "prealgebra", "precalculus"],
+    "split": "train",
+}
+MBPP_TRAIN_PIN = {
+    "repo": "google-research-datasets/mbpp",
+    "revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+    "config": "full",
+    "split": "train",
+}
+
+DOLCI_POOL_SIZE = 32_000
+DOLCI_SAMPLE_SEED = 42
+DOLCI_MAX_CHARS = 16_000          # ~4k tokens; longer rows cannot fit max_seq_length=4096
+DOLCI_EXCLUDED_DOMAINS = {"Tool Use", "Hardcoded Data"}
+DOLCI_INSTRUCTION_DOMAINS = {"Chat", "Precise IF", "Other", "Multilingual", "Safety"}
+DOLCI_REASONING_DOMAINS = {"Math", "Coding", "Reasoning", "Science"}
+DOLCI_POOL_DOMAINS = {
+    "dolci_instruction": DOLCI_INSTRUCTION_DOMAINS,
+    "dolci_reasoning": DOLCI_REASONING_DOMAINS,
+    "dolci_mixed": DOLCI_INSTRUCTION_DOMAINS | DOLCI_REASONING_DOMAINS,
+}
+PRECISE_IF_SOURCE = "Dolci Instruct Precise IF"
+PRECISE_IF_MIN_ASCII_RATIO = 0.95  # IFEval/IFBench are English; keep D* English too
+
+DOLCI_BENCHMARKS = ("ifeval", "ifbench", "math500", "gsm8k", "mbpp_plus")
+DOLCI_TARGETS = ("precise_if", "math_ref", "mbpp")   # pools are decontaminated against these
+DOLCI_AUDIT_TARGETS = DOLCI_TARGETS + ("math", "math_v2", "math_bench", "math_pool", "math_persona")   # built by SFT/data/build_math{,_pool,_persona}_target.py
+DECONTAM_NGRAM = 8
+DECONTAM_THRESHOLD = 0.8   # shared unique 8-grams / min(candidate, reference)
+
+# Target splits: validation = D* (>= 3*n_val so length rejection has slack), test = held-out.
+# None = "everything that is left" (MBPP train has 374 rows, 108 of which are MBPP+ tasks).
+TARGET_SPLIT_SIZES = {
+    "precise_if": {"validation": 128, "test": 472},   # 600 reserved rows total (all excluded from the pools)
+    "math_ref": {"validation": 64, "test": 500},    # MATH-train references; only used for pool decontamination now
+    "mbpp": {"validation": 128, "test": None},
+}
+
+
+try:
+    from SFT.data.decontam import PromptDecontaminator, user_prompts as _user_prompts
+except ImportError:  # run as `python SFT/data/prepare_datasets.py` (repo root not on sys.path)
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from SFT.data.decontam import PromptDecontaminator, user_prompts as _user_prompts
+
+
+def _read_jsonl(path):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _reference_prompts(output_dir, benchmarks=DOLCI_BENCHMARKS, targets=()):
+    """(id, user prompt) pairs from benchmark files and target splits already on disk."""
+    refs = []
+    for bench in benchmarks:
+        path = _bench_path(output_dir, bench)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"benchmark file missing: {path} (run --datasets {bench} first)")
+        for row in _read_jsonl(path):
+            for i, p in enumerate(_user_prompts(row.get("messages"))):
+                refs.append((f"{bench}:{row.get('id')}:{i}", p))
+    for target in targets:
+        for split in ("validation", "test"):
+            path = os.path.join(output_dir, "eval", target, f"{target}_{split}_data.jsonl")
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"target split missing: {path} (run --datasets {target} first)")
+            for row in _read_jsonl(path):
+                for i, p in enumerate(_user_prompts(row.get("messages"))):
+                    refs.append((f"{target}/{split}:{row.get('id')}:{i}", p))
+    return refs
+
+
+def _dolci_clean_messages(messages):
+    """Return [{role, content}] if the row is a plain chat conversation, else None.
+
+    Accepts an optional leading system turn, then strictly alternating
+    user/assistant turns ending with a non-empty assistant turn. Rows carrying
+    tool-use payloads (function_calls / functions) are rejected.
+    """
+    if not messages:
+        return None
+    cleaned = []
+    for m in messages:
+        if (m.get("function_calls") or "").strip() or (m.get("functions") or "").strip():
+            return None
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if role not in ("system", "user", "assistant") or not content:
+            return None
+        cleaned.append({"role": role, "content": content})
+    start = 1 if cleaned[0]["role"] == "system" else 0
+    turns = cleaned[start:]
+    if len(turns) < 2 or turns[-1]["role"] != "assistant":
+        return None
+    for i, m in enumerate(turns):
+        if m["role"] != ("user" if i % 2 == 0 else "assistant"):
+            return None
+    return cleaned
+
+
+def _dolci_row_features(example):
+    """Per-row features used by the pool/target filters (runs inside Dataset.map)."""
+    cleaned = _dolci_clean_messages(example.get("messages") or [])
+    if cleaned is None:
+        return {"eligible": False, "n_chars": 0, "n_turns": 0, "ascii_ratio": 0.0}
+    n_chars = sum(len(m["content"]) for m in cleaned)
+    text = "".join(m["content"] for m in cleaned)
+    ascii_ratio = sum(1 for ch in text if ord(ch) < 128) / max(1, len(text))
+    return {
+        "eligible": (example.get("domain") not in DOLCI_EXCLUDED_DOMAINS) and n_chars <= DOLCI_MAX_CHARS,
+        "n_chars": n_chars,
+        "n_turns": len([m for m in cleaned if m["role"] != "system"]),
+        "ascii_ratio": ascii_ratio,
+    }
+
+
+def _write_messages_jsonl(path, rows, label):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"  {label}: {path} ({len(rows)} rows)")
+    return path
+
+
+def _split_target(rows, target, output_dir):
+    sizes = TARGET_SPLIT_SIZES[target]
+    n_val = sizes["validation"]
+    n_test = sizes["test"]
+    if len(rows) < n_val + (n_test or 1):
+        raise RuntimeError(f"{target}: only {len(rows)} clean rows; need {n_val} validation + held-out")
+    val_rows = rows[:n_val]
+    test_rows = rows[n_val:] if n_test is None else rows[n_val:n_val + n_test]
+    out_dir = os.path.join(output_dir, "eval", target)
+    return (
+        _write_messages_jsonl(os.path.join(out_dir, f"{target}_validation_data.jsonl"), val_rows, "validation (D*)"),
+        _write_messages_jsonl(os.path.join(out_dir, f"{target}_test_data.jsonl"), test_rows, "test (held-out)"),
+    )
+
+
+def _load_dolci(num_proc):
+    pin = DOLCI_PIN
+    print(f"Loading {pin['repo']}@{pin['revision'][:8]} ({pin['split']}) ...")
+    dataset = load_dataset(pin["repo"], split=pin["split"], revision=pin["revision"])
+    print(f"  {len(dataset):,} rows; computing row features with {num_proc} workers ...")
+    dataset = dataset.map(_dolci_row_features, num_proc=num_proc, desc="dolci features")
+    return dataset
+
+
+def prepare_precise_if_target(output_dir, dataset=None, num_proc=16):
+    """D* / held-out for the IFEval-style target from Dolci Precise-IF rows (as in Next).
+
+    Single-turn, mostly-ASCII rows, decontaminated against the four benchmarks.
+    Returns (paths, held_out_ids) so prepare_dolci_pools can exclude the rows by id.
+    """
+    if dataset is None:
+        dataset = _load_dolci(num_proc)
+    blocker = PromptDecontaminator(_reference_prompts(output_dir))
+    sizes = TARGET_SPLIT_SIZES["precise_if"]
+    n_total = sizes["validation"] + sizes["test"]
+    pif = dataset.filter(
+        lambda ex: ex["eligible"] and ex["source_dataset"] == PRECISE_IF_SOURCE
+        and ex["n_turns"] == 2 and ex["ascii_ratio"] >= PRECISE_IF_MIN_ASCII_RATIO,
+        num_proc=num_proc, desc="precise_if candidates",
+    )
+    print(f"precise_if: {len(pif):,} single-turn English Precise-IF rows; decontaminating against "
+          f"{len(blocker)} benchmark prompts and sampling {n_total}")
+    pif = pif.shuffle(seed=DOLCI_SAMPLE_SEED)
+
+    rows, held_out_ids, blocked = [], set(), 0
+    for example in pif:
+        if len(rows) >= n_total:
+            break
+        cleaned = _dolci_clean_messages(example["messages"])
+        if blocker.blocked_messages(cleaned):
+            blocked += 1
+            continue
+        held_out_ids.add(example["id"])
+        rows.append({
+            "dataset": "precise_if",
+            "id": f"precise_if::{example['id']}",
+            "messages": cleaned,
+            "metadata": {
+                "source_id": example["id"],
+                "source_dataset": example["source_dataset"],
+                "domain": example["domain"],
+                "source_repo": DOLCI_PIN["repo"],
+                "source_revision": DOLCI_PIN["revision"],
+            },
+        })
+    print(f"precise_if: dropped {blocked} benchmark-overlapping rows while selecting {len(rows)}")
+    return _split_target(rows, "precise_if", output_dir), held_out_ids
+
+
+def prepare_dolci_pools(output_dir, pools=None, num_proc=16):
+    """Build the 32K-row Dolci training pools (and the precise_if target they exclude).
+
+    Requires the benchmark files and the math/mbpp targets to exist already
+    (`--datasets math mbpp ifeval ifbench math500 mbpp_plus`), because pools are
+    decontaminated against all of them.
+    """
+    pools = list(pools or DOLCI_POOL_DOMAINS)
+    dataset = _load_dolci(num_proc)
+    _, held_out_ids = prepare_precise_if_target(output_dir, dataset=dataset, num_proc=num_proc)
+    blocker = PromptDecontaminator(_reference_prompts(output_dir, targets=DOLCI_TARGETS))
+    print(f"dolci: decontaminating pools against {len(blocker)} benchmark + target prompts")
+
+    eligible = dataset.filter(
+        lambda ex, ids=held_out_ids, b=blocker: ex["eligible"] and ex["id"] not in ids
+        and not b.blocked_messages(ex["messages"]),
+        num_proc=num_proc, desc="eligible rows",
+    )
+    print(f"dolci: {len(eligible):,} eligible rows after format/length/held-out/decontamination filtering")
+
+    outputs = {}
+    for pool in pools:
+        domains = DOLCI_POOL_DOMAINS[pool]
+        cand = eligible.filter(lambda ex, d=domains: ex["domain"] in d, num_proc=num_proc, desc=f"{pool} candidates")
+        if len(cand) < DOLCI_POOL_SIZE:
+            raise RuntimeError(f"{pool}: only {len(cand)} candidates for a {DOLCI_POOL_SIZE}-row pool")
+        sampled = cand.shuffle(seed=DOLCI_SAMPLE_SEED).select(range(DOLCI_POOL_SIZE))
+        rows, by_domain = [], {}
+        for idx, example in enumerate(sampled):
+            by_domain[example["domain"]] = by_domain.get(example["domain"], 0) + 1
+            rows.append({
+                "dataset": pool,
+                "id": f"{pool}_{idx}",
+                "messages": _dolci_clean_messages(example["messages"]),
+                "metadata": {
+                    "source_id": example["id"],
+                    "source_dataset": example["source_dataset"],
+                    "domain": example["domain"],
+                },
+            })
+        print(f"{pool}: {len(cand):,} candidates -> {len(rows):,} rows; composition: "
+              + ", ".join(f"{k}={v}" for k, v in sorted(by_domain.items(), key=lambda kv: -kv[1])))
+        outputs[pool] = _write_messages_jsonl(
+            os.path.join(output_dir, "train", pool, f"{pool}_data.jsonl"), rows, pool)
+    return outputs
+
+
+def prepare_math_target(output_dir):
+    """D* / held-out for the MATH500 target from the MATH *train* split (all 7 subjects).
+
+    User turn is the raw problem (the math500 evaluator adds its own instruction
+    prefix at generation time, as in Next); rows are decontaminated against the benchmarks.
+    """
+    pin = MATH_TRAIN_PIN
+    print(f"Preparing math target from {pin['repo']}@{pin['revision'][:8]} ({pin['split']}) ...")
+    blocker = PromptDecontaminator(_reference_prompts(output_dir))
+    examples = []
+    for config in pin["configs"]:
+        ds = load_dataset(pin["repo"], config, split=pin["split"], revision=pin["revision"])
+        for ex in ds:
+            ex = dict(ex); ex["_config"] = config
+            examples.append(ex)
+    examples = shuffled_examples(examples, seed=DOLCI_SAMPLE_SEED)
+    sizes = TARGET_SPLIT_SIZES["math_ref"]
+    rows, blocked = [], 0
+    for ex in examples:
+        problem = (ex.get("problem") or "").strip()
+        solution = (ex.get("solution") or "").strip()
+        if not problem or not solution or "\\boxed" not in solution:
+            continue
+        if blocker.match(problem) is not None:
+            blocked += 1
+            continue
+        rows.append({
+            "dataset": "math_ref",
+            "id": f"math_ref::{ex['_config']}::{len(rows)}",
+            "messages": [
+                {"role": "user", "content": problem},
+                {"role": "assistant", "content": solution},
+            ],
+            "metadata": {
+                "subject": ex.get("type") or ex["_config"],
+                "level": str(ex.get("level") or ""),
+                "source_repo": pin["repo"],
+                "source_revision": pin["revision"],
+                "source_split": pin["split"],
+            },
+        })
+        if len(rows) >= sizes["validation"] + sizes["test"]:
+            break
+    print(f"math: dropped {blocked} benchmark-overlapping rows while selecting {len(rows)}")
+    return _split_target(rows, "math_ref", output_dir)
+
+
+def _mbpp_task_number(task_id):
+    """`Mbpp/123` or `123` -> 123 (None if unparsable)."""
+    tail = str(task_id).rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def render_mbpp_prompt(text, tests):
+    """Standard MBPP prompt (same as Next's target rows)."""
+    return (
+        "You are an expert Python programmer, and here is your task:\n"
+        f"{text.strip()}\nYour code should pass these tests:\n\n"
+        + "\n".join(str(t) for t in tests) + "\n"
+    )
+
+
+def prepare_mbpp_target(output_dir):
+    """D* / held-out for the MBPP+ target from MBPP *train* minus every MBPP+ task id.
+
+    MBPP+ is built from the sanitized MBPP set, which spans the original
+    train/test/validation splits, so 108 of the 374 train rows are benchmark
+    tasks and must be excluded (as Next does).
+    """
+    pin = MBPP_TRAIN_PIN
+    print(f"Preparing mbpp target from {pin['repo']}:{pin['config']}@{pin['revision'][:8]} ({pin['split']}) ...")
+    blocker = PromptDecontaminator(_reference_prompts(output_dir))
+    blocked_ids = set()
+    for row in _read_jsonl(_bench_path(output_dir, "mbpp_plus")):
+        number = _mbpp_task_number((row.get("metadata") or {}).get("task_id"))
+        if number is not None:
+            blocked_ids.add(number)
+    ds = load_dataset(pin["repo"], pin["config"], split=pin["split"], revision=pin["revision"])
+    examples = shuffled_examples(list(ds), seed=DOLCI_SAMPLE_SEED)
+    rows, id_blocked, prompt_blocked = [], 0, 0
+    for ex in examples:
+        # MBPP ships CRLF line endings; normalise so the fenced code is clean.
+        text = (ex.get("text") or "").replace("\r\n", "\n").strip()
+        code = (ex.get("code") or "").replace("\r\n", "\n").strip()
+        tests = [t.replace("\r\n", "\n") for t in (ex.get("test_list") or [])]
+        if not text or not code or not tests:
+            continue
+        if _mbpp_task_number(ex.get("task_id")) in blocked_ids:
+            id_blocked += 1
+            continue
+        prompt = render_mbpp_prompt(text, tests)
+        if blocker.match(prompt) is not None or blocker.match(text) is not None:
+            prompt_blocked += 1
+            continue
+        rows.append({
+            "dataset": "mbpp",
+            "id": f"mbpp::{ex.get('task_id')}",
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": f"```python\n{code}\n```"},
+            ],
+            "metadata": {
+                "task_id": str(ex.get("task_id")),
+                "test_list": tests,
+                "test_setup_code": (ex.get("test_setup_code") or "").replace("\r\n", "\n"),
+                "source_repo": pin["repo"],
+                "source_revision": pin["revision"],
+                "source_split": pin["split"],
+            },
+        })
+    print(f"mbpp: dropped {id_blocked} MBPP+ task ids and {prompt_blocked} benchmark-overlapping prompts; {len(rows)} rows remain")
+    return _split_target(rows, "mbpp", output_dir)
+
+
+def audit_dolci_leakage(output_dir):
+    """Re-check every pool/target row against the benchmark (and target) prompts."""
+    bench = PromptDecontaminator(_reference_prompts(output_dir))
+    full = PromptDecontaminator(_reference_prompts(output_dir, targets=DOLCI_TARGETS))
+    problems = 0
+    for target in DOLCI_AUDIT_TARGETS:
+        for split in ("validation", "test"):
+            path = os.path.join(output_dir, "eval", target, f"{target}_{split}_data.jsonl")
+            if not os.path.isfile(path):
+                continue
+            rows = _read_jsonl(path)
+            hits = sum(bench.blocked_messages(r["messages"]) for r in rows)
+            problems += hits
+            print(f"  {target}/{split}: {len(rows)} rows, {hits} benchmark matches")
+    for pool in DOLCI_POOL_DOMAINS:
+        path = os.path.join(output_dir, "train", pool, f"{pool}_data.jsonl")
+        if not os.path.isfile(path):
+            continue
+        rows = _read_jsonl(path)
+        hits = sum(full.blocked_messages(r["messages"]) for r in rows)
+        problems += hits
+        print(f"  {pool}: {len(rows)} rows, {hits} benchmark/target matches")
+    print("Leakage audit:", "CLEAN" if problems == 0 else f"{problems} MATCHES")
+    return problems == 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Prepare datasets for training and evaluation",
@@ -1041,10 +1469,17 @@ Available Datasets:
     ifbench   - IFBench (300 prompts; needs an allenai/IFBench checkout at eval time)
     math500   - MATH-500 (500 problems; math-verify or boxed-answer scoring)
     mbpp_plus - MBPP+ via the evalplus package (378 tasks)
+    gsm8k     - GSM8K test (1319 problems; math-verify scoring)
 
-  Dolci capability setting (train pools + targets): NOT built by this script yet.
-    Expected layout: train/dolci_{instruction,reasoning,mixed}/<name>_data.jsonl (32,000 rows)
-                     eval/{precise_if,math,mbpp}/<target>_{validation,test}_data.jsonl (D*, held-out)
+  Dolci capability setting (Qwen3 + Dolci-Instruct pools; see SFT/README.md):
+    Order matters: benchmarks -> math_ref mbpp -> dolci_pools (pools are decontaminated against all of them).
+    math_ref    - eval/math_ref/ MATH-train reference solutions (D* 64 / held-out 500); superseded as a target by
+                  `math` (SFT/data/build_math_mix_target.py) but kept: the pools were decontaminated against it
+    mbpp        - eval/mbpp/ from MBPP train minus MBPP+ task ids (D* 128 / held-out ~137)
+    dolci_pools - train/dolci_{instruction,reasoning,mixed}/<name>_data.jsonl (32,000 rows each)
+                  + eval/precise_if/ (Dolci Precise-IF rows; D* 128 / held-out 472, excluded from the pools)
+    precise_if  - only the precise_if target (same rows as dolci_pools writes)
+    dolci_audit - re-check pools/targets for exact or near-duplicate (8-gram) benchmark prompts
 
   Training Pools:
     nq_open         - NQ-open: train pool (~88K Q->A pairs)
@@ -1063,7 +1498,8 @@ Available Datasets:
         choices=['tydiqa', 'samsum', 'nq_open_eval', 'squad_eval', 'triviaqa_eval', 'truthfulqa',
                  'nq_open', 'triviaqa_train', 'squad', 'tulu3', 'alpaca',
                  'dolly', 'flan_v2', 'cot', 'oasst1',
-                 'ifeval', 'ifbench', 'math500', 'mbpp_plus'],
+                 'ifeval', 'ifbench', 'math500', 'gsm8k', 'mbpp_plus',
+                 'dolci_pools', 'precise_if', 'math_ref', 'mbpp', 'dolci_audit'],
         help="Datasets to prepare (see list below)"
     )
     parser.add_argument(
@@ -1071,6 +1507,13 @@ Available Datasets:
         type=str,
         default="SFT/data",
         help="Output directory for prepared data (default: SFT/data)"
+    )
+
+    parser.add_argument(
+        "--num_proc",
+        type=int,
+        default=16,
+        help="Worker processes for the Dolci pool filters (default: 16)"
     )
 
     args = parser.parse_args()
@@ -1125,8 +1568,27 @@ Available Datasets:
     if 'math500' in datasets_to_prepare:
         results['math500_bench'] = prepare_math500_bench(args.output_dir)
 
+    if 'gsm8k' in datasets_to_prepare:
+        results['gsm8k_bench'] = prepare_gsm8k_bench(args.output_dir)
+
     if 'mbpp_plus' in datasets_to_prepare:
         results['mbpp_plus_bench'] = prepare_mbpp_plus_bench(args.output_dir)
+
+    # Dolci capability setting
+    if 'dolci_pools' in datasets_to_prepare:
+        results.update(prepare_dolci_pools(args.output_dir, num_proc=args.num_proc))
+        results['precise_if'] = os.path.join(args.output_dir, "eval", "precise_if")
+    elif 'precise_if' in datasets_to_prepare:
+        results['precise_if'] = prepare_precise_if_target(args.output_dir, num_proc=args.num_proc)[0]
+
+    if 'math_ref' in datasets_to_prepare:
+        results['math_ref'] = prepare_math_target(args.output_dir)
+
+    if 'mbpp' in datasets_to_prepare:
+        results['mbpp'] = prepare_mbpp_target(args.output_dir)
+
+    if 'dolci_audit' in datasets_to_prepare:
+        results['dolci_audit'] = "clean" if audit_dolci_leakage(args.output_dir) else None
 
     # Training pools
     if 'nq_open' in datasets_to_prepare:

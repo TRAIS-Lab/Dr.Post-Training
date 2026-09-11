@@ -2,7 +2,9 @@
 Curation strategies for gradient-based data curation in trainers.
 
 This module provides two families of strategies based on how validation
-gradients are obtained:
+gradients are obtained (each with NA / LayerWiseSubset / GlobalSubset /
+GroupWiseSubset variants; GroupWiseSubset curates per layer group, e.g. per
+transformer block — see drpt.selection.grouping):
 
 1. **MergedBatch Strategies**:
    - Train and val samples are merged into a single batch
@@ -35,9 +37,46 @@ if TYPE_CHECKING:
 
 import torch
 import torch.nn as nn
-from .state import LayerWiseSubsetState, GlobalSubsetState
+from .state import LayerWiseSubsetState, GlobalSubsetState, GroupWiseSubsetState
 
 logger = logging.getLogger(__name__)
+
+# Curation methods that need gradient hooks (shared by the SFT/RLHF trainers).
+SELECTION_METHODS = ("LayerWiseSubset", "GlobalSubset", "GroupWiseSubset")
+
+
+def _finish_groupwise_backward(strategy, grad_hook: "GradientHook") -> None:
+    """Post-backward bookkeeping shared by the GroupWiseSubset strategies.
+
+    Every group normally finalizes (select + assemble .grad) inside backward.
+    Groups whose layers did not all run backward are finalized here with a
+    warning; on the first step we also warn about groups that are not
+    contiguous in backward order (correct, but higher peak memory).
+    """
+    state: GroupWiseSubsetState = grad_hook.selection_state
+    pending = state.finalize_remaining(grad_hook)
+    if pending and not getattr(strategy, "_warned_pending", False):
+        strategy._warned_pending = True
+        logger.warning(
+            f"GroupWiseSubset: {len(pending)} group(s) had layers that did not run backward "
+            f"and were finalized after loss.backward(): {[str(k) for k in pending[:5]]}"
+            f"{' ...' if len(pending) > 5 else ''}. Check that every hooked layer is used "
+            f"in the forward pass and trainable."
+        )
+    if not getattr(strategy, "_contiguity_checked", False):
+        strategy._contiguity_checked = True
+        bad = state.non_contiguous_groups()
+        if bad:
+            logger.warning(
+                f"GroupWiseSubset: {len(bad)} group(s) are not contiguous in backward order "
+                f"(e.g. {[str(k) for k in bad[:3]]}). Selection is still exact, but their "
+                f"activations stay retained until the group completes, raising peak memory."
+            )
+        else:
+            logger.info(
+                f"GroupWiseSubset: all {len(state.group_layers)} groups are contiguous in "
+                f"backward order (retained activations are released per group)."
+            )
 
 
 # ============================================================
@@ -428,6 +467,71 @@ class MergedBatchGlobalSubsetOnePassStrategy(MergedBatchStrategy):
         self.grad_hook.clear_retained_data()  # Safety net
 
 
+class MergedBatchGroupWiseSubsetStrategy(MergedBatchStrategy):
+    """
+    GroupWiseSubset strategy with merged batch: single-pass, per-group curation.
+
+    The hooked layers are partitioned into groups (per transformer block, per
+    attention/MLP sub-block, ...; see ``drpt.selection.grouping``). During
+    backward each group accumulates scores over its layers and, once all of
+    them have run, selects and assembles the curated gradient for exactly
+    those layers. Non-linear layers (RMSNorm) are wrapped with
+    TrainOnlyRMSNormBackward as in one-pass GlobalSubset.
+    """
+
+    def execute_training_step(
+        self,
+        model: nn.Module,
+        merged_batch: Dict[str, Tensor],
+        train_batch_size: int,
+        compute_loss_fn: Callable[[nn.Module, Dict[str, Tensor]], Tensor],
+        **kwargs
+    ) -> Tensor:
+        """Training step with per-group curation."""
+        lr = kwargs.get('lr', 1e-4)
+
+        self._setup_state(train_batch_size, lr)
+
+        if 'labels' in merged_batch:
+            self.grad_hook.set_token_counts(merged_batch['labels'], train_batch_size)
+
+        model.zero_grad()
+        loss = compute_loss_fn(model, merged_batch)
+        loss.backward()  # Groups select + assemble .grad as they complete
+
+        _finish_groupwise_backward(self, self.grad_hook)
+
+        self._extract_selection_records()
+        self._cleanup()
+        return loss.detach()
+
+    def _setup_state(self, train_batch_size: int, lr: float) -> None:
+        """Set up GroupWiseSubsetState for this step."""
+        dtype = next(self.grad_hook.model.parameters()).dtype
+
+        state = GroupWiseSubsetState(
+            layer_groups=self.grad_hook._require_layer_groups(),
+            train_batch_size=train_batch_size,
+            num_layers=len(self.grad_hook.layer_names),
+            frac=self.frac,
+            lr=lr,
+            device=self.grad_hook.device,
+            dtype=dtype,
+            use_second_order=self.use_second_order,
+            selection_mode=self.selection_mode,
+            record_selections=self.record_selections,
+            scoring_method=self.scoring_method,
+        )
+
+        self.grad_hook.selection_state = state
+
+    def _cleanup(self) -> None:
+        """Clean up after training step."""
+        self.grad_hook.clear_selection()
+        self.grad_hook.clear_token_counts()
+        self.grad_hook.clear_retained_data()  # Safety net
+
+
 def create_merged_batch_strategy(
     method: str,
     grad_hook: Optional[GradientHook],
@@ -444,8 +548,8 @@ def create_merged_batch_strategy(
     Note: Has padding overhead when val/train have different sequence lengths.
 
     Args:
-        method: Curation method ("NA", "LayerWiseSubset", "GlobalSubset")
-        grad_hook: GradientHook instance
+        method: Curation method ("NA", "LayerWiseSubset", "GlobalSubset", "GroupWiseSubset")
+        grad_hook: GradientHook instance (GroupWiseSubset: with layer_groups set)
         frac: Curation/filter fraction
         use_second_order: Use greedy curation with second-order
         selection_mode: "topk" (select top frac) or "filtering" (drop bottom frac of negative)
@@ -476,6 +580,12 @@ def create_merged_batch_strategy(
             return strategy
         else:
             return MergedBatchGlobalSubsetStrategy(**kwargs)
+
+    if method == "GroupWiseSubset":
+        grad_hook._require_layer_groups()
+        strategy = MergedBatchGroupWiseSubsetStrategy(**kwargs)
+        grad_hook.wrap_nonlinear_layers()
+        return strategy
 
     raise ValueError(f"Unknown curation method: {method}")
 
@@ -730,18 +840,24 @@ class SeparateBatchGlobalSubsetStrategy(SeparateBatchStrategy):
             # Re-enable hooks for next step
             self.grad_hook.enable_hooks()
 
+            # Pass 1 left .grad on parameters that are not routed through the
+            # curation hooks (e.g. the PPO value head); drop them so the caller's
+            # optimizer.step() does not apply an unfiltered update.
+            model.zero_grad()
+
             # Return zero loss and stats indicating batch was skipped
-            # Include placeholder loss stats for consistent logging
+            # (keys match compute_ppo_loss / _compute_ppo_stats for aggregation)
             import torch
             zero_loss = torch.tensor(0.0, device=next(model.parameters()).device)
             stats = {
                 "loss/total": 0.0,
                 "loss/policy": 0.0,
                 "loss/value": 0.0,
-                "policy/approx_kl": 0.0,
+                "policy/approxkl": 0.0,
+                "policy/policykl": 0.0,
                 "policy/clipfrac": 0.0,
-                "policy/ratio_mean": 1.0,
-                "values/mean": 0.0,
+                "policy/ratio": 1.0,
+                "val/mean": 0.0,
                 "selection/n_selected": 0,
             }
             return zero_loss, stats
@@ -869,6 +985,72 @@ class SeparateBatchGlobalSubsetOnePassStrategy(SeparateBatchStrategy):
         self.grad_hook.clear_retained_data()  # Safety net
 
 
+class SeparateBatchGroupWiseSubsetStrategy(SeparateBatchStrategy):
+    """
+    GroupWiseSubset strategy with cached val: single-pass, per-group curation.
+
+    Uses pre-captured validation gradients. During backward each group
+    accumulates scores over its layers and, once all of them have run, selects
+    and assembles the curated gradient for exactly those layers. Exact scale
+    factor parity with LayerWiseSubset/GlobalSubset since
+    batch_total_tokens == train_total_tokens in separate batch mode.
+    """
+
+    def execute_training_step(
+        self,
+        model: nn.Module,
+        batch_size: int,
+        compute_loss_fn: Callable[[], Tuple[Tensor, Dict]],
+        lr: float,
+        **kwargs
+    ) -> Tuple[Tensor, Dict]:
+        """Training step with per-group curation using stored val grads."""
+        labels = kwargs.get('labels')
+
+        self._setup_state(batch_size, lr)
+
+        if labels is not None:
+            self.grad_hook.set_token_counts(labels, batch_size)
+
+        model.zero_grad()
+        loss, stats = compute_loss_fn()
+        loss.backward()  # Groups select + assemble .grad as they complete
+
+        _finish_groupwise_backward(self, self.grad_hook)
+
+        # Curation stats (same keys as LayerWiseSubset)
+        sel_state = self.grad_hook.selection_state
+        if sel_state._layer_selections:
+            n_selected_list = [n for _, n in sel_state._layer_selections]
+            stats["selection/mean_selected"] = sum(n_selected_list) / len(n_selected_list)
+            stats["selection/min_selected"] = min(n_selected_list)
+            stats["selection/n_selected"] = min(n_selected_list)
+
+        self._extract_selection_records()
+        self._cleanup()
+        return loss.detach(), stats
+
+    def _setup_state(self, batch_size: int, lr: float) -> None:
+        """Set up GroupWiseSubsetState with stored val gradients."""
+        self.grad_hook.setup_selection_with_stored_val(
+            train_batch_size=batch_size,
+            selection_method="GroupWiseSubset",
+            frac=self.frac,
+            lr=lr,
+            compute_scores_only=True,
+            use_second_order=self.use_second_order,
+            selection_mode=self.selection_mode,
+            record_selections=self.record_selections,
+            scoring_method=self.scoring_method,
+            one_pass=True,
+        )
+
+    def _cleanup(self) -> None:
+        """Clean up after training step."""
+        self.grad_hook.clear_selection()
+        self.grad_hook.clear_retained_data()  # Safety net
+
+
 def create_separate_batch_strategy(
     method: str,
     grad_hook: Optional[GradientHook],
@@ -885,8 +1067,8 @@ def create_separate_batch_strategy(
     Avoids padding overhead when val/train have different sequence lengths.
 
     Args:
-        method: Curation method ("NA", "LayerWiseSubset", "GlobalSubset")
-        grad_hook: GradientHook instance
+        method: Curation method ("NA", "LayerWiseSubset", "GlobalSubset", "GroupWiseSubset")
+        grad_hook: GradientHook instance (GroupWiseSubset: with layer_groups set)
         frac: Fraction parameter. Meaning depends on selection_mode:
               - "topk": Fraction of samples to select (top frac by score)
               - "filtering": Fraction of negative-influence samples to DROP
@@ -919,5 +1101,11 @@ def create_separate_batch_strategy(
             return strategy
         else:
             return SeparateBatchGlobalSubsetStrategy(**kwargs)
+
+    if method == "GroupWiseSubset":
+        grad_hook._require_layer_groups()
+        strategy = SeparateBatchGroupWiseSubsetStrategy(**kwargs)
+        grad_hook.check_unhooked_trainable_params()
+        return strategy
 
     raise ValueError(f"Unknown curation method: {method}")

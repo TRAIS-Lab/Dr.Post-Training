@@ -2,7 +2,7 @@
 Training arguments for RLHF experiments.
 
 Following SFT conventions:
-- `method`: Controls data curation (NA, LayerWiseSubset, GlobalSubset)
+- `method`: Controls data curation (NA, IIF, LayerWiseSubset, GlobalSubset, GroupWiseSubset)
 - `sparsification`/`projection`: Controls compression (implies MeSO optimizer)
 - PPO-specific arguments for RLHF
 """
@@ -75,7 +75,30 @@ class TrainingArguments(TA):
                 "'NA' (baseline, no curation), "
                 "'IIF' (pre-filter entire rollout before PPO epochs), "
                 "'LayerWiseSubset' (per-layer curation, single-pass), "
-                "'GlobalSubset' (global curation, two-pass)"
+                "'GlobalSubset' (global curation, two-pass), "
+                "'GroupWiseSubset' (per-layer-group curation, single-pass; see "
+                "--selection_granularity / --selection_groups). 'BlockWiseSubset' and "
+                "'SublayerWiseSubset' are aliases for GroupWiseSubset with granularity block / sublayer."
+            )
+        },
+    )
+    selection_granularity: str = field(
+        default="block",
+        metadata={
+            "help": (
+                "GroupWiseSubset only. Layer grouping preset: 'layer' (== LayerWiseSubset), "
+                "'sublayer' (per block: attention vs MLP), 'block' (per decoder block, default), "
+                "'global' (== GlobalSubset one_pass), 'custom' (rules from --selection_groups)."
+            )
+        },
+    )
+    selection_groups: str = field(
+        default=None,
+        metadata={
+            "help": (
+                "GroupWiseSubset only. Custom per-block grouping rules "
+                "'<name>=<member>[,<member>..];<name>=..' matched against the layer name after "
+                "'...layers.N.' (works with PEFT LoRA names). Implies selection_granularity=custom."
             )
         },
     )
@@ -116,6 +139,16 @@ class TrainingArguments(TA):
                 "Batch size for validation gradient computation. "
                 "Controls how many validation samples are processed per gradient capture pass. "
                 "Smaller values use less memory but require more passes."
+            )
+        },
+    )
+    train_on_val: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Target-only baseline: use the n_val held-out validation prompts as the PPO "
+                "training set (method must be NA). Compares 'train directly on the target "
+                "prompts' against curating the full pool toward them."
             )
         },
     )
@@ -334,9 +367,9 @@ class TrainingArguments(TA):
         default=1.0,
         metadata={"help": "Sampling temperature"},
     )
-    top_k: float = field(
-        default=0.0,
-        metadata={"help": "Top-k sampling (0.0 to disable)"},
+    top_k: int = field(
+        default=0,
+        metadata={"help": "Top-k sampling (0 to disable)"},
     )
     top_p: float = field(
         default=1.0,
@@ -403,14 +436,39 @@ class TrainingArguments(TA):
         if self.task not in valid_tasks:
             raise ValueError(f"task must be one of {valid_tasks}, got {self.task}")
 
+        # Method aliases -> GroupWiseSubset + granularity preset
+        _aliases = {"BlockWiseSubset": "block", "SublayerWiseSubset": "sublayer"}
+        if self.method in _aliases:
+            self.selection_granularity = _aliases[self.method]
+            self.method = "GroupWiseSubset"
+        if self.selection_groups is not None and self.selection_groups.strip() == "":
+            self.selection_groups = None
+        if self.selection_groups is not None:
+            self.selection_granularity = "custom"
+
         # Validate method
-        valid_methods = ["NA", "IIF", "LayerWiseSubset", "GlobalSubset"]
+        valid_methods = ["NA", "IIF", "LayerWiseSubset", "GlobalSubset", "GroupWiseSubset"]
         if self.method not in valid_methods:
             raise ValueError(f"method must be one of {valid_methods}, got {self.method}")
+        if self.method == "GroupWiseSubset":
+            from drpt.selection.grouping import GRANULARITIES
+            if self.selection_granularity not in GRANULARITIES:
+                raise ValueError(
+                    f"selection_granularity must be one of {GRANULARITIES}, got {self.selection_granularity!r}"
+                )
+            if self.selection_granularity == "custom" and self.selection_groups is None:
+                raise ValueError("selection_granularity='custom' requires --selection_groups")
 
         # Validate filter_frac
         if not 0 <= self.filter_frac <= 1:
             raise ValueError(f"filter_frac must be in [0, 1], got {self.filter_frac}")
+
+        # Validate val_loss_type (names shared with train.sh: rew | tpg | tloss)
+        valid_val_loss_types = ["reward", "token-pg", "train-loss"]
+        if self.val_loss_type not in valid_val_loss_types:
+            raise ValueError(
+                f"val_loss_type must be one of {valid_val_loss_types}, got {self.val_loss_type}"
+            )
 
         # Validate kl_estimator (matching TRL experimental PPO)
         valid_kl_estimators = ["k1", "k2", "k3"]

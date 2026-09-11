@@ -9,12 +9,18 @@
 #
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ -z "$CODE_DIR" ]]; then
-    source "$REPO_ROOT/cluster_env.sh" || { echo "ERROR: cluster_env.sh not found."; exit 1; }
-    activate_env
-fi
+# Cluster bootstrap (same resolution order as SFT/train/train.sh): $DRPT_CLUSTER_ENV,
+# then this checkout's cluster_env.sh. Always activate the env: under sbatch the
+# variables may already be exported by run.slurm while the conda env is not active.
+_drpt_env=""
+for _c in "${DRPT_CLUSTER_ENV:-}" "$REPO_ROOT/cluster_env.sh"; do
+    [[ -n "$_c" && -f "$_c" ]] && { _drpt_env="$_c"; break; }
+done
+[[ -n "$_drpt_env" ]] || { echo "ERROR: cluster_env.sh not found (set DRPT_CLUSTER_ENV or create it at the repo root)."; exit 1; }
+source "$_drpt_env"
+activate_env
 
-cd $CODE_DIR/Dr.Post-Training
+cd "$CODE_DIR/Dr.Post-Training"
 export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,6 +41,10 @@ seed_override=""
 lr_override=""
 lr_vhead_override=""
 init_kl_coef_override=""
+n_val_override=""
+val_loss_type_override=""
+val_batch_size_override=""
+max_steps_override=""
 dry_run=false
 
 while [[ $# -gt 0 ]]; do
@@ -45,6 +55,10 @@ while [[ $# -gt 0 ]]; do
         --lr)                 lr_override="$2"; shift 2 ;;
         --lr_vhead)           lr_vhead_override="$2"; shift 2 ;;
         --init_kl_coef)       init_kl_coef_override="$2"; shift 2 ;;
+        --n_val)              n_val_override="$2"; shift 2 ;;
+        --val_loss_type)      val_loss_type_override="$2"; shift 2 ;;
+        --val_batch_size)     val_batch_size_override="$2"; shift 2 ;;
+        --max_steps)          max_steps_override="$2"; shift 2 ;;
         --dry-run)            dry_run=true; shift ;;
         --list)
             dir="${config_dir:-configs}"
@@ -56,7 +70,7 @@ while [[ $# -gt 0 ]]; do
                 [[ "$name" != "defaults" ]] && echo "  $name"
             done
             echo ""
-            echo "Categories: all, baseline, iif, layer-wise-subset, global-subset"
+            echo "Categories: all, baseline, target-only, iif, layer-wise-subset, global-subset, block-wise-subset, sublayer-wise-subset, group-wise-subset, lora"
             exit 0
             ;;
         --help|-h)
@@ -75,6 +89,10 @@ Optional:
   --lr <lr>               Override learning rate from config
   --lr_vhead <lr>         Override value head LR from config
   --init_kl_coef <coef>   Override initial KL coefficient from config
+  --n_val <n>             Override n_val (0 = self-referencing target, >0 = held-out prompts)
+  --val_loss_type <t>     Override validation target: reward | token-pg | train-loss
+  --val_batch_size <n>    Override held-out validation batch size
+  --max_steps <n>         Override max_steps (smoke tests)
   --dry-run               Print commands without executing
   --list                  List available methods and exit
 
@@ -118,6 +136,8 @@ reset_config() {
     cfg_scoring_method="reduced_ghost"
     cfg_score_compression=""
     cfg_subset_mode="two_pass"
+    cfg_selection_granularity=""       # GroupWiseSubset only; empty -> train.py default (block)
+    cfg_selection_groups=""            # GroupWiseSubset only; custom per-block rules
 
     # Optimizer compression
     cfg_opt_compression=""
@@ -205,6 +225,8 @@ parse_yaml() {
             optimizer.refresh_freq)              cfg_update_compressor_freq="$val" ;;
             scoring_method)                      cfg_scoring_method="$val" ;;
             subset_mode)                         cfg_subset_mode="$val" ;;
+            selection_granularity)               cfg_selection_granularity="$val" ;;
+            selection_groups)                    cfg_selection_groups="$val" ;;
             # Legacy keys (backward compat)
             score_grad_compression.sparsifier)   cfg_score_compression="$val" ;;
             score_grad_compression.projector)    ;; # Ignored
@@ -270,9 +292,13 @@ resolve_methods() {
         case "$item" in
             all)       for m in "${available[@]}"; do resolved="${resolved:+$resolved,}$m"; done ;;
             baseline)  for m in "${available[@]}"; do [[ "$m" == FullTraining-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            target-only) for m in "${available[@]}"; do [[ "$m" == TargetOnly-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             iif)       for m in "${available[@]}"; do [[ "$m" == IIF-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             layer-wise-subset) for m in "${available[@]}"; do [[ "$m" == LayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             global-subset)    for m in "${available[@]}"; do [[ "$m" == GlobalSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            block-wise-subset)    for m in "${available[@]}"; do [[ "$m" == BlockWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            sublayer-wise-subset) for m in "${available[@]}"; do [[ "$m" == SublayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
+            group-wise-subset)    for m in "${available[@]}"; do [[ "$m" == GroupWiseSubset-* || "$m" == BlockWiseSubset-* || "$m" == SublayerWiseSubset-* ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             lora)      for m in "${available[@]}"; do [[ "$m" == *-LoRA ]] && resolved="${resolved:+$resolved,}$m"; done ;;
             *)
                 if [[ -f "$config_dir/${item}.yaml" ]]; then
@@ -310,6 +336,10 @@ run_method() {
     [[ -n "$lr_override" ]] && cfg_learning_rate="$lr_override"
     [[ -n "$lr_vhead_override" ]] && cfg_lr_vhead="$lr_vhead_override"
     [[ -n "$init_kl_coef_override" ]] && cfg_init_kl_coef="$init_kl_coef_override"
+    [[ -n "$n_val_override" ]] && cfg_n_val="$n_val_override"
+    [[ -n "$val_loss_type_override" ]] && cfg_val_loss_type="$val_loss_type_override"
+    [[ -n "$val_batch_size_override" ]] && cfg_val_batch_size="$val_batch_size_override"
+    [[ -n "$max_steps_override" ]] && cfg_max_steps="$max_steps_override"
 
     # Validate required fields
     if [[ -z "$cfg_task" ]] || [[ -z "$cfg_reward_model" ]]; then
@@ -319,19 +349,37 @@ run_method() {
 
     # Derived values
     local internal_method="NA"
-    [[ "$cfg_method" != "FullTraining" ]] && internal_method="$cfg_method"
+    local train_on_val="false"
+    case "$cfg_method" in
+        FullTraining) ;;
+        TargetOnly)   train_on_val="true" ;;   # plain PPO on the n_val held-out prompts
+        *)            internal_method="$cfg_method" ;;
+    esac
 
     local model_name=$(basename "$cfg_model")
     local method_str="${cfg_method}"
     [[ "$internal_method" != "NA" && "$cfg_use_second_order" == "true" ]] && method_str="${method_str}-2nd"
 
     # Build job name
+    # Validation target naming. The canonical names are the --val_loss_type values
+    # (reward | token-pg | train-loss); the run directory uses rew | tpg | tloss.
+    # FullTraining (NA) never uses a target, so it is always filed under v0-rew
+    # and shared by every scenario in result.ipynb.
+    if [[ "$internal_method" == "NA" ]]; then
+        cfg_val_loss_type="reward"
+        if [[ "$train_on_val" == "true" ]]; then
+            # TargetOnly keeps n_val (it IS the training set); shares the held-out runs' val_str.
+            [[ "$cfg_n_val" -gt 0 ]] || { echo "ERROR: TargetOnly requires n_val > 0"; return 1; }
+        else
+            cfg_n_val="0"
+        fi
+    fi
     local val_type_short
     case "$cfg_val_loss_type" in
         reward)      val_type_short="rew" ;;
         token-pg)    val_type_short="tpg" ;;
         train-loss)  val_type_short="tloss" ;;
-        *)           val_type_short="$cfg_val_loss_type" ;;
+        *) echo "ERROR: unknown val_loss_type '$cfg_val_loss_type' (expected reward | token-pg | train-loss)"; return 1 ;;
     esac
     local val_str="v${cfg_n_val}-${val_type_short}"
     [[ "$cfg_n_val" -gt 0 ]] && val_str="${val_str}-b${cfg_val_batch_size}"
@@ -400,6 +448,10 @@ $FIXED_ARGS \
     # Scoring method
     cmd="$cmd --scoring_method=$cfg_scoring_method --subset_mode=$cfg_subset_mode"
 
+    # GroupWiseSubset grouping (single-quoted: the rules string contains ';' and spaces)
+    [[ -n "$cfg_selection_granularity" ]] && cmd="$cmd --selection_granularity=$cfg_selection_granularity"
+    [[ -n "$cfg_selection_groups" ]] && cmd="$cmd --selection_groups='$cfg_selection_groups'"
+
     # Scoring compression: parse "SPARSIFIER" or "SPARSIFIER/PROJECTOR" format
     if [[ -n "$cfg_score_compression" && "$cfg_score_compression" != "none" ]]; then
         cmd="$cmd --score_compression=${cfg_score_compression%%/*}"
@@ -421,6 +473,7 @@ $FIXED_ARGS \
 
     # Validation / Evaluation
     cmd="$cmd --n_val=$cfg_n_val --val_batch_size=$cfg_val_batch_size --val_loss_type=$cfg_val_loss_type"
+    [[ "$train_on_val" == "true" ]] && cmd="$cmd --train_on_val=True"
     cmd="$cmd --eval_interval=$cfg_eval_interval --n_eval=$cfg_n_eval --eval_batch_size=$cfg_eval_batch_size"
 
     cmd="$cmd 2>&1 | tee $output_dir/train.log"
@@ -432,7 +485,16 @@ $FIXED_ARGS \
     if [[ "$dry_run" == "true" ]]; then
         echo "[DRY-RUN] Would execute above command"
     else
+        # pipefail: the "| tee train.log" must not mask a failing python process,
+        # otherwise Slurm reports COMPLETED for a run that died mid-training.
+        set -o pipefail
         eval "$cmd"
+        local rc=$?
+        set +o pipefail
+        if [[ $rc -ne 0 ]]; then
+            echo "ERROR: $exp_name failed with exit code $rc (see $output_dir/train.log)"
+            return $rc
+        fi
     fi
 }
 
@@ -452,14 +514,20 @@ echo "Methods: $resolved_methods ($TOTAL total)"
 echo "========================================================"
 
 current=0
+failed=0
 for method_name in "${method_list[@]}"; do
     current=$((current + 1))
     echo ""
     echo "[$current/$TOTAL] $method_name"
-    run_method "$method_name"
+    run_method "$method_name" || failed=$((failed + 1))
 done
 
 echo ""
 echo "========================================================"
+if [[ $failed -gt 0 ]]; then
+    echo "  $failed/$TOTAL methods FAILED"
+    echo "========================================================"
+    exit 1
+fi
 echo "  All $TOTAL methods completed!"
 echo "========================================================"

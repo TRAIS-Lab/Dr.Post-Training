@@ -232,12 +232,27 @@ def main():
 
     # Load datasets
     logger.info("Loading datasets...")
-    train_dataset = get_prompt_dataset(
-        task=training_args.task,
-        tokenizer=tokenizer,
-        seed=training_args.seed,
-    )
-    logger.info(f"  Train dataset: {len(train_dataset)} samples")
+    if training_args.train_on_val:
+        # Target-only baseline: PPO directly on the held-out validation prompts
+        # (the same n_val prompts a held-out curation run uses as its target).
+        if training_args.n_val <= 0:
+            raise ValueError("--train_on_val requires --n_val > 0")
+        if training_args.has_selection:
+            raise ValueError("--train_on_val is a plain-PPO baseline; use --method=NA")
+        train_dataset = get_validation_prompt_dataset(
+            task=training_args.task,
+            tokenizer=tokenizer,
+            n_val=training_args.n_val,
+            seed=training_args.seed,
+        )
+        logger.info(f"  Train dataset: {len(train_dataset)} samples (TARGET-ONLY: held-out validation prompts)")
+    else:
+        train_dataset = get_prompt_dataset(
+            task=training_args.task,
+            tokenizer=tokenizer,
+            seed=training_args.seed,
+        )
+        logger.info(f"  Train dataset: {len(train_dataset)} samples")
 
     # Load validation dataset (if n_val > 0 AND method needs it)
     # Skip for Standard (NA) to avoid perturbing the global RNG state,
@@ -363,6 +378,21 @@ def main():
             layer_names=layer_names,
             device=device,
         )
+        if training_args.method == "GroupWiseSubset":
+            # Partition the hooked (LoRA) layers into selection groups; see drpt.selection.grouping
+            from drpt.selection import build_layer_groups, describe_layer_groups
+            layer_groups = build_layer_groups(
+                layer_names,
+                granularity=training_args.selection_granularity,
+                rules=training_args.selection_groups,
+            )
+            grad_hook.set_layer_groups(layer_groups)
+            logger.info(
+                f"=== GroupWiseSubset layer groups (granularity={training_args.selection_granularity}"
+                f"{', rules=' + repr(training_args.selection_groups) if training_args.selection_groups else ''}) ==="
+            )
+            for line in describe_layer_groups(layer_names, layer_groups).splitlines():
+                logger.info(line)
     else:
         logger.info(f"Training method: {training_args.method} - No gradient hooks needed")
 

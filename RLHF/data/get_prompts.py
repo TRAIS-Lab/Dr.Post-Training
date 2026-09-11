@@ -180,8 +180,9 @@ def _load_toxicity_validation_prompts(
 
     ds = ds.filter(filter_fn, batched=False)
 
-    # Use the same 80/20 split as training, but take the test portion
-    ds = ds.train_test_split(test_size=0.2, shuffle=False, seed=seed)["test"]
+    # Held-out 20% (never used for PPO training), "val" half: the "eval" half is
+    # reserved for the in-training toxicity evaluator so the two never overlap.
+    ds = _heldout_part(ds, part="val")
 
     # Shuffle and select n_val samples
     ds = ds.shuffle(seed=seed)
@@ -208,6 +209,35 @@ def _load_toxicity_validation_prompts(
     ds.set_format(type="torch")
 
     return ds
+
+
+def _heldout_part(ds_filtered: Dataset, part: str) -> Dataset:
+    """
+    Split the toxicity-filtered RTP rows exactly like the training loader
+    (80/20, unshuffled, training uses the first 80%) and return one half of the
+    held-out 20%: part="val" -> first half (fixed validation prompts for
+    curation), part="eval" -> second half (in-training toxicity evaluation).
+    """
+    heldout = ds_filtered.train_test_split(test_size=0.2, shuffle=False)["test"]
+    half = len(heldout) // 2
+    if part == "val":
+        return heldout.select(range(0, half))
+    if part == "eval":
+        return heldout.select(range(half, len(heldout)))
+    raise ValueError(f"part must be 'val' or 'eval', got {part}")
+
+
+def get_rtp_heldout_split(part: str = "eval", toxicity_threshold: float = 0.3) -> Dataset:
+    """
+    Raw (untokenized) RTP rows from the held-out 20% split, filtered with the
+    same toxicity threshold as the training loader. See _heldout_part.
+    """
+    ds = load_dataset("allenai/real-toxicity-prompts", split="train")
+    ds = ds.filter(
+        lambda x: x["prompt"]["toxicity"] is not None and x["prompt"]["toxicity"] > toxicity_threshold,
+        batched=False,
+    )
+    return _heldout_part(ds, part=part)
 
 
 def collator(data):

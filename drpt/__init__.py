@@ -51,12 +51,17 @@ from .selection import (
     SelectionState,
     LayerWiseSubsetState,
     GlobalSubsetState,
+    GroupWiseSubsetState,
+    SELECTION_METHODS,
+    build_layer_groups,
+    describe_layer_groups,
     # MergedBatch strategies
     MergedBatchStrategy,
     MergedBatchNoSelectionStrategy,
     MergedBatchLayerWiseSubsetStrategy,
     MergedBatchGlobalSubsetStrategy,
     MergedBatchGlobalSubsetOnePassStrategy,
+    MergedBatchGroupWiseSubsetStrategy,
     create_merged_batch_strategy,
     # SeparateBatch strategies
     SeparateBatchStrategy,
@@ -64,6 +69,7 @@ from .selection import (
     SeparateBatchLayerWiseSubsetStrategy,
     SeparateBatchGlobalSubsetStrategy,
     SeparateBatchGlobalSubsetOnePassStrategy,
+    SeparateBatchGroupWiseSubsetStrategy,
     create_separate_batch_strategy,
 )
 
@@ -82,12 +88,17 @@ __all__ = [
     "SelectionState",
     "LayerWiseSubsetState",
     "GlobalSubsetState",
+    "GroupWiseSubsetState",
+    "SELECTION_METHODS",
+    "build_layer_groups",
+    "describe_layer_groups",
     # MergedBatch strategy classes
     "MergedBatchStrategy",
     "MergedBatchNoSelectionStrategy",
     "MergedBatchLayerWiseSubsetStrategy",
     "MergedBatchGlobalSubsetStrategy",
     "MergedBatchGlobalSubsetOnePassStrategy",
+    "MergedBatchGroupWiseSubsetStrategy",
     "create_merged_batch_strategy",
     # SeparateBatch strategy classes
     "SeparateBatchStrategy",
@@ -95,5 +106,6 @@ __all__ = [
     "SeparateBatchLayerWiseSubsetStrategy",
     "SeparateBatchGlobalSubsetStrategy",
     "SeparateBatchGlobalSubsetOnePassStrategy",
+    "SeparateBatchGroupWiseSubsetStrategy",
     "create_separate_batch_strategy",
 ]

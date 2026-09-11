@@ -1,9 +1,11 @@
 """
 Hook manager with monkey-patching and custom autograd Functions.
 
-The hook supports two distinct curation methods via the selection module:
+The hook supports three curation methods via the selection module:
 - LayerWiseSubset: Per-layer curation, single-pass (LayerWiseSubsetLinearBackward)
 - GlobalSubset: Global curation, two-pass (GlobalSubsetLinearBackward)
+- GroupWiseSubset: Per-group curation (any partition of the hooked layers, e.g.
+  per transformer block), single-pass (GlobalSubsetLinearBackward + GroupWiseSubsetState)
 
 Compression is configured independently for two purposes:
 - Score compression: compresses gradients for influence score computation
@@ -32,7 +34,7 @@ from .compression_mode import CompressionMode
 from .validation_cache import ValidationCache
 
 # Curation module
-from .selection.state import SelectionState, LayerWiseSubsetState, GlobalSubsetState
+from .selection.state import SelectionState, LayerWiseSubsetState, GlobalSubsetState, GroupWiseSubsetState
 from .selection.backward import (
     CompressedLinearBackward,
     LayerWiseSubsetLinearBackward,
@@ -62,6 +64,7 @@ class GradientHook:
         model: nn.Module,
         layer_names: List[str],
         device: str = 'cpu',
+        layer_groups: Optional[List[Any]] = None,
     ) -> None:
         """
         Initialize the hook manager.
@@ -70,10 +73,19 @@ class GradientHook:
             model: The model to hook
             layer_names: Names of layers to hook (only Linear layers supported)
             device: Device for synchronization
+            layer_groups: Optional group key per hooked layer (same order as
+                layer_names) for GroupWiseSubset curation. See
+                drpt.selection.grouping.build_layer_groups. Can also be set
+                later via set_layer_groups().
         """
         self.model: nn.Module = model
         self.layer_names: List[str] = layer_names
         self.device: str = device
+
+        # Group key per hooked layer (GroupWiseSubset only)
+        self.layer_groups: Optional[List[Any]] = None
+        if layer_groups is not None:
+            self.set_layer_groups(layer_groups)
 
         # Create mapping from layer name to index
         self.layer_name_to_idx: Dict[str, int] = {name: idx for idx, name in enumerate(layer_names)}
@@ -269,6 +281,15 @@ class GradientHook:
         self.score_compressors = compressors
         self.update_compressors = compressors
 
+    def set_layer_groups(self, layer_groups: List[Any]) -> None:
+        """Set the group key of every hooked layer (for GroupWiseSubset curation)."""
+        if len(layer_groups) != len(self.layer_names):
+            raise ValueError(
+                f"layer_groups has {len(layer_groups)} entries but the hook has "
+                f"{len(self.layer_names)} layers"
+            )
+        self.layer_groups = list(layer_groups)
+
     def enable_hooks(self) -> None:
         """Enable hooks to compute custom gradients."""
         self.hooks_enabled = True
@@ -299,7 +320,8 @@ class GradientHook:
 
         Args:
             train_batch_size: Number of training samples
-            selection_method: Curation method ("LayerWiseSubset", "GlobalSubset", or "Regular")
+            selection_method: Curation method ("LayerWiseSubset", "GlobalSubset",
+                              "GroupWiseSubset", or "Regular")
             frac: Curation fraction (topk) or filter fraction (filtering)
             lr: Learning rate for score scaling
             compute_scores_only: If True, only compute scores (GlobalSubset pass 1)
@@ -309,6 +331,8 @@ class GradientHook:
                            (explicit per-sample gradient materialization, Algorithm 4.4)
             direct_batch_size: Chunk size for batched direct scoring. 0 = all at once.
                               Set to 1 for minimal memory at long sequences.
+
+        GroupWiseSubset requires layer_groups to have been set (see set_layer_groups).
         """
         if selection_method == "Regular":
             self.selection_state = None
@@ -359,10 +383,24 @@ class GradientHook:
                 scoring_method=scoring_method,
                 direct_batch_size=direct_batch_size,
             )
+        elif selection_method == "GroupWiseSubset":
+            self.selection_state = GroupWiseSubsetState(
+                layer_groups=self._require_layer_groups(),
+                train_batch_size=train_batch_size,
+                num_layers=num_layers,
+                frac=frac,
+                lr=lr,
+                device=self.device,
+                dtype=dtype,
+                use_second_order=use_second_order,
+                selection_mode=selection_mode,
+                scoring_method=scoring_method,
+                direct_batch_size=direct_batch_size,
+            )
         else:
             raise ValueError(
                 f"Unknown selection_method: {selection_method}. "
-                f"Use 'LayerWiseSubset', 'GlobalSubset', or 'Regular'."
+                f"Use 'LayerWiseSubset', 'GlobalSubset', 'GroupWiseSubset', or 'Regular'."
             )
 
         logger.debug(
@@ -374,6 +412,14 @@ class GradientHook:
     def clear_selection(self) -> None:
         """Clear curation state after forward/backward."""
         self.selection_state = None
+
+    def _require_layer_groups(self) -> List[Any]:
+        if self.layer_groups is None:
+            raise RuntimeError(
+                "GroupWiseSubset requires layer groups. Call set_layer_groups() with "
+                "drpt.selection.grouping.build_layer_groups(layer_names, granularity) first."
+            )
+        return self.layer_groups
 
     # =========================================================================
     # Token Count Tracking
@@ -503,7 +549,7 @@ class GradientHook:
 
         Args:
             train_batch_size: Number of training samples
-            selection_method: Curation method ("LayerWiseSubset" or "GlobalSubset")
+            selection_method: Curation method ("LayerWiseSubset", "GlobalSubset" or "GroupWiseSubset")
             frac: Curation/filter fraction
             lr: Learning rate for score scaling
             compute_scores_only: If True, only compute scores (GlobalSubset pass 1)
@@ -565,10 +611,25 @@ class GradientHook:
                 scoring_method=scoring_method,
                 direct_batch_size=direct_batch_size,
             )
+        elif selection_method == "GroupWiseSubset":
+            self.selection_state = GroupWiseSubsetState(
+                layer_groups=self._require_layer_groups(),
+                train_batch_size=train_batch_size,
+                num_layers=num_layers,
+                frac=frac,
+                lr=lr,
+                device=self.device,
+                dtype=dtype,
+                use_second_order=use_second_order,
+                selection_mode=selection_mode,
+                record_selections=record_selections,
+                scoring_method=scoring_method,
+                direct_batch_size=direct_batch_size,
+            )
         else:
             raise ValueError(
                 f"Unknown selection_method: {selection_method}. "
-                f"Use 'LayerWiseSubset' or 'GlobalSubset'."
+                f"Use 'LayerWiseSubset', 'GlobalSubset' or 'GroupWiseSubset'."
             )
 
         # Mark that we're using stored validation gradients
@@ -637,6 +698,7 @@ class GradientHook:
         self,
         selected_indices: Tensor,
         scale_factor: Tensor,
+        layer_indices: Optional[List[int]] = None,
     ) -> None:
         """
         Assemble weight gradients for selected samples using retained layer data.
@@ -644,13 +706,18 @@ class GradientHook:
         This is the post-hoc gradient assembly step in one-pass subset descent
         (Algorithm 4.2). For each layer, computes:
             g_l = scale_factor * Σ_{i∈S} grad_output_i ⊗ input_i
-        and assigns to param.grad.
+        and assigns to param.grad (adding if .grad already exists, e.g. for
+        tied embedding / lm_head weights).
 
         For MeSO (update compression), compresses selected gradients instead.
 
+        Retained data is released as each layer is assembled.
+
         Args:
-            selected_indices: Globally selected sample indices [K]
+            selected_indices: Selected sample indices [K]
             scale_factor: Scaling factor (batch_total_tokens / selected_tokens)
+            layer_indices: Restrict assembly to these hooked layer indices
+                (GroupWiseSubset: the layers of one group). None = all layers.
         """
         import torch
         from .selection.utils import (
@@ -659,8 +726,11 @@ class GradientHook:
             augment_input_for_bias,
         )
 
-        for layer_idx in range(len(self.layer_names)):
-            retained = self._retained_data.get(layer_idx)
+        if layer_indices is None:
+            layer_indices = range(len(self.layer_names))
+
+        for layer_idx in layer_indices:
+            retained = self._retained_data.pop(layer_idx, None)
             if retained is None:
                 continue
             grad_output, input_tensor = retained
@@ -710,8 +780,6 @@ class GradientHook:
                             module.bias.grad = grad_bias
                         else:
                             module.bias.grad.add_(grad_bias)
-
-        self.clear_retained_data()
 
     # =========================================================================
     # Compressor Management

@@ -4,6 +4,7 @@
 Training script for SFT with layer_wise_subset descent.
 """
 
+import functools
 import logging
 import os
 import sys
@@ -30,11 +31,14 @@ from drpt import (
     setup_model_compressors,
     create_sample_inputs,
     CompressionMode,
+    SELECTION_METHODS,
+    build_layer_groups,
+    describe_layer_groups,
 )
 from SFT.train.trainer import LayerWiseSubsetTrainer
 
 from SFT.train.data_arguments import DataArguments, get_data_statistics
-from SFT.train.model_arguments import ModelArguments, add_padding_to_tokenizer
+from SFT.train.model_arguments import ModelArguments, add_padding_to_tokenizer, init_end_of_turn_from_eos
 from SFT.train.training_arguments import TrainingArguments
 
 
@@ -174,6 +178,11 @@ def main():
             model.get_input_embeddings().weight.requires_grad = False
             model.get_output_embeddings().weight.requires_grad = False
 
+    # Optional: make the chat end-of-turn token emittable from step 0 (opt-in; see model_arguments.init_eot_from_eos)
+    if model_args.init_eot_from_eos:
+        eot_info = init_end_of_turn_from_eos(model, tokenizer)
+        logger.info(f"init_eot_from_eos: {eot_info}")
+
     # Apply LoRA using standard PEFT (no custom layers!)
     if not isinstance(model, PeftModel) and model_args.lora:
         target_modules = model_args.lora_target_modules
@@ -215,10 +224,10 @@ def main():
 
     # Determine if gradient hooks are needed based on training method
     # Hooks are needed for:
-    # 1. Selection method is not NA (LayerWiseSubset or GlobalSubset)
+    # 1. Selection method is not NA (LayerWiseSubset, GlobalSubset or GroupWiseSubset)
     # 2. Compression enabled (implies MeSO optimizer)
     has_explicit_compression = (training_args.sparsification is not None or training_args.projection is not None)
-    needs_selection = training_args.method in ('LayerWiseSubset', 'GlobalSubset')
+    needs_selection = training_args.method in SELECTION_METHODS
     needs_grad_hook = needs_selection or has_explicit_compression
 
     # Determine compression needs independently for score and update
@@ -235,6 +244,21 @@ def main():
             layer_names=layer_names,
             device=str(training_args.device),
         )
+        if training_args.method == 'GroupWiseSubset':
+            # Partition the hooked layers into selection groups (per block, per
+            # attention/MLP sub-block, custom rules, ...). See drpt.selection.grouping.
+            layer_groups = build_layer_groups(
+                layer_names,
+                granularity=training_args.selection_granularity,
+                rules=training_args.selection_groups,
+            )
+            grad_hook.set_layer_groups(layer_groups)
+            logger.info(
+                f"=== GroupWiseSubset layer groups (granularity={training_args.selection_granularity}"
+                f"{', rules=' + repr(training_args.selection_groups) if training_args.selection_groups else ''}) ==="
+            )
+            for line in describe_layer_groups(layer_names, layer_groups).splitlines():
+                logger.info(line)
     else:
         logger.info(f"Training method: {training_args.method} - No gradient hooks needed")
 
@@ -412,7 +436,10 @@ def main():
     # Save final evaluation results
     trainer.on_train_end()
 
-    # Save model
+    # Save model. Always write the weights as a single model.safetensors: transformers shards above 5 GB
+    # (Qwen3-4B/8B in bf16), while the eval / dispatch / results tooling keys on that one file.
+    if isinstance(trainer.model, transformers.PreTrainedModel) and not isinstance(trainer.model, PeftModel):
+        trainer.model.save_pretrained = functools.partial(trainer.model.save_pretrained, max_shard_size="200GB")
     trainer.save_model()
 
     # Clean up hooks (only if grad_hook was created)

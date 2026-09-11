@@ -1,0 +1,10 @@
+# LayerWiseSubset curation, top-k keeping 6 of 8 candidates per step
+method: LayerWiseSubset
+finetuning: Full
+learning_rate: 1.00e-05
+selection_frac: 0.75
+selection_mode: topk
+record_selections: true
+
+scoring:
+  method: reduced_ghost

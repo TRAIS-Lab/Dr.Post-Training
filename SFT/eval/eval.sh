@@ -31,6 +31,9 @@ method=""
 n_test=-1
 batch_size=1
 max_new_tokens=""     # empty -> per-task default in eval.py
+temperature=""        # empty -> eval.py default (0.7; 0 = greedy)
+top_p=""
+top_k=""
 seed=42
 dry_run=false
 target=""
@@ -82,6 +85,18 @@ while [[ $# -gt 0 ]]; do
             max_new_tokens="$2"
             shift 2
             ;;
+        --temperature)
+            temperature="$2"
+            shift 2
+            ;;
+        --top_p)
+            top_p="$2"
+            shift 2
+            ;;
+        --top_k)
+            top_k="$2"
+            shift 2
+            ;;
         --seed)
             seed="$2"
             shift 2
@@ -128,6 +143,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --n_test N           Number of test examples (-1 for all)"
             echo "  --batch_size N       Batch size for generation (default: 1)"
             echo "  --max_new_tokens N   Max tokens to generate (default: per task; 128 legacy, 2048 IF/code, 4096 math)"
+            echo "  --temperature T      Sampling temperature for benchmark tasks (default 0.7; 0 = greedy)"
+            echo "  --top_p P            Nucleus top-p (default 0.8)      --top_k K   top-k (default 20)"
             echo "  --seed N             Random seed for reproducibility (default: 42)"
             echo "  --dry-run            Print command without executing"
             exit 0
@@ -156,6 +173,7 @@ echo ""
 echo "Generation:"
 echo "  Batch size:    $batch_size"
 echo "  Max new tokens: ${max_new_tokens:-per-task default}"
+echo "  Sampling:      temperature=${temperature:-0.7} top_p=${top_p:-0.8} top_k=${top_k:-20}"
 echo "  N test:        $n_test (-1 = all)"
 echo "  Seed:          $seed"
 echo "========================================================"
@@ -171,6 +189,9 @@ cmd="$cmd --data_dir $data_dir"
 cmd="$cmd --n_test $n_test"
 cmd="$cmd --batch_size $batch_size"
 [[ -n "$max_new_tokens" ]] && cmd="$cmd --max_new_tokens $max_new_tokens"
+[[ -n "$temperature" ]] && cmd="$cmd --temperature $temperature"
+[[ -n "$top_p" ]] && cmd="$cmd --top_p $top_p"
+[[ -n "$top_k" ]] && cmd="$cmd --top_k $top_k"
 cmd="$cmd --seed $seed"
 [[ -n "$target" ]] && cmd="$cmd --target $target"
 [[ -n "$ifbench_repo" ]] && cmd="$cmd --ifbench_repo $ifbench_repo"

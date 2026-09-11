@@ -22,19 +22,28 @@ This module provides two families of strategies for computing validation gradien
        Better when validation batch is small (e.g., external validation set in SFT).
 """
 
-from .state import SelectionState, LayerWiseSubsetState, GlobalSubsetState
+from .state import SelectionState, LayerWiseSubsetState, GlobalSubsetState, GroupWiseSubsetState
+from .grouping import (
+    GRANULARITIES,
+    build_layer_groups,
+    describe_layer_groups,
+    group_members,
+    parse_group_rules,
+)
 from .backward import (
     CompressedLinearBackward,
     LayerWiseSubsetLinearBackward,
     GlobalSubsetLinearBackward,
 )
 from .strategies import (
+    SELECTION_METHODS,
     # MergedBatch strategies
     MergedBatchStrategy,
     MergedBatchNoSelectionStrategy,
     MergedBatchLayerWiseSubsetStrategy,
     MergedBatchGlobalSubsetStrategy,
     MergedBatchGlobalSubsetOnePassStrategy,
+    MergedBatchGroupWiseSubsetStrategy,
     create_merged_batch_strategy,
     # SeparateBatch strategies
     SeparateBatchStrategy,
@@ -42,6 +51,7 @@ from .strategies import (
     SeparateBatchLayerWiseSubsetStrategy,
     SeparateBatchGlobalSubsetStrategy,
     SeparateBatchGlobalSubsetOnePassStrategy,
+    SeparateBatchGroupWiseSubsetStrategy,
     create_separate_batch_strategy,
 )
 
@@ -50,6 +60,14 @@ __all__ = [
     "SelectionState",
     "LayerWiseSubsetState",
     "GlobalSubsetState",
+    "GroupWiseSubsetState",
+    # Layer grouping (GroupWiseSubset)
+    "GRANULARITIES",
+    "build_layer_groups",
+    "describe_layer_groups",
+    "group_members",
+    "parse_group_rules",
+    "SELECTION_METHODS",
     # Autograd functions
     "CompressedLinearBackward",
     "LayerWiseSubsetLinearBackward",
@@ -60,6 +78,7 @@ __all__ = [
     "MergedBatchLayerWiseSubsetStrategy",
     "MergedBatchGlobalSubsetStrategy",
     "MergedBatchGlobalSubsetOnePassStrategy",
+    "MergedBatchGroupWiseSubsetStrategy",
     "create_merged_batch_strategy",
     # SeparateBatch strategies
     "SeparateBatchStrategy",
@@ -67,5 +86,6 @@ __all__ = [
     "SeparateBatchLayerWiseSubsetStrategy",
     "SeparateBatchGlobalSubsetStrategy",
     "SeparateBatchGlobalSubsetOnePassStrategy",
+    "SeparateBatchGroupWiseSubsetStrategy",
     "create_separate_batch_strategy",
 ]

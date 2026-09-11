@@ -86,6 +86,14 @@ def single_source_revision(records: Iterable[Mapping[str, Any]]) -> Optional[str
     return next(iter(revisions), None)
 
 
+def sampling_kwargs(args: Any) -> Dict[str, Any]:
+    """Decoding kwargs for ``generate_completions``; ``--temperature 0`` selects greedy."""
+    if args.temperature <= 0:
+        return {"do_sample": False}
+    return {"do_sample": True, "temperature": float(args.temperature),
+            "top_p": float(args.top_p), "top_k": int(args.top_k)}
+
+
 def result_provenance(
     *,
     dataset_repository: str,
@@ -95,8 +103,11 @@ def result_provenance(
     n_tasks: int,
     max_new_tokens: int,
     thinking: bool = False,
+    sampling: Optional[Mapping[str, Any]] = None,
+    seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Provenance block stored in every benchmark result JSON."""
+    sampling = dict(sampling or {"do_sample": False})
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
         "dataset": {
@@ -107,8 +118,11 @@ def result_provenance(
         },
         "evaluator": dict(evaluator),
         "generation": {
-            "do_sample": False,
-            "temperature": 0.0,
+            "do_sample": bool(sampling.get("do_sample", False)),
+            "temperature": float(sampling.get("temperature", 0.0)) if sampling.get("do_sample") else 0.0,
+            "top_p": sampling.get("top_p"),
+            "top_k": sampling.get("top_k"),
+            "seed": seed,
             "max_new_tokens": int(max_new_tokens),
             "thinking": bool(thinking),
             "thinking_output_stripped": True,

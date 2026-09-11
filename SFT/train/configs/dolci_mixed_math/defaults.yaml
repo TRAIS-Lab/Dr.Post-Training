@@ -1,7 +1,7 @@
-# Shared experiment defaults for dolci_mixed -> math  (benchmark: MATH500)
+# Shared experiment defaults for dolci_mixed -> math (MATH train + GSM8K train, the benchmarks' held-out sets, 64 rows; + the pools' four math sources, 64 rows; benchmarks: MATH500 + GSM8K)
 #
 # Data roles (see SFT/README.md, "Dolci capability setting"):
-#   train pool   : train/dolci_mixed/dolci_mixed_data.jsonl          (32,000 rows, percentage 1.0)
+#   train pool   : train/dolci_mixed/dolci_mixed_data.jsonl  (32,000 rows, percentage 1.0)
 #   D* (n_val)   : eval/math/math_validation_data.jsonl  -> selection gradient + val_loss curve
 #   held-out     : eval/math/math_test_data.jsonl        -> eval_loss curve only (n_eval rows)
 #   benchmark    : eval/<bench>/<bench>_bench_data.jsonl, scored post hoc by SFT/eval/eval.sh --target math
@@ -22,8 +22,8 @@ seed: 42
 batch_size: 8
 gradient_accumulation_steps: 1
 optim: adamw_torch
-max_seq_length: 4096
-gradient_checkpointing: true
+max_seq_length: 2048
+gradient_checkpointing: false
 lr_scheduler_type: linear
 warmup_ratio: 0.03
 weight_decay: 0.0
@@ -40,7 +40,7 @@ selection_mode: topk
 n_val: 16
 val_batch_size: 1
 val_strategy: merged_batch
-# D* rejection threshold as a multiple of the average train length (0 disables)
-val_seq_length_multiplier: 1.2
+# 0 disables D* length rejection
+val_seq_length_multiplier: 0
 scoring:
   method: reduced_ghost

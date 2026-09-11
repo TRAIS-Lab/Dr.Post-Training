@@ -51,6 +51,9 @@ def get_train_files_for_dataset(data_dir: str, dataset_name: str) -> List[str]:
         "dolci_instruction": [f"{data_dir}/train/dolci_instruction/dolci_instruction_data.jsonl"],
         "dolci_reasoning":   [f"{data_dir}/train/dolci_reasoning/dolci_reasoning_data.jsonl"],
         "dolci_mixed":       [f"{data_dir}/train/dolci_mixed/dolci_mixed_data.jsonl"],
+        # Worst-case memory smoke pool: 160 dolci_reasoning rows that all pad to max_seq_length
+        # (built 2026-09-02; used by configs/debug_math_long*). Not an experiment setting.
+        "debug_reasoning_long": [f"{data_dir}/train/debug_reasoning_long/debug_reasoning_long_data.jsonl"],
         # LESS mixture (flan_v2 + cot + dolly + oasst1)
         "less": [
             f"{data_dir}/train/flan_v2/flan_v2_data.jsonl",

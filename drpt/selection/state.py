@@ -1,9 +1,11 @@
 """
 Curation state classes for gradient-based data curation.
 
-This module provides two distinct state classes:
+This module provides three state classes:
 - LayerWiseSubsetState: Per-layer curation (layer_wise_subset descent), single-pass
 - GlobalSubsetState: Global curation (subset descent), two-pass score accumulation
+- GroupWiseSubsetState: Per-group curation (any partition of the hooked layers,
+  e.g. per transformer block or per attention/MLP sub-block), single-pass
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from typing import Optional, Tuple
+    from typing import Dict, Hashable, List, Optional, Sequence, Tuple
     from torch import Tensor
 
 import torch
@@ -369,6 +371,7 @@ class GlobalSubsetState(SelectionState):
         scores: Tensor,
         similarity: Optional[Tensor],
         score_correction: Optional[Tensor] = None,
+        layer_idx: Optional[int] = None,
     ) -> None:
         """
         Accumulate pre-computed scores (for full gradient path).
@@ -380,6 +383,8 @@ class GlobalSubsetState(SelectionState):
             scores: Pre-computed scores [train_batch_size]
             similarity: Pre-computed similarity matrix [train_batch_size, train_batch_size] or None
             score_correction: Correction factor for joint batch mode (scalar Tensor or None)
+            layer_idx: Index of the layer these scores came from. Ignored here;
+                used by GroupWiseSubsetState to route scores to the layer's group.
         """
         # Apply score correction
         if score_correction is not None:
@@ -392,6 +397,36 @@ class GlobalSubsetState(SelectionState):
         if self.similarity_matrix is not None and similarity is not None:
             self.similarity_matrix += similarity.to(self.dtype)
 
+    def on_layer_processed(self, layer_idx: int, hook_manager) -> None:
+        """
+        Hook called by the GlobalSubset autograd Functions once a layer's scores
+        have been accumulated (and, in one-pass mode, its data retained).
+
+        No-op for global curation; GroupWiseSubsetState uses it to finalize a
+        group as soon as all of its layers have run backward.
+        """
+        return None
+
+    def _select_from_accumulators(
+        self,
+        grad_dot_scores: Tensor,
+        similarity_matrix: Optional[Tensor],
+    ) -> Tensor:
+        """Apply lr scaling and the configured selection rule to accumulated scores."""
+        scores = grad_dot_scores * self.lr
+
+        similarity = None
+        if similarity_matrix is not None:
+            similarity = similarity_matrix * (self.lr ** 2)
+
+        k = max(1, int(self.train_batch_size * self.frac))
+        if self.selection_mode == "filtering":
+            return negative_filtering(scores, self.frac)
+        elif self.use_second_order and similarity is not None:
+            return greedy_selection(scores, similarity, k)
+        else:
+            return topk_selection(scores, k)
+
     def get_final_selection(self) -> Tensor:
         """
         Compute global curation after all layers processed.
@@ -399,18 +434,9 @@ class GlobalSubsetState(SelectionState):
         Returns:
             Tensor of selected indices
         """
-        scores = self.grad_dot_scores * self.lr
-
-        similarity = None
-        if self.similarity_matrix is not None:
-            similarity = self.similarity_matrix * (self.lr ** 2)
-
-        if self.selection_mode == "filtering":
-            selected_indices = negative_filtering(scores, self.frac)
-        elif self.use_second_order and similarity is not None:
-            selected_indices = greedy_selection(scores, similarity, self.num_selected)
-        else:
-            selected_indices = topk_selection(scores, self.num_selected)
+        selected_indices = self._select_from_accumulators(
+            self.grad_dot_scores, self.similarity_matrix
+        )
 
         self.num_selected = len(selected_indices)
 
@@ -450,3 +476,206 @@ class GlobalSubsetState(SelectionState):
         self.grad_dot_scores.zero_()
         if self.similarity_matrix is not None:
             self.similarity_matrix.zero_()
+
+
+class GroupWiseSubsetState(GlobalSubsetState):
+    """
+    State for GroupWiseSubset: curation at an arbitrary layer-group granularity.
+
+    The hooked layers are partitioned into groups (see ``drpt.selection.grouping``).
+    Scores are accumulated per group; as soon as every layer of a group has run
+    backward, the group selects its samples and assembles the curated gradient
+    for its layers from the retained (grad_output, input) pairs — all inside
+    ``loss.backward()``. LayerWiseSubset is the singleton-group special case and
+    one-pass GlobalSubset the single-group special case.
+
+    Correctness never depends on autograd's execution order: each group is
+    keyed independently and finalized on its own completion counter. Peak
+    memory does depend on it — a group whose layers are far apart in backward
+    order retains its activations for longer (see ``non_contiguous_groups``).
+
+    Always one-pass (the autograd Functions return None for weight gradients;
+    ``hook_manager.assemble_gradients_from_retained`` writes ``.grad``).
+    """
+
+    def __init__(self, layer_groups: "Sequence[Hashable]", **kwargs):
+        kwargs["one_pass"] = True
+        super().__init__(**kwargs)
+
+        if len(layer_groups) != self.num_layers:
+            raise ValueError(
+                f"layer_groups has {len(layer_groups)} entries but the hook has "
+                f"{self.num_layers} layers"
+            )
+        self.layer_groups = list(layer_groups)
+
+        # group key -> hooked layer indices (first-appearance order)
+        self.group_layers: "Dict[Hashable, List[int]]" = {}
+        for idx, key in enumerate(self.layer_groups):
+            self.group_layers.setdefault(key, []).append(idx)
+
+        # Per-group accumulators (created lazily on first contribution)
+        self._group_scores: "Dict[Hashable, Tensor]" = {}
+        self._group_similarity: "Dict[Hashable, Tensor]" = {}
+
+        # Bookkeeping
+        self._group_done: "Dict[Hashable, set]" = {}
+        self._finalized: set = set()
+        self._processing_order: "List[int]" = []     # layer_idx in backward order
+        self._group_selected: "Dict[Hashable, Tensor]" = {}
+
+        # (group_key, n_selected) per finalized group — mirrors LayerWiseSubsetState
+        self._layer_selections: list = []
+
+    # ------------------------------------------------------------------ accumulate
+
+    def _accumulators(self, key: "Hashable") -> "Tuple[Tensor, Optional[Tensor]]":
+        scores = self._group_scores.get(key)
+        if scores is None:
+            scores = torch.zeros(self.train_batch_size, device=self.device, dtype=self.dtype)
+            self._group_scores[key] = scores
+        sim = None
+        if self.use_second_order:
+            sim = self._group_similarity.get(key)
+            if sim is None:
+                sim = torch.zeros(
+                    self.train_batch_size, self.train_batch_size,
+                    device=self.device, dtype=self.dtype,
+                )
+                self._group_similarity[key] = sim
+        return scores, sim
+
+    def process_layer_gradients(
+        self,
+        train_grads: Tensor,
+        val_grad: Tensor,
+        layer_idx: int,
+        score_correction: Optional[Tensor] = None,
+    ) -> None:
+        """Accumulate compressed-gradient scores into the layer's group."""
+        if train_grads.dtype != self.dtype:
+            train_grads = train_grads.to(self.dtype)
+        if val_grad.dtype != self.dtype:
+            val_grad = val_grad.to(self.dtype)
+
+        layer_scores = torch.mv(train_grads, val_grad)
+        layer_sim = torch.mm(train_grads, train_grads.t()) if self.use_second_order else None
+        self.accumulate_precomputed_scores(
+            layer_scores, layer_sim, score_correction, layer_idx=layer_idx
+        )
+        return None
+
+    def accumulate_precomputed_scores(
+        self,
+        scores: Tensor,
+        similarity: Optional[Tensor],
+        score_correction: Optional[Tensor] = None,
+        layer_idx: Optional[int] = None,
+    ) -> None:
+        """Accumulate scores into the group of ``layer_idx`` (required)."""
+        if layer_idx is None:
+            raise ValueError("GroupWiseSubsetState.accumulate_precomputed_scores requires layer_idx")
+        key = self.layer_groups[layer_idx]
+        if key in self._finalized:
+            raise RuntimeError(
+                f"Layer {layer_idx} contributed scores to group {key!r} after the group "
+                f"was finalized — a hooked layer ran backward twice in one step?"
+            )
+
+        if score_correction is not None:
+            scores = scores * score_correction
+            if similarity is not None:
+                similarity = similarity * (score_correction ** 2)
+
+        acc_scores, acc_sim = self._accumulators(key)
+        acc_scores.add_(scores.to(self.dtype))
+        if acc_sim is not None and similarity is not None:
+            acc_sim.add_(similarity.to(self.dtype))
+
+    # ------------------------------------------------------------------ finalize
+
+    def on_layer_processed(self, layer_idx: int, hook_manager) -> None:
+        """Mark ``layer_idx`` done; finalize its group once every member is done."""
+        key = self.layer_groups[layer_idx]
+        self._processing_order.append(layer_idx)
+        done = self._group_done.setdefault(key, set())
+        done.add(layer_idx)
+        if key not in self._finalized and len(done) == len(self.group_layers[key]):
+            self._finalize_group(key, hook_manager)
+
+    def _finalize_group(self, key: "Hashable", hook_manager) -> None:
+        """Select for one group and assemble its layers' gradients."""
+        scores = self._group_scores.pop(key, None)
+        similarity = self._group_similarity.pop(key, None)
+        if scores is None:
+            # No layer of this group produced scores (e.g. no cached val gradient).
+            # Match GlobalSubset behaviour: select on all-zero scores.
+            scores = torch.zeros(self.train_batch_size, device=self.device, dtype=self.dtype)
+
+        selected_indices = self._select_from_accumulators(scores, similarity)
+        selected_indices = selected_indices.sort()[0]
+        n_selected = selected_indices.numel()
+
+        self._group_selected[key] = selected_indices
+        self._layer_selections.append((key, n_selected))
+        self.num_selected = n_selected
+
+        if self._record_selections:
+            self._selection_records.append({
+                'group': str(key),
+                'layer_indices': list(self.group_layers[key]),
+                'selected_indices': selected_indices.tolist(),
+                'scores': scores.detach().float().cpu().tolist(),
+            })
+
+        scale_factor = self._compute_scale_factor_for_assembly(selected_indices)
+        hook_manager.assemble_gradients_from_retained(
+            selected_indices, scale_factor, layer_indices=self.group_layers[key]
+        )
+        self._finalized.add(key)
+
+    def finalize_remaining(self, hook_manager) -> "List[Hashable]":
+        """
+        Finalize groups that never completed during backward (a hooked layer did
+        not run, e.g. an unused or frozen layer). Returns the affected group keys
+        so the caller can warn. Normally returns an empty list.
+        """
+        pending = [key for key in self.group_layers if key not in self._finalized]
+        for key in pending:
+            self._finalize_group(key, hook_manager)
+        return pending
+
+    def non_contiguous_groups(self) -> "List[Hashable]":
+        """
+        Group keys whose layers were *not* processed as one contiguous run in
+        backward order. Such groups are still correct, but they retain their
+        activations for longer and raise peak memory.
+        """
+        order = self._processing_order
+        first_last: "Dict[Hashable, List[int]]" = {}
+        for pos, layer_idx in enumerate(order):
+            key = self.layer_groups[layer_idx]
+            span = first_last.setdefault(key, [pos, pos])
+            span[1] = pos
+        bad = []
+        for key, (first, last) in first_last.items():
+            if last - first + 1 != len(self.group_layers[key]):
+                bad.append(key)
+        return bad
+
+    def get_final_selection(self) -> Tensor:
+        """GroupWiseSubset selects per group during backward, not globally."""
+        raise NotImplementedError(
+            "GroupWiseSubsetState selects per group inside backward; "
+            "there is no single global selection."
+        )
+
+    def reset_accumulators(self) -> None:
+        super().reset_accumulators()
+        self._group_scores.clear()
+        self._group_similarity.clear()
+        self._group_done.clear()
+        self._finalized.clear()
+        self._processing_order.clear()
+        self._group_selected.clear()
+        self._layer_selections.clear()

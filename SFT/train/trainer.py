@@ -18,7 +18,7 @@ from transformers import Trainer
 
 from drpt.optimizer import MeSOAdamW
 from drpt.hook import GradientHook
-from drpt.selection import create_separate_batch_strategy, create_merged_batch_strategy
+from drpt.selection import create_separate_batch_strategy, create_merged_batch_strategy, SELECTION_METHODS
 
 logger = logging.getLogger(__name__)
 
@@ -151,11 +151,14 @@ class LayerWiseSubsetTrainer(Trainer):
 
         # Log the training mode based on configuration
         # Naming convention: {curation}-{compression}-{training_type}
-        if self.args.method in ('LayerWiseSubset', 'GlobalSubset'):
+        if self.args.method in SELECTION_METHODS:
+            mode_name = self.args.method
+            if self.args.method == 'GroupWiseSubset':
+                mode_name += f" (granularity={getattr(self.args, 'selection_granularity', 'block')})"
             if self.has_compression:
-                logger.info(f"  Mode: {self.args.method} with compression (MeSO optimizer)")
+                logger.info(f"  Mode: {mode_name} with compression (MeSO optimizer)")
             else:
-                logger.info(f"  Mode: {self.args.method} without compression (standard optimizer)")
+                logger.info(f"  Mode: {mode_name} without compression (standard optimizer)")
         elif self.has_compression:
             logger.info(f"  Mode: MeSO only (compressed gradients, no curation)")
         else:
@@ -299,7 +302,8 @@ class LayerWiseSubsetTrainer(Trainer):
 
         The curation strategy handles the difference between:
         - LayerWiseSubset: Single-pass, per-layer curation
-        - GlobalSubset: Two-pass, global curation
+        - GlobalSubset: Two-pass (or one-pass), global curation
+        - GroupWiseSubset: Single-pass, per-layer-group curation (block / sublayer / custom)
         - NA: Baseline (no curation)
 
         With or without compression (MeSO).
@@ -313,8 +317,8 @@ class LayerWiseSubsetTrainer(Trainer):
             if isinstance(unwrapped_optimizer, MeSOAdamW):
                 unwrapped_optimizer.refresh_compressors_if_needed()
 
-        # === DATA CURATION MODE (LayerWiseSubset or GlobalSubset) ===
-        if args.method in ('LayerWiseSubset', 'GlobalSubset'):
+        # === DATA CURATION MODE (LayerWiseSubset, GlobalSubset or GroupWiseSubset) ===
+        if args.method in SELECTION_METHODS:
             # Get validation batch for curation
             try:
                 val_batch = next(self.val_dataloader_iter)
@@ -448,7 +452,8 @@ class LayerWiseSubsetTrainer(Trainer):
         """Capture curation record from the last training step.
 
         Records decoded text for both training and validation samples,
-        along with per-layer (LayerWiseSubset) or global (GlobalSubset) curation data.
+        along with per-layer (LayerWiseSubset), per-group (GroupWiseSubset) or
+        global (GlobalSubset) curation data.
         """
         record = getattr(self.selection_strategy, 'last_selection_record', None)
         if record is None:
@@ -467,6 +472,9 @@ class LayerWiseSubsetTrainer(Trainer):
 
         if self.args.method == 'LayerWiseSubset':
             step_record['layers'] = record
+        elif self.args.method == 'GroupWiseSubset':
+            # One entry per layer group: {'group', 'layer_indices', 'selected_indices', 'scores'}
+            step_record['groups'] = record
         else:
             # GlobalSubset: single global curation
             step_record['selection'] = record[0] if record else {}
@@ -489,6 +497,14 @@ class LayerWiseSubsetTrainer(Trainer):
                 'record_freq': self._record_selections_freq,
                 'num_layers': len(self.grad_hook.layer_names) if self.grad_hook else 0,
                 'layer_names': self.grad_hook.layer_names if self.grad_hook else [],
+                # GroupWiseSubset: group key per hooked layer (same order as layer_names)
+                'selection_granularity': getattr(self.args, 'selection_granularity', None)
+                    if self.args.method == 'GroupWiseSubset' else None,
+                'selection_groups': getattr(self.args, 'selection_groups', None)
+                    if self.args.method == 'GroupWiseSubset' else None,
+                'layer_groups': (self.grad_hook.layer_groups
+                                 if self.grad_hook is not None and self.grad_hook.layer_groups is not None
+                                 else None),
             },
             'steps': self._selection_records,
         }

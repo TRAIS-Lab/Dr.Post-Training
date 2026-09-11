@@ -1,0 +1,46 @@
+# Shared experiment defaults for dolci_reasoning -> math_v2 (GSM8K train + Persona MATH/GSM/Algebra, 32 each; drops MATH train and OpenMathInstruct 2; benchmarks: MATH500 + GSM8K)
+#
+# Data roles (see SFT/README.md, "Dolci capability setting"):
+#   train pool   : train/dolci_reasoning/dolci_reasoning_data.jsonl  (32,000 rows, percentage 1.0)
+#   D* (n_val)   : eval/math_v2/math_v2_validation_data.jsonl  -> selection gradient + val_loss curve
+#   held-out     : eval/math_v2/math_v2_test_data.jsonl        -> eval_loss curve only (n_eval rows)
+#   benchmark    : eval/<bench>/<bench>_bench_data.jsonl, scored post hoc by SFT/eval/eval.sh --target math_v2
+#
+# These values are inherited by all method configs in this directory.
+# Method configs can override any value.
+
+# Model
+model: Qwen/Qwen3-1.7B-Base
+
+# Dataset
+train_dataset: dolci_reasoning
+target_task: math_v2
+percentage: 1.0
+
+# Training
+seed: 42
+batch_size: 8
+gradient_accumulation_steps: 1
+optim: adamw_torch
+max_seq_length: 2048
+gradient_checkpointing: false
+lr_scheduler_type: linear
+warmup_ratio: 0.03
+weight_decay: 0.0
+num_train_epochs: 1
+eval_steps: 100
+use_flash_attention: true
+
+# Evaluation (target held-out; loss curve only)
+n_eval: 500
+
+# Curation defaults (used by LayerWiseSubset/GlobalSubset methods)
+selection_frac: 0.5
+selection_mode: topk
+n_val: 16
+val_batch_size: 1
+val_strategy: merged_batch
+# 0 disables D* length rejection
+val_seq_length_multiplier: 0
+scoring:
+  method: reduced_ghost
