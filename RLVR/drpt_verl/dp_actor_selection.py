@@ -22,12 +22,14 @@ The validation gradients are captured from a fixed validation set (reward object
 and used to compute gradient similarity scores for training sample selection.
 
 Loss convention: the actor's ``loss_agg_mode`` decides what one item of the loss is.
-With the default ``seq-mean-token-mean`` every response is one item — per-sample
-gradients are gradients of per-response token-mean losses, the validation target is
-the mean over validation responses, and the curated update is the plain mean over the
-kept responses (train_total/selected = n/k). ``token-mean`` (legacy) makes an item a
-response token, weighting samples by length in scores and updates. The hook, the
-validation normalisation and the training loss all follow the same mode.
+With ``token-mean`` (verl's default and the aggregation of its official GRPO/DAPO
+examples; the RLVR launchers keep it) an item is a response token: the validation
+target is normalised by total response tokens and kept samples enter the curated
+update weighted by length, consistent with the training loss. With a ``seq-mean-*``
+mode every response is one item — per-sample gradients are gradients of per-response
+losses, the validation target is the mean over validation responses, and the curated
+update is the plain mean over the kept responses (train_total/selected = n/k). The
+hook, the validation normalisation and the training loss all follow the same mode.
 """
 
 from __future__ import annotations
@@ -147,7 +149,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
             return
 
         # Create GradientHook. Item counts follow the actor's loss aggregation mode
-        # (verl default "token-mean"; the RLVR launcher sets "seq-mean-token-mean").
+        # (verl default "token-mean", which the RLVR launchers keep).
         loss_agg_mode = getattr(self.config, 'loss_agg_mode', 'token-mean')
         self.grad_hook = GradientHookVerl(
             model=unwrapped_module,

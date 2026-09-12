@@ -77,7 +77,7 @@ class GradientHookVerl:
         model: nn.Module,
         layer_names: List[str],
         device: str = 'cuda',
-        loss_agg_mode: str = "seq-mean-token-mean",
+        loss_agg_mode: str = "token-mean",
     ) -> None:
         """
         Initialize the hook manager.
@@ -88,11 +88,12 @@ class GradientHookVerl:
             device: Device for tensors
             loss_agg_mode: verl ``actor.loss_agg_mode`` of the policy loss the actor
                 backpropagates. It decides what one "item" of the batch loss is (see
-                ``drpt.losses``): the ``seq-mean-*`` modes average per-sequence losses
-                over sequences, so every sample is one item and the curated update is
-                a plain mean over the kept samples (``item_convention == "sample"``);
-                ``token-mean`` averages over response tokens, so an item is a token and
-                samples are weighted by length (legacy, ``item_convention == "token"``).
+                ``drpt.losses``): ``token-mean`` (verl's default and official GRPO/DAPO
+                practice) averages over response tokens, so an item is a token and
+                samples are weighted by length (``item_convention == "token"``); the
+                ``seq-mean-*`` modes average per-sequence losses over sequences, so every
+                sample is one item and the curated update is a plain mean over the kept
+                samples (``item_convention == "sample"``).
         """
         self.model = model
         self.layer_names = layer_names

@@ -150,7 +150,7 @@ Settings live in YAML config files under `configs/`. Each config directory has:
 | `train_batch_size` | `128` | Training batch size |
 | `learning_rate` | `1e-6` | Learning rate |
 | `total_epochs` | `5` | Number of epochs |
-| `loss_agg_mode` | `seq-mean-token-mean` | verl loss aggregation; defines what one "item" is (see below) |
+| `loss_agg_mode` | `token-mean` | verl loss aggregation; defines what one "item" is (see below) |
 | `selection_frac` | `1.0` | Negative filtering: 1.0=drop all negatives, 0.0=keep all |
 | `val_pool_size` | `512` | Number of validation prompts |
 | `val_batch_size` | `64` | Batch size for validation gradient capture |
@@ -169,15 +169,19 @@ Settings live in YAML config files under `configs/`. Each config directory has:
 
 drpt reads per-sample gradients off the backward pass of the batch loss, so whatever
 the loss averages over is one "item" in every influence score and curated update.
-With `seq-mean-token-mean` (default since 2026-09-11) every response is one item:
-the per-sample gradient is the gradient of that response's token-mean loss, the
-validation target is the mean over validation responses of the same per-response
-loss, and the curated update is the plain mean over the kept responses (scale
-`n/k`), as written in the paper. verl's default `token-mean` is the legacy
-convention: an item is a response token, so scores carry a factor of the response
-length and long responses dominate the update. The hook, the validation
-normalisation and the training loss all follow the configured mode; results from
-runs before the switch are not like-for-like with new ones.
+The launchers keep verl's default `token-mean`, the aggregation of every official
+GRPO/DAPO example (verl's docs warn that the paper's sample-level
+`seq-mean-token-mean` "may be unstable in long-CoT scenarios"). Under `token-mean`
+an item is a response token: the validation target is normalised by the total
+number of validation response tokens, scores carry a factor of the response length,
+and kept responses enter the curated update weighted by length, consistent with the
+training loss. Because RLVR selects by negative filtering (sign of the score) this
+changes little in practice. Setting a `seq-mean-*` mode (`seq-mean-token-mean` =
+original GRPO, `seq-mean-token-sum-norm` = Dr. GRPO) makes every response one item:
+the per-sample gradient is the gradient of the per-response loss, the target is the
+mean over validation responses and the curated update is the plain mean over the kept
+responses (scale `n/k`). The hook, the validation normalisation and the training loss
+always follow the configured mode; `tests/test_rlvr_hook_convention.py` checks both.
 
 ### Legacy Script
 

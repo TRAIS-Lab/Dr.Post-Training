@@ -18,12 +18,14 @@ ppo_micro_batch_size_per_gpu: 2
 kl_loss_coef: 0.001
 rollout_n: 8
 gpu_memory_utilization: 0.6
-# Loss aggregation (verl actor.loss_agg_mode). seq-mean-token-mean: every response is
-# one item — per-sample gradients are gradients of per-response token-mean losses, the
-# validation target is the mean over validation responses and the curated update is the
-# plain mean over the kept responses (paper convention). token-mean (verl default) is the
-# legacy behaviour, where samples are weighted by response length in scores and updates.
-loss_agg_mode: seq-mean-token-mean
+# Loss aggregation (verl actor.loss_agg_mode). token-mean is verl's default and the aggregation of
+# every official GRPO/DAPO example (verl's docs warn the paper's sample-level seq-mean-token-mean may
+# be unstable for long CoT); the drpt hook then treats a response token as the loss item, so the
+# validation target is normalised by total response tokens and kept samples are weighted by length,
+# consistent with the training loss. seq-mean-* modes (seq-mean-token-mean = original GRPO,
+# seq-mean-token-sum-norm = Dr. GRPO) make every response one item; the hook follows the mode.
+# Decision 2026-09-12: keep token-mean, matching the runs already on W&B.
+loss_agg_mode: token-mean
 
 # Evaluation & checkpointing
 test_freq: 3

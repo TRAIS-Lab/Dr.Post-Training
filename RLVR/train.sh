@@ -140,10 +140,11 @@ reset_config() {
     cfg_kl_loss_coef="0.001"
     cfg_rollout_n="8"
     cfg_gpu_memory_utilization="0.6"
-    # Loss aggregation: seq-mean-token-mean makes every response one item (the
-    # paper's convention: curated update = mean over kept samples). token-mean is
-    # verl's default and the legacy behaviour (samples weighted by length).
-    cfg_loss_agg_mode="seq-mean-token-mean"
+    # Loss aggregation (verl actor.loss_agg_mode). token-mean = verl's default and its official GRPO/DAPO
+    # practice (the docs warn the sample-level seq-mean-token-mean may be unstable for long CoT); the
+    # drpt hook then counts tokens as items. seq-mean-* modes make every response one item
+    # (seq-mean-token-sum-norm = Dr. GRPO); the hook follows whichever mode is set. Decision 2026-09-12: token-mean.
+    cfg_loss_agg_mode="token-mean"
 
     # Evaluation & checkpointing
     cfg_test_freq="3"
