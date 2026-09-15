@@ -4,6 +4,7 @@ Script to download and prepare datasets for training and evaluation.
 Supports: TyDiQA, SamSUM, TriviaQA, NQ-open (eval) + NQ-open, TriviaQA, SQuAD, Alpaca, Dolly, FLAN-v2, CoT, OASST1, Tulu3 (train).
 """
 
+import glob
 import json
 import os
 import random
@@ -1309,6 +1310,108 @@ def prepare_dolci_pools(output_dir, pools=None, num_proc=16):
     return outputs
 
 
+# =============================================================================
+# Tulu 3 general SFT mixture pool (2026-09-13)
+#
+# `tulu3_general` = a 32,000-row uniform sample of allenai/tulu-3-sft-mixture, the
+# standard general-purpose SFT recipe, filtered and decontaminated exactly like the
+# Dolci pools (plain alternating chats <= DOLCI_MAX_CHARS chars; prompts blocked
+# against the benchmarks and the precise_if / math_ref / mbpp / math_persona targets).
+# Compared with dolci_mixed it dilutes precise IF (~3 % of rows vs 7 %) and
+# concentrates math (~36 % vs 14 %), so the two targets bracket the "how much of the
+# pool is on-target" question. The dataset is read from the pinned snapshot as parquet
+# when it is on disk (shared read-only hub), otherwise through load_dataset(revision).
+# =============================================================================
+TULU3_PIN = {
+    "repo": "allenai/tulu-3-sft-mixture",
+    "revision": "b14afda60f1bbebe55d5d2fa1e4df5042f97f8be",
+    "split": "train",
+    "snapshot": os.environ.get(
+        "TULU3_SNAPSHOT",
+        "/workspace-vast/pretrained_ckpts/hub/datasets--allenai--tulu-3-sft-mixture/snapshots/"
+        "b14afda60f1bbebe55d5d2fa1e4df5042f97f8be"),
+}
+TULU3_POOL = "tulu3_general"
+TULU3_POOL_TARGETS = DOLCI_TARGETS + ("math_persona",)   # math_persona rows come from Tulu 3 persona sources
+# Tulu 3 `source` -> domain label (reporting / metadata only; the sample is uniform over all sources)
+TULU3_DOMAIN_OF = {
+    "ai2-adapt-dev/personahub_math_v5_regen_149960": "Math",
+    "ai2-adapt-dev/numinamath_tir_math_decontaminated": "Math",
+    "ai2-adapt-dev/tulu_v3.9_open_math_2_gsm8k_50k": "Math",
+    "allenai/tulu-3-sft-personas-math-grade": "Math",
+    "ai2-adapt-dev/tulu_v3.9_personahub_math_interm_algebra_20k": "Math",
+    "ai2-adapt-dev/evol_codealpaca_heval_decontaminated": "Coding",
+    "ai2-adapt-dev/personahub_code_v2_34999": "Coding",
+    "ai2-adapt-dev/personahub_ifdata_manual_seed_v3_29980": "Precise IF",
+    "ai2-adapt-dev/tulu_v3.9_wildchat_100k": "Chat",
+    "ai2-adapt-dev/no_robots_converted": "Chat",
+    "ai2-adapt-dev/oasst1_converted": "Chat",
+    "ai2-adapt-dev/flan_v2_converted": "Other",
+    "ai2-adapt-dev/tulu_v3.9_table_gpt_5k": "Other",
+    "ai2-adapt-dev/tulu_hard_coded_repeated_10": "Other",
+    "ai2-adapt-dev/tulu_v3.9_sciriff_10k": "Science",
+    "ai2-adapt-dev/tulu_v3.9_aya_100k": "Multilingual",
+    "ai2-adapt-dev/tulu_v3.9_wildjailbreak_decontaminated_50k": "Safety",
+    "ai2-adapt-dev/tulu_v3.9_synthetic_finalresp_wildguardmixtrain_decontaminated_50k": "Safety",
+    "ai2-adapt-dev/coconot_converted": "Safety",
+}
+
+
+def _load_tulu3(num_proc):
+    pin = TULU3_PIN
+    snapshot = pin["snapshot"]
+    files = sorted(glob.glob(os.path.join(snapshot, "data", "*.parquet"))) if snapshot else []
+    if files:
+        print(f"Loading {pin['repo']}@{pin['revision'][:8]} from the local snapshot ({len(files)} parquet files) ...")
+        dataset = load_dataset("parquet", data_files=files, split="train")
+    else:
+        print(f"Loading {pin['repo']}@{pin['revision'][:8]} ({pin['split']}) from the hub ...")
+        dataset = load_dataset(pin["repo"], split=pin["split"], revision=pin["revision"])
+    print(f"  {len(dataset):,} rows; computing row features with {num_proc} workers ...")
+    return dataset.map(_dolci_row_features, num_proc=num_proc, desc="tulu3 features")
+
+
+def prepare_tulu3_pool(output_dir, num_proc=16):
+    """Build the 32K-row Tulu 3 general pool (see the module comment above).
+
+    Requires the benchmark files and the precise_if / math_ref / mbpp / math_persona
+    target splits on disk (the pool is decontaminated against all of them).
+    """
+    dataset = _load_tulu3(num_proc)
+    blocker = PromptDecontaminator(_reference_prompts(output_dir, targets=TULU3_POOL_TARGETS))
+    print(f"{TULU3_POOL}: decontaminating against {len(blocker)} benchmark + target prompts")
+    eligible = dataset.filter(
+        lambda ex, b=blocker: ex["eligible"] and not b.blocked_messages(ex["messages"]),
+        num_proc=num_proc, desc="eligible rows",
+    )
+    print(f"{TULU3_POOL}: {len(eligible):,} of {len(dataset):,} rows eligible after format/length/decontamination filtering")
+    if len(eligible) < DOLCI_POOL_SIZE:
+        raise RuntimeError(f"{TULU3_POOL}: only {len(eligible)} candidates for a {DOLCI_POOL_SIZE}-row pool")
+    sampled = eligible.shuffle(seed=DOLCI_SAMPLE_SEED).select(range(DOLCI_POOL_SIZE))
+    rows, by_domain, by_source = [], {}, {}
+    for idx, example in enumerate(sampled):
+        source = example.get("source", "")
+        domain = TULU3_DOMAIN_OF.get(source, "Other")
+        by_domain[domain] = by_domain.get(domain, 0) + 1
+        by_source[source] = by_source.get(source, 0) + 1
+        rows.append({
+            "dataset": TULU3_POOL,
+            "id": f"{TULU3_POOL}_{idx}",
+            "messages": _dolci_clean_messages(example["messages"]),
+            "metadata": {
+                "source_id": example["id"],
+                "source_dataset": source,
+                "domain": domain,
+                "source_repo": TULU3_PIN["repo"],
+                "source_revision": TULU3_PIN["revision"],
+            },
+        })
+    print(f"{TULU3_POOL}: {len(rows):,} rows; domains: "
+          + ", ".join(f"{k}={v}" for k, v in sorted(by_domain.items(), key=lambda kv: -kv[1])))
+    print(f"{TULU3_POOL}: sources: " + ", ".join(f"{k.split('/')[-1]}={v}" for k, v in sorted(by_source.items(), key=lambda kv: -kv[1])))
+    return _write_messages_jsonl(os.path.join(output_dir, "train", TULU3_POOL, f"{TULU3_POOL}_data.jsonl"), rows, TULU3_POOL)
+
+
 def prepare_math_target(output_dir):
     """D* / held-out for the MATH500 target from the MATH *train* split (all 7 subjects).
 
@@ -1477,6 +1580,8 @@ Available Datasets:
                   `math` (SFT/data/build_math_mix_target.py) but kept: the pools were decontaminated against it
     mbpp        - eval/mbpp/ from MBPP train minus MBPP+ task ids (D* 128 / held-out ~137)
     dolci_pools - train/dolci_{instruction,reasoning,mixed}/<name>_data.jsonl (32,000 rows each)
+    tulu3_pool  - train/tulu3_general/tulu3_general_data.jsonl (32,000-row Tulu 3 SFT mixture sample; needs the
+                  benchmarks + precise_if/math_ref/mbpp/math_persona targets on disk)
                   + eval/precise_if/ (Dolci Precise-IF rows; D* 128 / held-out 472, excluded from the pools)
     precise_if  - only the precise_if target (same rows as dolci_pools writes)
     dolci_audit - re-check pools/targets for exact or near-duplicate (8-gram) benchmark prompts
@@ -1499,7 +1604,7 @@ Available Datasets:
                  'nq_open', 'triviaqa_train', 'squad', 'tulu3', 'alpaca',
                  'dolly', 'flan_v2', 'cot', 'oasst1',
                  'ifeval', 'ifbench', 'math500', 'gsm8k', 'mbpp_plus',
-                 'dolci_pools', 'precise_if', 'math_ref', 'mbpp', 'dolci_audit'],
+                 'dolci_pools', 'precise_if', 'math_ref', 'mbpp', 'dolci_audit', 'tulu3_pool'],
         help="Datasets to prepare (see list below)"
     )
     parser.add_argument(
@@ -1586,6 +1691,9 @@ Available Datasets:
 
     if 'mbpp' in datasets_to_prepare:
         results['mbpp'] = prepare_mbpp_target(args.output_dir)
+
+    if 'tulu3_pool' in datasets_to_prepare:
+        results[TULU3_POOL] = prepare_tulu3_pool(args.output_dir, num_proc=args.num_proc)
 
     if 'dolci_audit' in datasets_to_prepare:
         results['dolci_audit'] = "clean" if audit_dolci_leakage(args.output_dir) else None

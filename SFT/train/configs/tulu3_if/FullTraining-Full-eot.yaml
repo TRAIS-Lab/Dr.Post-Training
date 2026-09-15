@@ -1,0 +1,7 @@
+# Standard full fine-tuning (no data curation) — eot variant: <|im_end|> row initialised from <|endoftext|> before SFT (2026-09-11)
+method: FullTraining
+finetuning: Full
+learning_rate: 1.00e-05
+
+# Stop-token initialisation (needs SFT/train/train_v2.sh)
+init_eot_from_eos: true

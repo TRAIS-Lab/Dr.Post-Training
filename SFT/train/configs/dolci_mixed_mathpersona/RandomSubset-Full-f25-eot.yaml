@@ -1,8 +1,0 @@
-# RandomSubset control: a uniformly random 2 of 8 candidates per step, trained with the same (sample-mean) loss as the curated arms — eot variant: <|im_end|> row initialised from <|endoftext|> before SFT (2026-09-11)
-method: RandomSubset
-finetuning: Full
-learning_rate: 1.00e-05
-selection_frac: 0.25
-
-# Stop-token initialisation (needs SFT/train/train_v2.sh or later)
-init_eot_from_eos: true

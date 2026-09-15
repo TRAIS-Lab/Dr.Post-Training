@@ -51,6 +51,9 @@ def get_train_files_for_dataset(data_dir: str, dataset_name: str) -> List[str]:
         "dolci_instruction": [f"{data_dir}/train/dolci_instruction/dolci_instruction_data.jsonl"],
         "dolci_reasoning":   [f"{data_dir}/train/dolci_reasoning/dolci_reasoning_data.jsonl"],
         "dolci_mixed":       [f"{data_dir}/train/dolci_mixed/dolci_mixed_data.jsonl"],
+        # Tulu 3 SFT mixture 32K pool (2026-09-13; prepare_datasets.py --datasets tulu3_pool): the general-purpose recipe,
+        # precise IF ~3 % / math ~36 % of rows.
+        "tulu3_general":     [f"{data_dir}/train/tulu3_general/tulu3_general_data.jsonl"],
         # Worst-case memory smoke pool: 160 dolci_reasoning rows that all pad to max_seq_length
         # (built 2026-09-02; used by configs/debug_math_long*). Not an experiment setting.
         "debug_reasoning_long": [f"{data_dir}/train/debug_reasoning_long/debug_reasoning_long_data.jsonl"],

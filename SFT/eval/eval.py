@@ -49,6 +49,8 @@ BENCHMARK_TASKS = ["ifeval", "ifbench", "math500", "gsm8k", "mbpp_plus"]
 TARGET_BENCHMARKS = {
     "precise_if": ["ifeval", "ifbench"],
     "math": ["math500", "gsm8k"],       # MATH train + GSM8K train (benchmark held-out) + the pools' four math sources
+    "math_ref": ["math500", "gsm8k"],   # MATH train only (64-row D*, official reference solutions)
+    "math_ref128": ["math500", "gsm8k"],  # MATH train only, 128-row D* (math_ref D* + 64 held-out rows); base of the math_ref128_gen* targets
     "math_persona": ["math500", "gsm8k"],  # held-out Dolci Persona MATH/Algebra/GSM rows (the pool's own math style)
     "math_pool": ["math500", "gsm8k"],  # pool-side sources only (control)
     "math_v2": ["math500", "gsm8k"],    # GSM8K train + the three Persona sources
