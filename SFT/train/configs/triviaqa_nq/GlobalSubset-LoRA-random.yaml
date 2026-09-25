@@ -1,0 +1,14 @@
+# Random Global Subset control: a uniformly random k = selection_frac * n subset per step, shared by all
+# layers, run through the SAME one-pass GlobalSubset gradient path as GlobalSubset-LoRA-cmp (scores are computed with
+# the compressed 64x64 backend but ignored), so it differs from that arm only in which samples are kept.
+method: GlobalSubset
+subset_mode: one_pass
+selection_mode: random
+scoring:
+  method: compress
+  compression: normal-64*64
+finetuning: LoRA
+learning_rate: 1.00e-04
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.1

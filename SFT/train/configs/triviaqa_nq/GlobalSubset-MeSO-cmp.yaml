@@ -1,0 +1,12 @@
+# GlobalSubset with MeSO fine-tuning, compressed 64x64: one cell of the QA
+# fine-tuning-method x scoring-backend x partition matrix (launched by SFT/train/qa_matrix_task.sh). Same learning rate,
+# LoRA / MeSO knobs, k = n/2 and 16 target examples as the other configs of this directory.
+method: GlobalSubset
+finetuning: MeSO
+learning_rate: 5.00e-05
+subset_mode: one_pass
+scoring:
+  method: compress
+  compression: normal-64*64
+optimizer:
+  compression: normal-512*512

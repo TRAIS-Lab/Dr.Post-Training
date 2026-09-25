@@ -1,0 +1,10 @@
+# As LayerWiseSubset-Full.yaml (in-run cross-validation target: 64 training prompts x 8 rollouts, refreshed every round)
+# with val_loss_type nice (raw-reward Monte-Carlo policy gradient, no baseline or normalisation).
+method: LayerWiseSubset
+finetuning: Full
+selection_frac: 1.0
+val_loss_type: nice
+refresh_freq: 1
+hook_embeddings: true
+total_training_steps: 80
+exp_suffix: _cv64

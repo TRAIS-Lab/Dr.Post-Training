@@ -1,0 +1,10 @@
+# GlobalSubset with a lazy target: target rollouts regenerated every 4 rounds (refresh_freq 4; 64 prompts x 8 per
+# capture, reused in between), embedding + tied output layer hooked, 80 rounds.
+method: GlobalSubset
+finetuning: Full
+selection_frac: 1.0
+val_loss_type: reward
+refresh_freq: 4
+hook_embeddings: true
+total_training_steps: 80
+exp_suffix: _rf4emb

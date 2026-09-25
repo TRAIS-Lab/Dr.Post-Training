@@ -1,0 +1,11 @@
+# LayerWiseSubset data curation with full fine-tuning; <|im_end|> row initialised from <|endoftext|> before SFT
+method: LayerWiseSubset
+finetuning: Full
+learning_rate: 1.00e-05
+record_selections: true
+
+scoring:
+  method: pip
+
+# Stop-token initialisation (init_eot_from_eos is forwarded by SFT/train/train.sh)
+init_eot_from_eos: true

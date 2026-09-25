@@ -1,0 +1,10 @@
+# layer-normalized Global Subset (score_normalization: layer_meanabs) under Full fine-tuning: the Full counterpart of GlobalSubset-LoRA-lnorm.yaml for the QA ablations
+# (launched by SFT/train/qa_matrix_task.sh). Compressed 64x64 scoring like the LoRA controls; k = n/2, 16 target examples.
+method: GlobalSubset
+finetuning: Full
+learning_rate: 1.00e-05
+subset_mode: one_pass
+score_normalization: layer_meanabs
+scoring:
+  method: compress
+  compression: normal-64*64

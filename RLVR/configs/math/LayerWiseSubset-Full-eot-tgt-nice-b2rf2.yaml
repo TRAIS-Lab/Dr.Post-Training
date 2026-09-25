@@ -1,0 +1,14 @@
+# As LayerWiseSubset-Full-eot-tgt-nice.yaml with 2 target prompts x 8 rollouts captured every 2nd round (same amortized
+# target cost); the captured target gradient is reused on the intervening round.
+method: LayerWiseSubset
+finetuning: Full
+model: ${SCRATCH_DIR}/Dr.Post-Training/models/Qwen3-1.7B-Base-eot
+selection_frac: 1.0
+val_loss_type: nice
+val_source: from_test
+val_pool_size: 64
+val_batch_size: 2
+refresh_freq: 2
+hook_embeddings: true
+total_training_steps: 80
+exp_suffix: _eot_tgt64_b2rf2

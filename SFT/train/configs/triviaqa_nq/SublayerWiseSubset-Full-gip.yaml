@@ -1,0 +1,8 @@
+# SublayerWiseSubset with Full fine-tuning, ghost inner product (GIP, GREATS): one cell of the QA
+# fine-tuning-method x scoring-backend x partition matrix (launched by SFT/train/qa_matrix_task.sh). Same learning rate,
+# LoRA / MeSO knobs, k = n/2 and 16 target examples as the other configs of this directory.
+method: SublayerWiseSubset
+finetuning: Full
+learning_rate: 1.00e-05
+scoring:
+  method: gip

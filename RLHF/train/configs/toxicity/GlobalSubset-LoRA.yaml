@@ -1,0 +1,14 @@
+# GlobalSubset: global curation across all layers, per-mini-batch during PPO
+#
+# subset_mode: one_pass (score + train in a single backward, like LayerWiseSubset)
+#              or two_pass (original GREATS: pass 1 scores, pass 2 recomputes on the subset).
+# one_pass is used for parity with LayerWiseSubset. Note: only hooked (LoRA) layers are
+# assembled from the selected samples; the value head is not hooked and therefore trains
+# on the full mini-batch under one_pass (two_pass trains it on the subset).
+# scoring.method: pip, gip, direct, compress
+#
+method: GlobalSubset
+finetuning: LoRA
+subset_mode: one_pass
+scoring:
+  method: pip

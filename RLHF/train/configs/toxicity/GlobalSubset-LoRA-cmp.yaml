@@ -1,0 +1,7 @@
+# GlobalSubset with the compressed scoring backend (dense Gaussian 64x64; compared against exact PIP).
+method: GlobalSubset
+finetuning: LoRA
+subset_mode: one_pass
+scoring:
+  method: compress
+  compression: normal-64*64

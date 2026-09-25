@@ -1,0 +1,11 @@
+# Random Subset control (uniformly random k of n at every step, selection_mode: random) under MeSO fine-tuning: the MeSO counterpart of LayerWiseSubset-LoRA-random.yaml for the QA ablations
+# (launched by SFT/train/qa_matrix_task.sh). Compressed 64x64 scoring like the LoRA controls; k = n/2, 16 target examples.
+method: LayerWiseSubset
+finetuning: MeSO
+learning_rate: 5.00e-05
+selection_mode: random
+scoring:
+  method: compress
+  compression: normal-64*64
+optimizer:
+  compression: normal-512*512

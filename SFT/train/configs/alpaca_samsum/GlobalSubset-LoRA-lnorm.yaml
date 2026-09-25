@@ -1,0 +1,14 @@
+# Layer-normalized Global Subset control: every layer's score vector is divided by its mean absolute value
+# before the layers are summed into the shared per-sample score, so no layer dominates the global ranking by magnitude
+# alone; otherwise identical to GlobalSubset-LoRA-cmp (one-pass, compressed 64x64 scoring, LoRA).
+method: GlobalSubset
+subset_mode: one_pass
+score_normalization: layer_meanabs
+scoring:
+  method: compress
+  compression: normal-64*64
+finetuning: LoRA
+learning_rate: 1.00e-04
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.1

@@ -1,0 +1,11 @@
+# diagnostic: exact vs compressed 512 x 512 scoring on identical batches (record_selections)
+method: LayerWiseSubset
+finetuning: LoRA
+learning_rate: 1.00e-04
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.1
+record_selections: true
+scoring:
+  method: compress
+  compression: normal-512*512

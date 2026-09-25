@@ -1,0 +1,196 @@
+# RLVR Experiment
+
+This directory contains the implementation for online gradient-based data curation during RLHF/GRPO training, built on top of [verl](https://github.com/volcengine/verl).
+
+## Quick Start
+
+```bash
+# 1. Prepare data
+python verl/examples/data_preprocess/math_dataset.py --local_save_dir $DATA_DIR/math
+
+# 2. Run training with LayerWiseSubset curation (full fine-tuning)
+bash train.sh -c configs/math -m LayerWiseSubset-Full
+
+# 3. Or run baseline (no curation)
+bash train.sh -c configs/math -m FullTraining-Full
+
+# 4. Run all methods
+bash train.sh -c configs/math -m all
+
+# 5. Dry-run to verify commands
+bash train.sh -c configs/math -m LayerWiseSubset-Full --dry-run
+```
+
+## Data Preparation
+
+### Step 1: Download and Preprocess MATH Dataset
+
+```bash
+python verl/examples/data_preprocess/math_dataset.py --local_save_dir $DATA_DIR/math
+```
+
+This creates:
+- `$DATA_DIR/math/train.parquet` (~7,500 problems)
+- `$DATA_DIR/math/test.parquet` (~5,000 problems)
+
+### Step 2: Prepare Validation Prompts
+
+For gradient-based curation, we need validation prompts. There are two options:
+
+#### Option A: Validation from Test Set (Default)
+
+Split the test set into validation prompts and cleaned test set:
+
+```bash
+python data/prepare_data.py \
+    --test_data $DATA_DIR/math/test.parquet \
+    --output $DATA_DIR/math/val_from_test.parquet \
+    --output_test $DATA_DIR/math/test_cleaned.parquet \
+    --num_samples 1000 \
+    --seed 42
+```
+
+This creates:
+- `val_from_test.parquet`: Validation prompts (disjoint from test_cleaned)
+- `test_cleaned.parquet`: Remaining samples for final evaluation
+
+**Important:** When evaluating, use `test_cleaned.parquet` instead of `test.parquet` to avoid evaluating on validation data.
+
+#### Option B: Validation from Training Set (For Ablation)
+
+Sample validation prompts from the training set:
+
+```bash
+python data/prepare_data.py \
+    --train_data $DATA_DIR/math/train.parquet \
+    --output $DATA_DIR/math/val_from_train.parquet \
+    --num_samples 1000 \
+    --seed 42
+```
+
+This creates:
+- `val_from_train.parquet`: Validation prompts sampled from training data
+
+Note: `val_from_train` can overlap with the training set (it's just a random sample, not a split).
+
+#### Preparing Both (Recommended for Experiments)
+
+To run ablation studies comparing validation sources, prepare both:
+
+```bash
+# 1. Split test → val_from_test + test_cleaned
+python data/prepare_data.py \
+    --test_data $DATA_DIR/math/test.parquet \
+    --output $DATA_DIR/math/val_from_test.parquet \
+    --output_test $DATA_DIR/math/test_cleaned.parquet \
+    --num_samples 1000 \
+    --seed 42
+
+# 2. Sample train → val_from_train
+python data/prepare_data.py \
+    --train_data $DATA_DIR/math/train.parquet \
+    --output $DATA_DIR/math/val_from_train.parquet \
+    --num_samples 1000 \
+    --seed 42
+```
+
+This creates 4 files:
+| File | Source | Description |
+|------|--------|-------------|
+| `train.parquet` | original | Training data (unchanged) |
+| `test_cleaned.parquet` | test | Test data minus validation samples |
+| `val_from_test.parquet` | test | Validation prompts (disjoint from test_cleaned) |
+| `val_from_train.parquet` | train | Validation prompts (can overlap with train) |
+
+To switch which validation set is used, set `val_source` in the config:
+- `from_train` (default): validation from training set
+- `from_test`: validation from test set
+
+## Running Experiments
+
+```bash
+# LayerWiseSubset curation (full fine-tuning)
+bash train.sh -c configs/math -m LayerWiseSubset-Full
+
+# Baseline (no curation)
+bash train.sh -c configs/math -m FullTraining-Full
+
+# GlobalSubset curation
+bash train.sh -c configs/math -m GlobalSubset-Full
+
+# All methods
+bash train.sh -c configs/math -m all
+
+# By category (runs all matching configs)
+bash train.sh -c configs/math -m layer-wise-subset    # all LayerWiseSubset-* configs
+bash train.sh -c configs/math -m full         # all *-Full configs
+
+# Override seed or learning rate
+bash train.sh -c configs/math -m LayerWiseSubset-Full --seed 123 --lr 5e-7
+
+# Dry-run to inspect generated commands
+bash train.sh -c configs/math -m all --dry-run
+
+# List available methods
+bash train.sh -c configs/math --list
+```
+
+## Configuration
+
+Settings live in YAML config files under `configs/`. Each config directory has:
+- `defaults.yaml`: shared settings inherited by all methods
+- Per-method configs named `Method-Finetuning.yaml` (e.g., `FullTraining-Full.yaml`, `LayerWiseSubset-Full.yaml`)
+
+### Config Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `model` | `Qwen/Qwen3-1.7B-Base` | Model path |
+| `seed` | `42` | Random seed |
+| `train_batch_size` | `128` | Training batch size |
+| `learning_rate` | `1e-6` | Learning rate |
+| `total_epochs` | `5` | Number of epochs |
+| `loss_agg_mode` | `token-mean` | verl loss aggregation; defines what one "item" is (see below) |
+| `selection_frac` | `1.0` | Negative filtering: 1.0=drop all negatives, 0.0=keep all |
+| `hook_embeddings` | `True` | Hook the token embedding and `lm_head` too (same parameter coverage as the SFT hook: every trainable parameter is hooked except normalization weights). `False` = hook only the Linear layers inside the transformer blocks; `tests/test_rlvr_embedding_hook.py` checks the embedding path |
+| `val_pool_size` | `512` | Number of validation prompts |
+| `val_batch_size` | `64` | Batch size for validation gradient capture |
+| `val_loss_type` | `reward` | Validation loss: `reward` or `train-loss` |
+| `val_source` | `from_train` | Validation source: `from_train` or `from_test` |
+| `refresh_freq` | `1` | How often to refresh validation gradients |
+
+### Validation Loss Types
+
+| Name | Formula | Description |
+| --- | --- | --- |
+| `reward` | `-E[normalized_reward * log_prob]` | Batch-normalized reward weighting |
+| `train-loss` | `-E[advantages * log_prob]` | GRPO-normalized, matches training objective |
+
+### Loss convention (`loss_agg_mode`)
+
+drpt reads per-sample gradients off the backward pass of the batch loss, so whatever
+the loss averages over is one "item" in every influence score and curated update.
+The launchers keep verl's default `token-mean`, the aggregation of every official
+GRPO/DAPO example (verl's docs warn that the paper's sample-level
+`seq-mean-token-mean` "may be unstable in long-CoT scenarios"). Under `token-mean`
+an item is a response token: the validation target is normalised by the total
+number of validation response tokens, scores carry a factor of the response length,
+and kept responses enter the curated update weighted by length, consistent with the
+training loss. Because RLVR selects by negative filtering (sign of the score) this
+changes little in practice. Setting a `seq-mean-*` mode (`seq-mean-token-mean` =
+original GRPO, `seq-mean-token-sum-norm` = Dr. GRPO) makes every response one item:
+the per-sample gradient is the gradient of the per-response loss, the target is the
+mean over validation responses and the curated update is the plain mean over the kept
+responses (scale `n/k`). The hook, the validation normalisation and the training loss
+always follow the configured mode; `tests/test_rlvr_hook_convention.py` checks both.
+
+## MATH Dataset Info
+
+| Aspect              | Value                                |
+| ------------------- | ------------------------------------ |
+| Difficulty          | Competition level                    |
+| Train samples       | ~7,500                               |
+| Test samples        | ~5,000 (split: 1,000 val + 4,000 test) |
+| Answer format       | `\boxed{<answer>}`                   |
+| Max response length | 4096                                 |
+| Data source         | `DigitalLearningGmbH/MATH-lighteval` |

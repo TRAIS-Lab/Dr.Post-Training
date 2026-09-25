@@ -1,0 +1,43 @@
+# Shared experiment defaults for MATH GRPO training
+#
+# These values are inherited by all method configs in this directory.
+# Method configs can override any value.
+
+# Model
+model: Qwen/Qwen3-1.7B-Base
+
+# Training
+seed: 42
+train_batch_size: 128
+max_prompt_length: 1024
+max_response_length: 2048
+learning_rate: 1e-6
+total_epochs: 3
+ppo_mini_batch_size: 32
+ppo_micro_batch_size_per_gpu: 2
+kl_loss_coef: 0.001
+rollout_n: 8
+gpu_memory_utilization: 0.6
+# Loss aggregation (verl actor.loss_agg_mode). token-mean is verl's default and the aggregation of
+# every official GRPO/DAPO example (verl's docs warn the paper's sample-level seq-mean-token-mean may
+# be unstable for long CoT); the drpt hook then treats a response token as the loss item, so the
+# validation target is normalised by total response tokens and kept samples are weighted by length,
+# consistent with the training loss. seq-mean-* modes (seq-mean-token-mean = original GRPO,
+# seq-mean-token-sum-norm = Dr. GRPO) make every response one item; the hook follows the mode.
+loss_agg_mode: token-mean
+
+# Evaluation & checkpointing
+test_freq: 3
+save_freq: 1000
+
+# Curation defaults (used by LayerWiseSubset/GlobalSubset methods)
+# Selection mode is negative filtering (hardcoded in dp_actor_selection.py):
+#   frac=1.0 → drop ALL negative-influence samples (keep only positive)
+#   frac=0.5 → drop 50% of negative-influence samples
+#   frac=0.0 → keep all samples (no filtering)
+selection_frac: 1.0
+val_pool_size: -1
+val_batch_size: 64
+val_loss_type: reward
+val_source: from_train
+refresh_freq: 1

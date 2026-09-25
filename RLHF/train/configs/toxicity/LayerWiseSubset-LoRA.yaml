@@ -1,0 +1,8 @@
+# LayerWiseSubset: per-layer, per-mini-batch curation during PPO
+#
+# scoring.method: pip, gip, direct, compress
+#
+method: LayerWiseSubset
+finetuning: LoRA
+scoring:
+  method: pip

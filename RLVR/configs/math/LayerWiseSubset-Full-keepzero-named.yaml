@@ -1,0 +1,11 @@
+# As LayerWiseSubset-Full-keepzero.yaml, launched under the W&B name Qwen3-1.7B_LayerWise_s<seed>_reward read by
+# RLVR/tables/accuracy.py and RLVR/result.ipynb.
+method: LayerWiseSubset
+finetuning: Full
+selection_frac: 1.0
+keep_zero_adv: true
+val_loss_type: reward
+refresh_freq: 1
+hook_embeddings: true
+total_training_steps: 80
+name_method: LayerWise

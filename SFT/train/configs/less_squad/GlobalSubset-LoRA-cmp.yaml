@@ -1,0 +1,12 @@
+# Global Subset with the compressed 64x64 scoring backend of the QA protocol, the same backend as
+# GlobalSubset-LoRA-lnorm and LayerWiseSubset-LoRA.
+method: GlobalSubset
+subset_mode: one_pass
+scoring:
+  method: compress
+  compression: normal-64*64
+finetuning: LoRA
+learning_rate: 1.00e-04
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.1

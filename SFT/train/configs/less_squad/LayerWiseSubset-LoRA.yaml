@@ -1,0 +1,11 @@
+# LayerWiseSubset data curation with LoRA fine-tuning
+method: LayerWiseSubset
+finetuning: LoRA
+learning_rate: 1.00e-04
+
+scoring:
+  method: compress
+  compression: normal-64*64
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.1

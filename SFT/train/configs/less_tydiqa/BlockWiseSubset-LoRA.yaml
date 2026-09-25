@@ -1,0 +1,14 @@
+# BlockWiseSubset = GroupWiseSubset curation per transformer block ({q,k,v,o,gate,up,down} LoRA factors of model.layers.N
+# score jointly; embed_tokens / lm_head are singleton groups). Same compressed 64x64 scoring backend, LoRA setup and learning
+# rate as LayerWiseSubset-LoRA / GlobalSubset-LoRA-cmp, so the four granularities (global, block, layer, sublayer) form one
+# self-contained partition sweep. See drpt/selection/grouping.py.
+method: BlockWiseSubset
+finetuning: LoRA
+learning_rate: 1.00e-04
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.1
+
+scoring:
+  method: compress
+  compression: normal-64*64

@@ -1,0 +1,6 @@
+# MeSO ablation: 2048x2048 sketch (identity on every 2048-wide side)
+method: FullTraining
+finetuning: MeSO
+learning_rate: 1.00e-05
+optimizer:
+  compression: normal-2048*2048

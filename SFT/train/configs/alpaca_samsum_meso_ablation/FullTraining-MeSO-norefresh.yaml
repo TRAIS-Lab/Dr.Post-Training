@@ -1,0 +1,7 @@
+# MeSO ablation: no compressor refresh
+method: FullTraining
+finetuning: MeSO
+learning_rate: 1.00e-05
+optimizer:
+  compression: normal-512*512
+  refresh_freq: 1000000

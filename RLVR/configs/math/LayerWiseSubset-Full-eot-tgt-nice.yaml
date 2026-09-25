@@ -1,0 +1,14 @@
+# As LayerWiseSubset-Full-eot-tgt.yaml with val_loss_type nice (raw-reward Monte-Carlo policy gradient, no baseline or
+# normalisation) as the target objective.
+method: LayerWiseSubset
+finetuning: Full
+model: ${SCRATCH_DIR}/Dr.Post-Training/models/Qwen3-1.7B-Base-eot
+selection_frac: 1.0
+val_loss_type: nice
+val_source: from_test
+val_pool_size: 64
+val_batch_size: 1
+refresh_freq: 1
+hook_embeddings: true
+total_training_steps: 80
+exp_suffix: _eot_tgt64

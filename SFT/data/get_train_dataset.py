@@ -1,0 +1,203 @@
+import contextlib
+from functools import partial
+from typing import List, Union
+
+import torch
+from datasets import load_dataset
+
+
+@contextlib.contextmanager
+def temp_seed(seed):
+    torch_state = torch.get_rng_state()
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        cuda_state = torch.cuda.get_rng_state_all()
+        torch.cuda.manual_seed_all(seed)
+    try:
+        yield
+    finally:
+        torch.set_rng_state(torch_state)
+        if torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_state)
+
+
+def get_train_files_for_dataset(data_dir: str, dataset_name: str) -> List[str]:
+    """
+    Map a training dataset name to its file path(s).
+
+    Args:
+        data_dir: Base directory containing training data
+        dataset_name: Name of the training dataset
+
+    Returns:
+        List of file paths for the training dataset
+    """
+    dataset_mapping = {
+        # Single dataset files
+        "alpaca":   [f"{data_dir}/train/alpaca/alpaca_data.jsonl"],
+        "dolly":    [f"{data_dir}/train/dolly/dolly_data.jsonl"],
+        "flan_v2":  [f"{data_dir}/train/flan_v2/flan_v2_data.jsonl"],
+        "cot":      [f"{data_dir}/train/cot/cot_data.jsonl"],
+        "oasst1":   [f"{data_dir}/train/oasst1/oasst1_data.jsonl"],
+        "tulu3":    [f"{data_dir}/train/tulu3/tulu3_data.jsonl"],
+        "samsum":   [f"{data_dir}/train/samsum/samsum_train_data.jsonl"],
+        "nq_open":  [f"{data_dir}/train/nq_open/nq_open_data.jsonl"],
+        "triviaqa": [f"{data_dir}/train/triviaqa/triviaqa_data.jsonl"],
+        "squad":    [f"{data_dir}/train/squad/squad_data.jsonl"],
+        # Validation-only ablation: use a task's validation split as the training source
+        "truthfulqa_val": [f"{data_dir}/eval/truthfulqa/truthfulqa_validation_data.jsonl"],
+        # Dolci-Instruct 32K pools (see SFT/README.md, "Dolci capability setting").
+        # Each is a 32,000-row messages JSONL sampled from allenai/Dolci-Instruct-SFT.
+        "dolci_instruction": [f"{data_dir}/train/dolci_instruction/dolci_instruction_data.jsonl"],
+        "dolci_reasoning":   [f"{data_dir}/train/dolci_reasoning/dolci_reasoning_data.jsonl"],
+        "dolci_mixed":       [f"{data_dir}/train/dolci_mixed/dolci_mixed_data.jsonl"],
+        # Tulu 3 SFT mixture 32K pool (prepare_datasets.py --datasets tulu3_pool): the general-purpose recipe,
+        # precise IF ~3 % / math ~36 % of rows.
+        "tulu3_general":     [f"{data_dir}/train/tulu3_general/tulu3_general_data.jsonl"],
+        # Worst-case memory smoke pool: 160 dolci_reasoning rows that all pad to max_seq_length
+        # (used by configs/debug_math_long*). Not an experiment setting.
+        "debug_reasoning_long": [f"{data_dir}/train/debug_reasoning_long/debug_reasoning_long_data.jsonl"],
+        # LESS mixture (flan_v2 + cot + dolly + oasst1)
+        "less": [
+            f"{data_dir}/train/flan_v2/flan_v2_data.jsonl",
+            f"{data_dir}/train/cot/cot_data.jsonl",
+            f"{data_dir}/train/dolly/dolly_data.jsonl",
+            f"{data_dir}/train/oasst1/oasst1_data.jsonl",
+        ],
+    }
+
+    if dataset_name not in dataset_mapping:
+        raise ValueError(f"Unknown training dataset: {dataset_name}. "
+                        f"Available: {list(dataset_mapping.keys())}")
+
+    return dataset_mapping[dataset_name]
+
+
+def _get_default_train_files(data_dir: str, task: str) -> List[str]:
+    """
+    Get default training files based on task.
+
+    Args:
+        data_dir: Base directory containing training data
+        task: Evaluation task name
+
+    Returns:
+        List of default training file paths for the task
+    """
+    # LESS mixture for general instruction tuning evaluation tasks
+    less_mixture = [
+        f"{data_dir}/train/flan_v2/flan_v2_data.jsonl",
+        f"{data_dir}/train/cot/cot_data.jsonl",
+        f"{data_dir}/train/dolly/dolly_data.jsonl",
+        f"{data_dir}/train/oasst1/oasst1_data.jsonl"
+    ]
+
+    task_defaults = {
+        "samsum":   [f"{data_dir}/train/alpaca/alpaca_data.jsonl"],
+        "tydiqa":   less_mixture,
+        "triviaqa": [f"{data_dir}/train/nq_open/nq_open_data.jsonl"],
+        "nq_open":  [f"{data_dir}/train/triviaqa/triviaqa_data.jsonl"],
+    }
+
+    return task_defaults.get(task, less_mixture)
+
+
+def get_training_dataset(data_dir: str, task: str, tokenizer, max_seq_length,
+                         sample_percentage=1.0, seed=0, train_files: List[str] = None,
+                         train_dataset_names: List[str] = None):
+    """
+    Get training dataset with a specified seed.
+
+    Args:
+        data_dir: Base directory containing training data
+        task: Evaluation task name (mmlu, samsum, tydiqa, bbh, gsm8k, math500)
+        tokenizer: Tokenizer to use for encoding
+        max_seq_length: Maximum sequence length
+        sample_percentage: Percentage of data to sample
+        seed: Random seed for sampling
+        train_files: Optional explicit list of training files (overrides all other selection)
+        train_dataset_names: Optional list of training dataset names (e.g., ['wizardlm', 'alpaca'])
+
+    Returns:
+        Encoded training dataset
+    """
+    # Priority: train_files > train_dataset_names > task-based default
+    if train_files is None:
+        if train_dataset_names is not None:
+            # Use explicitly specified training datasets
+            train_files = []
+            for name in train_dataset_names:
+                train_files.extend(get_train_files_for_dataset(data_dir, name))
+        else:
+            # Fall back to task-based defaults
+            train_files = _get_default_train_files(data_dir, task)
+
+    raw_datasets = load_raw_dataset(
+        train_files, sample_percentage=sample_percentage, seed=seed)
+    lm_datasets = encode_data(
+        raw_datasets, tokenizer, max_seq_length)
+    return lm_datasets
+
+
+def load_raw_dataset(train_files: Union[List[str], str], sample_size=None, sample_percentage=1.0, seed=0):
+    """ load raw dataset """
+    if isinstance(train_files, str):
+        train_files = [train_files]
+    processed_datasets = load_dataset(
+        "json",
+        data_files=train_files,
+    )["train"]
+    if sample_size is None:
+        sample_size = int(len(processed_datasets) * sample_percentage)
+
+    if sample_size == len(processed_datasets):
+        return processed_datasets  # not shuffle
+
+    with temp_seed(seed):
+        index = torch.randperm(len(processed_datasets))[:sample_size].tolist()
+
+    sampled_dataset = processed_datasets.select(index)
+
+    return sampled_dataset
+
+
+def encode_data(raw_datasets, tokenizer, max_seq_length, processing_num_workers=10, overwrite_cache=False):
+    """Encode messages-format examples with the tokenizer's native chat template."""
+    if "input_ids" in raw_datasets.features:
+        return raw_datasets
+    if "messages" not in raw_datasets.column_names:
+        raise ValueError(
+            "Training data must have a 'messages' column. Got columns: "
+            f"{raw_datasets.column_names}"
+        )
+    encode_function = partial(
+        encode_with_messages_format,
+        tokenizer=tokenizer,
+        max_seq_length=max_seq_length,
+    )
+    lm_datasets = raw_datasets.map(
+        encode_function,
+        batched=False,
+        num_proc=processing_num_workers,
+        load_from_cache_file=not overwrite_cache,
+        desc="Tokenizing and reformatting instruction data",
+    )
+    lm_datasets.set_format(type="pt")
+    return lm_datasets
+
+
+def encode_with_messages_format(example, tokenizer, max_seq_length):
+    '''Render `example['messages']` with the tokenizer's chat template and
+    produce labels that supervise only each assistant *answer* span.
+
+    Uses the tokenizer's native template when it ships one (Qwen3) and the
+    tulu-style fallback otherwise (Llama-3.2-1B-Base); see
+    `SFT/data/chat_format.py`. Token positions come from the fast tokenizer's
+    offset mapping rather than prefix re-encoding, so the labels stay correct on
+    Qwen3 multi-turn data, where the empty `<think></think>` scaffold is
+    injected only on the final assistant turn and partial-prefix renders are
+    therefore not byte-prefixes of the full render. Tokenization uses
+    `add_special_tokens=False`, matching `get_val_dataset.tokenize`.
+    '''
+    from SFT.data.chat_format import encode_messages_with_chat_template
+    return encode_messages_with_chat_template(example, tokenizer, max_seq_length)

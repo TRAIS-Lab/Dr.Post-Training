@@ -1,0 +1,14 @@
+# Random Layer-Wise Subset control: every layer draws its own uniformly random k = selection_frac * n subset
+# per step, through the SAME LayerWiseSubset gradient path as LayerWiseSubset-LoRA (scores are computed with the
+# compressed 64x64 backend but ignored), so it differs from that arm only in which samples each layer keeps.
+method: LayerWiseSubset
+selection_mode: random
+finetuning: LoRA
+learning_rate: 1.00e-04
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.1
+
+scoring:
+  method: compress
+  compression: normal-64*64

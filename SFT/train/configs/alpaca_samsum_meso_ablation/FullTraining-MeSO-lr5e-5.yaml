@@ -1,0 +1,6 @@
+# MeSO learning-rate sweep, Full-Training MeSO on alpaca/samsum
+method: FullTraining
+finetuning: MeSO
+learning_rate: 5.00e-05
+optimizer:
+  compression: normal-512*512

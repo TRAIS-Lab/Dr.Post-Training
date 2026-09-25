@@ -1,0 +1,7 @@
+# Standard GRPO (no data curation) evaluated on the cleaned MATH test set (the evaluation set of the curated arms),
+# capped at 80 rounds.
+method: FullTraining
+finetuning: Full
+eval_cleaned_test: true
+total_training_steps: 80
+exp_suffix: _clean

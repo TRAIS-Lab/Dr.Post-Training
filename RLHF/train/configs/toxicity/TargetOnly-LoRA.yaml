@@ -1,0 +1,9 @@
+# TargetOnly: plain PPO (no curation) trained ONLY on the n_val held-out validation
+# prompts, i.e. the prompts that the held-out curation runs use as their target.
+# Matched to FullTraining's update budget: 1024 prompts / batch 256 = 4 rollout steps
+# per epoch, 28 epochs, capped at max_steps 110 (FullTraining: 28087 prompts -> 110 steps).
+method: TargetOnly
+finetuning: LoRA
+n_val: 1024
+epochs: 28
+max_steps: 110

@@ -1,0 +1,13 @@
+# SublayerWiseSubset = GroupWiseSubset curation per attention / MLP sub-block ({q,k,v,o} and {gate,up,down} LoRA factors of
+# each layer select separately; embed_tokens / lm_head are singleton groups). Same compressed 64x64 scoring backend, LoRA
+# setup and learning rate as LayerWiseSubset-LoRA / GlobalSubset-LoRA-cmp. See drpt/selection/grouping.py.
+method: SublayerWiseSubset
+finetuning: LoRA
+learning_rate: 1.00e-04
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.1
+
+scoring:
+  method: compress
+  compression: normal-64*64

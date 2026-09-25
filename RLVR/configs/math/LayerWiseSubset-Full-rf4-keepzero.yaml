@@ -1,0 +1,11 @@
+# LayerWiseSubset, one-pass rollout filtering with a lazy target: target rollouts regenerated every 4 rounds
+# (refresh_freq 4), 80 rounds.
+method: LayerWiseSubset
+finetuning: Full
+selection_frac: 1.0
+keep_zero_adv: true
+val_loss_type: reward
+refresh_freq: 4
+hook_embeddings: true
+total_training_steps: 80
+exp_suffix: _rf4emb_keepzero

@@ -1,0 +1,17 @@
+# LayerWiseSubset, stop-token-initialised base + small fixed target set:
+#   model = Qwen3-1.7B-Base with the <|im_end|> embedding row copied from <|endoftext|> (SFT init_eot_from_eos) and
+#   generation_config eos = [<|im_end|>, <|endoftext|>]; target = the first 64 prompts of val_from_test.parquet (held out
+#   from the MATH test set), 1 prompt x 8 rollouts per round, regenerated every round; embedding + tied output layer
+#   hooked; 80 rounds; evaluation on test_cleaned.parquet.
+method: LayerWiseSubset
+finetuning: Full
+model: ${SCRATCH_DIR}/Dr.Post-Training/models/Qwen3-1.7B-Base-eot
+selection_frac: 1.0
+val_loss_type: reward
+val_source: from_test
+val_pool_size: 64
+val_batch_size: 1
+refresh_freq: 1
+hook_embeddings: true
+total_training_steps: 80
+exp_suffix: _eot_tgt64

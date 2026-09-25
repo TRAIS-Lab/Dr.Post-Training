@@ -1,0 +1,6 @@
+# MeSO ablation: 1024x1024 sketch
+method: FullTraining
+finetuning: MeSO
+learning_rate: 1.00e-05
+optimizer:
+  compression: normal-1024*1024

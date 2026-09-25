@@ -1,0 +1,15 @@
+# As GlobalSubset-Full-eot-tgt-nice.yaml with tie_embeddings: embed_tokens and the tied lm_head share one target gradient
+# (sum of both site gradients) and one subset.
+method: GlobalSubset
+finetuning: Full
+model: ${SCRATCH_DIR}/Dr.Post-Training/models/Qwen3-1.7B-Base-eot
+selection_frac: 1.0
+val_loss_type: nice
+val_source: from_test
+val_pool_size: 64
+val_batch_size: 1
+refresh_freq: 1
+hook_embeddings: true
+total_training_steps: 80
+exp_suffix: _eot_tgt64_tied
+tie_embeddings: true

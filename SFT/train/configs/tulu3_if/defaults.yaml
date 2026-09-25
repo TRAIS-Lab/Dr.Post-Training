@@ -1,0 +1,46 @@
+# Shared experiment defaults for tulu3_general -> precise_if (32K-row Tulu 3 SFT mixture pool: precise IF ~3 %, math ~36 % of rows). Everything else identical to dolci_mixed_if.
+#
+# Data roles (see SFT/README.md, "Dolci capability setting"):
+#   train pool   : train/tulu3_general/tulu3_general_data.jsonl          (32,000 rows, percentage 1.0)
+#   D* (n_val)   : eval/precise_if/precise_if_validation_data.jsonl  -> selection gradient + val_loss curve
+#   held-out     : eval/precise_if/precise_if_test_data.jsonl        -> eval_loss curve only (n_eval rows)
+#   benchmark    : eval/<bench>/<bench>_bench_data.jsonl, scored post hoc by SFT/eval/eval.sh --target precise_if
+#
+# These values are inherited by all method configs in this directory.
+# Method configs can override any value.
+
+# Model
+model: Qwen/Qwen3-1.7B-Base
+
+# Dataset
+train_dataset: tulu3_general
+target_task: precise_if
+percentage: 1.0
+
+# Training
+seed: 42
+batch_size: 8
+gradient_accumulation_steps: 1
+optim: adamw_torch
+max_seq_length: 2048
+gradient_checkpointing: false
+lr_scheduler_type: linear
+warmup_ratio: 0.03
+weight_decay: 0.0
+num_train_epochs: 1
+eval_steps: 100
+use_flash_attention: true
+
+# Evaluation (target held-out; loss curve only)
+n_eval: 500
+
+# Curation defaults (used by LayerWiseSubset/GlobalSubset methods)
+selection_frac: 0.5
+selection_mode: topk
+n_val: 16
+val_batch_size: 1
+val_strategy: merged_batch
+# 0 disables D* length rejection
+val_seq_length_multiplier: 0
+scoring:
+  method: pip
