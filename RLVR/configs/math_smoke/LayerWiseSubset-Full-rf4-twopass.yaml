@@ -1,0 +1,10 @@
+# Two-round smoke of the two-pass Layer-Wise path: refresh every round so selection runs from round 1.
+method: LayerWiseSubset
+finetuning: Full
+two_pass: true
+selection_frac: 1.0
+val_loss_type: reward
+refresh_freq: 1
+hook_embeddings: true
+total_training_steps: 2
+exp_suffix: _rf4emb_twopass_smoke

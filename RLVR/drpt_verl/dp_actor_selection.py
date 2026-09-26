@@ -128,7 +128,13 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         use_second_order: bool = False,
         hook_embeddings: bool = True,
         tie_embeddings: bool = False,
-        keep_zero_adv: bool = True,
+        selection_mode: str = 'filtering',
+        selection_level: str = 'rollout',
+        score_normalization: str = 'none',
+        recenter_advantages: bool = False,
+        two_pass: bool = False,
+        drop_zero_adv: bool = False,
+        keep_zero_adv: bool = False,
     ):
         super().__init__(config, actor_module, actor_optimizer)
 
@@ -136,10 +142,25 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         self.selection_method = selection_method
         self.train_selection_ratio = train_selection_ratio
         self.use_second_order = use_second_order
+        # Selection rule. The legacy in-backward / per-micro-batch paths
+        # implement negative filtering per rollout only; any other rule, layer-normalized Global
+        # scoring, advantage re-centring or an explicit two_pass request routes update_policy through
+        # drpt_verl.selection_v2 (scores gathered over the whole mini-batch and all DP ranks first).
+        from .selection_rules import SelectionRule
+        self.selection_rule = SelectionRule(
+            mode=selection_mode, frac=train_selection_ratio, level=selection_level,
+            score_normalization=score_normalization,
+        ).validate()
+        self.recenter_advantages = recenter_advantages
+        self.drop_zero_adv = drop_zero_adv
         # One-pass Layer-Wise: force-keep zero-advantage rollouts in every layer (their in-backward score is a
         # random-sign KL-only number, so the legacy rule drops about half of them). Mirrors the two-pass
         # semantics (pg-only scores are exactly 0 -> kept) at one-pass cost.
         self.keep_zero_adv = keep_zero_adv
+        self.use_v2_update = bool(
+            two_pass or selection_mode != 'filtering' or selection_level != 'rollout'
+            or score_normalization != 'none' or recenter_advantages or drop_zero_adv
+        )
         # Hook the token embedding and lm_head as well (same coverage as the SFT hook);
         # False hooks only the block-internal Linear layers.
         self.hook_embeddings = hook_embeddings
@@ -792,6 +813,10 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         if not self.has_external_validation_gradients():
             logger.warning("No validation gradients captured, using baseline update_policy")
             return super().update_policy(data)
+
+        if self.use_v2_update:
+            from .selection_v2 import update_policy_v2
+            return update_policy_v2(self, data)
 
         # For LayerWiseSubset, use custom implementation with hooks
         if self.selection_method == 'LayerWiseSubset':

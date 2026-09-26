@@ -315,9 +315,10 @@ class GradientHookVerl:
         frac: float,
         lr: float,
         use_second_order: bool = False,
-        selection_mode: str = "topk"
+        selection_mode: str = "topk",
+        record_layer_scores: bool = False,
     ) -> None:
-        """Set up selection state."""
+        """Set up selection state (``record_layer_scores`` keeps per-layer score vectors, Global only)."""
         if selection_method == "Regular" or selection_method == "NA":
             self.selection_state = None
             return
@@ -336,7 +337,8 @@ class GradientHookVerl:
                 device=self.device,
                 dtype=dtype,
                 use_second_order=use_second_order,
-                selection_mode=selection_mode
+                selection_mode=selection_mode,
+                record_layer_scores=record_layer_scores,
             )
         elif selection_method == "LayerWiseSubset":
             self.selection_state = LayerWiseSubsetStateVerl(
@@ -501,7 +503,8 @@ class GradientHookVerl:
         lr: float,
         compute_scores_only: bool = False,
         use_second_order: bool = False,
-        selection_mode: str = "topk"
+        selection_mode: str = "topk",
+        record_layer_scores: bool = False,
     ) -> None:
         """
         Set up selection state using pre-captured validation gradients.
@@ -519,7 +522,8 @@ class GradientHookVerl:
             frac=frac,
             lr=lr,
             use_second_order=use_second_order,
-            selection_mode=selection_mode
+            selection_mode=selection_mode,
+            record_layer_scores=record_layer_scores,
         )
 
     # =========================================================================
@@ -756,7 +760,7 @@ class GlobalSubsetLinearBackwardVerl(Function):
                 )
 
             # Accumulate scores
-            state.accumulate_precomputed_scores(scores, similarity)
+            state.accumulate_precomputed_scores(scores, similarity, layer_idx=layer_idx)
 
         return grad_input, None, None, None, None
 
@@ -918,6 +922,6 @@ class GlobalSubsetEmbeddingBackwardVerl(Function):
                 scores = compute_embedding_scores_standard(grad_output, input_ids, val_grad_weight)
 
             # Accumulate scores (no similarity contribution from embeddings)
-            state.accumulate_precomputed_scores(scores, None)
+            state.accumulate_precomputed_scores(scores, None, layer_idx=layer_idx)
 
         return None, None, None, None, None

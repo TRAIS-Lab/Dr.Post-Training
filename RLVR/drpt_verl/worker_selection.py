@@ -112,7 +112,13 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
             use_second_order=selection_config.get("use_second_order", False),
             hook_embeddings=selection_config.get("hook_embeddings", True),
             tie_embeddings=selection_config.get("tie_embeddings", False),
-            keep_zero_adv=selection_config.get("keep_zero_adv", True),
+            selection_mode=selection_config.get("selection_mode", "filtering"),
+            selection_level=selection_config.get("selection_level", "rollout"),
+            score_normalization=selection_config.get("score_normalization", "none"),
+            recenter_advantages=selection_config.get("recenter_advantages", False),
+            two_pass=selection_config.get("two_pass", False),
+            drop_zero_adv=selection_config.get("drop_zero_adv", False),
+            keep_zero_adv=selection_config.get("keep_zero_adv", False),
         )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

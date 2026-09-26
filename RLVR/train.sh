@@ -164,6 +164,14 @@ reset_config() {
     cfg_name_method=""                # method label in EXP_NAME (W&B name / output dir); empty = method (e.g. LayerWise for LayerWiseSubset)
     cfg_eval_cleaned_test="false"     # "true": evaluate on test_cleaned.parquet even when selection is disabled (same eval set for all arms)
     cfg_keep_zero_adv="true"          # one-pass Layer-Wise: force-keep zero-advantage rollouts in every layer ("false" = plain sign rule)
+    # Selection rule (drpt_verl/selection_rules.py); any non-default value uses the gather-then-select (two-pass) path
+    cfg_selection_mode="filtering"    # filtering | topk   (selection_frac: share of negatives dropped | share kept)
+    cfg_selection_level="rollout"     # rollout | prompt   (prompt = all rollouts of a prompt decided together)
+    cfg_score_normalization="none"    # Global only: none | layer_meanabs | layer_std
+    cfg_recenter_advantages="false"   # Global, rollout level: re-centre kept rollouts' advantages per prompt
+    cfg_two_pass="false"              # score in a separate policy-gradient-only pass, then train with fixed per-layer masks
+    cfg_keep_groups=""                # ""=auto (on for prompt level) | true | false: whole prompt groups per mini-batch
+    cfg_drop_zero_adv="false"         # drop zero-advantage rollouts after the rule (two-pass path only)
 }
 
 parse_yaml() {
@@ -219,6 +227,13 @@ parse_yaml() {
             exp_suffix)                      cfg_exp_suffix="$val" ;;
             name_method)                     cfg_name_method="$val" ;;
             eval_cleaned_test)               cfg_eval_cleaned_test="$val" ;;
+            selection_mode)                  cfg_selection_mode="$val" ;;
+            selection_level)                 cfg_selection_level="$val" ;;
+            score_normalization)             cfg_score_normalization="$val" ;;
+            recenter_advantages)             cfg_recenter_advantages="$val" ;;
+            two_pass)                        cfg_two_pass="$val" ;;
+            keep_groups)                     cfg_keep_groups="$val" ;;
+            drop_zero_adv)                   cfg_drop_zero_adv="$val" ;;
             keep_zero_adv)                   cfg_keep_zero_adv="$val" ;;
         esac
     done < "$file"
@@ -324,7 +339,7 @@ run_method() {
     echo "LR: $cfg_learning_rate | Seed: $cfg_seed"
     echo "Batch: $cfg_train_batch_size | Epochs: $cfg_total_epochs"
     echo "Val loss type: $cfg_val_loss_type | Val source: $cfg_val_source"
-    echo "Target refresh every $cfg_refresh_freq round(s) | hook_embeddings=$cfg_hook_embeddings | keep_zero_adv=$cfg_keep_zero_adv"
+    echo "Rule: $cfg_selection_mode/$cfg_selection_level frac=$cfg_selection_frac norm=$cfg_score_normalization recenter=$cfg_recenter_advantages two_pass=$cfg_two_pass keep_groups=${cfg_keep_groups:-auto} drop_zero_adv=$cfg_drop_zero_adv keep_zero_adv=$cfg_keep_zero_adv"
     echo "Output: $OUTPUT_DIR"
     echo "=============================================="
 
@@ -425,7 +440,15 @@ run_method() {
     +selection.val_loss_type=$cfg_val_loss_type \
     +selection.hook_embeddings=$([[ "$cfg_hook_embeddings" == "true" ]] && echo True || echo False) \
     +selection.tie_embeddings=$([[ "$cfg_tie_embeddings" == "true" ]] && echo True || echo False) \
+    +selection.selection_mode=$cfg_selection_mode \
+    +selection.selection_level=$cfg_selection_level \
+    +selection.score_normalization=$cfg_score_normalization \
+    +selection.recenter_advantages=$([[ "$cfg_recenter_advantages" == "true" ]] && echo True || echo False) \
+    +selection.two_pass=$([[ "$cfg_two_pass" == "true" ]] && echo True || echo False) \
+    +selection.drop_zero_adv=$([[ "$cfg_drop_zero_adv" == "true" ]] && echo True || echo False) \
     +selection.keep_zero_adv=$([[ "$cfg_keep_zero_adv" == "true" ]] && echo True || echo False)"
+        [[ -n "$cfg_keep_groups" ]] && cmd+=" \
+    +selection.keep_groups=$([[ "$cfg_keep_groups" == "true" ]] && echo True || echo False)"
     fi
     [[ -n "$cfg_total_training_steps" ]] && cmd+=" \
     trainer.total_training_steps=$cfg_total_training_steps"

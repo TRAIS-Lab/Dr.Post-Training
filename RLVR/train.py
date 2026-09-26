@@ -201,7 +201,14 @@ class SelectionTaskRunner(BaseTaskRunner):
                 val_seed=selection_cfg.get("val_seed"),
                 refresh_freq=selection_cfg.get("refresh_freq", 1),
                 val_loss_type=selection_cfg.get("val_loss_type", "reward"),
-                keep_zero_adv=bool(selection_cfg.get("keep_zero_adv", True)),
+                selection_mode=selection_cfg.get("selection_mode", "filtering"),
+                selection_level=selection_cfg.get("selection_level", "rollout"),
+                score_normalization=selection_cfg.get("score_normalization", "none"),
+                recenter_advantages=bool(selection_cfg.get("recenter_advantages", False)),
+                two_pass=bool(selection_cfg.get("two_pass", False)),
+                keep_groups=selection_cfg.get("keep_groups", None),
+                drop_zero_adv=bool(selection_cfg.get("drop_zero_adv", False)),
+                keep_zero_adv=bool(selection_cfg.get("keep_zero_adv", False)),
             )
 
             trainer = SelectionRayPPOTrainerWithOnlineVal(

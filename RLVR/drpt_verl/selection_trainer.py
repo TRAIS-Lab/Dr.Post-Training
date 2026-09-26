@@ -108,6 +108,32 @@ class SelectionTrainerConfig:
     # One-pass Layer-Wise: force-keep zero-advantage rollouts (all-correct / all-wrong groups) in every layer.
     # Their in-backward score is a random-sign KL-only number, so the plain sign rule would drop about half of them.
     keep_zero_adv: bool = True
+    # Selection rule (see drpt_verl/selection_rules.py):
+    #   selection_mode   "filtering" (drop negative-score candidates; frac = share of negatives dropped)
+    #                    or "topk" (keep the best frac share of candidates)
+    #   selection_level  "rollout" (candidate = one response) or "prompt" (candidate = all n responses
+    #                    of a prompt, decided from the summed score; keeps GRPO groups intact)
+    #   score_normalization  Global only: "none" | "layer_meanabs" | "layer_std" before summing layers
+    #   recenter_advantages  Global, rollout level: re-centre the kept rollouts' advantages per prompt
+    #   two_pass         score every rollout in a separate policy-gradient-only pass, then train with the
+    #                    per-layer masks fixed (gather-then-select path)
+    #   keep_groups      balance sequence lengths within each mini-batch block so every mini-batch
+    #                    holds whole prompt groups (None = automatic: on for prompt-level selection)
+    #   drop_zero_adv    drop rollouts whose GRPO advantage is zero after the rule (two-pass path only)
+    selection_mode: str = "filtering"
+    selection_level: str = "rollout"
+    score_normalization: str = "none"
+    recenter_advantages: bool = False
+    two_pass: bool = False
+    keep_groups: Optional[bool] = None
+    drop_zero_adv: bool = False
+
+    def uses_v2_update(self) -> bool:
+        return bool(self.two_pass or self.selection_mode != "filtering" or self.selection_level != "rollout"
+                    or self.score_normalization != "none" or self.recenter_advantages or self.drop_zero_adv)
+
+    def keep_groups_resolved(self) -> bool:
+        return self.selection_level == "prompt" if self.keep_groups is None else bool(self.keep_groups)
 
 
 class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
@@ -172,6 +198,12 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
             "frac": self.selection_config.frac,
             "use_second_order": self.selection_config.use_second_order,
             "hook_embeddings": self.selection_config.hook_embeddings,
+            "selection_mode": self.selection_config.selection_mode,
+            "selection_level": self.selection_config.selection_level,
+            "score_normalization": self.selection_config.score_normalization,
+            "recenter_advantages": self.selection_config.recenter_advantages,
+            "two_pass": self.selection_config.two_pass,
+            "drop_zero_adv": self.selection_config.drop_zero_adv,
             "keep_zero_adv": self.selection_config.keep_zero_adv,
         }
 
@@ -320,6 +352,47 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
             return False
         # Capture validation gradients every refresh_freq steps
         return self._step_counter % self.selection_config.refresh_freq == 0
+
+    def _balance_batch_keep_groups(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
+        """
+        Sequence-length balancing across DP ranks that keeps every mini-batch made of whole prompt
+        groups: the batch is cut into consecutive blocks of ppo_mini_batch_size * rollout.n samples
+        (the prompts of one optimizer step, still in prompt-major order), each block is balanced
+        across the dp ranks on its own, and rank j receives block k's j-th part as its k-th
+        mini-batch. Same idea as verl's ``_balance_batch(keep_minibatch=True)`` with the block size
+        expressed in samples. Needed by prompt-level selection, harmless otherwise.
+        """
+        from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+
+        attention_mask = batch.batch["attention_mask"]
+        batch_size = attention_mask.shape[0]
+        global_seqlen_lst = attention_mask.view(batch_size, -1).sum(-1)
+        workload_lst = calculate_workload(global_seqlen_lst)
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        n = self.config.actor_rollout_ref.rollout.n
+        block = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * int(n)
+        if batch_size % block != 0 or block % dp_size != 0:
+            raise ValueError(
+                f"keep_groups balancing needs batch_size ({batch_size}) divisible by ppo_mini_batch_size*n "
+                f"({block}) and that block divisible by dp_size ({dp_size})"
+            )
+        n_blocks = batch_size // block
+        if not getattr(self, "_keep_groups_logged", False):
+            print(f"[Selection] keep_groups balancing: {batch_size} samples = {n_blocks} mini-batch blocks of {block} "
+                  f"({block // int(n)} prompts x {n} rollouts) split over dp_size={dp_size}")
+            self._keep_groups_logged = True
+        partitions = [[] for _ in range(dp_size)]
+        for i in range(n_blocks):
+            sub = get_seqlen_balanced_partitions(
+                workload_lst[i * block:(i + 1) * block].tolist(), k_partitions=dp_size, equal_size=True
+            )
+            for j, part in enumerate(sub):
+                partitions[j].extend([x + i * block for x in part])
+        global_idx = torch.tensor([j for partition in partitions for j in partition])
+        batch.reorder(global_idx)
+        metrics.update(log_seqlen_unbalance(
+            seqlen_list=global_seqlen_lst.tolist(), partitions=partitions, prefix=logging_prefix
+        ))
 
     def fit(self):
         """
@@ -502,7 +575,10 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        if self.selection_config.enable and self.selection_config.keep_groups_resolved():
+                            self._balance_batch_keep_groups(batch, metrics=metrics)
+                        else:
+                            self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()

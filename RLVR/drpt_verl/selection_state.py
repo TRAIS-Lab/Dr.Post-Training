@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from torch import Tensor
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -159,13 +159,21 @@ class LayerWiseSubsetStateVerl(SelectionStateVerl):
         super().__init__(**kwargs)
         self._last_selected_indices: Optional[Tensor] = None
         self._layer_selections: list = []
-        # Micro-batch positions that every layer must keep regardless of their score
-        # (zero-advantage rollouts, whose in-backward score is a random-sign KL-only number).
+        # Gather-then-select ("v2") path: per-layer keep-indices decided before the training
+        # backward (layer_idx -> LongTensor of kept micro-batch positions). When set, the backward
+        # uses them instead of the in-backward sign rule; layers without an entry keep everything.
+        self.fixed_selections: Optional[Dict[int, Tensor]] = None
+        # One-pass path: micro-batch positions that every layer must keep regardless of their score
+        # (used for zero-advantage rollouts, whose in-backward score is a random-sign KL-only number).
         self.force_keep: Optional[Tensor] = None
 
     def select_for_layer(self, layer_idx: int, scores: Tensor, similarity: Optional[Tensor] = None) -> Tensor:
-        """Kept indices for one layer: the score rule plus the forced keeps."""
-        sel = self._select_indices(scores, similarity)
+        """Kept indices for one layer: the fixed selection if one was provided, else the score rule (+ forced keeps)."""
+        if self.fixed_selections is not None:
+            fixed = self.fixed_selections.get(layer_idx)
+            sel = torch.arange(scores.shape[0], device=scores.device) if fixed is None else fixed.to(scores.device)
+        else:
+            sel = self._select_indices(scores, similarity)
         if self.force_keep is not None and bool(self.force_keep.any()):
             forced = self.force_keep.to(scores.device).nonzero(as_tuple=False).view(-1)
             sel = torch.unique(torch.cat([sel.to(scores.device), forced]))
@@ -182,8 +190,12 @@ class GlobalSubsetStateVerl(SelectionStateVerl):
     Global selection, two-pass with packed sequence support.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, record_layer_scores: bool = False, **kwargs):
         super().__init__(**kwargs)
+        # Gather-then-select ("v2") path: keep every layer's score vector (layer_idx -> [B])
+        # in addition to the running sum, so Layer-Wise decisions can be made after the pass.
+        self.record_layer_scores = record_layer_scores
+        self.layer_scores: Dict[int, Tensor] = {}
 
         self.grad_dot_scores = torch.zeros(
             self.train_batch_size,
@@ -203,11 +215,29 @@ class GlobalSubsetStateVerl(SelectionStateVerl):
         self,
         scores: Tensor,
         similarity: Optional[Tensor],
+        layer_idx: Optional[int] = None,
     ) -> None:
-        """Accumulate pre-computed scores."""
+        """Accumulate pre-computed scores (and record the layer's own vector when requested)."""
         self.grad_dot_scores += scores.to(self.dtype)
         if self.similarity_matrix is not None and similarity is not None:
             self.similarity_matrix += similarity.to(self.dtype)
+        if self.record_layer_scores and layer_idx is not None:
+            prev = self.layer_scores.get(layer_idx)
+            cur = scores.detach().to(torch.float32)
+            # a layer may report twice in one pass (e.g. tied sites); keep the sum like the accumulator
+            self.layer_scores[layer_idx] = cur if prev is None else prev + cur
+
+    def layer_score_matrix(self, num_layers: int) -> Tuple[Tensor, Tensor]:
+        """
+        Recorded per-layer scores as a dense matrix [num_layers, B] (float32, zeros for layers
+        that did not report) plus a bool vector [num_layers] marking the layers that did.
+        """
+        S = torch.zeros(num_layers, self.train_batch_size, device=self.device, dtype=torch.float32)
+        scored = torch.zeros(num_layers, dtype=torch.bool, device=self.device)
+        for idx, vec in self.layer_scores.items():
+            S[idx] = vec.to(S.device)
+            scored[idx] = True
+        return S, scored
 
     def get_final_selection(self) -> Tensor:
         """Compute global selection after all layers."""
@@ -231,3 +261,4 @@ class GlobalSubsetStateVerl(SelectionStateVerl):
         self.grad_dot_scores.zero_()
         if self.similarity_matrix is not None:
             self.similarity_matrix.zero_()
+        self.layer_scores = {}

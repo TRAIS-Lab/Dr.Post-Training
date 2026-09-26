@@ -1,0 +1,10 @@
+# LayerWiseSubset, refresh-4 protocol, legacy per-layer rollout negative filtering routed through the two-pass path
+method: LayerWiseSubset
+finetuning: Full
+two_pass: true
+selection_frac: 1.0
+val_loss_type: reward
+refresh_freq: 4
+hook_embeddings: true
+total_training_steps: 80
+exp_suffix: _rf4emb_twopass
