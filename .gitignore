@@ -91,3 +91,7 @@ logs/
 
 # Per-run exports written by the table generators (--scan); regenerated locally
 SFT/tables/data/
+
+# Hillclimb hook files
+/.claude/settings.local.json
+/.claude/settings.local.json.malformed-*
