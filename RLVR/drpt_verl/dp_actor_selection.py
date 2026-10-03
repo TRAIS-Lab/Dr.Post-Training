@@ -86,14 +86,14 @@ def get_trainable_linear_layers(
     Linear layers and left embeddings and ``lm_head`` to the standard update.
     """
     layer_names = []
-    legacy_exclude_patterns = ['embed', 'lm_head', 'wte', 'wpe']
+    embedding_exclude_patterns = ['embed', 'lm_head', 'wte', 'wpe']
 
     for name, module in model.named_modules():
         is_linear = isinstance(module, nn.Linear)
         is_embedding = isinstance(module, nn.Embedding)
         if not (is_linear or (is_embedding and hook_embeddings)):
             continue
-        if not hook_embeddings and any(pattern in name.lower() for pattern in legacy_exclude_patterns):
+        if not hook_embeddings and any(pattern in name.lower() for pattern in embedding_exclude_patterns):
             continue
         if skip_grad_check or any(p.requires_grad for p in module.parameters()):
             layer_names.append(name)
@@ -134,7 +134,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         recenter_advantages: bool = False,
         two_pass: bool = False,
         drop_zero_adv: bool = False,
-        keep_zero_adv: bool = False,
+        keep_zero_adv: bool = True,
     ):
         super().__init__(config, actor_module, actor_optimizer)
 
@@ -142,7 +142,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         self.selection_method = selection_method
         self.train_selection_ratio = train_selection_ratio
         self.use_second_order = use_second_order
-        # Selection rule. The legacy in-backward / per-micro-batch paths
+        # Selection rule. The one-pass in-backward / per-micro-batch paths
         # implement negative filtering per rollout only; any other rule, layer-normalized Global
         # scoring, advantage re-centring or an explicit two_pass request routes update_policy through
         # drpt_verl.selection_v2 (scores gathered over the whole mini-batch and all DP ranks first).
@@ -154,7 +154,7 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         self.recenter_advantages = recenter_advantages
         self.drop_zero_adv = drop_zero_adv
         # One-pass Layer-Wise: force-keep zero-advantage rollouts in every layer (their in-backward score is a
-        # random-sign KL-only number, so the legacy rule drops about half of them). Mirrors the two-pass
+        # random-sign KL-only number, so the plain sign rule drops about half of them). Mirrors the two-pass
         # semantics (pg-only scores are exactly 0 -> kept) at one-pass cost.
         self.keep_zero_adv = keep_zero_adv
         self.use_v2_update = bool(
@@ -830,9 +830,8 @@ class DataParallelPPOActorWithSelection(DataParallelPPOActor):
         """
         Update policy with LayerWiseSubset selection (per-layer during backward).
 
-        Unlike the previous implementation that called super().update_policy(),
-        this version handles micro-batches explicitly to ensure selection state
-        (tokens_per_sample, cu_seqlens, etc.) is correctly set per micro-batch.
+        Handles the micro-batches explicitly (instead of delegating to super().update_policy()) so that
+        the selection state (tokens_per_sample, cu_seqlens, etc.) is set per micro-batch.
 
         This is critical because:
         1. Selection indices are relative to the micro-batch (0 to micro_batch_size-1)

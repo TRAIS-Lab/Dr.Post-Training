@@ -528,10 +528,10 @@ class Compressor(ProjectionContainer):
             return None
         return kernel_ops().compressed_grad(c1, c2, P1, P2, scale=scale)
 
-    def fused_partials(self, grad_output: torch.Tensor, input: torch.Tensor) -> Optional[torch.Tensor]:
-        """Scaled fp32 per-tile partials ``[B, S_tiles, 64, 64]`` of the compressed gradients
-        (``drpt.kernels.cute_ops.compressed_partials``), or None when the fused path does not apply
-        (non-CuTe backend, bias-augmented input, non-dense factors, k > 64, unsupported dtype/shape)."""
+    def fused_project(self, grad_output: torch.Tensor, input: torch.Tensor) -> Optional[torch.Tensor]:
+        """First stage of the fused compressed scoring (``drpt.kernels.cute_ops.compress_project``): the per-backend
+        intermediate for :meth:`fused_score`, or None when the fused path does not apply (non-CuTe backend,
+        bias-augmented input, non-dense factors, k > 64, unsupported dtype/shape)."""
         from .kernels import fused_ok, backend, kernel_ops
 
         if backend() != "cute" or not fused_ok(grad_output, input, op="proj"):
@@ -543,7 +543,19 @@ class Compressor(ProjectionContainer):
         if (P1.dtype != grad_output.dtype or P2.dtype != input.dtype or P1.shape[0] != grad_output.shape[-1]
                 or P2.shape[0] != input.shape[-1]):
             return None
-        return kernel_ops().compressed_partials(grad_output, input, P1, P2, scale=scale)
+        return kernel_ops().compress_project(grad_output, input, P1, P2, scale=scale)
+
+    def fused_score(self, proj: torch.Tensor, n_train: int, k: int, corr) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Second stage: ``corr * <c_b, sum_val c_v>`` for the training rows of the merged batch and the sorted top-k
+        (``k = 0`` -> scores only) from the intermediate of :meth:`fused_project`, in one launch."""
+        from .kernels import kernel_ops
+
+        return kernel_ops().compress_score(proj, self._fused_plan()[2], n_train, k, corr)
+
+    def fused_scores(self, grad_output: torch.Tensor, input: torch.Tensor, n_train: int, k: int, corr) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """:meth:`fused_project` followed by :meth:`fused_score`, or None when the fused path does not apply."""
+        proj = self.fused_project(grad_output, input)
+        return None if proj is None else self.fused_score(proj, n_train, k, corr)
 
     def _fused_plan(self):
         """(P_O, P_I, scale) when both first-stage factors are dense and the second stage is the

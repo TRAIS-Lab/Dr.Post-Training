@@ -8,6 +8,7 @@ scripts live next to the experiments that produced the numbers, one per table fa
 | Qwen3-1.7B-Base SFT (main + appendix k / target-size tables) | `SFT/tables/qwen_capability.py` | H200 cluster | `$DRPT_RESULTS/SFT/runs_v2/<run>/*_results.greedy.json` |
 | Llama-3.2-1B QA (Table 1, perplexity, QA matrices, controls) | `SFT/tables/qa_downstream.py` | A40 cluster | `$DRPT_RESULTS/SFT/runs_v2/<run>/{<target>_results.json, evaluation_results.json}` with `--scan`; otherwise the local (gitignored) per-run export `SFT/tables/data/qa_runs.csv` |
 | System-efficiency benchmarks (overhead, score cost, memory, timing grids) | `SFT/tables/system_efficiency.py` | A40 cluster | `SFT/benchmark/results/paper/{breakdown,breakdown_checkpointing,scoring}/*.json` (local, gitignored) |
+| System-efficiency benchmark on one H200 (Qwen3-8B-Base, Hopper kernels; not in the paper) | `SFT/tables/system_efficiency_h200.py` | H200 cluster | `SFT/benchmark/results/paper/h200/{breakdown,breakdown_checkpointing,scoring}/*.json` (local, gitignored) |
 | Per-component timing of real QA steps | `SFT/tables/qa_timing.py` | A40 cluster | `SFT/benchmark/results/paper/{qa_profile,qa_throughput}/<run>/` (local, gitignored) |
 | RLHF final-adapter toxicity under four judges, exact vs compressed | `RLHF/tables/scoring_backend.py` | H200 cluster | `$DRPT_RESULTS/RLHF/<run>/rescore_final.json` |
 | RLVR accuracy at selected rounds | `RLVR/tables/accuracy.py` | W&B (`verl_grpo_math`) | read directly from W&B (5 seeds per method, matched by run name) |

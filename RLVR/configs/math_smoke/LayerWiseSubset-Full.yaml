@@ -1,0 +1,8 @@
+# Two-round smoke test of the Layer-Wise path (selection from round 1, no evaluation).
+method: LayerWiseSubset
+finetuning: Full
+selection_frac: 1.0
+val_loss_type: reward
+refresh_freq: 1
+total_training_steps: 2
+exp_suffix: _smoke

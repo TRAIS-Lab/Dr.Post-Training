@@ -8,8 +8,8 @@ Two suites are maintained for different hardware:
 
 - **A40 suite** — 3 small/mid models from different families, packed
   one-model-per-GPU on a single A40x4 node.
-- **H200 suite** — Qwen3 family at larger sizes and longer sequences,
-  one-job-per-(model, config) on H200 nodes.
+- **H200 suite** — one 10B+ model (Qwen3-14B-Base) at longer sequences on a single
+  H200, one array task per `(n, T)`.
 
 ## Suites
 
@@ -28,17 +28,29 @@ GPU, three GPUs in parallel.
 
 ### H200 — `slurm/launch_h200.sh`
 
-Qwen3 family at scale (one GPU per job).
+One model at the 8-14B scale on a single H200 (141 GB), submitted as one Slurm job array (one
+GPU per task, one `(n, T)` per task, `MAX_CONCURRENT` throttle).
 
-| Model      | hidden | intermediate | L  | heads (q / kv) | head dim | GQA |
-|------------|--------|--------------|----|----------------|----------|-----|
-| Qwen3-1.7B | 2048   |  6144        | 28 | 16 / 8         | 128      | 2:1 |
-| Qwen3-4B   | 2560   |  9728        | 36 | 32 / 8         | 128      | 4:1 |
-| Qwen3-8B   | 4096   | 12288        | 36 | 32 / 8         | 128      | 4:1 |
+| Model           | hidden | intermediate | L  | heads (q / kv) | head dim | GQA |
+|-----------------|--------|--------------|----|----------------|----------|-----|
+| Qwen3-8B-Base   | 4096   | 12288        | 36 | 32 / 8         | 128      | 4:1 |
+| Qwen3-14B-Base  | 5120   | 17408        | 40 | 40 / 8         | 128      | 5:1 |
 
-Configs: `(n=8, T=1024)`, `(n=4, T=2048)`, `(n=2, T=4096)`, `(n=16, T=512)`,
-each with `m=1`. Per (model, config) → 2 jobs (with/without gradient
-checkpointing) → 24 breakdown jobs + 3 scoring jobs = 27 total.
+Configs: `(n, T) = (8, 512), (16, 512), (32, 256), (8, 1024), (4, 1024), (16, 256), (4, 2048),
+(2, 2048), (2, 4096)`, `m = 1`, `k = n/2`, plus one standalone scoring job (T-sweep to 32768).
+Protocol: bf16 weights, activations (autocast) and Adam state, **fused AdamW** (`--fused-adamw`;
+the default foreach implementation materialises full-size temporaries, `_foreach_sqrt` of the
+second moments alone is ~30 GB at 14B), the CuTe backend's **Hopper kernels**
+(`drpt/kernels/hopper_ops.py`, TMA + `wgmma`; see the Hopper note below), and **no activation
+checkpointing** by default: Qwen3-8B fits up to ~9k tokens per step on one H200 (static state
+66 GB, ~6.6 MB per token), the primary setting. `CKPT=1` turns checkpointing on, which Qwen3-14B
+needs beyond ~2.5k tokens per step (static state ~105 GB, ~10 MB per token); those results land
+in `breakdown_checkpointing/` and carry the two measurement effects described in the Hopper note.
+
+Results: `results/h200/{breakdown,breakdown_checkpointing,scoring}/`; the paper tables come from
+`SFT/tables/system_efficiency_h200.py` (`--model-tag`, `--subdir`, `--totals plain|phases`), which
+reads the snapshot copied to `results/paper/h200/` like the A40 generator. The 1.7B/4B shapes
+remain available in `benchmark_scoring.py` (`--model-tag`) and through `MODELS=`.
 
 ## Benchmarks
 
@@ -69,7 +81,10 @@ loading — tests all scoring regimes at scale.
 bash SFT/benchmark/run_benchmarks.sh scoring
 ```
 
-Results: `results/scoring/`. `benchmark_scoring.py --gpu N` is applied before
+Results: `results/scoring/`. The GIP / PIP / direct rows time the library's dispatch on
+synthetic activations (fused kernels when the backend provides them); the compressed row
+times the fused `compressed_scores` path of the training step on the CuTe backend and a
+torch simulation of the projection elsewhere. `benchmark_scoring.py --gpu N` is applied before
 any import: the CuTe DSL initialises the CUDA driver when `drpt.kernels` is
 imported, after which `CUDA_VISIBLE_DEVICES` is ignored (setting it inside
 `main()` would put every model on GPU 0).
@@ -150,6 +165,8 @@ fallback backend (`drpt/kernels/triton_ops.py`). Backend selection:
 `DRPT_KERNEL_BACKEND=cute|triton|off` (default `cute` when
 `nvidia-cutlass-dsl` + `apache-tvm-ffi` are installed), or `--kernel-backend` /
 `--no-fused` in the benchmark scripts. `off` runs the PyTorch reference ops.
+`DRPT_FUSED_DISABLE=wgrad` (or `gip`, `pip`, `proj`, `gather`) sends one operation to the reference
+path while the backend stays fused.
 
 ```bash
 pip install nvidia-cutlass-dsl apache-tvm-ffi   # CuTe backend (CUDA 12+ driver)
@@ -163,7 +180,11 @@ pip install nvidia-cutlass-dsl apache-tvm-ffi   # CuTe backend (CUDA 12+ driver)
 | `total_wgrad` | `einsum('vto,vti->oi')` | the target gradient `G_val = Σ_v go_vᵀ inp_v` (and every other batch-summed weight gradient, `compute_total_gradient`) through the `selected_wgrad` mainloop with all samples selected: ~20 % faster than the cuBLAS einsum for `K = m·T ≳ 2k` and immune to the `[3072, 8192]` heuristic bug below; used by the PIP and Direct scoring paths and the separate-batch validation cache |
 | `compressed_grad` (CuTe only) | `Compressor.forward`: 2 skinny GEMMs + `bmm` + scale (torch.compile) | both `κ^{1/2}`-wide projections of a 64-row tile and their outer product `(go P_O)ᵀ(inp P_I)` formed on-chip; one launch + one tile-sum per layer, replaces the five-kernel compiled graph and its guard overhead |
 | `reduce_select` (CuTe only) | partial sum, correction, `topk`, `sort` | single-CTA epilogue for the exact methods: the pip / gip kernels now expose their per-CTA partial sums (`pip_partials`, `gip_partials`); one launch turns them (plus the bias-gradient column when present) into corrected scores and the sorted top-k (`drpt.selection.backward.exact_scores_fused`, same `DRPT_FUSED_SELECT` switch) |
-| `score_select` (CuTe only) | tile-sum, bf16 cast, val sum, GEMV, correction, `topk`, `sort` | single-CTA epilogue over the projection's fp32 tile partials: validation vector, `corr · <c_b, c_val>` for every training row and the sorted top-k indices, in one launch (~30 µs; ≈ 8 launches before). Used by the Layer-Wise and Global compress paths (`drpt.selection.backward.compressed_scores_fused`); `DRPT_FUSED_SELECT=0` keeps only the projection kernel |
+| `gather_rows` | `index_select` x2 + scale | the selected samples of a `[B, S, F]` activation copied into the contiguous `[K*S, F]` operand of the reference w.grad GEMM, 128-bit vectors, item-count scale fused into the gradient-output copy (3.1 TB/s on H200 vs ~1 TB/s for `index_select`) |
+| `hopper_ops.selected_wgrad` (sm_90) | the `selected_wgrad` above on Hopper | TMA + `wgmma` persistent kernel: A = `go` viewed as `(O, S, B)` (M-major), B = `inp` as `(I, S, B)` (N-major), the producer warp walks K as (selected sample, 64-token tile) with the sample index as the third TMA coordinate, fp32 accumulation, scale in the epilogue, TMA store; within a few percent of cuBLAS on a contiguous copy of the selected rows |
+| `hopper_ops.gip_partials` (sm_90) | the `gip_scores` above on Hopper | dual TMA + `wgmma` GEMM (K = O, then K = I, one smem ring, two fp32 accumulators), Hadamard + CTA reduction to one fp32 per 128×128 tile; 1.7× the cuBLAS Gram-matrix path at T = 512 |
+| `hopper_ops.compressed_partials` / `compressed_scores` (sm_90) | the `compressed_grad` projection above and `score_select` on Hopper | two kernels: `HopperDualProj` forms both projections (`go P_O`, `inp P_I`) over the flattened tokens in one persistent TMA + `wgmma` launch (64×64×64 tiles, no K split, output rounded once to bf16 like the reference), `HopperOuterScore` forms the per-sample 64×64 outer products on tensor cores (K = the tokens of one sample) and, one CTA per training row, the scores `corr · <c_b, c_val>`; the last CTA to finish selects the sorted top-k. Two launches per layer instead of five; the projection runs at 55–70 % of HBM bandwidth |
+| `score_select` (CuTe only) | tile-sum, bf16 cast, val sum, GEMV, correction, `topk`, `sort` | single-CTA epilogue over the projection's fp32 tile partials: validation vector, `corr · <c_b, c_val>` for every training row and the sorted top-k indices, in one launch (≈ 8 launches before). Used by the Layer-Wise and Global compress paths (`drpt.selection.backward.compressed_scores_fused`) on Ampere; on `sm_90` the scores and the selection come out of `HopperOuterScore` instead. `DRPT_FUSED_SELECT=0` keeps only the projection kernel |
 
 Per-layer kernel time on A40 (`benchmark_kernels.py`, Qwen3-1.7B shapes,
 `n=8 T=512 m=1`, summed over the 28 blocks; reference → CuTe → Triton):
@@ -214,10 +235,120 @@ training strategies, with and without checkpointing).
 layer shapes and `profile_step.py` reproduces the per-phase / per-layer kernel
 attribution on a real model step.
 
-Hopper note: the CuTe kernels run on H100/H200 through the Ampere-compatible
-path; a wgmma/TMA mainloop (see NVIDIA's `cute/hopper/dense_gemm.py`) is the
-natural next step for the H200 suite and was not written here (no Hopper GPU to
-validate on).
+### Hopper note (H200)
+
+The `mma.sync` CuTe kernels above are an Ampere design (`cp.async` + `ldmatrix` +
+`mma.sync`); on H100/H200 they run through the compatibility path and pass every test,
+but lose to cuBLAS, which uses `wgmma`. Per-layer kernel time at Qwen3-14B shapes on one
+H200 (`benchmark_kernels.py --model-tag qwen3-14b`, `n=8 T=512 m=1 k=4`, ms summed over
+the 40 blocks; reference = PyTorch ops on cuBLAS):
+
+| op                          | reference | CuTe (`mma.sync`) | Triton |
+|-----------------------------|-----------|-------------------|--------|
+| PIP scores                  | 185       | 274               | 201    |
+| GIP scores                  | 38        | 52                | 46     |
+| selected w.grad (4 of 8)    | 78 (mm)   | 158               | 125    |
+| compressed projection 64x64 | 32        | 30                | —      |
+
+The full-batch w.grad (8 samples, one cuBLAS GEMM) is 142 ms, so with the Ampere
+kernels the halved w.grad of the curated update saved nothing on Hopper. On `sm_90` the
+CuTe backend therefore runs **`drpt/kernels/hopper_ops.py`**: two TMA + `wgmma` kernels
+written after NVIDIA's `cute/hopper/kernel/dense_gemm` persistent example (one TMA
+producer warp, two consumer warpgroups, 4–7-stage smem ring, persistent tile scheduler,
+`setmaxnreg` register split), measured standalone on the four block shapes of Qwen3-14B:
+
+- **`selected_wgrad`** — `go` viewed as `(O, S, B)` (M-major A) and `inp` as `(I, S, B)`
+  (N-major B); the producer walks K as (selected sample, 64-token tile), the sample index
+  being the third TMA coordinate, so the selected rows are never gathered; the item-count
+  scale multiplies the fp32 accumulators before the single rounding; TMA-store epilogue.
+  128×256 tile, 2×1 cluster (B-tile multicast), swizzle 4 for problems with ≥ 8 waves of
+  tiles (MLP projections, lm_head), 128×128 / 2×1 / 8 below (q/o, k/v), and 128×256 in a 2×2
+  cluster (both operands multicast) for problems of 1–1.5 waves of 128×128 tiles with an even
+  tile grid (the MLP projections of sub-billion models: 20–25 % faster than the nearly empty
+  second wave). At `k=4, T=512`
+  (K = 2048) it is 1.00–1.03× a cuBLAS `mm` on a contiguous copy of the selected rows for
+  the MLP shapes, 1.13× for q/o and 1.2× for the small k/v projections (1.05× lm_head); at
+  K = 4096 (`n=16`, or `T ≥ 1024`) it is faster than cuBLAS (0.90–0.95×). It removes the
+  15 ms gather that the reference path needs per step.
+- **`gip_partials`** — the two token-pair Gram matrices are never written: one CTA tile
+  streams `go_t[b] · go_v[v]ᵀ` (K = O) and then `inp_t[b] · inp_v[v]ᵀ` (K = I) through
+  the same smem ring into two fp32 accumulators, multiplies them elementwise and reduces
+  to one fp32 per 128×128 tile (`reduce_select` finishes). 1.7× faster than the cuBLAS
+  Gram path at `n=8 T=512` (0.36 vs 0.60 ms over the four shapes), 1.3× at `n=16`, parity
+  at `T ≥ 2048` (the 128×128 tile is L2-bound), slower on the 152k-row lm_head, which
+  therefore keeps the cuBLAS partials (`_gip_partials_cublas`); rel. error vs fp64 ≤ 1e-5
+  against 1–3e-3 for the bf16 Gram path.
+
+- **`compressed_partials` / `compressed_scores`** — the Ampere projection kernel is a
+  `64 × 64 × K` GEMM per 64-token tile and launches only `B · S/64` CTAs (72 at `n=8, T=512`),
+  so it ran at a fraction of the memory bandwidth (31 ms per step, plus 18 ms in the
+  tile-summing `score_select`). On `sm_90` two kernels replace the five launches of that
+  chain: `HopperDualProj` forms both projections over the flattened tokens in one persistent
+  TMA + `wgmma` launch (64×64×64 tiles, the two problems' 64-row tiles fill the GPU without a
+  K split, output rounded once to bf16 as the reference's matmul does), and
+  `HopperOuterScore` forms the per-sample 64×64 outer products on tensor cores (K = the tokens
+  of a sample) — as fp32 compressed gradients for `compressed_grad`, or, one CTA per training
+  row, straight into `corr · <c_b, c_val>` with the sorted top-k selected by the last CTA to
+  finish (arrival counter, acquire/release at GPU scope). Per layer at `n=8, T=512` on the 8B
+  q/o shape: 28 + 7 µs of GPU time against 66 µs before; on SmolLM2's 960-wide layers with
+  `n=32`: 21 + 13 µs against 96 µs (the single-CTA `score_select` alone took 51 µs at B = 33).
+
+- **`pip_partials`** — the per-token inner product as one TMA + `wgmma` GEMM
+  (`inp[b] · Gᵀ`, K-major operands, 128×256 tiles, persistent scheduler rastered along the
+  token tiles so the CTAs sharing a tile of the weight-sized `G` run together) whose fp32
+  accumulator tile is dotted with the matching `go` tile in registers; the reference's
+  `[B, S, O]` temporary and its casts disappear. PIP stays compute-bound by construction
+  (`G · x` for every token is a forward pass' worth of GEMM, 62 TFLOP at 8B and 4k tokens),
+  so the kernel runs at cuBLAS speed rather than below it: ~105 ms per step either way.
+
+On the vocabulary-sized lm_head the GIP problem stays on cuBLAS GEMMs plus an fp32
+product-reduction (`_gip_partials_cublas`); PIP runs the Hopper kernel at every width. The
+`reduce_select` epilogue of pip/gip is unchanged.
+`DRPT_FUSED_DISABLE=hopper` keeps the `mma.sync` w.grad, `DRPT_CUTE_SCORING_ON_HOPPER=1`
+the `mma.sync` pip/gip kernels; `DRPT_FUSED_DISABLE=<op>[,<op>]` (`gip`, `pip`, `wgrad`,
+`proj`, `gather`) still routes single operations to the reference path.
+
+The reference path (`KERNEL_BACKEND=off`) is itself Hopper-aware: `compute_selected_gradients`
+runs one cuBLAS `mm` on contiguous operands produced by the **row-gather kernel**
+(`GatherRows` in `cute_ops.py`, Triton port in `triton_ops.py`): the selected samples of a
+`[B, S, F]` activation are copied into a `[K*S, F]` tensor with one 128-bit vector per
+thread and the item-count scale fused into the copy of the gradient output (33 GB of
+selected rows in 15 ms at the 14B shapes, 3.1 TB/s; `index_select` needs 32 ms plus 11 ms
+for a separate scale). The gather backend is chosen independently of the GEMM backend
+(`kernels.gather_backend()`: CuTe, else Triton, else `index_select`).
+
+**Two measurement effects at this scale.** (i) The per-layer timing wrapper that splits
+Full-Training's backward into `act_grad` / `w.grad` (a Python autograd Function with four
+CUDA-event marks per Linear) costs the 14B step about 4 % on an H200: 1047–1051 ms wrapped
+against 1003–1007 ms for the native step on the same GPU and batches. Every method's
+result therefore also carries `plain_step_ms`, the same step timed once per iteration with
+every patch removed; overheads should be quoted from those numbers (at `n=8, T=512`:
+plain Full-Training 1004 ms, plain Layer-Wise / GIP 1094 ms, +9 %). (ii) cuBLAS picks its
+kernels per shape: the block GEMMs run at 34.5 µs per token at `M = 4096` rows (Full-Training,
+`n=8, T=512`) but at 36.5–38.5 µs per token at `M = 4608` (the merged batch with the
+target sequence), 39–40 µs at `M = 8192` and `8704`. The ninth sequence at `n=8, T=512`
+therefore costs its 1/8 share of forward, `a.grad` and recompute (≈ 87 ms) plus a
+≈ 35 ms tile-shape penalty on the other eight, while at `n = 16` and `n = 32` the merged
+and the plain batch sit on the same efficiency plateau (`gemm_shape_probe` in the
+benchmark notes; cuBLASLt does not remove the effect).
+
+**What is left is the merged target example.** With the Hopper kernels the curated GPU
+work is already below Full-Training's `w.grad` (14B, `n=8, T=512`: selected `w.grad` 89 ms +
+scoring 28–29 ms against 162 ms); the overhead is the target sequence's `1/n` share of
+forward, `a.grad` and (with checkpointing) recompute, minus that saving. Without
+checkpointing there is no recompute and no lost early stop, and the `w.grad` share of the
+step doubles: Qwen3-8B, one H200, plain step times, Layer-Wise / compress **+3.1 % at
+`n=8, T=512`** (479 ms baseline), **−2.0 % at `n=16, T=512`** (887 ms) and **−5.3 % at
+`n=32, T=256`**; exact GIP reads +7.0 % / +1.7 % / −3.3 % on the same steps (its score is a
+forward-sized GEMM per candidate, quadratic in the sequence length); the two-pass Global
+variant stays at +38–41 % (its second forward/backward). With checkpointing at 14B the
+`n=8` / `n=16` configurations read +8.0 % / +4.3 % (plain) or +4.1 % / −0.2 % (wrapped
+baseline). Longer sequences at fixed tokens per step make the target share larger (`n = 2`,
+`T = 2048`: one sequence in three, +29 % compress / +44 % GIP), more candidates per target
+make it smaller. Small models follow the same curve once they leave the launch-bound
+regime: at `n = 32, T = 512` the Layer-Wise compress step is +6 % on SmolLM2-360M, −2 % on
+TinyLlama-1.1B and −3 % on Llama-3.2-3B (GIP +10 % / +4 % / 0 %), against +33 % / +11 % / +10 %
+at `n = 8`. Per-configuration numbers: `results/h200/`.
 
 Small models are a different regime: on SmolLM2-360M the curated backward was
 **CPU-bound** with the reference ops (their +34 % there is Python and launch overhead of the
@@ -252,8 +383,8 @@ per GPU (`GPUS=0,1,2,3`). ms/step is the slope of the trainer's CUDA-event
 `train_wall_time` between the evaluations at steps 26 and 130 (evaluation time
 excluded; the first 26 steps absorb kernel compilation). The four 26-step windows
 of a run agree with their mean within 6 % on median and 9 % at worst (the
-sequence-length mix changes per window); one run in 41 had a single 3× slower
-window and was replaced by a repeat (373 / 374 ms in two repeats). The scoring method is overridden on the command line; `compress`
+sequence-length mix changes per window); a run with an anomalous window is repeated.
+The scoring method is overridden on the command line; `compress`
 uses the compressor of the matching `LayerWiseSubset-<ft>` config — 64×64 for
 Full / LoRA and 512×512 for MeSO as in the actual experiments (512×512 is outside
 the fused compressor kernel's κ ≤ 64, so both backends run the reference path
@@ -419,7 +550,7 @@ benchmark/
 └── results/
     ├── breakdown/                 # A40, no gradient checkpointing
     ├── breakdown_checkpointing/   # A40, with gradient checkpointing
-    ├── h200/                      # H200 results
+    ├── h200/                      # H200 suite (breakdown, breakdown_checkpointing, scoring; manifest + task.sh of the launcher)
     ├── scoring/                   # Scoring-comparison results
     ├── fused_ab/                  # Fused kernels (cute, triton) vs PyTorch reference (A40)
     └── paper/                     # Full suite with the CuTe backend (breakdown, checkpointing, scoring, qa_throughput, qa_profile)

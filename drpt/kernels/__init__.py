@@ -14,17 +14,24 @@ kernels here fuse each into a single tensor-core kernel:
 - ``selected_wgrad``  index-mapped GEMM over the selected samples with the item-count
                       scale (and bias gradient) fused in
 - ``compressed_grad`` (CuTe backend) the ``compress`` scoring projection
-                      ``(go P_O)^T (inp P_I)`` per sample in one kernel, used by
-                      :meth:`drpt.compressor.Compressor.forward`
+                      ``(go P_O)^T (inp P_I)`` per sample, used by
+                      :meth:`drpt.compressor.Compressor.forward`; ``compress_project`` /
+                      ``compress_score`` run the same projection straight into scores and a
+                      sorted top-k for the merged-batch selection paths
 
 Two backends implement the same three functions:
 
 - ``cute``   (default) CuTe DSL / CUTLASS Python DSL kernels, :mod:`drpt.kernels.cute_ops`
-             (needs ``nvidia-cutlass-dsl`` and ``apache-tvm-ffi``)
+             (needs ``nvidia-cutlass-dsl`` and ``apache-tvm-ffi``); on Hopper (sm_90) the weight
+             gradient runs the TMA + wgmma kernel of :mod:`drpt.kernels.hopper_ops`
 - ``triton`` Triton kernels, :mod:`drpt.kernels.triton_ops` (kept as a fallback)
 
 Select with ``DRPT_KERNEL_BACKEND=cute|triton|off`` (``off`` = PyTorch reference ops;
-``DRPT_FUSED_KERNELS=0`` is an alias for ``off``) or :func:`set_backend` at runtime.  The
+``DRPT_FUSED_KERNELS=0`` is an alias for ``off``) or :func:`set_backend` at runtime;
+``DRPT_FUSED_DISABLE=<op>[,<op>]`` (``gip``, ``pip``, ``wgrad``, ``proj``, ``gather``) routes single operations to
+the reference path while the rest of the backend stays fused (``hopper`` keeps the mma.sync weight gradient on
+sm_90, see :mod:`drpt.kernels.cute_ops`); ``gather`` is the row gather (CuTe, else Triton) that feeds the
+reference weight-gradient GEMM, chosen independently of the GEMM backend.  The
 dispatch in :mod:`drpt.selection.utils` uses the kernels only for 3-D CUDA bf16/fp16
 operands whose shapes the backend supports; everything else takes the reference path.
 """
@@ -39,6 +46,7 @@ import torch
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _BACKENDS = ("cute", "triton", "off")
+_DISABLED_OPS = frozenset(x.strip().lower() for x in os.environ.get("DRPT_FUSED_DISABLE", "").split(",") if x.strip())
 
 
 def _importable(mod: str) -> bool:
@@ -126,7 +134,7 @@ def fused_ok(*tensors: Optional[torch.Tensor], ndim: int = 3, op: Optional[str] 
     backend supports (see ``supports`` of the backend module).  2-D, fp32 and CPU inputs
     always take the reference path.
     """
-    if not fused_kernels_enabled():
+    if not fused_kernels_enabled() or (op is not None and op in _DISABLED_OPS):
         return False
     dtype = None
     for t in tensors:
@@ -141,5 +149,29 @@ def fused_ok(*tensors: Optional[torch.Tensor], ndim: int = 3, op: Optional[str] 
     return True
 
 
+def gather_backend() -> Optional[str]:
+    """Backend of the row gather that feeds the reference weight-gradient GEMM: ``"cute"`` when the CuTe DSL is
+    importable, else ``"triton"``, else ``None`` (index_select); ``DRPT_FUSED_DISABLE=gather`` forces ``None``.
+    Independent of the GEMM backend, so it also serves ``off``."""
+    if "gather" in _DISABLED_OPS:
+        return None
+    return "cute" if HAS_CUTE else ("triton" if HAS_TRITON else None)
+
+
+def gather_rows(src: torch.Tensor, idx: torch.Tensor, scale=None) -> torch.Tensor:
+    """``src[idx]`` of a ``[B, S, F]`` activation as a contiguous ``[K*S, F]`` tensor (optionally scaled) through the
+    active gather backend; the caller falls back to ``index_select`` when :func:`gather_backend` is ``None``."""
+    b = gather_backend()
+    if b == "cute":
+        from . import cute_ops
+        if cute_ops.supports_gather(tuple(src.shape)):
+            return cute_ops.gather_rows(src, idx, scale)
+        b = "triton" if HAS_TRITON else None
+    if b == "triton":
+        from . import triton_ops
+        return triton_ops.gather_rows(src, idx, scale)
+    raise RuntimeError("no gather backend")
+
+
 __all__ = ["HAS_TRITON", "HAS_CUTE", "backend", "set_backend", "set_fused_kernels",
-           "fused_kernels_enabled", "fused_ok", "kernel_ops"]
+           "fused_kernels_enabled", "fused_ok", "kernel_ops", "gather_backend", "gather_rows"]

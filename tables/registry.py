@@ -7,7 +7,8 @@ but whose tables the paper no longer includes (skipped by the check and the orph
 verifies every generator against the files on disk and reports registered tables whose generator is missing on
 this checkout, unregistered files in Tables/, and registered files the paper no longer \\input{}s.
 
-Machines: ``h200`` = the H200 Slurm cluster (8x H200 nodes; results under $SCRATCH_DIR/Dr.Post-Training),
+Machines: ``h200`` = the H200 Slurm cluster (8x H200 nodes; results under $SCRATCH_DIR/Dr.Post-Training, the one-GPU benchmark
+JSONs under SFT/benchmark/results/paper/h200, gitignored),
 ``a40`` = the A40 Slurm cluster (one node, 4x A40; results under $SCRATCH_DIR/Dr.Post-Training) that ran every Llama-3.2-1B
 question-answering and system-benchmark experiment (its benchmark JSONs live under SFT/benchmark/results/paper, gitignored; the QA tables are built from a local per-run export written by --scan),
 ``wandb`` = W&B project verl_grpo_math (the RLVR runs).
@@ -32,6 +33,10 @@ FAMILIES = [
          tables={"system_overhead.tex": "tab:system-overhead", "score_cost.tex": "tab:score-cost", "peak_memory.tex": "adxtab:peak-memory",
                  **{f"timing_grid_{m}_n{n}.tex": "adxtab:timing-grid" for m in ("smollm2", "tinyllama", "llama3b") for n in (2, 8)},
                  **{f"timing_grid_ckpt_{m}_n{n}.tex": "adxtab:timing-grid-ckpt" for m in ("smollm2", "tinyllama", "llama3b") for n in (2, 8)}}),
+    dict(script="SFT/tables/system_efficiency_h200.py", machine="h200", kind="shelved",   # one-H200 suite (Qwen3-8B-Base, Hopper kernels); not in the paper, generator kept
+         results="SFT/benchmark/results/paper/h200/{breakdown,breakdown_checkpointing}/<tag>_n<n>_T<T>_m1.json, scoring/scoring_<tag>.json (local, gitignored)",
+         tables={"system_overhead_h200.tex": "adxtab:system-overhead-h200", "peak_memory_h200.tex": "adxtab:peak-memory-h200",
+                 "score_cost_h200.tex": "adxtab:score-cost-h200"}),
     dict(script="SFT/tables/qa_timing.py", machine="a40", kind="shelved",   # not in the paper; generator kept
          results="SFT/benchmark/results/paper/qa_profile/<run>/profile.json + qa_throughput/<run>/evaluation_results.json (local, gitignored)",
          tables={"qa_timing_grid_full.tex": "adxtab:qa-timing-grid", "qa_timing_grid_lora.tex": "adxtab:qa-timing-grid",

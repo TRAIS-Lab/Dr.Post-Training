@@ -54,6 +54,22 @@ MODEL_DEFS = {
         "name": "meta-llama/Llama-3.2-3B",
         "h": 3072, "i": 8192, "L": 28, "heads": 24, "kv": 8, "hd": 128,
     },
+    "qwen3-1.7b": {
+        "name": "Qwen/Qwen3-1.7B-Base",
+        "h": 2048, "i": 6144, "L": 28, "heads": 16, "kv": 8, "hd": 128,
+    },
+    "qwen3-4b": {
+        "name": "Qwen/Qwen3-4B-Base",
+        "h": 2560, "i": 9728, "L": 36, "heads": 32, "kv": 8, "hd": 128,
+    },
+    "qwen3-8b": {
+        "name": "Qwen/Qwen3-8B-Base",
+        "h": 4096, "i": 12288, "L": 36, "heads": 32, "kv": 8, "hd": 128,
+    },
+    "qwen3-14b": {
+        "name": "Qwen/Qwen3-14B-Base",
+        "h": 5120, "i": 17408, "L": 40, "heads": 40, "kv": 8, "hd": 128,
+    },
 }
 
 
@@ -183,13 +199,17 @@ def time_scoring_all_layers(method, n, T, m, model_def, device,
 
 def time_compress_scoring(n, T, m, O, I, device, kappa=4096,
                           num_warmup=5, num_iters=10):
-    """Simulate compress scoring: project to R^kappa, then inner product.
+    """Compress scoring of one layer for a merged batch of n training and m validation samples.
 
-    Real compress does: sparsify(go) ⊗ sparsify(inp) → R^kappa per sample,
-    then s = train_compressed @ val_compressed.T
-    We simulate the dominant cost: two random projections + Kronecker + matmul.
+    With the CuTe backend this times the fused path the training step uses (``compressed_scores``:
+    both projections ``go P_O``, ``inp P_I`` and the per-sample outer products on tensor cores, scores
+    against the validation rows, top-1 selection).  Other backends time a torch simulation of the
+    dominant cost: two random projections + Kronecker product + inner product.
     """
     k = int(math.sqrt(kappa))  # e.g., 64 for kappa=4096
+    fused = _fused_compress_timer(n, T, m, O, I, k, device, num_warmup, num_iters)
+    if fused is not None:
+        return fused
     try:
         # Simulate: project go (n, T, O) → (n, k) and inp (n, T, I) → (n, k)
         # Then Kronecker: (n, k*k) = (n, kappa)
@@ -231,6 +251,42 @@ def time_compress_scoring(n, T, m, O, I, device, kappa=4096,
     times = [starts[j].elapsed_time(ends[j]) for j in range(num_iters)]
 
     del train_go, train_inp, train_c, val_c, proj_O, proj_I
+    torch.cuda.empty_cache()
+    return sum(times) / len(times)
+
+
+def _fused_compress_timer(n, T, m, O, I, k, device, num_warmup, num_iters):
+    """ms per call of the fused compressed scoring (CuTe backend), or None when it does not apply."""
+    from drpt.kernels import backend, fused_ok, kernel_ops
+    if backend() != "cute" or k > 64 or k % 8 or O % 8 or I % 8:
+        return None
+    try:
+        go = torch.randn(n + m, T, O, dtype=torch.bfloat16, device=device)
+        inp = torch.randn(n + m, T, I, dtype=torch.bfloat16, device=device)
+        P_O = torch.randn(O, k, dtype=torch.bfloat16, device=device)
+        P_I = torch.randn(I, k, dtype=torch.bfloat16, device=device)
+    except torch.cuda.OutOfMemoryError:
+        return None
+    if not fused_ok(go, inp, op="proj"):
+        return None
+    corr = torch.ones(1, dtype=torch.float32, device=device)
+    ops = kernel_ops()
+
+    def fn():
+        return ops.compressed_scores(go, inp, P_O, P_I, 1.0 / k, n, 1, corr)
+
+    for _ in range(num_warmup):
+        fn()
+    torch.cuda.synchronize()
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    for j in range(num_iters):
+        starts[j].record()
+        fn()
+        ends[j].record()
+    torch.cuda.synchronize()
+    times = [starts[j].elapsed_time(ends[j]) for j in range(num_iters)]
+    del go, inp, P_O, P_I
     torch.cuda.empty_cache()
     return sum(times) / len(times)
 
@@ -286,6 +342,10 @@ def main():
     parser.add_argument("--num-warmup", type=int, default=5)
     parser.add_argument("--num-iters", type=int, default=10)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--n", type=int, default=8, help="Candidate batch size")
+    parser.add_argument("--m-sweep", type=str, default="1,2,4,8,16", help="m values at T=512 (comma-separated)")
+    parser.add_argument("--t-sweep", type=str, default="256,512,1024,2048,4096,8192",
+                        help="T values at m=1 (comma-separated)")
     args = parser.parse_args()
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.gpu))  # already applied at import time
@@ -300,15 +360,17 @@ def main():
 
     # Define configs: m-sweep at T=512, T-sweep at m=1
     configs = []
-    n = 8
+    n = args.n
+    m_values = [int(x) for x in args.m_sweep.split(",") if x]
+    t_values = [int(x) for x in args.t_sweep.split(",") if x]
 
     # Axis 1: m sweep at T=512
-    for m in [1, 2, 4, 8, 16]:
+    for m in m_values:
         configs.append({"n": n, "T": 512, "m": m, "axis": "m_sweep"})
 
     # Axis 2: T sweep at m=1
-    for T in [256, 512, 1024, 2048, 4096, 8192]:
-        if T == 512:
+    for T in t_values:
+        if T == 512 and 1 in m_values:
             continue  # already covered by m_sweep with m=1
         configs.append({"n": n, "T": T, "m": 1, "axis": "T_sweep"})
 

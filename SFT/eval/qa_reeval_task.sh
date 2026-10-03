@@ -1,9 +1,9 @@
 #!/bin/bash
 # qa_reeval_task.sh <run_dir>   (one Slurm array task; wrapper SFT/train/slurm/qa_array.sbatch, manifests SFT/train/manifests/qa_reeval_*.txt)
-# Re-evaluates one Llama-3.2-1B question-answering run with the paper protocol (SFT/eval/eval.sh --batch_size 64 --n_test 500) after the
-# evaluation fixes: evaluation prompts no longer get a <|begin_of_text|> the training sequences never had (SFT/eval/utils.py), and samsum /
-# tydiqa decode greedily like the closed-book tasks (SFT/eval/tasks/{samsum,tydiqa}.py).
-# The previous result file is kept as <task>_results.bos.json; a result file that already carries "prompt_encoding" is left alone.
+# Re-evaluates one Llama-3.2-1B question-answering run with the paper protocol (SFT/eval/eval.sh --batch_size 64 --n_test 500):
+# prompts encoded without a <|begin_of_text|> token, as in training (SFT/eval/utils.py), and greedy decoding for samsum / tydiqa like
+# the closed-book tasks (SFT/eval/tasks/{samsum,tydiqa}.py).
+# A result file produced under another prompt encoding is kept as <task>_results.bos.json; one that already carries "prompt_encoding" is left alone.
 set -u
 d=${1:?usage: qa_reeval_task.sh <run_dir>}
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

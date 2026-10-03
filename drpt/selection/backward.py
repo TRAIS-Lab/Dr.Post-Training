@@ -189,10 +189,10 @@ def compressed_scores_fused(
     """Compressed scoring (and, for LayerWiseSubset, top-k selection) in two fused kernel launches.
 
     Applies to the merged-batch compressed path without MeSO/val-capture/stored-val and without
-    second-order or filtering selection: the projection kernel writes per-tile partials of the
-    compressed gradients and the score-select kernel turns them into ``corr * <c_b, sum_val c_v>``
-    and the sorted top-k indices — replacing the bf16 compressed tensor, its slicing, the val sum,
-    the GEMV, the correction multiply, top-k and sort (≈ 8 launches per layer).
+    second-order or filtering selection: the projection kernel writes the compressed intermediate and
+    the score kernel turns it into ``corr * <c_b, sum_val c_v>`` and the sorted top-k indices —
+    replacing the bf16 compressed tensor, its slicing, the val sum, the GEMV, the correction
+    multiply, top-k and sort (≈ 8 launches per layer).
 
     Returns ``(scores [n], selected [k] or None)`` or None when the fused path does not apply.
     """
@@ -209,12 +209,11 @@ def compressed_scores_fused(
             return None
     if grad_output.shape[0] > 256 or state.train_batch_size >= grad_output.shape[0]:
         return None  # no validation rows in the merged batch (or too many rows for the epilogue)
-    partials = score_compressor.fused_partials(grad_output, input)
-    if partials is None:
-        return None
-    from ..kernels.cute_ops import score_select
     corr = _correction_f32(state, grad_output.device)
-    scores, sel = score_select(partials, state.train_batch_size, k, corr)
+    fused = score_compressor.fused_scores(grad_output, input, state.train_batch_size, k, corr)
+    if fused is None:
+        return None
+    scores, sel = fused
     return scores, (sel if select else None)
 
 

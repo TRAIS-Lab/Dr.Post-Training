@@ -66,7 +66,7 @@ COMBOS = [
 # Subprocess runner
 # =============================================================================
 
-def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterations, model=None, direct_batch_size=0, gradient_checkpointing=False, fused=True, cublaslt=False, kernel_backend=None):
+def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterations, model=None, direct_batch_size=0, gradient_checkpointing=False, fused=True, cublaslt=False, kernel_backend=None, fused_adamw=False):
     """Run a single benchmark via bash (clean process, no CUDA context leak)."""
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT + ":" + env.get("PYTHONPATH", "")
@@ -96,6 +96,8 @@ def run_single(method, scoring, score_comp, config, gpu, num_warmup, num_iterati
         args += ["--kernel-backend", kernel_backend]
     if cublaslt:
         args += ["--cublaslt"]
+    if fused_adamw:
+        args += ["--fused-adamw"]
     cmd = ["bash", BENCHMARK_SH] + args
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -314,11 +316,13 @@ Examples:
     parser.add_argument("--num-warmup", type=int, default=10, help="Warmup iterations (default: 10)")
     parser.add_argument("--num-iterations", type=int, default=20, help="Timed iterations (default: 20)")
     parser.add_argument("--direct-batch-size", type=int, default=0, help="Chunk size for batched direct scoring (0=all at once)")
+    parser.add_argument("--keep-frac", type=float, default=None, help="Fraction of the training batch kept per selection, k = keep_frac * n (default 0.5)")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient (activation) checkpointing")
     parser.add_argument("--no-fused", action="store_true", help="Disable the fused kernels (reference PyTorch ops)")
     parser.add_argument("--kernel-backend", type=str, default=None, choices=["cute", "triton", "off"],
                         help="Fused-kernel backend: cute (default), triton, or off")
     parser.add_argument("--cublaslt", action="store_true", help="Prefer cuBLASLt for all GEMMs (baseline included)")
+    parser.add_argument("--fused-adamw", action="store_true", help="torch.optim.AdamW(fused=True) (no full-size optimizer temporaries; large models on one GPU)")
     parser.add_argument("--output", type=str, default=None, help="Save JSON results to file")
     parser.add_argument("--only-scoring", type=str, default=None, choices=["compress", "gip", "pip", "direct"],
                         help="Run only full_training and the combos with this scoring method; when --output "
@@ -364,7 +368,7 @@ Examples:
                                 direct_batch_size=args.direct_batch_size,
                                 gradient_checkpointing=args.gradient_checkpointing,
                                 fused=not args.no_fused, cublaslt=args.cublaslt,
-                                kernel_backend=args.kernel_backend)
+                                kernel_backend=args.kernel_backend, fused_adamw=args.fused_adamw)
             if r is None:
                 print(f"    FAILED: {err}")
             else:
@@ -381,7 +385,7 @@ Examples:
         os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
         with open(args.output, 'w') as f:
             json.dump({"model": model_name, "fused": not args.no_fused, "kernel_backend": args.kernel_backend or "cute",
-                       "cublaslt": args.cublaslt,
+                       "cublaslt": args.cublaslt, "fused_adamw": args.fused_adamw,
                        "results": all_results}, f, indent=2)
         print(f"\nResults saved to: {args.output}")
 

@@ -267,6 +267,56 @@ def selected_wgrad(go: torch.Tensor, inp: torch.Tensor, sel: torch.Tensor, scale
     return out, bias
 
 
+# =============================================================================
+# Row gather: the selected samples of a [B, S, F] activation as one contiguous
+# [K*S, F] operand for the cuBLAS weight-gradient GEMM of the reference path,
+# with the item-count scale fused into the copy.  A [ROWS, BLOCK] tile per program
+# keeps the copy bandwidth-bound (index_select moves the same rows at a fraction
+# of the bandwidth on H200).
+# =============================================================================
+
+@triton.jit
+def _gather_rows_kernel(src, idx, out, S, F, KS, s_b, s_s, s_f, scale_ptr,
+                        SCALE: tl.constexpr, ROWS: tl.constexpr, BLOCK: tl.constexpr):
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    rm = rows < KS
+    cm = cols < F
+    k = rows // S
+    s = rows - k * S
+    b = tl.load(idx + k, mask=rm, other=0).to(tl.int64)
+    x = tl.load(src + b[:, None] * s_b + s[:, None] * s_s + cols[None, :] * s_f,
+                mask=rm[:, None] & cm[None, :], other=0.0)
+    if SCALE:
+        x = (x.to(tl.float32) * tl.load(scale_ptr).to(tl.float32)).to(x.dtype)
+    tl.store(out + rows[:, None] * F + cols[None, :], x, mask=rm[:, None] & cm[None, :])
+
+
+def gather_rows(src: torch.Tensor, idx: torch.Tensor, scale=None) -> torch.Tensor:
+    """``src[idx]`` for ``src [B, S, F]`` as a contiguous ``[K*S, F]`` tensor, optionally multiplied by ``scale``.
+
+    Args:
+        src: ``[B, S, F]`` CUDA tensor (any strides, unit stride in F)
+        idx: sample indices ``[K]`` (any integer dtype, CUDA)
+        scale: optional scalar (0-dim tensor or float) multiplied into the copy
+    """
+    B, S, F = src.shape
+    if idx.dtype != torch.int64:
+        idx = idx.to(torch.int64)
+    idx = idx.contiguous()
+    K = idx.numel()
+    out = torch.empty(K * S, F, dtype=src.dtype, device=src.device)
+    if K == 0:
+        return out
+    src = _inner_contiguous(src)
+    scale_t = torch.as_tensor(scale, device=src.device, dtype=torch.float32).reshape(1) if scale is not None else out
+    ROWS, BLOCK = 32, 1024
+    grid = (triton.cdiv(K * S, ROWS), triton.cdiv(F, BLOCK))
+    _gather_rows_kernel[grid](src, idx, out, S, F, K * S, *src.stride(), scale_t,
+                              SCALE=scale is not None, ROWS=ROWS, BLOCK=BLOCK, num_warps=8)
+    return out
+
+
 def supports(op: str, *shapes) -> bool:
     """The Triton kernels mask every dimension, so any shape is supported."""
     return op in ("pip", "gip", "wgrad")
@@ -283,4 +333,4 @@ def _inner_contiguous(t: torch.Tensor) -> torch.Tensor:
     return t if t.stride(-1) == 1 else t.contiguous()
 
 
-__all__ = ["gip_scores", "pip_scores", "selected_wgrad", "supports"]
+__all__ = ["gip_scores", "pip_scores", "selected_wgrad", "gather_rows", "supports"]

@@ -248,11 +248,7 @@ class LayerWiseSubsetTrainer(Trainer):
 
     def _merge_batches(self, batch_train: Dict[str, Tensor], batch_val: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """
-        Merge training and validation batches along batch dimension.
-
-        NOTE: This method is kept for backward compatibility but is no longer used
-        by default. The trainer now uses separate val/train passes via StoredValStrategy
-        to avoid padding overhead when batches have different sequence lengths.
+        Merge training and validation batches along the batch dimension (``val_strategy == 'merged_batch'``).
 
         Handles the case where batches have different sequence lengths by padding
         to the maximum length across both batches.

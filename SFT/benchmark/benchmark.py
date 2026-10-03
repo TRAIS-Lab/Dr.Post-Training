@@ -69,6 +69,34 @@ def _warmup_and_measure(step_fn, train_batches, val_batches, config, rec):
     return {k: v / N for k, v in comp_accum.items()}
 
 
+def _plain_step_time(step_fn, train_batches, val_batches, config):
+    """Mean wall time (ms) of the same step with every per-layer timing patch removed: one CUDA-event pair per step,
+    ``num_warmup`` untimed steps first.  The per-phase timers and the per-layer marks above cost the launch-bound parts
+    of the step a few percent, and the wrapper that splits Full-Training's backward into act_grad / w.grad replaces the
+    native Linear backward; this number is the protocol-free reference for the overhead of a method."""
+    N = config.num_iterations
+    for i in range(config.num_warmup):
+        if val_batches is not None:
+            step_fn(train_batches[i % len(train_batches)], val_batches[i % len(val_batches)])
+        else:
+            step_fn(train_batches[i % len(train_batches)])
+    torch.cuda.synchronize()
+    pairs = []
+    for i in range(N):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        if val_batches is not None:
+            step_fn(train_batches[(config.num_warmup + i) % len(train_batches)],
+                    val_batches[(config.num_warmup + i) % len(val_batches)])
+        else:
+            step_fn(train_batches[(config.num_warmup + i) % len(train_batches)])
+        e.record()
+        pairs.append((s, e))
+    torch.cuda.synchronize()
+    return sum(s.elapsed_time(e) for s, e in pairs) / N
+
+
 # =============================================================================
 # Measurement: Full-Training
 # =============================================================================
@@ -130,10 +158,12 @@ def measure_full_training(model, optimizer, grad_hook, train_batches, config):
 
     for module, orig in patched:
         module._original_forward = orig
+    plain = _plain_step_time(step, train_batches, None, config)
     grad_hook.enable_hooks()
 
     result = timer.mean_elapsed()
     result.update(comp)
+    result["plain_step_ms"] = plain
     return result
 
 
@@ -190,14 +220,13 @@ def measure_layer_wise_subset(model, optimizer, grad_hook, train_batches, val_ba
         hb = bias is not None
         if _bwd._FUSED_SELECT and not cvm and state is not None and not usv and uc is None:
             # Fused CuTe path: projection kernel (compress) + score/select kernel (score); select is inside it
-            rec.mark('compress'); parts = sc.fused_partials(go, inp) if not hb else None; rec.mark('compress')
-            if parts is not None and state.selection_mode == "topk" and not state.use_second_order \
+            rec.mark('compress'); proj = sc.fused_project(go, inp) if not hb else None; rec.mark('compress')
+            if proj is not None and state.selection_mode == "topk" and not state.use_second_order \
                     and state.train_batch_size < go.shape[0] and go.shape[0] <= 256:
-                from drpt.kernels.cute_ops import score_select
                 from drpt.selection.backward import _record_selection
                 rec.mark('score')
                 corr = _bwd._correction_f32(state, go.device)
-                scores, si = score_select(parts, state.train_batch_size, min(state.num_selected, state.train_batch_size), corr)
+                scores, si = sc.fused_score(proj, state.train_batch_size, min(state.num_selected, state.train_batch_size), corr)
                 rec.mark('score')
                 rec.mark('select'); _record_selection(state, lidx, si, scores); rec.mark('select')
                 rec.mark('wgrad')
@@ -425,7 +454,7 @@ def measure_layer_wise_subset(model, optimizer, grad_hook, train_batches, val_ba
         merged = pad_and_merge_batches(batch, val_batch, pad_token_id=pad_token_id)
         grad_hook.setup_selection(
             train_batch_size=train_bs, selection_method="LayerWiseSubset",
-            frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
+            frac=getattr(config, 'keep_frac', 0.5), lr=optimizer.param_groups[0].get("lr", 5e-5),
             selection_mode="topk", use_second_order=config.use_second_order,
             scoring_method=getattr(config, 'scoring_method', 'pip'),
             direct_batch_size=getattr(config, 'direct_batch_size', 0),
@@ -455,6 +484,7 @@ def measure_layer_wise_subset(model, optimizer, grad_hook, train_batches, val_ba
 
     result = timer.mean_elapsed()
     result.update(comp)
+    result["plain_step_ms"] = _plain_step_time(step, train_batches, val_batches, config)
     return result
 
 
@@ -542,12 +572,11 @@ def measure_global_subset(model, optimizer, grad_hook, train_batches, val_batche
     def timed_accum(hm, compressor, state, lidx, inp, go, bias, usv):
         if _bwd._FUSED_SELECT and bias is None and not usv and state is not None and not state.use_second_order \
                 and state.train_batch_size < go.shape[0] and go.shape[0] <= 256:
-            rec.mark('compress'); parts = compressor.fused_partials(go, inp); rec.mark('compress')
-            if parts is not None:
-                from drpt.kernels.cute_ops import score_select
+            rec.mark('compress'); proj = compressor.fused_project(go, inp); rec.mark('compress')
+            if proj is not None:
                 rec.mark('score')
                 corr = _bwd._correction_f32(state, go.device)
-                scores, _ = score_select(parts, state.train_batch_size, 0, corr)
+                scores, _ = compressor.fused_score(proj, state.train_batch_size, 0, corr)
                 state.accumulate_precomputed_scores(scores, None, None, layer_idx=lidx)
                 rec.mark('score')
                 return
@@ -630,6 +659,8 @@ def measure_global_subset(model, optimizer, grad_hook, train_batches, val_batche
     if scoring_method != "compress":
         grad_hook.score_compressors = [None] * len(saved_score_compressors)
 
+    plain_mode = [False]   # True while _plain_step_time runs: no pass-2 timing wrapper
+
     def step(batch, val_batch, i=None):
         train_bs = batch['input_ids'].shape[0]
         merged = pad_and_merge_batches(batch, val_batch, pad_token_id=pad_token_id)
@@ -637,7 +668,7 @@ def measure_global_subset(model, optimizer, grad_hook, train_batches, val_batche
         # Pass 1
         grad_hook.setup_selection(
             train_batch_size=train_bs, selection_method="GlobalSubset",
-            frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
+            frac=getattr(config, 'keep_frac', 0.5), lr=optimizer.param_groups[0].get("lr", 5e-5),
             selection_mode="topk", use_second_order=config.use_second_order,
             scoring_method=scoring_method,
             direct_batch_size=getattr(config, 'direct_batch_size', 0),
@@ -670,8 +701,9 @@ def measure_global_subset(model, optimizer, grad_hook, train_batches, val_batche
         if not has_update:
             grad_hook.disable_hooks()
             # Apply TimedLinearP2 patches for pass 2 breakdown
-            for mod, orig, timed in _p2_patches:
-                mod._original_forward = timed
+            if not plain_mode[0]:
+                for mod, orig, timed in _p2_patches:
+                    mod._original_forward = timed
         optimizer.zero_grad()
         if i is not None: timer.mark("pass2_forward", i, True)
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -682,8 +714,9 @@ def measure_global_subset(model, optimizer, grad_hook, train_batches, val_batche
         if i is not None: timer.mark("pass2_backward", i, False)
         if not has_update:
             # Restore original forwards
-            for mod, orig, timed in _p2_patches:
-                mod._original_forward = orig
+            if not plain_mode[0]:
+                for mod, orig, timed in _p2_patches:
+                    mod._original_forward = orig
             grad_hook.enable_hooks()
         if i is not None: timer.mark("optimizer", i, True)
         optimizer.step()
@@ -718,6 +751,8 @@ def measure_global_subset(model, optimizer, grad_hook, train_batches, val_batche
         result[f"p1_{k}"] = v / N
     for k, v in p2_accum.items():
         result[k] = v / N
+    plain_mode[0] = True
+    result["plain_step_ms"] = _plain_step_time(step, train_batches, val_batches, config)
     return result
 
 
@@ -791,12 +826,11 @@ def measure_global_subset_one_pass(model, optimizer, grad_hook, train_batches, v
     def timed_accum_compressed(hm, compressor, state, lidx, inp, go, bias, usv):
         if _bwd._FUSED_SELECT and bias is None and not usv and state is not None and not state.use_second_order \
                 and state.train_batch_size < go.shape[0] and go.shape[0] <= 256:
-            rec.mark('compress'); parts = compressor.fused_partials(go, inp); rec.mark('compress')
-            if parts is not None:
-                from drpt.kernels.cute_ops import score_select
+            rec.mark('compress'); proj = compressor.fused_project(go, inp); rec.mark('compress')
+            if proj is not None:
                 rec.mark('score')
                 corr = _bwd._correction_f32(state, go.device)
-                scores, _ = score_select(parts, state.train_batch_size, 0, corr)
+                scores, _ = compressor.fused_score(proj, state.train_batch_size, 0, corr)
                 state.accumulate_precomputed_scores(scores, None, None, layer_idx=lidx)
                 rec.mark('score')
                 return
@@ -889,7 +923,7 @@ def measure_global_subset_one_pass(model, optimizer, grad_hook, train_batches, v
 
         grad_hook.setup_selection(
             train_batch_size=train_bs, selection_method="GlobalSubset",
-            frac=0.5, lr=optimizer.param_groups[0].get("lr", 5e-5),
+            frac=getattr(config, 'keep_frac', 0.5), lr=optimizer.param_groups[0].get("lr", 5e-5),
             selection_mode="topk", use_second_order=config.use_second_order,
             scoring_method=scoring_method,
             one_pass=True,
@@ -954,6 +988,7 @@ def measure_global_subset_one_pass(model, optimizer, grad_hook, train_batches, v
     result = timer.mean_elapsed()
     for k, v in comp_accum.items():
         result[k] = v / N
+    result["plain_step_ms"] = _plain_step_time(step, train_batches, val_batches, config)
     return result
 
 
@@ -1138,7 +1173,7 @@ def run_method(method, config):
 
     model, tokenizer = setup_model(config)
     grad_hook = setup_grad_hook(model, config, tokenizer, config.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, **({'fused': True} if config.fused_adamw else {}))
 
     train_loader, val_loader = create_dataloaders(config, tokenizer)
     train_batches, val_batches = get_batches(train_loader, val_loader, total_needed, config.device)
@@ -1161,9 +1196,12 @@ def run_method(method, config):
         raise ValueError(f"Unknown method: {method}")
 
     result["peak_memory_gb"] = torch.cuda.max_memory_allocated() / 1024**3
+    if "plain_step_ms" in result:
+        print(f"  plain step (no per-layer timing patches): {result['plain_step_ms']:.1f} ms")
     result["fused"] = bool(fused_kernels_enabled())
     result["kernel_backend"] = backend()
     result["cublaslt"] = bool(config.cublaslt)
+    result["fused_adamw"] = bool(config.fused_adamw)
     return result
 
 
@@ -1175,7 +1213,7 @@ def _build_config(args):
                       ('num_warmup','num_warmup'), ('num_iterations','num_iterations'),
                       ('seed','seed'), ('score_compression','score_compression'),
                       ('scoring_method','scoring_method'),
-                      ('direct_batch_size','direct_batch_size')]:
+                      ('direct_batch_size','direct_batch_size'), ('keep_frac','keep_frac')]:
         val = getattr(args, arg, None)
         if val is not None:
             kwargs[attr] = val
@@ -1193,6 +1231,8 @@ def _build_config(args):
             kwargs['fused'] = False
     if getattr(args, 'cublaslt', False):
         kwargs['cublaslt'] = True
+    if getattr(args, 'fused_adamw', False):
+        kwargs['fused_adamw'] = True
     return BenchmarkConfig(**kwargs)
 
 
@@ -1224,6 +1264,8 @@ def main():
                         help='Fused-kernel backend: cute (CuTe DSL, default), triton, or off (reference ops).')
     parser.add_argument('--cublaslt', action='store_true',
                         help="Prefer cuBLASLt for all GEMMs (torch.backends.cuda.preferred_blas_library).")
+    parser.add_argument('--fused-adamw', action='store_true',
+                        help='torch.optim.AdamW(fused=True) instead of the default foreach implementation (no full-size optimizer temporaries).')
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--method', type=str, default=None, choices=METHODS)

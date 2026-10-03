@@ -1,7 +1,7 @@
 """
 Gather-then-select ("v2") policy update for the RLVR selection actor.
 
-The legacy paths decide per rollout from the SIGN of its score inside each micro-batch of
+The one-pass paths decide per rollout from the SIGN of its score inside each micro-batch of
 ``ppo_micro_batch_size_per_gpu`` samples (Layer-Wise in every layer's backward, Global in a
 scoring pass per micro-batch). That is enough for negative filtering but not for rules that
 need to see the whole mini-batch: top-k budgets, prompt-level decisions (all rollouts of a
@@ -374,7 +374,7 @@ def update_policy_v2(actor, data: DataProto) -> Dict[str, Any]:
             if method != 'GlobalSubset':
                 keep_all[~scored_all] = True  # layers without a target gradient keep everything
             if getattr(actor, 'drop_zero_adv', False):
-                # Control for the legacy one-pass Layer-Wise artefact: rollouts of all-correct / all-wrong groups carry no
+                # drop_zero_adv: rollouts of all-correct / all-wrong groups carry no
                 # policy gradient; dropping them removes their KL-penalty gradient and their share of the token-mean denominator.
                 keep_all[:, adv_all.abs() < 1e-8] = False
             shift_all = recentered_advantage_shift(adv_all, keep_all[0], group_ids, num_groups) if recenter else None

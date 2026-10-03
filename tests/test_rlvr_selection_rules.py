@@ -1,5 +1,5 @@
 """
-Tests for the gather-then-select ("v2") RLVR selection path (2026-09-24):
+Tests for the gather-then-select ("v2") RLVR selection path:
 
   * drpt_verl.selection_rules: filtering / top-k rules, prompt-level aggregation + broadcast,
     layer normalization, advantage re-centring, diagnostics
@@ -233,17 +233,17 @@ def test_force_keep_unions_with_the_sign_rule():
     none = _run_force_keep([False] * H.B_TRAIN, False)
     ref = H.run("LayerWiseSubset", frac=1.0, selection_mode="filtering")["grads"]
     for k in ref:
-        H.close(none[k], ref[k], f"all-False force_keep == legacy ({k})")
-    print(f"  force_keep: forced sample {dropped_emb[:1]} joins the kept set of every layer; all-False == legacy rule")
+        H.close(none[k], ref[k], f"all-False force_keep == sign rule ({k})")
+    print(f"  force_keep: forced sample {dropped_emb[:1]} joins the kept set of every layer; all-False == plain sign rule")
 
 
-def test_legacy_sign_rule_unchanged():
+def test_sign_rule_unchanged():
     out = H.run("LayerWiseSubset", frac=1.0, selection_mode="filtering")
     for l in (H.EMB, H.OUT):
         expected = H.mean_grads([H.REF.train[b] for b in H.REF.kept(l)])
         for k in H.LAYER_KEYS[l]:
-            H.close(out["grads"][k], expected[k], f"legacy filtering {H.HOOKED[l]} {k}")
-    print("  legacy in-backward filtering unchanged when no fixed selection is set")
+            H.close(out["grads"][k], expected[k], f"in-backward filtering {H.HOOKED[l]} {k}")
+    print("  in-backward filtering unchanged when no fixed selection is set")
 
 
 if __name__ == "__main__":

@@ -20,8 +20,8 @@ import transformers
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._dynamo')
 
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from transformers import (AutoModelForCausalLM, AutoTokenizer,
-                          DataCollatorForSeq2Seq, HfArgumentParser, set_seed)
+from transformers import (AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq,
+                          HfArgumentParser, TrainerCallback, set_seed)
 
 from SFT.data.get_train_dataset import get_training_dataset
 from SFT.data.get_val_dataset import get_dataset, ensure_chat_template, DEFAULT_SEQ_LENGTH_MULTIPLIER
@@ -93,6 +93,26 @@ def find_trainable_layers(model, lora_only=True):
                 layer_names.append(name)
 
     return layer_names
+
+
+class SaveAtStepsCallback(TrainerCallback):
+    """Write a full Trainer checkpoint (model + optimizer + scheduler) at the listed global steps, whatever save_strategy is.
+    Entries <= 1 are fractions of the run's step budget (0.25 -> a quarter of max_steps, 1.0 -> the last step)."""
+
+    def __init__(self, steps):
+        self.raw = steps
+        self.steps = set()
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.steps = {int(round(x * state.max_steps)) if x <= 1 else int(x) for x in self.raw}
+        self.steps.discard(0)
+        logger.info(f"Full checkpoints will be written at steps {sorted(self.steps)} (max_steps {state.max_steps})")
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step in self.steps:
+            control.should_save = True
+        return control
 
 
 def main():
@@ -442,6 +462,10 @@ def main():
 
     # Train
     logger.info("*** Starting training ***")
+    if training_args.save_at_steps:
+        steps = [float(x) for x in str(training_args.save_at_steps).split(",") if x.strip()]
+        trainer.add_callback(SaveAtStepsCallback(steps))
+
     train_result = trainer.train()
 
     # Final evaluation after training

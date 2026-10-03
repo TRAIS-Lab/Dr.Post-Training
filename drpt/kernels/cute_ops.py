@@ -30,11 +30,20 @@ have to be multiples of 8 (16-byte rows).
 Kernels are compiled once per (op, dtype) with symbolic shapes and called through the
 TVM-FFI entry point with torch tensors directly (about 25 us of host overhead per call).
 Layout/tiling helpers follow NVIDIA's ``examples/python/CuTeDSL/cute/ampere`` GEMM.
+
+On Hopper (sm_90) the weight gradient, the ghost inner product, the per-token inner product and the compressed
+projection go to the TMA + wgmma kernels of :mod:`drpt.kernels.hopper_ops` (the mma.sync mainloop below runs at
+about half the cuBLAS rate there); the lm_head-sized ghost inner product uses cuBLAS GEMMs plus an fp32
+product-reduction (``_gip_partials_cublas``).  The pip/gip ``reduce_select`` epilogue stays; the compressed path's
+scoring and selection run inside the Hopper outer-product kernel (``compressed_scores``), so ``score_select`` is the
+epilogue of the mma.sync projection only.  ``DRPT_FUSED_DISABLE=hopper`` keeps the mma.sync weight gradient,
+``DRPT_CUTE_SCORING_ON_HOPPER=1`` keeps the mma.sync pip/gip/projection kernels.
 """
 
 from __future__ import annotations
 
 import math
+import os
 from typing import Dict, Optional, Tuple, Type
 
 import torch
@@ -46,6 +55,20 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 K_MAJOR, MN_MAJOR = "k", "mn"
+
+_SM90: Optional[bool] = None
+_HOPPER_WGRAD = "hopper" not in {x.strip().lower() for x in os.environ.get("DRPT_FUSED_DISABLE", "").split(",")}
+_HOPPER_SCORING_KERNELS = os.environ.get("DRPT_CUTE_SCORING_ON_HOPPER", "0").strip().lower() in ("1", "true", "yes", "on")
+# The 128x128-tile dual GEMM is L2-bound; on the vocabulary-sized lm_head (O ~ 150k) the cuBLAS Gram path wins.
+_HOPPER_GIP_MAX_FEATURES = 32768
+
+
+def _sm90() -> bool:
+    """True on Hopper-class devices (compute capability 9.x), where the sm_90a kernels apply."""
+    global _SM90
+    if _SM90 is None:
+        _SM90 = bool(torch.cuda.is_available()) and torch.cuda.get_device_capability()[0] == 9
+    return _SM90
 
 
 class AmpereFusedGemm:
@@ -614,8 +637,9 @@ def _cdiv(a, b):
 
 
 def supports(op: str, *shapes) -> bool:
-    """Whether the CuTe kernels handle these operands: feature dims must be multiples of 8
-    (16-byte rows); any sequence length works."""
+    """Whether the CuTe backend handles these operands: feature dims must be multiples of 8
+    (16-byte rows); any sequence length works.  On Hopper the same shapes are served by the
+    kernels named in the module docstring."""
     if op == "pip":
         (B, S, O), (_, _, I) = shapes[0], shapes[1]
         return _ok((O, 8), (I, 8))
@@ -631,6 +655,11 @@ def supports(op: str, *shapes) -> bool:
     return False
 
 
+def supports_gather(src_shape) -> bool:
+    """Row gather: bf16/fp16 ``[B, S, F]`` with F % 8 == 0."""
+    return len(src_shape) == 3 and src_shape[2] % 8 == 0
+
+
 def pip_partials(go: torch.Tensor, inp: torch.Tensor, G: torch.Tensor) -> torch.Tensor:
     """Per-CTA partial sums of the per-token inner product scores: fp32 ``[B, tiles]``; ``.sum(1)`` = scores."""
     B, S, O = go.shape
@@ -639,6 +668,9 @@ def pip_partials(go: torch.Tensor, inp: torch.Tensor, G: torch.Tensor) -> torch.
     if G.dtype != go.dtype:
         G = G.to(go.dtype)
     go, inp, G = go.contiguous(), inp.contiguous(), G.contiguous()
+    if _sm90() and not _HOPPER_SCORING_KERNELS:
+        from . import hopper_ops
+        return hopper_ops.pip_partials(go, inp, G)
     out = torch.empty(B, _cdiv(S, 128) * _cdiv(O, 128), dtype=torch.float32, device=go.device)
     _get("pip", go.dtype)(inp, G, go, G, out)
     return out
@@ -656,9 +688,22 @@ def gip_partials(go_t: torch.Tensor, inp_t: torch.Tensor, go_v: torch.Tensor, in
     if not supports("gip", go_t.shape, inp_t.shape):
         raise ValueError("cute gip_scores: needs O % 8 == 0 and I % 8 == 0")
     go_t, inp_t, go_v, inp_v = (t.contiguous() for t in (go_t, inp_t, go_v, inp_v))
+    if _sm90() and not _HOPPER_SCORING_KERNELS:
+        if max(go_t.shape[2], inp_t.shape[2]) <= _HOPPER_GIP_MAX_FEATURES:
+            from . import hopper_ops
+            return hopper_ops.gip_partials(go_t, inp_t, go_v, inp_v)
+        return _gip_partials_cublas(go_t, inp_t, go_v, inp_v)
     out = torch.empty(B * V, _cdiv(S, 128) ** 2, dtype=torch.float32, device=go_t.device)
     _get("gip", go_t.dtype)(go_t, go_v, inp_t, inp_v, out)
     return out.view(B, -1)
+
+
+def _gip_partials_cublas(go_t: torch.Tensor, inp_t: torch.Tensor, go_v: torch.Tensor, inp_v: torch.Tensor) -> torch.Tensor:
+    """Per-validation-row partial sums fp32 ``[B, V]`` of the ghost inner product: the two token-pair Gram
+    matrices on cuBLAS, Hadamard product and reduction in fp32 (the Hopper substitute for the mma.sync ``gip`` kernel)."""
+    go_dot = torch.einsum("bso,vto->bvst", go_t, go_v)     # [B, V, S, S]
+    inp_dot = torch.einsum("bsi,vti->bvst", inp_t, inp_v)
+    return torch.sum(go_dot.float() * inp_dot.float(), dim=(2, 3))   # [B, V]
 
 
 def gip_scores(go_t: torch.Tensor, inp_t: torch.Tensor, go_v: torch.Tensor, inp_v: torch.Tensor) -> torch.Tensor:
@@ -679,16 +724,22 @@ def selected_wgrad(go: torch.Tensor, inp: torch.Tensor, sel: torch.Tensor, scale
     if not inp.is_contiguous():
         inp = inp.contiguous()
     out_dtype = out_dtype or go.dtype
-    out = torch.empty(O, I, dtype=out_dtype, device=go.device)
-    if sel.numel() == 0:
-        out.zero_()
-        return out, (torch.zeros(O, dtype=out_dtype, device=go.device) if has_bias else None)
     sel64 = sel if (sel.dtype == torch.int64 and sel.is_contiguous()) else sel.to(torch.int64).contiguous()
     if isinstance(scale, torch.Tensor) and scale.dtype == torch.float32 and scale.numel() == 1 and scale.is_cuda:
         scale_t = scale.reshape(1)
     else:
         scale_t = torch.as_tensor(scale, device=go.device, dtype=torch.float32).reshape(1)
-    _get("wgrad", go.dtype)(go, inp, sel64, scale_t, out)
+    if _HOPPER_WGRAD and out_dtype == go.dtype and _sm90():
+        from . import hopper_ops
+        out = hopper_ops.selected_wgrad(go, inp, sel64, scale_t)
+    else:
+        out = torch.empty(O, I, dtype=out_dtype, device=go.device)
+        if sel.numel() == 0:
+            out.zero_()
+        else:
+            _get("wgrad", go.dtype)(go, inp, sel64, scale_t, out)
+    if sel.numel() == 0:
+        return out, (torch.zeros(O, dtype=out_dtype, device=go.device) if has_bias else None)
     bias = (go[sel64].sum(dim=(0, 1)).float() * scale_t).to(out_dtype) if has_bias else None
     return out, bias
 
@@ -906,6 +957,89 @@ class ReduceSelect:
                         mSel[i] = cutlass.Int64(s_sel[i])
 
 
+class GatherRows:
+    """Rows of the selected samples of a ``[B, S, F]`` activation as one contiguous ``[K*S, F]`` tensor,
+    optionally multiplied by a scale: one 128-bit vector per thread per row, ``GATHER_ROWS`` rows per CTA.
+    Feeds the cuBLAS weight-gradient GEMM of the reference path (``index_select`` moves the same rows at a
+    fraction of the bandwidth)."""
+
+    def __init__(self, dtype, scale_on: bool):
+        self.dtype = dtype
+        self.scale_on = scale_on
+
+    @cute.jit
+    def __call__(self, mSrc: cute.Tensor, mIdx: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor,
+                 S: cutlass.Int32, stream: cuda.CUstream):
+        KS = cute.size(mOut.shape[0])
+        F = cute.size(mOut.shape[1])
+        grid = (cute.ceil_div(KS, GATHER_ROWS), cute.ceil_div(F, GATHER_THREADS * GATHER_VEC), 1)
+        self.kernel(mSrc, mIdx, mOut, mScale, S).launch(grid=grid, block=(GATHER_THREADS, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, mSrc: cute.Tensor, mIdx: cute.Tensor, mOut: cute.Tensor, mScale: cute.Tensor, S: cutlass.Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        bx, by, _ = cute.arch.block_idx()
+        KS = cute.size(mOut.shape[0])
+        F = cute.size(mOut.shape[1])
+        vcol = by * GATHER_THREADS + tidx
+        scale = mScale[0]
+        if vcol * GATHER_VEC + GATHER_VEC <= F:          # F % 8 == 0: every vector is whole or entirely outside
+            for r in cutlass.range_constexpr(GATHER_ROWS):
+                row = bx * GATHER_ROWS + r
+                if row < KS:
+                    k = row // S
+                    s = row - k * S
+                    b = cutlass.Int32(mIdx[k])
+                    gS = cute.local_tile(mSrc[b, None, None], (1, GATHER_VEC), (s, vcol))
+                    gD = cute.local_tile(mOut, (1, GATHER_VEC), (row, vcol))
+                    frag = cute.make_fragment_like(gS)
+                    cute.autovec_copy(gS, frag)
+                    if cutlass.const_expr(self.scale_on):
+                        frag.store((frag.load().to(cutlass.Float32) * scale).to(self.dtype))
+                    cute.autovec_copy(frag, gD)
+
+
+GATHER_THREADS, GATHER_ROWS, GATHER_VEC = 256, 8, 8
+
+
+def _get_gather(torch_dtype, scale_on: bool):
+    key = ("gather", torch_dtype, scale_on)
+    fn = _COMPILED.get(key)
+    if fn is None:
+        dt = _CUTE_DT[torch_dtype]
+        src = _fake3(dt)
+        idx = make_fake_compact_tensor(cutlass.Int64, (cute.sym_int(),), assumed_align=8)
+        out = _fake2(dt, (1, 8))
+        scl = make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
+        fn = cute.compile(GatherRows(dt, scale_on), src, idx, out, scl, cutlass.Int32(0),
+                          make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
+        _COMPILED[key] = fn
+    return fn
+
+
+def gather_rows(src: torch.Tensor, idx: torch.Tensor, scale=None) -> torch.Tensor:
+    """``src[idx]`` for ``src [B, S, F]`` (bf16/fp16, F % 8 == 0) as a contiguous ``[K*S, F]`` tensor, optionally
+    multiplied by ``scale`` (0-dim tensor or float)."""
+    B, S, F = src.shape
+    if not src.is_contiguous():
+        src = src.contiguous()
+    if idx.dtype != torch.int64:
+        idx = idx.to(torch.int64)
+    idx = idx.contiguous()
+    K = idx.numel()
+    out = torch.empty(K * S, F, dtype=src.dtype, device=src.device)
+    if K == 0:
+        return out
+    if scale is None:
+        scale_t = torch.ones(1, dtype=torch.float32, device=src.device)
+    elif isinstance(scale, torch.Tensor):
+        scale_t = scale.reshape(1) if (scale.dtype == torch.float32 and scale.is_cuda) else scale.to(device=src.device, dtype=torch.float32).reshape(1)
+    else:
+        scale_t = torch.tensor([float(scale)], dtype=torch.float32, device=src.device)
+    _get_gather(src.dtype, scale is not None)(src, idx, out, scale_t, int(S))
+    return out
+
+
 def _get_reduce_select():
     fn = _COMPILED.get("reduce_select")
     if fn is None:
@@ -959,18 +1093,12 @@ def compressed_partials(go: torch.Tensor, inp: torch.Tensor, P_O: torch.Tensor, 
                         scale: float = 1.0) -> torch.Tensor:
     """Per-tile partials of :func:`compressed_grad`: fp32 ``[B, S_tiles, 64, 64]`` (already scaled);
     ``partials.sum(1)`` flattened is the compressed gradient of each sample (zero-padded beyond k1, k2)."""
-    B, S, O = go.shape
-    I = inp.shape[2]
-    if not (P_O.shape[0] == O and P_I.shape[0] == I and P_O.shape[1] <= 64 and P_I.shape[1] <= 64 and _ok((O, 8), (I, 8))):
-        raise ValueError("cute compressed_partials: needs P_O [O,k1], P_I [I,k2] with k <= 64 and O % 8 == I % 8 == 0")
-    if not go.is_contiguous():
-        go = go.contiguous()
-    if not inp.is_contiguous():
-        inp = inp.contiguous()
-    if P_O.dtype != go.dtype or not P_O.is_contiguous():
-        P_O = P_O.to(go.dtype).contiguous()
-    if P_I.dtype != go.dtype or not P_I.is_contiguous():
-        P_I = P_I.to(go.dtype).contiguous()
+    go, inp, P_O, P_I = _compress_operands(go, inp, P_O, P_I)
+    B, S = go.shape[:2]
+    if _hopper_compress():
+        from . import hopper_ops
+        if hopper_ops.supports_proj(go.shape, inp.shape, P_O.shape[1], P_I.shape[1], go.dtype):
+            return hopper_ops.compressed_partials(go, inp, P_O, P_I, scale)
     out = torch.empty(B, -(-S // _PROJ_BM), 64, 64, dtype=torch.float32, device=go.device)
     _get("proj", go.dtype)(go, inp, P_O, P_I, out, float(scale))
     return out
@@ -998,6 +1126,56 @@ def score_select(partials: torch.Tensor, n_train: int, k: int, corr) -> Tuple[to
     return scores, sel[:k]
 
 
+def _hopper_compress() -> bool:
+    return _sm90() and not _HOPPER_SCORING_KERNELS
+
+
+def compress_project(go: torch.Tensor, inp: torch.Tensor, P_O: torch.Tensor, P_I: torch.Tensor,
+                     scale: float = 1.0) -> torch.Tensor:
+    """First stage of compressed scoring: the per-backend intermediate that :func:`compress_score` consumes.
+
+    On sm_90 the two projections ``[2, B, S, 64]`` in the activation dtype (``hopper_ops.dual_proj``); elsewhere the
+    scaled fp32 tile partials of :func:`compressed_partials`.  Same operand requirements as :func:`compressed_grad`."""
+    if _hopper_compress():
+        from . import hopper_ops
+        if hopper_ops.supports_proj(go.shape, inp.shape, P_O.shape[1], P_I.shape[1], go.dtype):
+            go, inp, P_O, P_I = _compress_operands(go, inp, P_O, P_I)
+            return hopper_ops.dual_proj(go, inp, P_O, P_I)
+    return compressed_partials(go, inp, P_O, P_I, scale)
+
+
+def compress_score(proj: torch.Tensor, scale: float, n_train: int, k: int, corr) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Second stage: ``scores [n_train]`` = ``corr * <c_b, sum_v c_v>`` for the merged batch (training rows first, ``c`` the
+    scaled compressed gradients) and the k largest indices in ascending order (``k = 0`` -> empty), in one launch
+    (``hopper_ops.outer_scores`` on sm_90, :func:`score_select` on the tile partials elsewhere)."""
+    if proj.dim() == 4 and proj.shape[0] == 2 and proj.dtype != torch.float32:
+        from . import hopper_ops
+        return hopper_ops.outer_scores(proj, scale, n_train, k, corr)
+    return score_select(proj, n_train, k, corr)
+
+
+def compressed_scores(go: torch.Tensor, inp: torch.Tensor, P_O: torch.Tensor, P_I: torch.Tensor, scale: float,
+                      n_train: int, k: int, corr) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compressed scoring and sorted top-k selection of a merged batch: :func:`compress_project` + :func:`compress_score`."""
+    return compress_score(compress_project(go, inp, P_O, P_I, scale), scale, n_train, k, corr)
+
+
+def _compress_operands(go, inp, P_O, P_I):
+    B, S, O = go.shape
+    I = inp.shape[2]
+    if not (P_O.shape[0] == O and P_I.shape[0] == I and P_O.shape[1] <= 64 and P_I.shape[1] <= 64 and _ok((O, 8), (I, 8))):
+        raise ValueError("cute compressed scoring: needs P_O [O,k1], P_I [I,k2] with k <= 64 and O % 8 == I % 8 == 0")
+    if not go.is_contiguous():
+        go = go.contiguous()
+    if not inp.is_contiguous():
+        inp = inp.contiguous()
+    if P_O.dtype != go.dtype or not P_O.is_contiguous():
+        P_O = P_O.to(go.dtype).contiguous()
+    if P_I.dtype != go.dtype or not P_I.is_contiguous():
+        P_I = P_I.to(go.dtype).contiguous()
+    return go, inp, P_O, P_I
+
+
 def compressed_grad(go: torch.Tensor, inp: torch.Tensor, P_O: torch.Tensor, P_I: torch.Tensor,
                     scale: float = 1.0) -> torch.Tensor:
     """Kronecker-projected per-sample gradients (the ``compress`` scoring path).
@@ -1020,9 +1198,8 @@ def compressed_grad(go: torch.Tensor, inp: torch.Tensor, P_O: torch.Tensor, P_I:
         P_O = P_O.to(go.dtype).contiguous()
     if P_I.dtype != go.dtype or not P_I.is_contiguous():
         P_I = P_I.to(go.dtype).contiguous()
-    tiles = -(-S // _PROJ_BM)
-    out = torch.empty(B, tiles, 64, 64, dtype=torch.float32, device=go.device)
-    _get("proj", go.dtype)(go, inp, P_O, P_I, out, float(scale))
+    out = compressed_partials(go, inp, P_O, P_I, scale)
+    tiles = out.shape[1]
     if k1 != 64 or k2 != 64:
         out = out[:, :, :k1, :k2]
     # sum the fp32 tile partials first, then round once (torch.sum(dtype=bf16) would round each partial)
@@ -1032,4 +1209,4 @@ def compressed_grad(go: torch.Tensor, inp: torch.Tensor, P_O: torch.Tensor, P_I:
 
 __all__ = ["AmpereFusedGemm", "ScoreSelect", "ReduceSelect", "supports", "pip_scores", "pip_partials",
            "gip_scores", "gip_partials", "selected_wgrad", "compressed_grad", "compressed_partials",
-           "score_select", "reduce_select"]
+           "compress_project", "compress_score", "compressed_scores", "score_select", "reduce_select"]

@@ -264,7 +264,7 @@ def test_topk_half_is_mean_over_selected():
     print(f"  LayerWiseSubset top-k 0.5: layer grad == (1/k) sum over its top-k responses (scale n/k), both layouts")
 
 
-def test_legacy_target_is_token_weighted():
+def test_token_mean_target_is_token_weighted():
     """Under token-mean the cached target is the token-weighted mean over val responses, not the plain mean."""
     out = run("GlobalSubset", "token-mean", frac=1.0, selection_mode="filtering")
     t_val = torch.tensor(RESP[B_TRAIN:B_TRAIN + B_VAL], dtype=torch.float64)
@@ -282,7 +282,7 @@ ALL_TESTS = [
     test_layerwise_filtering_update_is_mean_over_positive,
     test_frac1_reproduces_full_training_both_conventions,
     test_topk_half_is_mean_over_selected,
-    test_legacy_target_is_token_weighted,
+    test_token_mean_target_is_token_weighted,
 ]
 
 if __name__ == "__main__":

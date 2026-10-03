@@ -64,7 +64,7 @@ def build(args):
     set_seed(cfg.seed)
     model, tok = setup_model(cfg)
     hook = setup_grad_hook(model, cfg, tok, cfg.device)
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-5)
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-5, **({'fused': True} if args.fused_adamw else {}))
     tl, vl = create_dataloaders(cfg, tok)
     tb, vb = get_batches(tl, vl, cfg.num_warmup + cfg.num_iterations, cfg.device)
     return cfg, model, tok, hook, opt, tb, vb
@@ -236,6 +236,7 @@ def main():
     p.add_argument("--warmup", type=int, default=4)
     p.add_argument("--steps", type=int, default=3)
     p.add_argument("--ckpt", action="store_true")
+    p.add_argument("--fused-adamw", action="store_true", help="torch.optim.AdamW(fused=True), as in the H200 suite")
     p.add_argument("--trace", default=None, help="chrome trace output path")
     p.add_argument("--trace-dir", default=os.path.join(REPO, "SFT", "benchmark", "results", "profiles"),
                    help="directory for the chrome trace when --trace is not given")

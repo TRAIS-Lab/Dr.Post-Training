@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 import torch
 
-from ..kernels import fused_ok, kernel_ops
+from ..kernels import fused_ok, kernel_ops, gather_backend, gather_rows
 
 
 def augment_input_for_bias(input: Tensor, has_bias: bool) -> Tensor:
@@ -458,17 +458,30 @@ def compute_selected_gradients(
         # the same pass.
         return kernel_ops().selected_wgrad(train_grad_output, train_input, selected_indices, scale_factor, has_bias)
 
-    selected_grad_output = train_grad_output[selected_indices]
-    selected_input = train_input[selected_indices]
+    # Reference path: the selected rows are gathered as contiguous operands (CuTe / Triton row gather with the
+    # scale fused when available, index_select otherwise), the scale is applied to the small grad_output operand (not
+    # to the [O, I] result), and the contraction over the selected tokens is one cuBLAS GEMM: at k = n/2 it costs
+    # half of the full-batch weight gradient.
+    if (train_grad_output.dim() == 3 and selected_indices.is_cuda and train_grad_output.is_cuda
+            and train_grad_output.dtype in (torch.bfloat16, torch.float16)
+            and train_input.dtype == train_grad_output.dtype and gather_backend() is not None):
+        go2 = gather_rows(train_grad_output, selected_indices, scale_factor)
+        in2 = gather_rows(train_input, selected_indices)
+        grad_bias = go2.sum(dim=0) if has_bias else None
+        return go2.t() @ in2, grad_bias
+
+    selected_grad_output = train_grad_output.index_select(0, selected_indices) * scale_factor
+    selected_input = train_input.index_select(0, selected_indices)
 
     if selected_grad_output.dim() == 3:
         # 3D case: [K, S, O] x [K, S, I] -> [O, I]
-        grad_weight = torch.einsum('kso,ksi->oi', selected_grad_output, selected_input) * scale_factor
-        grad_bias = selected_grad_output.sum(dim=(0, 1)) * scale_factor if has_bias else None
+        go2, in2 = selected_grad_output.reshape(-1, selected_grad_output.shape[-1]), selected_input.reshape(-1, selected_input.shape[-1])
+        grad_bias = go2.sum(dim=0) if has_bias else None
     else:
         # 2D case: [K, O] x [K, I] -> [O, I]
-        grad_weight = torch.einsum('ko,ki->oi', selected_grad_output, selected_input) * scale_factor
-        grad_bias = selected_grad_output.sum(dim=0) * scale_factor if has_bias else None
+        go2, in2 = selected_grad_output, selected_input
+        grad_bias = go2.sum(dim=0) if has_bias else None
+    grad_weight = go2.t() @ in2
 
     return grad_weight, grad_bias
 

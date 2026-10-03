@@ -220,6 +220,33 @@ def test_score_select_matches_torch():
     print(f"  compressed_partials consistent with compressed_grad (rel {e:.1e}), padding zero")
 
 
+def test_compressed_scores_matches_score_select():
+    """CuTe-only: the two-stage compressed scoring (compress_project + compress_score) equals score_select on the tile
+    partials: identical selections, scores within bf16-rounding noise of the projections, k = 0 gives scores only, and a
+    repeated call reproduces (the sm_90 kernel resets its arrival counter)."""
+    if kernels.backend() != "cute":
+        print("  compressed scoring kernels are CuTe-only; skipped")
+        return
+    from drpt.kernels.cute_ops import compress_project, compress_score, compressed_scores, compressed_partials, score_select
+    g = torch.Generator(device=DEV).manual_seed(11)
+    for (B, S, O, I, kk, n_train, k) in [(9, 512, 1024, 2048, 64, 8, 4), (17, 387, 960, 2560, 32, 16, 8), (5, 64, 512, 768, 64, 4, 1),
+                                          (129, 128, 960, 960, 64, 128, 64), (12, 200, 512, 768, 64, 8, 0)]:
+        go, inp, _, _ = _data(B, S, O, I, 1, seed=B)
+        P_O = torch.randn(O, kk, device=DEV, generator=g).to(torch.bfloat16)
+        P_I = torch.randn(I, kk, device=DEV, generator=g).to(torch.bfloat16)
+        corr = torch.tensor(1.7, device=DEV)
+        scale = 1.0 / kk
+        ref_scores, ref_sel = score_select(compressed_partials(go, inp, P_O, P_I, scale), n_train, k, corr)
+        proj = compress_project(go, inp, P_O, P_I, scale)
+        scores, sel = compress_score(proj, scale, n_train, k, corr)
+        e = _rel(scores, ref_scores.double())
+        assert scores.shape == (n_train,) and sel.shape == (k,) and e < 1e-3, f"compressed scores {(B, S, O, I, kk, n_train, k)}: rel {e:.1e}"
+        assert torch.equal(sel, ref_sel), f"selection {(B, S, O, I, kk, n_train, k)}: {sel.tolist()} vs {ref_sel.tolist()}"
+        scores2, sel2 = compressed_scores(go, inp, P_O, P_I, scale, n_train, k, corr)
+        assert torch.equal(sel2, sel) and torch.equal(scores2, scores), "repeated call differs"
+        print(f"  compressed_scores B={B} S={S} O={O} I={I} k1=k2={kk} n={n_train} k={k}: rel {e:.1e}, selection identical")
+
+
 def test_reduce_select_and_partials():
     """CuTe-only: reduce_select equals the torch chain and pip/gip partials sum to the scores."""
     if kernels.backend() != "cute":
@@ -287,6 +314,58 @@ def test_dispatch_matches_reference():
     print("  dispatch: set_fused_kernels(False) routes to the reference path")
 
 
+def test_gather_rows_matches_index_select():
+    """Row gather of the active backend (CuTe / Triton) == index_select, bit-exact, with and without the fused scale;
+    the dispatcher takes the Triton port for widths the CuTe kernel does not cover (F % 8 != 0)."""
+    ops = kernels.kernel_ops()
+    torch.manual_seed(0)
+    scale = torch.tensor(1.7, device="cuda")
+    cases = [((9, 512, 5120), torch.bfloat16), ((5, 1024, 1536), torch.float16), ((3, 64, 96), torch.bfloat16), ((9, 37, 1000), torch.bfloat16)]
+    for (B, S, F), dt in cases:
+        src = torch.randn(B, S, F, device="cuda", dtype=dt)
+        idx = torch.randperm(B, device="cuda")[: max(1, B // 2)]
+        ref = src.index_select(0, idx).reshape(-1, F)
+        got = ops.gather_rows(src, idx, None)
+        assert torch.equal(got, ref), f"gather {(B, S, F)} {dt}: copy differs"
+        scaled = ops.gather_rows(src, idx, scale)
+        assert torch.equal(scaled, (ref.float() * 1.7).to(dt)), f"gather {(B, S, F)} {dt}: scaled copy differs"
+        # a batch-strided (non-compact) source takes the same path
+        src_nc = src.transpose(0, 1).contiguous().transpose(0, 1)
+        assert torch.equal(ops.gather_rows(src_nc, idx, None), ref), f"gather {(B, S, F)} {dt}: strided source differs"
+        print(f"  gather_rows {(B, S, F)} {str(dt)[6:]}: exact (plain, scaled, strided)")
+    if kernels.HAS_TRITON:
+        src = torch.randn(4, 16, 1500, device="cuda", dtype=torch.bfloat16)   # F % 8 != 0 -> Triton port
+        idx = torch.tensor([3, 1], device="cuda")
+        assert torch.equal(kernels.gather_rows(src, idx, None), src.index_select(0, idx).reshape(-1, 1500))
+        print("  gather_rows dispatch: F % 8 != 0 handled (Triton port)")
+    assert kernels.gather_backend() in ("cute", "triton")
+
+
+def test_hopper_ops_both_configs():
+    """On sm_90 the CuTe backend runs drpt/kernels/hopper_ops.py: exercise the three w.grad tile configurations explicitly
+    (the heuristic picks one per shape) and the GIP kernel with V > 1 and sequence lengths that are not tile multiples."""
+    if kernels.backend() != "cute" or torch.cuda.get_device_capability()[0] != 9:
+        print("  hopper_ops: sm_90 + CuTe backend only; skipped")
+        return
+    from drpt.kernels import hopper_ops
+    for (B, S, O, I, V) in [(8, 512, 1024, 2048, 1), (3, 387, 960, 2560, 2), (4, 200, 384, 256, 3)]:
+        go, inp, vgo, vinp = _data(B, S, O, I, V)
+        sel = torch.arange(0, B, 2, device=DEV)
+        ref = torch.einsum("kso,ksi->oi", go[sel].double(), inp[sel].double()) * 1.75
+        for cfg in (hopper_ops.CONFIG_LARGE, hopper_ops.CONFIG_SMALL, hopper_ops.CONFIG_WIDE):
+            w = hopper_ops.selected_wgrad(go, inp, sel, torch.tensor(1.75, device=DEV), cfg=cfg)
+            e = _rel(w, ref)
+            assert e < 5e-3, f"hopper wgrad {(B, S, O, I)} cfg={cfg}: rel err {e:.2e}"
+        parts = hopper_ops.gip_partials(go, inp, vgo, vinp)
+        assert parts.shape[0] == B and parts.dtype == torch.float32
+        e = _rel(parts.sum(1), _ref_scores(go, inp, vgo, vinp))
+        assert e < 2e-3, f"hopper gip {(B, S, O, I, V)}: rel err {e:.2e}"
+        print(f"  hopper_ops {(B, S, O, I, V)}: wgrad ok (all three tile configs), gip rel err {e:.1e}")
+    assert hopper_ops.pick_config(17408, 5120) == hopper_ops.CONFIG_LARGE
+    assert hopper_ops.pick_config(1024, 5120) == hopper_ops.CONFIG_SMALL
+    assert hopper_ops.pick_config(2560, 960) == hopper_ops.CONFIG_WIDE and hopper_ops.pick_config(960, 960) == hopper_ops.CONFIG_SMALL
+
+
 ALL_TESTS = [
     test_gip_matches_fp64,
     test_pip_matches_fp64,
@@ -294,8 +373,11 @@ ALL_TESTS = [
     test_total_wgrad_matches_fp64,
     test_compressed_grad_matches_reference,
     test_score_select_matches_torch,
+    test_compressed_scores_matches_score_select,
     test_reduce_select_and_partials,
     test_dispatch_matches_reference,
+    test_gather_rows_matches_index_select,
+    test_hopper_ops_both_configs,
 ]
 
 if __name__ == "__main__":

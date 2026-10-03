@@ -363,8 +363,8 @@ read_yaml() {
 # Helper: Pick fixed LR (CLI override > LoRA default > Full default)
 # =============================================================================
 lookup_lr() {
-    local _config_key="$1"   # legacy unused arg
-    local _exp_name="$2"     # legacy unused arg
+    local _config_key="$1"   # unused positional argument
+    local _exp_name="$2"     # unused positional argument
     local is_lora="$3"
 
     if [[ -n "$lr_override" ]]; then

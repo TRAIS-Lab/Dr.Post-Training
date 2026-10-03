@@ -3,6 +3,7 @@ Training arguments for SFT experiments.
 """
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 from transformers import TrainingArguments as TA
 
@@ -153,6 +154,15 @@ class TrainingArguments(TA):
     n_eval: int = field(
         default=500,
         metadata={"help": "Number of evaluation samples for generalization testing"},
+    )
+    save_at_steps: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated global steps at which a full Trainer checkpoint (model, optimizer, scheduler) is written under "
+                "output_dir/checkpoint-<step>, independent of save_strategy; e.g. '100,500,1000,2000,4000'. Entries <= 1 are fractions of max_steps (1.0 = the last step)."
+            )
+        },
     )
     val_seq_length_multiplier: float = field(
         default=1.2,

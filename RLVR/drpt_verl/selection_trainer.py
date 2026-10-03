@@ -178,6 +178,9 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
 
         # Step counter for refresh frequency
         self._step_counter = 0
+        # Set after resuming from a checkpoint: the captured target gradient lives only in worker memory,
+        # so it is re-captured at the first resumed step before the regular refresh schedule takes over.
+        self._recapture_after_resume = False
 
     def init_workers(self):
         """Initialize workers and validation data manager."""
@@ -350,6 +353,8 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
             return False
         if self.val_data_manager is None:
             return False
+        if self._recapture_after_resume:
+            return True
         # Capture validation gradients every refresh_freq steps
         return self._step_counter % self.selection_config.refresh_freq == 0
 
@@ -432,6 +437,10 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        if self.global_steps > 0:
+            # resumed: keep the target-refresh schedule aligned with the global step and re-capture once
+            self._step_counter = self.global_steps
+            self._recapture_after_resume = True
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -490,6 +499,7 @@ class SelectionRayPPOTrainerWithOnlineVal(RayPPOTrainer):
                         torch.cuda.empty_cache()
                         val_batch = self._generate_validation_rollouts()
                         val_stats = self._capture_validation_gradients(val_batch)
+                        self._recapture_after_resume = False
 
                         # Log stats (now synchronized across all ranks)
                         for k, v in val_stats.items():

@@ -106,6 +106,7 @@ class BenchmarkConfig:
     val_strategy: str = 'merged'  # 'separate' or 'merged' - how to handle validation gradients
     score_compression: str = "normal-64*64"  # Score-only compression for influence scoring (e.g., "normal-64*64")
     scoring_method: str = 'pip'  # Scoring method: 'pip' (default), 'gip', 'direct', 'compress'
+    keep_frac: float = 0.5  # Fraction of the training batch kept per selection (k = keep_frac * n)
     direct_batch_size: int = 0  # Chunk size for batched direct scoring. 0=all at once, 1=per-sample (min memory)
     val_dataset: str = 'tydiqa'  # Validation dataset for selection. Options: 'samsum', 'gsm8k', 'bbh', etc. If None, uses same as training dataset
     data_dir: str = 'data'  # Data directory for validation datasets (used when val_dataset is set)
@@ -117,6 +118,7 @@ class BenchmarkConfig:
     fused: bool = True        # Fused kernels for gip/pip scoring and selected w.grad (drpt.kernels); False = reference ops
     kernel_backend: str = "cute"  # "cute" (CuTe DSL, default), "triton", or "off" (reference); "off" == fused=False
     cublaslt: bool = False    # torch.backends.cuda.preferred_blas_library('cublaslt') for all GEMMs (baseline included)
+    fused_adamw: bool = False  # torch.optim.AdamW(fused=True): in-place update kernel without full-size temporaries (large models on one GPU)
 
     # Reproducibility
     seed: int = 42
@@ -201,30 +203,32 @@ def encode_with_messages_format(example, tokenizer, max_seq_length):
 
 
 class DummyDataset(Dataset):
-    """Dummy dataset that generates random tokens for benchmarking."""
+    """Dummy dataset of identical fixed-length token sequences for benchmarking (no padding at any seq_length)."""
 
     def __init__(self, tokenizer, seq_length: int, size: int = 10000):
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.size = size
-        # Pre-tokenize a dummy sentence
-        self.dummy_text = "This is a test sentence for memory and performance benchmarking. " * 512
+        # Tokenize once; the sentence is at least one token per word, so seq_length repetitions always fill the sequence.
+        sentence = "This is a test sentence for memory and performance benchmarking. "
+        tokens = tokenizer(
+            sentence * max(512, seq_length),
+            return_tensors='pt',
+            padding='max_length',
+            max_length=seq_length,
+            truncation=True,
+        )
+        self.input_ids = tokens['input_ids'].squeeze(0)
+        self.attention_mask = tokens['attention_mask'].squeeze(0)
 
     def __len__(self):
         return self.size
 
     def __getitem__(self, idx):
-        tokens = self.tokenizer(
-            self.dummy_text,
-            return_tensors='pt',
-            padding='max_length',
-            max_length=self.seq_length,
-            truncation=True
-        )
         return {
-            'input_ids': tokens['input_ids'].squeeze(0),
-            'attention_mask': tokens['attention_mask'].squeeze(0),
-            'labels': tokens['input_ids'].squeeze(0).clone(),
+            'input_ids': self.input_ids.clone(),
+            'attention_mask': self.attention_mask.clone(),
+            'labels': self.input_ids.clone(),
         }
 
 

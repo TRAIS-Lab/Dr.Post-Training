@@ -57,6 +57,7 @@ eval_split_override=""
 gc_override=""
 subset_mode_override=""
 eval_steps_override=""
+save_at_steps_override=""
 dry_run=false
 
 while [[ $# -gt 0 ]]; do
@@ -71,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --gradient_checkpointing) gc_override="$2"; shift 2 ;;
         --subset_mode)    subset_mode_override="$2"; shift 2 ;;
         --eval_steps)     eval_steps_override="$2"; shift 2 ;;
+        --save_at_steps)  save_at_steps_override="$2"; shift 2 ;;
         --dry-run)        dry_run=true; shift ;;
         --list)
             dir="${config_dir:-configs}"
@@ -105,6 +107,7 @@ Optional:
   --gradient_checkpointing <bool>  Override gradient_checkpointing from config (48 GB cards)
   --subset_mode <one_pass|two_pass>  Override subset_mode from config (two_pass avoids the one-pass retention memory)
   --eval_steps <n>        Override the periodic-evaluation interval (evaluation does not affect training)
+  --save_at_steps <list>  Write full checkpoints (model + optimizer) at these comma-separated steps (default: none)
   --dry-run               Print commands without executing
   --list                  List available methods and exit
 
@@ -466,6 +469,7 @@ $fsdp_args \
     [[ -n "$cfg_selection_groups" ]] && cmd="$cmd --selection_groups '$cfg_selection_groups'"
     [[ -n "$cfg_train_dataset" ]] && cmd="$cmd --train_dataset_names $cfg_train_dataset"
     [[ -n "$cfg_val_batch_size" ]] && cmd="$cmd --val_batch_size_for_selection $cfg_val_batch_size"
+    [[ -n "$save_at_steps_override" ]] && cmd="$cmd --save_at_steps $save_at_steps_override"
 
     # LoRA
     if [[ "$use_lora" == "true" ]]; then

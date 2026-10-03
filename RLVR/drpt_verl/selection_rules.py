@@ -11,7 +11,7 @@ prompt gives the alignment of that prompt's whole GRPO group update with the tar
 Rules
 -----
 mode = "filtering": keep every candidate with a non-negative score; with ``frac < 1`` only the
-    most negative ``int(frac * n_negative)`` candidates are dropped (the legacy drpt semantics).
+    most negative ``int(frac * n_negative)`` candidates are dropped (the drpt filtering semantics).
 mode = "topk":      keep the ``max(1, int(frac * n))`` best-scoring candidates.
 level = "rollout":  candidates are rollouts.
 level = "prompt":   candidates are prompts (score = sum over the prompt's rollouts); the decision

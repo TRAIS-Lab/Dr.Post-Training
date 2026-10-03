@@ -118,6 +118,14 @@ bash train.sh -c configs/math -m FullTraining-Full
 # GlobalSubset curation
 bash train.sh -c configs/math -m GlobalSubset-Full
 
+# Lazy target: the target rollouts are regenerated every 4 rounds within an 80-round budget
+# (checkpoint every 8 rounds, newest kept; a requeued job resumes from it)
+bash train.sh -c configs/math -m LayerWiseSubset-Full-rf4
+bash train.sh -c configs/math -m GlobalSubset-Full-rf4
+
+# Two-round pipeline smoke test (no evaluation)
+bash train.sh -c configs/math_smoke -m LayerWiseSubset-Full
+
 # All methods
 bash train.sh -c configs/math -m all
 
@@ -158,6 +166,16 @@ Settings live in YAML config files under `configs/`. Each config directory has:
 | `val_loss_type` | `reward` | Validation loss: `reward` or `train-loss` |
 | `val_source` | `from_train` | Validation source: `from_train` or `from_test` |
 | `refresh_freq` | `1` | How often to refresh validation gradients |
+| `test_freq` | `3` | Evaluate on the test prompts every N rounds |
+| `save_freq` | `1000` | Write a verl checkpoint (actor + optimizer) every N rounds |
+| `resume_mode` | `disable` | `auto`: resume from the newest checkpoint of the same Slurm job, which a requeued job finds under its own `job_<id>/` checkpoint dir while a fresh job starts from round 0; the target gradient is re-captured at the first resumed step |
+| `max_ckpt_keep` | all | Keep only the newest N checkpoints (`trainer.max_actor_ckpt_to_keep`) |
+| `total_training_steps` | all epochs | Cap on the number of training rounds |
+| `exp_suffix` | empty | Suffix appended to the experiment name (W&B run and output dir) to keep variants apart |
+| `keep_zero_adv` | `True` | One-pass Layer-Wise: keep the zero-advantage rollouts (all-correct / all-wrong groups) in every layer; their policy-gradient score is zero, so the in-backward sign rule alone would decide them by the KL term |
+| `two_pass` | `False` | Score in a separate policy-gradient-only pass over the mini-batch, then train with fixed per-layer masks (`drpt_verl/selection_v2.py`) |
+| `selection_mode` / `selection_level` | `filtering` / `rollout` | `topk` keeps the best `selection_frac` share of the candidates; `prompt` decides all rollouts of a prompt together. Any non-default value takes the two-pass path |
+| `eval_cleaned_test` | `False` | Evaluate on `test_cleaned.parquet` even without curation, so that every arm shares the evaluation set |
 
 ### Validation Loss Types
 

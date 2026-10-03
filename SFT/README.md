@@ -124,7 +124,7 @@ benchmark task. What this cannot cover is the base model's pre-training data.
 python SFT/data/prepare_datasets.py --datasets ifeval ifbench math500 gsm8k mbpp_plus
 
 # mbpp target (D* 128 + held-out) from MBPP train minus MBPP+ task ids, and math_ref (MATH-train
-# reference solutions; no longer a training target, but the pools were decontaminated against it).
+# reference solutions; not a training target, but the pools are decontaminated against it).
 # Both are decontaminated against the benchmark prompts, so build the benchmark files first.
 python SFT/data/prepare_datasets.py --datasets math_ref mbpp
 
@@ -316,6 +316,7 @@ Stages (paper suite walltimes; Dolci main runs get 16h and evals 8h):
 ```bash
 bash SFT/train/train.sh -c configs/<setting> -m all
 bash SFT/train/train.sh -c configs/<setting> -m FullTraining-Full --seed 42
+bash SFT/train/train.sh -c configs/<setting> -m FullTraining-Full --save_at_steps 100,500,1000   # full checkpoints (model + optimizer) at these steps
 bash SFT/train/train.sh -c configs/<setting> --list
 ```
 

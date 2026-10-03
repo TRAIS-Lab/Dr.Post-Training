@@ -208,7 +208,7 @@ class SelectionTaskRunner(BaseTaskRunner):
                 two_pass=bool(selection_cfg.get("two_pass", False)),
                 keep_groups=selection_cfg.get("keep_groups", None),
                 drop_zero_adv=bool(selection_cfg.get("drop_zero_adv", False)),
-                keep_zero_adv=bool(selection_cfg.get("keep_zero_adv", False)),
+                keep_zero_adv=bool(selection_cfg.get("keep_zero_adv", True)),
             )
 
             trainer = SelectionRayPPOTrainerWithOnlineVal(

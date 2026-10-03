@@ -92,6 +92,9 @@ logs/
 # Per-run exports written by the table generators (--scan); regenerated locally
 SFT/tables/data/
 
+# Overleaf clone of the paper: its own git repository (the table/figure generators write into <repo>/Paper by default)
+/Paper/
+
 # Hillclimb hook files
 /.claude/settings.local.json
 /.claude/settings.local.json.malformed-*

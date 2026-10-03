@@ -24,7 +24,6 @@ gpu_memory_utilization: 0.6
 # validation target is normalised by total response tokens and kept samples are weighted by length,
 # consistent with the training loss. seq-mean-* modes (seq-mean-token-mean = original GRPO,
 # seq-mean-token-sum-norm = Dr. GRPO) make every response one item; the hook follows the mode.
-# Decision 2026-09-12: keep token-mean, matching the runs already on W&B.
 loss_agg_mode: token-mean
 
 # Evaluation & checkpointing

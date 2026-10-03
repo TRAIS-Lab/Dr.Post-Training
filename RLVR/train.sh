@@ -149,6 +149,8 @@ reset_config() {
     # Evaluation & checkpointing
     cfg_test_freq="3"
     cfg_save_freq="1000"
+    cfg_resume_mode="disable"         # verl trainer.resume_mode: disable | auto (auto = resume from the newest checkpoint of THIS Slurm job)
+    cfg_max_ckpt_keep=""              # verl trainer.max_actor_ckpt_to_keep; empty = verl default (keep all)
 
     # Selection
     cfg_selection_frac="1.0"
@@ -215,6 +217,8 @@ parse_yaml() {
             gpu_memory_utilization)          cfg_gpu_memory_utilization="$val" ;;
             test_freq)                       cfg_test_freq="$val" ;;
             save_freq)                       cfg_save_freq="$val" ;;
+            resume_mode)                     cfg_resume_mode="$val" ;;
+            max_ckpt_keep)                   cfg_max_ckpt_keep="$val" ;;
             selection_frac)                  cfg_selection_frac="$val" ;;
             val_pool_size)                   cfg_val_pool_size="$val" ;;
             val_batch_size)                  cfg_val_batch_size="$val" ;;
@@ -329,6 +333,10 @@ run_method() {
     EXP_NAME="${EXP_NAME}${cfg_exp_suffix}"
     local OUTPUT_DIR="${OUTPUT_BASE}/${EXP_NAME}"
     local HYDRA_DIR="${OUTPUT_BASE}/hydra/${EXP_NAME}"
+    # Checkpoint dir: with resume_mode != disable every Slurm job (= attempt) gets its own subdir, which a requeued
+    # job (same job id) finds again while a fresh attempt of the same experiment starts from scratch.
+    local CKPT_DIR="$OUTPUT_DIR"
+    [[ "$cfg_resume_mode" != "disable" && -n "${SLURM_JOB_ID:-}" ]] && CKPT_DIR="${OUTPUT_DIR}/job_${SLURM_JOB_ID}"
 
     echo ""
     echo "=============================================="
@@ -341,6 +349,7 @@ run_method() {
     echo "Val loss type: $cfg_val_loss_type | Val source: $cfg_val_source"
     echo "Rule: $cfg_selection_mode/$cfg_selection_level frac=$cfg_selection_frac norm=$cfg_score_normalization recenter=$cfg_recenter_advantages two_pass=$cfg_two_pass keep_groups=${cfg_keep_groups:-auto} drop_zero_adv=$cfg_drop_zero_adv keep_zero_adv=$cfg_keep_zero_adv"
     echo "Output: $OUTPUT_DIR"
+    [[ "$cfg_resume_mode" != "disable" ]] && echo "Checkpoint: every $cfg_save_freq round(s) -> $CKPT_DIR (resume_mode=$cfg_resume_mode, keep=${cfg_max_ckpt_keep:-all})"
     echo "=============================================="
 
     # Auto-prepare data if missing (only for selection methods)
@@ -418,8 +427,8 @@ run_method() {
     trainer.save_freq=$cfg_save_freq \
     trainer.test_freq=$cfg_test_freq \
     trainer.total_epochs=$cfg_total_epochs \
-    trainer.default_local_dir=$OUTPUT_DIR \
-    trainer.resume_mode=disable \
+    trainer.default_local_dir=$CKPT_DIR \
+    trainer.resume_mode=$cfg_resume_mode \
     trainer.balance_batch=True \
     trainer.log_val_generations=5 \
     +selection.enable=$selection_enabled \
@@ -452,6 +461,8 @@ run_method() {
     fi
     [[ -n "$cfg_total_training_steps" ]] && cmd+=" \
     trainer.total_training_steps=$cfg_total_training_steps"
+    [[ -n "$cfg_max_ckpt_keep" ]] && cmd+=" \
+    trainer.max_actor_ckpt_to_keep=$cfg_max_ckpt_keep"
 
     echo ""
     echo "Running command:"

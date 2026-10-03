@@ -118,7 +118,7 @@ class SelectionActorRolloutRefWorker(BaseActorRolloutRefWorker):
             recenter_advantages=selection_config.get("recenter_advantages", False),
             two_pass=selection_config.get("two_pass", False),
             drop_zero_adv=selection_config.get("drop_zero_adv", False),
-            keep_zero_adv=selection_config.get("keep_zero_adv", False),
+            keep_zero_adv=selection_config.get("keep_zero_adv", True),
         )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
