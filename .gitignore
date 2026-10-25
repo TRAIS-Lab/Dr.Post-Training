@@ -98,3 +98,11 @@ SFT/tables/data/
 # Hillclimb hook files
 /.claude/settings.local.json
 /.claude/settings.local.json.malformed-*
+
+# Results roots folded into the repo (SCRATCH_DIR may equal CODE_DIR): per-setting run dirs, job manifests,
+# theory-probe step checkpoints, generated datasets, base models
+**/manifests/
+SFT/theory-probe/checkpoints/
+SFT/data/candidates/
+RLVR/data/math/
+/models/

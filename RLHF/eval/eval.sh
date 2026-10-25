@@ -15,7 +15,7 @@ export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 set -e
 
 # Default values
-models_dir="$SCRATCH_DIR/Dr.Post-Training/RLHF"
+models_dir="$SCRATCH_DIR/Dr.Post-Training/RLHF/runs"
 task=""
 n_samples=400
 batch_size=16
@@ -63,7 +63,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo ""
             echo "Options:"
-            echo "  --models_dir DIR       Models directory (default: \$SCRATCH_DIR/Dr.Post-Training/RLHF)"
+            echo "  --models_dir DIR       Models directory (default: \$SCRATCH_DIR/Dr.Post-Training/RLHF/runs)"
             echo "  --task NAME            Filter by task (e.g., toxicity)"
             echo "  --n_samples N          Number of test samples (default: 400, -1 for all)"
             echo "  --batch_size N         Batch size for generation (default: 16)"

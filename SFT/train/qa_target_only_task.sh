@@ -3,7 +3,7 @@
 # qa_target_only.txt from SFT/train/qa_matrix_manifest.py, wrapper slurm/qa_array.sbatch)
 # Optional 4th argument <steps>: a short step budget instead of the main run's (e.g. 50 = the oracle early-stopping probe,
 # evaluation perplexity every 5 steps). Launch those with RUNS_ROOT set to a directory the table scanner does not read
-# (SFT/tables/qa_downstream.py --scan matches every ms<steps> dir directly under runs_v2), e.g. runs_v2/target_only_ms50.
+# (SFT/tables/qa_downstream.py --scan matches every ms<steps> dir directly under runs), e.g. runs/target_only_ms50.
 # N_VAL=<k> in the environment trains on k target examples instead of 16 (the first k rows of the seed's shuffled D*, the same rows a
 # curated run with N_VAL=k scores against; run dir -v<k>-, not read by the paper scanner): the target-set size sweep, SFT/tables/qa_nval_sweep.py.
 # Target-Only Update for the question-answering tables (adxtab:sft-prelim-ppl): standard training on the 16 held-out target examples
@@ -13,7 +13,7 @@
 set -u
 cfg=$1; method=$2; seed=$3; steps=${4:-}
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; cd "$REPO_ROOT"; source "$REPO_ROOT/cluster_env.sh"; activate_env
-RUNS_ROOT=${RUNS_ROOT:-$SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2}
+RUNS_ROOT=${RUNS_ROOT:-$SCRATCH_DIR/Dr.Post-Training/SFT/runs}
 declare -A TASK=( [alpaca_samsum]=samsum [less_tydiqa]=tydiqa [triviaqa_nq]=nq_open [less_squad]=squad )
 declare -A EVERY=( [samsum]=100 [tydiqa]=45 [nq_open]=44 [squad]=44 )   # eval every ~1/26 of the step budget
 task=${TASK[$cfg]}

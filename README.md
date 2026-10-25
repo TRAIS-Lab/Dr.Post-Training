@@ -73,7 +73,7 @@ cat > cluster_env.sh << 'EOF'
 # This file is gitignored — safe to edit without merge conflicts.
 
 # Directory paths
-export SCRATCH_DIR="/scratch/$USER/Project"   # where data/checkpoints live
+export SCRATCH_DIR="$HOME/Project"            # results root: runs/checkpoints land under $SCRATCH_DIR/Dr.Post-Training/<setting>/runs (may equal CODE_DIR)
 export CODE_DIR="$HOME/Project"               # where this repo is cloned
 
 # Conda environment activation

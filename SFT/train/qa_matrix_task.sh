@@ -12,7 +12,7 @@ set -u
 cfg=$1; method=$2; seed=$3
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"; source "$REPO_ROOT/cluster_env.sh"; activate_env
-RUNS_ROOT=${RUNS_ROOT:-$SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2}
+RUNS_ROOT=${RUNS_ROOT:-$SCRATCH_DIR/Dr.Post-Training/SFT/runs}
 cdir=SFT/train/configs/$cfg
 yval() { grep -E "^$2:" "$1" | head -1 | cut -d: -f2- | xargs; }
 train=$(yval $cdir/defaults.yaml train_dataset); target=$(yval $cdir/defaults.yaml target_task)

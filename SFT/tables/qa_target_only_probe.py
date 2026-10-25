@@ -4,7 +4,7 @@
 Not a paper table. The probe trains the Target-Only arm on the 16 target examples for 50 steps instead of the main run's budget
 (the held-out perplexity of the full-budget runs is minimal within the first ~50 steps, read off the test set, so the probe is an
 oracle early stop) and evaluates with the paper protocol (SFT/eval/eval.sh --batch_size 64 --n_test 500).
-Probe runs:   <results root>/SFT/runs_v2/target_only_ms50/<task>_val_<task>-Llama-3.2-1B-FullTraining-<FT>-ms50-lr<lr>-b8-v16-s<seed>/
+Probe runs:   <results root>/SFT/runs/target_only_ms50/<task>_val_<task>-Llama-3.2-1B-FullTraining-<FT>-ms50-lr<lr>-b8-v16-s<seed>/
               (SFT/train/qa_target_only_ms50_task.sh over SFT/train/manifests/qa_target_only_ms50{,_meso}.txt; 3 fine-tuning
               methods x 4 settings x 5 seeds) -> <task>_results.json (downstream metric), evaluation_results.json (held-out
               perplexity every 5 steps).
@@ -94,7 +94,7 @@ def main():
     ap.add_argument("--csv", type=Path, default=REPO / "SFT" / "tables" / "data" / "qa_runs.csv")
     ap.add_argument("--md", type=Path, default=REPO / "SFT" / "tables" / "data" / "qa_target_only_ms50.md")
     a = ap.parse_args()
-    root = results_root(a.results_root) / "SFT" / "runs_v2" / "target_only_ms50"
+    root = results_root(a.results_root) / "SFT" / "runs" / "target_only_ms50"
     probe = read_probe(root)
     base = read_csv(a.csv)
     out = []

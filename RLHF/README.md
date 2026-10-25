@@ -99,7 +99,7 @@ Clipping only affects the *training-side* per-sample gradients inside the PPO ep
 
 Run directories are named
 `{task}-{model}-{Method}-{finetuning}-lr{lr}-b{batch}-v{n_val}-{rew|tpg|tloss}[-b{val_batch_size}]-pe{ppo_epochs}-mb{mini_batch}-kl{init_kl_coef}-s{seed}`
-under `$SCRATCH_DIR/Dr.Post-Training/RLHF/`. `FullTraining` never uses a target and is always
+under `$SCRATCH_DIR/Dr.Post-Training/RLHF/runs/`. `FullTraining` never uses a target and is always
 filed under `v0-rew`; `result.ipynb` reuses that single run for every scenario. The same names
 (`SCENARIOS`, `VAL_TYPE_SHORT`) are used in `result.ipynb` and `train/submit_all.sh`.
 

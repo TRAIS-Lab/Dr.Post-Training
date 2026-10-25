@@ -539,7 +539,7 @@ def main():
     model_group.add_argument(
         "--models_dir",
         type=str,
-        default=os.environ.get("SCRATCH_DIR", "/scratch") + "/Dr.Post-Training/RLHF",
+        default=os.environ.get("SCRATCH_DIR", "/scratch") + "/Dr.Post-Training/RLHF/runs",
         help="Directory containing trained models",
     )
     model_group.add_argument(

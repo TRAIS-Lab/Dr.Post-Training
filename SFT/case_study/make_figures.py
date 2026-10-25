@@ -6,7 +6,7 @@ Experiments run on : one node with 4x A40
 Launcher           : SFT/case_study/run.sh --train <pool> --task <target> --percentage <pct> --seed <seed> (manifest case_study.txt of
                      SFT/train/qa_matrix_manifest.py with SFT/train/slurm/qa_array.sbatch): full-parameter Llama-3.2-1B, lr 1e-5, the
                      step budget of the setting, both selection rules scored at every step without being applied
-Results read from  : <results root>/SFT/runs_v2/case_study/<pool>_<target>-Llama-3.2-1B-p<pct>-lr1e-05-b8-v16-s<seed>/selection_records.json
+Results read from  : <results root>/SFT/runs/case_study/<pool>_<target>-Llama-3.2-1B-p<pct>-lr1e-05-b8-v16-s<seed>/selection_records.json
 Seeds / statistics : 42, 2, 22, 62, 82; per (block, layer type) the per-step values of all seeds are pooled; lines = mean, bands =
                      25th-75th percentile; the annotation marks the down_proj peak (magnitude ratio to the next type; rho_S at the peak)
 Usage              : python SFT/case_study/make_figures.py [--results-root DIR] [--paper-root DIR] [--venues ICLR] [--out DIR] [--summary]
@@ -204,7 +204,7 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="write the PDFs here instead of <paper root>/<venue>/Figures/SFT/case_study")
     ap.add_argument("--summary", action="store_true", help="print the type-averaged magnitudes and correlations")
     args = ap.parse_args()
-    runs = results_root(args.results_root) / "SFT" / "runs_v2" / "case_study"
+    runs = results_root(args.results_root) / "SFT" / "runs" / "case_study"
     outs = [Path(args.out)] if args.out else [paper_root(args.paper_root) / v / "Figures" / "SFT" / "case_study" for v in args.venues.split(",") if v]
     missing = 0
     for prefix, pct in SETTINGS:

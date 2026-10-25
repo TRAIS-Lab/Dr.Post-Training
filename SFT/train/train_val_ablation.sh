@@ -4,7 +4,7 @@
 # When n_val < the D* file size the run uses exactly the rows a curation run with the same --seed / --n_val sees
 # (train.py: random.Random(seed).shuffle(all rows), first n_val), written to <run_dir>/dstar_subset.jsonl.
 # Forwards the yaml keys init_eot_from_eos / loss_reduction; run dirs land under --runs_root (default
-# $SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2). The yaml `learning_rate` is used unless --lr is given (MeSO 5e-5, LoRA 1e-4,
+# $SCRATCH_DIR/Dr.Post-Training/SFT/runs). The yaml `learning_rate` is used unless --lr is given (MeSO 5e-5, LoRA 1e-4,
 # Full 1e-5 as in the FullTraining-*.yaml of the setting) and the nested MeSO keys `optimizer.compression` / `optimizer.refresh_freq`
 # are parsed. Used by SFT/train/qa_target_only_task.sh for the Target-Only rows of the question-answering tables (adxtab:sft-prelim-ppl);
 # the Qwen Target-Only arms are not part of the paper. Never edit this file while jobs run it: copy, edit, launch the copy.
@@ -181,7 +181,7 @@ Optional:
   --eval_steps <n>       Evaluate every N steps (default: 400; set to ~max_steps/100 for ~100 ppl points)
   --lr <lr>              Learning rate override
   --seed <seed>          Random seed (default: 42)
-  --runs_root <dir>      Parent directory for run dirs (default $SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2)
+  --runs_root <dir>      Parent directory for run dirs (default $SCRATCH_DIR/Dr.Post-Training/SFT/runs)
   --init_eot_from_eos <bool>  Initialise the chat end-of-turn row from <|endoftext|> (overrides the yaml key)
   --dry-run              Print commands without executing
 HELP
@@ -431,7 +431,7 @@ run_method() {
     fi
     local JOB_NAME="${task}_val_${task}-${model_name}-${method_str:-$exp_name}-ms${max_steps}-lr${exp_lr}-b${batch_size}-v${n_val}-s${seed}${sched_suffix}"
 
-    local runs_root="${runs_root_override:-$SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2}"
+    local runs_root="${runs_root_override:-$SCRATCH_DIR/Dr.Post-Training/SFT/runs}"
     local output_dir=$runs_root/${JOB_NAME}
     mkdir -p "$output_dir"
 

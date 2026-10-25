@@ -17,12 +17,12 @@ question-answering and system-benchmark experiment (its benchmark JSONs live und
 FAMILIES = [
     # ------------------------------------------------------------------ SFT, Qwen3-1.7B-Base capability settings (h200)
     dict(script="SFT/tables/qwen_capability.py", machine="h200",
-         results="$DRPT_RESULTS/SFT/runs_v2/<run>/{ifeval,ifbench,math500,gsm8k}_results.greedy.json",
+         results="$DRPT_RESULTS/SFT/runs/<run>/{ifeval,ifbench,math500,gsm8k}_results.greedy.json",
          tables={"sft_qwen_main.tex": "tab:SFT-qwen",
                  "sft_qwen_nval_if.tex": "adxtab:sft-qwen-nval-if", "sft_qwen_nval_math.tex": "adxtab:sft-qwen-nval-math"}),
     # ------------------------------------------------------------------ SFT, Llama-3.2-1B question answering (a40)
     dict(script="SFT/tables/qa_downstream.py", machine="a40",
-         results="$DRPT_RESULTS/SFT/runs_v2/<run>/{<target>_results.json, evaluation_results.json} (--scan) -> SFT/tables/data/qa_runs.csv (local, gitignored per-run export the tables are built from)",
+         results="$DRPT_RESULTS/SFT/runs/<run>/{<target>_results.json, evaluation_results.json} (--scan) -> SFT/tables/data/qa_runs.csv (local, gitignored per-run export the tables are built from)",
          tables={"sft_downstream.tex": "tab:SFT-downstream", "sft_qa_ppl.tex": "adxtab:sft-qa-ppl",
                  "sft_qa_matrix_lora.tex": "adxtab:sft-qa-matrix-lora", "sft_qa_matrix_full.tex": "adxtab:sft-qa-matrix-full",
                  "sft_qa_matrix_meso.tex": "adxtab:sft-qa-matrix-meso",

@@ -31,7 +31,7 @@ record_freq=1
 max_steps=-1  # -1 = full epoch
 dry_run=false
 sweep=false
-runs_root="${RUNS_ROOT:-$SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2}"
+runs_root="${RUNS_ROOT:-$SCRATCH_DIR/Dr.Post-Training/SFT/runs}"
 
 # Parse CLI arguments
 while [[ $# -gt 0 ]]; do

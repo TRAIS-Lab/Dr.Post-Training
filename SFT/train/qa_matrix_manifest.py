@@ -13,7 +13,7 @@ Matrix: exact scoring = GIP (PIP computes the same inner product, SFT/benchmark/
 compressed scoring = normal-64*64 for every fine-tuning method. Yaml names: FullTraining-<FT>; LayerWiseSubset-<FT> (Full / LoRA) and
 {Block,Sublayer}WiseSubset-LoRA are the compressed cells without a suffix; every other cell is <Method>-<FT>-<gip|cmp>;
 controls <Method>-<FT>-{random,lnorm} (Random Subset; layer-normalized Global Subset, compressed). MeSO arms use learning rate 5e-5.
-Run dirs: <results root>/SFT/runs_v2 (tables/common.py: --results-root, $DRPT_RESULTS or $SCRATCH_DIR/Dr.Post-Training).
+Run dirs: <results root>/SFT/runs (tables/common.py: --results-root, $DRPT_RESULTS or $SCRATCH_DIR/Dr.Post-Training).
 Usage: python SFT/train/qa_matrix_manifest.py [--force] [--results-root DIR]
 """
 from __future__ import annotations
@@ -88,7 +88,7 @@ def main():
     ap.add_argument("--force", action="store_true", help="overwrite existing manifest files (only when no array uses them)")
     ap.add_argument("--results-root", default=None)
     a = ap.parse_args()
-    runs = results_root(a.results_root) / "SFT" / "runs_v2"
+    runs = results_root(a.results_root) / "SFT" / "runs"
     out_all = []
     for stage, cells in STAGES:
         lines, minutes = [], 0.0

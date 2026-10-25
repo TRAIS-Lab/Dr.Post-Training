@@ -39,7 +39,7 @@ fi
 # Data paths
 # =============================================================================
 DATA_DIR=$SCRATCH_DIR/Dr.Post-Training/RLVR/data
-OUTPUT_BASE=$SCRATCH_DIR/Dr.Post-Training/RLVR/output
+OUTPUT_BASE=$SCRATCH_DIR/Dr.Post-Training/RLVR/runs
 
 # =============================================================================
 # CLI

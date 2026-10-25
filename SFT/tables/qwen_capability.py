@@ -3,10 +3,10 @@
 IFEval-loose column) for ad-hoc use; they are not paper tables.
 
 Experiments run on : 8x H200 nodes
-Launcher           : SFT/train/train.sh -c configs/<setting> -m <arm> --runs_root <results root>/SFT/runs_v2 ; SFT/eval/eval.sh --target <target>
+Launcher           : SFT/train/train.sh -c configs/<setting> -m <arm> --runs_root <results root>/SFT/runs ; SFT/eval/eval.sh --target <target>
                      settings dolci_inst_if, dolci_mixed_if, tulu3_if, dolci_reason_mathpersona, dolci_mixed_mathpersona, tulu3_mathpersona,
                      dolci_reason_mathref128_gen32b; arms FullTraining-Full-eot, {Global,LayerWise}Subset-Full[-f25|-f75]-eot; --n_val 128/64/32/16
-Results read from  : <results root>/SFT/runs_v2/<pool>_<target>-Qwen3-1.7B-Base-<arm>-p1.0-lr1.00e-05-b8-v<n_val>-s<seed>/
+Results read from  : <results root>/SFT/runs/<pool>_<target>-Qwen3-1.7B-Base-<arm>-p1.0-lr1.00e-05-b8-v<n_val>-s<seed>/
                      {ifeval,ifbench,math500,gsm8k}_results.greedy.json
 Seeds / statistics : 42, 2, 22, 62, 82; mean +- SE (population std / sqrt n); best per column bold (ties at one decimal all bold)
 Usage              : python SFT/tables/qwen_capability.py [--results-root DIR] [--paper-root DIR] [--venues ICLR] [--check]
@@ -64,10 +64,10 @@ SETTINGS = IF_SETTINGS + MATH_SETTINGS
 
 # --------------------------------------------------------------------------------------------------------------- reading
 class Runs:
-    """Reads one metric of one arm over all seeds from <results root>/SFT/runs_v2."""
+    """Reads one metric of one arm over all seeds from <results root>/SFT/runs."""
 
     def __init__(self, root: Path):
-        self.dir = root / "SFT" / "runs_v2"
+        self.dir = root / "SFT" / "runs"
 
     def scores(self, prefix: str, arm: str, nval: int, metric) -> dict[int, float]:
         _, fn, key = metric

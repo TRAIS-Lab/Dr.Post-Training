@@ -18,7 +18,7 @@ export PYTHONPATH="$CODE_DIR/Dr.Post-Training:$PYTHONPATH"
 set -e
 
 # Default values
-models_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2"
+models_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/runs"
 data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
 model_path=""
 train=""

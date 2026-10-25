@@ -6,7 +6,7 @@ Not a paper table (the paper's n_val ablation is the Qwen one, SFT/tables/qwen_c
 results: on the format-dominated targets (samsum, tydiqa) a handful of target examples should already carry Target-Only, while the
 curated arms' scoring signal degrades with fewer target examples; on the knowledge targets (nq_open, squad) Target-Only should stay
 below the curated arms at every size.
-Runs:   <results root>/SFT/runs_v2/<pool>_<target>-Llama-3.2-1B-<arm>-p<pct>-lr1.00e-04-b8-v<k>-s<seed>/<target>_results.json
+Runs:   <results root>/SFT/runs/<pool>_<target>-Llama-3.2-1B-<arm>-p<pct>-lr1.00e-04-b8-v<k>-s<seed>/<target>_results.json
         (SFT/train/qa_matrix_task.sh with N_VAL=k over manifests/qa_nval_sweep.txt; arms LayerWiseSubset-LoRA-gip, GlobalSubset-LoRA-gip)
         <target>_val_<target>-Llama-3.2-1B-FullTraining-LoRA-ms<budget>-lr1.00e-04-b8-v<k>-s<seed>/ (qa_target_only_task.sh with N_VAL=k
         over manifests/qa_nval_sweep_target_only.txt); k = 16 rows are the paper's runs.
@@ -52,7 +52,7 @@ def main():
     ap.add_argument("--results-root", default=None)
     ap.add_argument("--md", type=Path, default=REPO / "SFT" / "tables" / "data" / "qa_nval_sweep.md")
     a = ap.parse_args()
-    runs = results_root(a.results_root) / "SFT" / "runs_v2"
+    runs = results_root(a.results_root) / "SFT" / "runs"
     out = ["# Target-set size sweep (LoRA, exact scoring): downstream metric, mean ± SE over 5 seeds\n",
            f"runs: `{runs}`; ROUGE-L x100 (samsum) or F1 (others), 500-example test protocol.\n"]
     for setting, prefix, task in SETTINGS:

@@ -4,7 +4,7 @@
 # Yaml keys forwarded to train.py besides the shared ones: init_eot_from_eos (Qwen3 <|im_end|> row init),
 # loss_reduction (sample_mean | token_mean; the paper uses sample_mean), score_normalization (none | layer_meanabs |
 # layer_std, layer-normalized Global Subset control), selection_mode (topk | random). Run dirs land under
-# --runs_root (default $SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2, the sample-mean tree the paper reads).
+# --runs_root (default $SCRATCH_DIR/Dr.Post-Training/SFT/runs, the sample-mean tree the paper reads).
 # CLI overrides of yaml keys: --gradient_checkpointing, --subset_mode, --eval_steps (48 GB cards; evaluation cadence).
 # Never edit this file while jobs are running it (bash reads scripts incrementally): copy, edit, launch the copy.
 #
@@ -101,7 +101,7 @@ Required:
 Optional:
   --seed <seed>           Override seed from config
   --lr <lr>               Override learning rate from config
-  --runs_root <dir>       Parent directory for run dirs (default $SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2)
+  --runs_root <dir>       Parent directory for run dirs (default $SCRATCH_DIR/Dr.Post-Training/SFT/runs)
   --n_val <n>             Override the number of D* rows (n_val) from config
   --eval_split <split>    Override eval split ("test" or "lr")
   --gradient_checkpointing <bool>  Override gradient_checkpointing from config (48 GB cards)
@@ -390,7 +390,7 @@ run_method() {
     local JOB_NAME="${train_str}_${cfg_target_task}-${model_name}-${method_str}-p${cfg_percentage}-lr${cfg_learning_rate}-b${cfg_batch_size}-v${cfg_n_val}-s${cfg_seed}"
 
     local data_dir="$SCRATCH_DIR/Dr.Post-Training/SFT/data"
-    local runs_root="${runs_root_override:-$SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2}"
+    local runs_root="${runs_root_override:-$SCRATCH_DIR/Dr.Post-Training/SFT/runs}"
     local output_dir="$runs_root/${JOB_NAME}"
     mkdir -p "$output_dir"
 

@@ -6,7 +6,7 @@ run=$1
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"; source "$REPO_ROOT/cluster_env.sh"; activate_env
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
-RLHF_ROOT=${RLHF_ROOT:-$SCRATCH_DIR/Dr.Post-Training/RLHF}
+RLHF_ROOT=${RLHF_ROOT:-$SCRATCH_DIR/Dr.Post-Training/RLHF/runs}
 if [ "$run" = "BASE" ]; then out=$RLHF_ROOT/rescore_BASE.json; else run=$RLHF_ROOT/$run; out=$run/rescore_final.json; fi
 [ -f "$out" ] && { echo "[rescore] exists: $out"; exit 0; }
 python -m RLHF.eval.rescore_final --run_dir "$run" --out "$out"

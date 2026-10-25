@@ -162,7 +162,7 @@ python SFT/data/build_rewrite_target.py --data_dir $DATA --source_target math_re
 
 # Train (Qwen3-1.7B-Base, batch 8, 2048 tokens, one epoch over the pool, sample-mean loss, <|im_end|> row initialised
 # from <|endoftext|>): the seven paper arms of every setting, 5 seeds, 128 target examples (the robustness tables also
-# use --n_val 64 / 32 / 16). Run dirs land under $SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2.
+# use --n_val 64 / 32 / 16). Run dirs land under $SCRATCH_DIR/Dr.Post-Training/SFT/runs.
 bash SFT/train/train.sh -c configs/dolci_inst_if -m all --seed 42
 bash SFT/train/train.sh -c configs/dolci_reason_mathpersona -m "FullTraining-Full-eot,LayerWiseSubset-Full-eot" --seed 42
 
@@ -228,7 +228,7 @@ length. Reported val/eval perplexities always use the model's token-mean loss.
 `tests/test_loss_convention.py` pins both conventions.
 
 `SFT/train/train.sh` forwards the `loss_reduction` yaml key and takes `--runs_root <dir>`
-(default `$SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2`, the sample-mean tree).
+(default `$SCRATCH_DIR/Dr.Post-Training/SFT/runs`, the sample-mean tree).
 
 ## Data preparation
 
@@ -279,7 +279,7 @@ Every setting runs the whole matrix. Yaml naming (`SFT/train/configs/README.md`)
 are compressed; every other cell is `<Method>-<FT>-<gip|cmp>`, the controls `<Method>-<FT>-{random,lnorm}`.
 `SFT/train/qa_matrix_task.sh <setting> <yaml> <seed>` trains and evaluates one cell as a Slurm array task,
 `SFT/train/qa_target_only_task.sh` one Target-Only run (`train_val_ablation.sh`; an optional 4th argument sets a short step budget:
-`SFT/train/qa_target_only_ms50_task.sh` runs the 50-step Target-Only probe under `runs_v2/target_only_ms50/`, summarized by
+`SFT/train/qa_target_only_ms50_task.sh` runs the 50-step Target-Only probe under `runs/target_only_ms50/`, summarized by
 `SFT/tables/qa_target_only_probe.py`, not a paper table). The Qwen settings use the `-eot` arms
 `FullTraining-Full-eot` and `{Global,LayerWise}Subset-Full[-f25|-f75]-eot`; their Target-Only arms are not part of the paper.
 

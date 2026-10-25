@@ -5,7 +5,7 @@ Experiments run on : one node with 4x A40
 Launcher           : SFT/train/qa_matrix_task.sh <setting> <yaml> <seed> (train.sh, then eval.sh --batch_size 64 --n_test 500) over the
                      manifests of SFT/train/qa_matrix_manifest.py; Target-Only rows: SFT/train/qa_target_only_task.sh (train_val_ablation.sh);
                      settings alpaca_samsum, less_tydiqa, triviaqa_nq, less_squad; arms FullTraining-<FT>, <Method>-<FT>[-gip|-cmp|-random|-lnorm]
-Results read from  : <results root>/SFT/runs_v2/<pool>_<target>-Llama-3.2-1B-<yaml>-p<pct>-lr<lr>-b8-v16-s<seed>/{<target>_results.json,
+Results read from  : <results root>/SFT/runs/<pool>_<target>-Llama-3.2-1B-<yaml>-p<pct>-lr<lr>-b8-v16-s<seed>/{<target>_results.json,
                      evaluation_results.json} and <target>_val_<target>-Llama-3.2-1B-FullTraining-<FT>-ms<steps>-lr<lr>-b8-v16-s<seed>/ (Target-Only, full budget)
                      and target_only_ms50/<the same>-ms50-... (Target-Only, early-stopped: the rows of the tables).
                      --scan reads them and rewrites the local per-run export SFT/tables/data/qa_runs.csv (gitignored); without --scan
@@ -22,7 +22,7 @@ sft_downstream = the three main update rules under LoRA with exact scoring + Tar
 Layer-Wise Subset (all curated rows compressed, the backend of the layer-normalized control) x setting x fine-tuning method;
 sft_qa_ppl = Full-Training / Global (exact) / Layer-Wise (exact) / Target-Only, final evaluation perplexity, rows = setting x fine-tuning.
 Target-Only (no pool, no scoring): in Table 2 (sft_downstream) it is a plain fourth row that competes for bold like every other row; in the
-appendix tables it is listed after a rule and bold = best pool-based arm. Table 2 shows its early-stopped runs (50 steps, runs_v2/target_only_ms50, SFT/train/qa_target_only_ms50_task.sh; csv variant ms50), the appendix
+appendix tables it is listed after a rule and bold = best pool-based arm. Table 2 shows its early-stopped runs (50 steps, runs/target_only_ms50, SFT/train/qa_target_only_ms50_task.sh; csv variant ms50), the appendix
 tables show both the same-budget runs (csv variant "") and the early-stopped ones.
 --report prints the markdown matrix, the Target-Only perplexity trajectory (minimum vs final) and seconds per step by backend.
 """
@@ -354,11 +354,11 @@ def completeness(c: Cells) -> None:
 # -------------------------------------------------------------------------------------------------------------------- main
 def main() -> int:
     ap = add_common_args(argparse.ArgumentParser(description=__doc__.splitlines()[0]))
-    ap.add_argument("--scan", action="store_true", help=f"rescan the run dirs under <results root>/SFT/runs_v2 and rewrite {CSV.relative_to(REPO)}")
+    ap.add_argument("--scan", action="store_true", help=f"rescan the run dirs under <results root>/SFT/runs and rewrite {CSV.relative_to(REPO)}")
     ap.add_argument("--report", action="store_true", help="print the markdown matrix, the Target-Only trajectory and s/step by backend")
     args = ap.parse_args()
     if args.scan or not CSV.exists():
-        runs = results_root(args.results_root) / "SFT" / "runs_v2"
+        runs = results_root(args.results_root) / "SFT" / "runs"
         rows = scan(runs)
         write_csv(rows)
         print(f"{len(rows)} runs under {runs} -> {CSV.relative_to(REPO)}")

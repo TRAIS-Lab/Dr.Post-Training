@@ -89,7 +89,7 @@ validation gradient storage. The actual training is unaffected.
 ### Raw data
 
 ```
-$SCRATCH_DIR/Dr.Post-Training/SFT/runs_v2/case_study/        # <results root>/SFT/runs_v2/case_study, see tables/common.py
+$SCRATCH_DIR/Dr.Post-Training/SFT/runs/case_study/        # <results root>/SFT/runs/case_study, see tables/common.py
   alpaca_samsum-Llama-3.2-1B-p0.4-lr1e-05-b8-v16-s{2,22,42,62,82}/
   less_tydiqa-Llama-3.2-1B-p0.005-lr1e-05-b8-v16-s{2,22,42,62,82}/
   triviaqa_nq_open-Llama-3.2-1B-p0.05-lr1e-05-b8-v16-s{2,22,42,62,82}/

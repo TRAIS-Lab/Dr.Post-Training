@@ -107,7 +107,7 @@ def main():
     ap.add_argument("--results-root", default=None)
     ap.add_argument("--md", type=Path, default=REPO / "SFT" / "tables" / "data" / "qa_generation_stats.md")
     a = ap.parse_args()
-    runs = results_root(a.results_root) / "SFT" / "runs_v2"
+    runs = results_root(a.results_root) / "SFT" / "runs"
     out = ["# Generation statistics (LoRA, exact scoring; mean over seeds)\n", f"runs: `{runs}`\n"]
     for setting, prefix, task in SETTINGS:
         cols = ["metric", "words", "run-on %"] + (["script match %"] if task == "tydiqa" else []) + [f"metric | first {TRUNC[task]} words"]
