@@ -28,9 +28,7 @@ compressed 64×64} plus the controls (`SFT/train/qa_matrix_task.sh`, `SFT/tables
 | `GlobalSubset-<FT>-lnorm` | layer-normalized Global Subset (`score_normalization: layer_meanabs`, compressed) |
 
 Learning rates: Full 1e-5, LoRA 1e-4, MeSO 5e-5 (`alpaca_samsum_meso_ablation/`: the Full-Training MeSO sweep
-over the learning rate, the sketch size and the refresh that selected 5e-5). `alpaca_samsum_diag/` holds the Layer-Wise LoRA
-runs with `record_selections: true` behind `SFT/benchmark/diag_compression_agreement.py` (exact vs 64/128/256/512 compressed
-scores on identical batches, quoted in the appendix).
+over the learning rate, the sketch size and the refresh that selected 5e-5).
 
 ## Dolci capability settings
 

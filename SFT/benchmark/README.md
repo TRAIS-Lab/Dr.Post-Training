@@ -540,7 +540,6 @@ benchmark/
 ├── aggregate_fused_ab.py     # Fused-kernel vs reference A/B table (results/fused_ab/)
 ├── qa_throughput_table.py    # Markdown summary of results/paper/qa_throughput (paper tables: SFT/tables/{system_efficiency,qa_timing}.py)
 ├── check_pip_gip_equivalence.py   # PIP == GIP on random factors (the matrix's exact backend is GIP)
-├── diag_compression_agreement.py  # exact vs 64..512 compressed Layer-Wise scores on identical batches (configs/alpaca_samsum_diag)
 ├── run_benchmarks.sh         # A40 launcher (breakdown + scoring)
 ├── README.md
 ├── slurm/
