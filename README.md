@@ -68,25 +68,11 @@ Both `cluster_env.sh` and `submit.sh` are **gitignored** — each user creates t
 ### 1. Create `cluster_env.sh`
 
 ```bash
-cat > cluster_env.sh << 'EOF'
-# Cluster-specific configuration
-# This file is gitignored — safe to edit without merge conflicts.
-
-# Directory paths
-export SCRATCH_DIR="$HOME/Project"            # results root: runs/checkpoints land under $SCRATCH_DIR/Dr.Post-Training/<setting>/runs (may equal CODE_DIR)
-export CODE_DIR="$HOME/Project"               # where this repo is cloned
-
-# Conda environment activation
-activate_env() { conda activate drpt; }
-# Or if conda activate doesn't work in non-interactive shells:
-# activate_env() { export PATH="$HOME/.conda/envs/drpt/bin:$PATH"; }
-
-# SLURM defaults
-export SLURM_ACCOUNT="my-account"
-export SLURM_PARTITION="gpu"
-export SLURM_MAIL_USER="user@example.edu"
-EOF
+cp cluster_env.example.sh cluster_env.sh   # then edit: SCRATCH_DIR, CODE_DIR, activate_env, SLURM_ACCOUNT/PARTITION/MAIL_USER
 ```
+
+The template documents every variable the scripts read (paths, conda activation, SLURM defaults for `submit.sh`,
+`HF_HOME`, `NLTK_DATA`, and the optional `DRPT_IFBENCH_REPO` override of the `third_party/IFBench` submodule).
 
 ### 2. Create `submit.sh`
 
@@ -102,14 +88,14 @@ GPUS="${GPUS:-4}"
 MEM="${MEM:-128g}"
 CPUS="${CPUS:-16}"
 TIME="${TIME:-12:00:00}"
-CONSTRAINT="${CONSTRAINT:-scratch}"
+CONSTRAINT="${CONSTRAINT:-}"   # node feature, e.g. scratch on Delta; empty = none
 LOG_DIR="${CODE_DIR}/Dr.Post-Training/log"
 mkdir -p "$LOG_DIR"
 
 sbatch --job-name="$JOB_NAME" --account="$SLURM_ACCOUNT" --partition="$SLURM_PARTITION" \
     --mail-user="$SLURM_MAIL_USER" --mail-type="END" --mem="$MEM" --nodes=1 \
     --ntasks-per-node=1 --cpus-per-task="$CPUS" --gpus-per-node="$GPUS" \
-    --gpu-bind=none --time="$TIME" --constraint="$CONSTRAINT" \
+    --gpu-bind=none --time="$TIME" ${CONSTRAINT:+--constraint="$CONSTRAINT"} \
     --output="$LOG_DIR/%x-%j.log" "$SCRIPT" "$@"
 SCRIPT
 chmod +x submit.sh

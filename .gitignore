@@ -57,7 +57,7 @@ dist
 **/wandb
 
 # Cluster-specific config and any local copy/backup of it (never commit; each user has their own)
-cluster_env.sh*
+/cluster_env.sh
 submit.sh*
 
 # debug
