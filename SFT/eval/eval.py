@@ -642,8 +642,9 @@ def main():
         help="Run every benchmark of this target (precise_if -> ifeval+ifbench, math -> math500, "
              "mbpp -> mbpp_plus; <base>_gen*/<base>_rw* rewritten-D* variants map to the base target's "
              "benchmarks). Also used as the run-name filter together with --train.")
-    parser.add_argument("--ifbench_repo", type=str, default=os.environ.get("DRPT_IFBENCH_REPO"),
-        help="Local checkout of allenai/IFBench (required for ifbench)")
+    parser.add_argument("--ifbench_repo", type=str,
+        default=os.environ.get("DRPT_IFBENCH_REPO") or os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "third_party", "IFBench"),
+        help="Checkout of allenai/IFBench (default: the third_party/IFBench submodule, or DRPT_IFBENCH_REPO)")
     parser.add_argument("--ifbench_revision", type=str, default=None,
         help="Expected IFBench commit (default: the pinned commit in tasks/ifbench.py)")
     parser.add_argument("--evalplus_runner", type=str, default=None,

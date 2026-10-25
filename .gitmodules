@@ -1,3 +1,6 @@
 [submodule "RLVR/verl"]
 	path = RLVR/verl
 	url = https://github.com/volcengine/verl.git
+[submodule "third_party/IFBench"]
+	path = third_party/IFBench
+	url = https://github.com/allenai/IFBench

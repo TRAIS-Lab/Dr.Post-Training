@@ -4,7 +4,8 @@ Generation happens here; scoring is delegated to a local checkout of
 ``allenai/IFBench`` (``python -m run_eval``) so its 58 out-of-distribution
 constraint implementations are not approximated with the older IFEval registry.
 
-Point ``--ifbench_repo`` (or ``DRPT_IFBENCH_REPO``) at the checkout. The commit
+The checkout is the ``third_party/IFBench`` submodule by default; ``--ifbench_repo``
+(or ``DRPT_IFBENCH_REPO``) points at another one. The commit
 is compared against ``DEFAULT_IFBENCH_REVISION`` and a mismatch is logged as a
 warning; pass ``--ifbench_revision`` to pin a different commit. Primary metric:
 prompt-level loose accuracy (the IFBench reporting convention).

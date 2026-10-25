@@ -106,3 +106,6 @@ SFT/theory-probe/checkpoints/
 SFT/data/candidates/
 RLVR/data/math/
 /models/
+
+# third-party data kept inside the repo
+/data/nltk_data/

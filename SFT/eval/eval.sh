@@ -34,7 +34,7 @@ top_k=""
 seed=42
 dry_run=false
 target=""
-ifbench_repo="${DRPT_IFBENCH_REPO:-}"
+ifbench_repo="${DRPT_IFBENCH_REPO:-$CODE_DIR/Dr.Post-Training/third_party/IFBench}"   # the third_party/IFBench submodule
 evalplus_runner=""
 evalplus_image=""
 evalplus_dataset_path=""
@@ -131,7 +131,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --train NAME         Filter by training dataset (alpaca, less, tulu3, wizardlm)"
             echo "  --task NAME          Run exactly one task (legacy: samsum tydiqa mmlu bbh gsm8k; benchmarks: ifeval ifbench math500 mbpp_plus)"
             echo "  --target NAME        Run all benchmarks of a target (precise_if -> ifeval+ifbench, math -> math500, mbpp -> mbpp_plus)"
-            echo "  --ifbench_repo DIR   Checkout of allenai/IFBench (or set DRPT_IFBENCH_REPO); needed for ifbench"
+            echo "  --ifbench_repo DIR   Checkout of allenai/IFBench (default: the third_party/IFBench submodule, or DRPT_IFBENCH_REPO)"
             echo "  --evalplus_runner R  auto|apptainer|singularity|host for mbpp_plus (default auto)"
             echo "  --evalplus_image I   EvalPlus container image (default: pinned official image)"
             echo "  --evalplus_dataset_path P  Local MbppPlus JSONL for offline container evaluation"

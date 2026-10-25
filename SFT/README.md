@@ -167,8 +167,7 @@ bash SFT/train/train.sh -c configs/dolci_inst_if -m all --seed 42
 bash SFT/train/train.sh -c configs/dolci_reason_mathpersona -m "FullTraining-Full-eot,LayerWiseSubset-Full-eot" --seed 42
 
 # Evaluate every run of a setting on its benchmarks (greedy decoding, 2048 new tokens)
-bash SFT/eval/eval.sh --train dolci_instruction --target precise_if --batch_size 64 --temperature 0 \
-    --ifbench_repo /path/to/IFBench
+bash SFT/eval/eval.sh --train dolci_instruction --target precise_if --batch_size 64 --temperature 0
 bash SFT/eval/eval.sh --train dolci_reasoning --target math_persona --batch_size 64 --temperature 0
 
 # Paper tables from the finished runs (verified against the paper with --check)
@@ -176,9 +175,12 @@ python SFT/tables/qwen_capability.py --check
 ```
 
 Verifier dependencies: `langdetect`, `immutabledict`, `nltk` (IFEval, vendored
-under `SFT/eval/tasks/ifeval_lib`), a checkout of
-[`allenai/IFBench`](https://github.com/allenai/IFBench) at the pinned commit
-(IFBench), and `math-verify` (MATH500 / GSM8K; boxed-answer fallback if missing).
+under `SFT/eval/tasks/ifeval_lib`), the
+[`allenai/IFBench`](https://github.com/allenai/IFBench) submodule at `third_party/IFBench`
+(IFBench; `git submodule update --init`, pinned to the commit named in `SFT/eval/tasks/ifbench.py`;
+`--ifbench_repo` / `DRPT_IFBENCH_REPO` override it), and `math-verify` (MATH500 / GSM8K;
+boxed-answer fallback if missing). NLTK's punkt models are looked up through `NLTK_DATA`
+(cluster_env.sh points it at `data/nltk_data`) and downloaded there once if missing.
 
 ## Hyperparameters
 
