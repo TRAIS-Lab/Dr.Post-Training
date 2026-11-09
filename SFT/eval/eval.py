@@ -150,6 +150,15 @@ def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None):
         if len(tokenizer) > embedding_size:
             model.resize_token_embeddings(len(tokenizer))
 
+        # Base-weight edits made before LoRA wrapping at train time are not in the adapter (SFT/train/train.py)
+        edits_path = os.path.join(model_path, "base_model_edits.json")
+        if os.path.exists(edits_path):
+            with open(edits_path, "r") as f:
+                edits = json.load(f)
+            if edits.get("init_eot_from_eos"):
+                from SFT.train.model_arguments import init_end_of_turn_from_eos
+                logger.info(f"Re-applying init_eot_from_eos to the base model: {init_end_of_turn_from_eos(model, tokenizer)}")
+
         model = PeftModel.from_pretrained(model, model_path)
         model = model.merge_and_unload()
     else:

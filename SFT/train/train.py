@@ -5,6 +5,7 @@ Training script for SFT with layer_wise_subset descent.
 """
 
 import functools
+import json
 import logging
 import os
 import sys
@@ -480,6 +481,11 @@ def main():
     if isinstance(trainer.model, transformers.PreTrainedModel) and not isinstance(trainer.model, PeftModel):
         trainer.model.save_pretrained = functools.partial(trainer.model.save_pretrained, max_shard_size="200GB")
     trainer.save_model()
+    # A LoRA run saves only the adapter, so the init_eot_from_eos edit of the frozen base rows is not in the checkpoint;
+    # record it so SFT/eval/eval.py re-applies it to the base model before attaching the adapter.
+    if model_args.init_eot_from_eos and isinstance(trainer.model, PeftModel):
+        with open(os.path.join(training_args.output_dir, "base_model_edits.json"), "w") as f:
+            json.dump({"init_eot_from_eos": True}, f)
 
     # Clean up hooks (only if grad_hook was created)
     if grad_hook is not None and grad_hook.hooks_registered:
