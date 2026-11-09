@@ -116,6 +116,19 @@ class SaveAtStepsCallback(TrainerCallback):
         return control
 
 
+class StopAtStepCallback(TrainerCallback):
+    """End training at a global step without touching the scheduler, whose horizon stays the full run's."""
+
+    def __init__(self, step):
+        self.step = int(step)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step >= self.step:
+            logger.info(f"stop_at_step: ending training at step {state.global_step} of {state.max_steps}")
+            control.should_training_stop = True
+        return control
+
+
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
 
@@ -155,6 +168,19 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
     ensure_chat_template(tokenizer)
+    if model_args.chat_template:
+        from SFT.data.chat_format import CHAT_TEMPLATES, has_native_chat_template
+        if has_native_chat_template(tokenizer):
+            raise ValueError(f"chat_template={model_args.chat_template} replaces the fallback only; this tokenizer ships its own")
+        tokenizer.chat_template = CHAT_TEMPLATES[model_args.chat_template]
+        logger.info(f"Chat template: {model_args.chat_template}")
+    if model_args.add_bos:
+        from SFT.data.chat_format import ENCODING_FILE, set_add_bos
+        set_add_bos(tokenizer, True)
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        with open(os.path.join(training_args.output_dir, ENCODING_FILE), "w") as f:
+            json.dump({"add_bos": True}, f)
+        logger.info(f"add_bos: every sequence starts with BOS id {tokenizer.bos_token_id} ({tokenizer.bos_token!r})")
 
     # Load training dataset
     train_dataset = get_training_dataset(
@@ -163,7 +189,9 @@ def main():
         tokenizer=tokenizer,
         max_seq_length=data_args.max_seq_length,
         sample_percentage=data_args.percentage,
-        seed=training_args.data_seed if training_args.data_seed is not None else training_args.seed,
+        seed=(training_args.subset_seed if training_args.subset_seed is not None
+              else training_args.data_seed if training_args.data_seed is not None else training_args.seed),
+        subset_sampler=training_args.subset_sampler,
         train_files=data_args.train_files if data_args.train_files else None,
         train_dataset_names=training_args.train_dataset_names
     )
@@ -425,7 +453,7 @@ def main():
         task=training_args.analysis_dataset,
         data_dir=data_args.data_dir,
         tokenizer=tokenizer,
-        max_length=data_args.max_seq_length,
+        max_length=training_args.target_max_seq_length or data_args.max_seq_length,
         split="validation",
         k=training_args.n_val,
         seed=training_args.seed,
@@ -437,7 +465,7 @@ def main():
         task=training_args.analysis_dataset,
         data_dir=data_args.data_dir,
         tokenizer=tokenizer,
-        max_length=data_args.max_seq_length,
+        max_length=training_args.target_max_seq_length or data_args.max_seq_length,
         split=data_args.eval_split,
         k=training_args.n_eval,
     )
@@ -466,6 +494,8 @@ def main():
     if training_args.save_at_steps:
         steps = [float(x) for x in str(training_args.save_at_steps).split(",") if x.strip()]
         trainer.add_callback(SaveAtStepsCallback(steps))
+    if training_args.stop_at_step:
+        trainer.add_callback(StopAtStepCallback(training_args.stop_at_step))
 
     train_result = trainer.train()
 

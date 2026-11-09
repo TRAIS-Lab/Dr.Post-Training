@@ -164,6 +164,31 @@ class TrainingArguments(TA):
             )
         },
     )
+    subset_sampler: str = field(
+        default="torch",
+        metadata={"help": "How the `percentage` subset of the pool is drawn: torch (torch.randperm) or numpy "
+                          "(np.random.permutation, the LESS / GREATS sampler)."},
+    )
+    subset_seed: Optional[int] = field(
+        default=None,
+        metadata={"help": "Seed of the pool subset, fixed across training seeds (GREATS: sample_data_seed 42). Default: data_seed, "
+                          "else seed."},
+    )
+    target_max_seq_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "Truncation length of the target rows (D* and the held-out curve); default max_seq_length. "
+                          "GREATS's torchtune SAMSum target is not truncated."},
+    )
+    stop_at_step: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "End training after this many optimizer steps while the learning-rate schedule keeps the horizon of the full "
+                "run (num_train_epochs / max_steps), e.g. GREATS's TyDiQA curves stop at ~3K steps of a 27K-step linear schedule. "
+                "max_steps instead shortens the schedule itself."
+            )
+        },
+    )
     val_seq_length_multiplier: float = field(
         default=1.2,
         metadata={

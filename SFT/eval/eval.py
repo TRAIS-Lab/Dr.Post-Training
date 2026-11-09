@@ -45,6 +45,9 @@ logger = logging.getLogger(__name__)
 # One target can map to several benchmarks.
 # ---------------------------------------------------------------------------
 LEGACY_TASKS = ["nq_open", "samsum", "tydiqa", "squad", "triviaqa"]
+# GREATS-grounded targets (SFT/data/prepare_greats_data.py, SFT/eval/tasks/greats.py): pre-rendered rows, test split of the target itself
+GREATS_TASKS = ["tydiqa_less", "samsum_tt"]
+LEGACY_TASKS += GREATS_TASKS
 BENCHMARK_TASKS = ["ifeval", "ifbench", "math500", "gsm8k", "mbpp_plus"]
 TARGET_BENCHMARKS = {
     "precise_if": ["ifeval", "ifbench"],
@@ -106,7 +109,7 @@ def get_device():
     return torch.device('cpu')
 
 
-def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None):
+def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None, lora_merge: bool = True):
     """Load trained model and tokenizer."""
     device = get_device()
     logger.info(f"Loading model from {model_path} to {device}")
@@ -123,6 +126,16 @@ def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     from SFT.data.get_val_dataset import ensure_chat_template
     ensure_chat_template(tokenizer)
+    # Runs trained with add_bos record it in encoding.json (run dir; checkpoint-<step> dirs read their parent's)
+    from SFT.data.chat_format import ENCODING_FILE, set_add_bos
+    for enc_dir in (model_path, os.path.dirname(os.path.normpath(model_path))):
+        enc_path = os.path.join(enc_dir, ENCODING_FILE)
+        if os.path.exists(enc_path):
+            with open(enc_path, "r") as f:
+                add_bos = bool(json.load(f).get("add_bos", False))
+            set_add_bos(tokenizer, add_bos)
+            logger.info(f"{enc_path}: add_bos={add_bos}")
+            break
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -160,7 +173,12 @@ def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None):
                 logger.info(f"Re-applying init_eot_from_eos to the base model: {init_end_of_turn_from_eos(model, tokenizer)}")
 
         model = PeftModel.from_pretrained(model, model_path)
-        model = model.merge_and_unload()
+        if lora_merge:
+            model = model.merge_and_unload()
+        else:
+            # Unmerged: the fp32 LoRA branch runs next to the bf16 base. Merging into bf16 weights rounds away updates below
+            # the weights' bf16 spacing, which erases small-scale adapters (GREATS's SAMSum LoRA, alpha/r = 1/80).
+            logger.info("LoRA adapter kept unmerged (--lora_merge false)")
     else:
         logger.info("Loading full model")
         model = AutoModelForCausalLM.from_pretrained(
@@ -486,6 +504,7 @@ def evaluate_model(
     subject: Optional[str] = None,
     target_override: Optional[str] = None,
     extra_args: Optional[Dict] = None,
+    lora_merge: bool = True,
 ) -> Dict:
     """Evaluate a single model on every task implied by its name (or the overrides).
 
@@ -516,7 +535,7 @@ def evaluate_model(
     logger.info(f"Tasks for {model_name}: {tasks}")
 
     try:
-        model, tokenizer = load_model_and_tokenizer(model_path, base_model)
+        model, tokenizer = load_model_and_tokenizer(model_path, base_model, lora_merge=lora_merge)
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         results["error"] = str(e)
@@ -530,6 +549,7 @@ def evaluate_model(
     args.batch_size = batch_size
     args.subject = subject  # legacy arg; unused in current scope
     args.output_dir = model_path  # benchmark evaluators write generations/verifier files here
+    args.lora_merge = lora_merge
     for key, value in (extra_args or {}).items():
         setattr(args, key, value)
 
@@ -589,6 +609,20 @@ def _evaluate_one_task(task, args, model, tokenizer, model_path, model_name, res
         results["samsum_rougeL"] = samsum_results["rougeL"]
         with open(os.path.join(model_path, "samsum_results.json"), "w") as f:
             json.dump(samsum_results, f, indent=2)
+
+    elif task in GREATS_TASKS:
+        from .tasks.greats import compute_samsum_tt, compute_tydiqa_less
+        from SFT.data.chat_format import bos_ids
+        logger.info(f"Evaluating {model_name} on {task} (GREATS protocol)...")
+        fn = compute_tydiqa_less if task == "tydiqa_less" else compute_samsum_tt
+        task_results = {"task": task, **fn(args, model, tokenizer, batch_size=args.batch_size)}
+        task_results["prompt_encoding"] = ("bos+" if bos_ids(tokenizer) else "no_bos+") + "prerendered+greedy"
+        task_results["lora_merge"] = getattr(args, "lora_merge", True)
+        for key in ("f1_score", "exact_match", "rouge1", "rouge2", "rougeL"):
+            if key in task_results:
+                results[f"{task}_{key}"] = task_results[key]
+        with open(os.path.join(model_path, f"{task}_results.json"), "w") as f:
+            json.dump(task_results, f, indent=2)
 
     elif task == "tydiqa":
         logger.info(f"Evaluating {model_name} on TyDiQA...")
@@ -683,6 +717,9 @@ def main():
     parser.add_argument("--top_k", type=int, default=20, help="Top-k sampling cutoff (default 20)")
     parser.add_argument("--base_model", type=str, default=None,
         help="Base model for LoRA adapters")
+    parser.add_argument("--lora_merge", type=lambda v: str(v).lower() in ("1", "true", "yes"), default=True,
+        help="Merge LoRA adapters into the bf16 base before evaluating (default true). false keeps the adapter as a separate "
+             "fp32 branch, needed for small-scale adapters whose updates fall below bf16 weight spacing.")
     parser.add_argument("--seed", type=int, default=42,
         help="Random seed for reproducibility (default: 42)")
 
@@ -712,6 +749,7 @@ def main():
             task_override=args.task,
             subject=args.subject,
             target_override=args.target,
+            lora_merge=args.lora_merge,
             extra_args={
                 "temperature": args.temperature,
                 "top_p": args.top_p,
@@ -764,6 +802,7 @@ def main():
             task_override=args.task,
             subject=args.subject,
             target_override=args.target,
+            lora_merge=args.lora_merge,
             extra_args={
                 "temperature": args.temperature,
                 "top_p": args.top_p,

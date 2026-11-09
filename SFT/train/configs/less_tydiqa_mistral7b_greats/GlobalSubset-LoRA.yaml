@@ -1,0 +1,13 @@
+# Global Subset, exact scoring (PIP = GIP): top half of the batch by first-order influence, shared by all layers. At GREATS's
+# learning rates this is GREATS: its greedy selection's interaction term is scaled by lr^2 and does not change the picks
+# (GlobalSubset-LoRA-greats, use_second_order, gave adapters equal to this arm's to 1e-7 in a 25-step test).
+method: GlobalSubset
+finetuning: LoRA
+learning_rate: 1.00e-05
+subset_mode: one_pass
+scoring:
+  method: pip
+lora_r: 128
+lora_alpha: 1
+lora_dropout: 0.0
+lora_target_modules: q_proj,k_proj

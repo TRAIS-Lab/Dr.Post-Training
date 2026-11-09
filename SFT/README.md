@@ -182,6 +182,52 @@ under `SFT/eval/tasks/ifeval_lib`), the
 boxed-answer fallback if missing). NLTK's punkt models are looked up through `NLTK_DATA`
 (cluster_env.sh points it at `data/nltk_data`) and downloaded there once if missing.
 
+## GREATS settings at 7–8B (Mistral-7B TyDiQA, Llama-3-8B SAMSum)
+
+Two settings reproduce the largest-scale LLM experiments of GREATS (Wang et al., *GREATS: Online Selection of High-Quality
+Data for LLM Training in Every Iteration*, NeurIPS 2024, Table 1 and App. B) with GREATS's own hyperparameters. Where the paper
+and its code ([Jiachen-T-Wang/GREATS](https://github.com/Jiachen-T-Wang/GREATS)) disagree, the code wins: it swaps PEFT's LoRA
+layers for its own, so TyDiQA really trains with LoRA dropout 0 and SAMSum in pure fp32. Every value is documented in the
+`defaults.yaml` of each config dir.
+
+| Config dir | Model | Pool → target | Length | LoRA | LR | Batch (kept) | D\* | Precision |
+|---|---|---|---|---|---|---|---|---|
+| `less_tydiqa_mistral7b_greats` | Mistral-7B-v0.1 | 40% of the official LESS pool → TyDiQA | 1-epoch schedule (27,068 steps), stopped at step 3,000 | r 128, α 1, q/k | 1e-5 | 4 (2) | 9 | fp32 weights, bf16 autocast |
+| `alpaca_samsum_llama3_8b_greats` | Meta-Llama-3-8B | Alpaca → SAMSum | 1 epoch (3,251 steps), checkpoint at 1,000 | r 8, α 0.1, q/k/v/o | 2e-5 | 16 (8) | 16 | fp32 |
+
+Rows are rendered exactly as GREATS renders them. TyDiQA uses LESS's tulu format with BOS; SAMSum uses torchtune's Llama-3
+header format with the Alpaca and "Summarize this dialogue" templates. `tests/test_greats_encoding.py` checks the training,
+target and test rows token by token against GREATS's encoding functions. Downstream metrics (`SFT/eval/tasks/greats.py`):
+`tydiqa_less` is 1-shot TyDiQA F1 on GREATS's 500 test rows with the LESS / open-instruct protocol; `samsum_tt` is ROUGE.
+GREATS reports SAMSum by perplexity only, and in this setting ROUGE mostly tracks output length.
+
+```bash
+# Data: official LESS pool + TyDiQA target (princeton-nlp/less_data), torchtune-format Alpaca pool and SAMSum target
+python SFT/data/prepare_greats_data.py --data_dir $SCRATCH_DIR/Dr.Post-Training/SFT/data
+TORCHDYNAMO_DISABLE=1 python tests/test_greats_encoding.py --less_zip <path to less-data.zip>   # must print ALL PASS
+
+# 3 arms x 3 seeds per setting; one task = train + eval of the final adapter and of every saved checkpoint
+for cfg in less_tydiqa_mistral7b_greats alpaca_samsum_llama3_8b_greats; do
+  for s in 42 2 22; do for a in FullTraining-LoRA GlobalSubset-LoRA LayerWiseSubset-LoRA; do echo "$cfg $a $s"; done; done \
+    > SFT/train/manifests/qa_$cfg.txt
+done
+# One GPU per task with at least 64 GB (fp32 weights: peak 49-59 GB) and ~110 GB host memory. On one GH200 a task takes
+# about 0.5 h (TyDiQA) or 5 h (SAMSum, fp32). The flags override qa_array.sbatch's A40 defaults; set the partition for your cluster.
+mkdir -p logs/qa
+sbatch --array=0-8 --time=1:00:00 --mem=110G SFT/train/slurm/qa_array.sbatch SFT/train/manifests/qa_less_tydiqa_mistral7b_greats.txt SFT/train/greats_task.sh
+sbatch --array=0-8 --time=7:00:00 --mem=110G SFT/train/slurm/qa_array.sbatch SFT/train/manifests/qa_alpaca_samsum_llama3_8b_greats.txt SFT/train/greats_task.sh
+
+python SFT/tables/greats_settings.py     # F1 / perplexity / training wall-clock, mean ± s.e. over seeds
+```
+
+- **Global Subset stands in for GREATS.** GREATS's greedy interaction term scales with lr², so at these learning rates it does
+  not change the selection. `GlobalSubset-LoRA-greats` (`use_second_order: true`) produced the same adapter as
+  `GlobalSubset-LoRA` to within 1e-7.
+- **Evaluate adapters unmerged** (`eval.sh --lora_merge false`, which `greats_task.sh` passes). Merging GREATS's small-scale
+  SAMSum adapter (α/r = 1/80) into bf16 weights rounds most of it away: held-out perplexity was 9.2 merged vs 6.9 unmerged, the
+  same as in fp32.
+- **Not reproduced:** GREATS's fixed batch order across seeds (here each seed draws its own order).
+
 ## Hyperparameters
 
 Fixed across all settings. No LR tuning per setting.
@@ -210,7 +256,12 @@ open-instruct-style fallback (`<|user|>` / `<|assistant|>` plaintext
 markers) via `SFT/data/chat_format.py:ensure_chat_template` (re-exported from
 `get_val_dataset.py`). Tokenizers that ship a template (Qwen3) use their own.
 Both training and eval call `tokenizer.apply_chat_template(...)`; loss is
-computed only on the assistant-content tokens.
+computed only on the assistant-content tokens. The fallback's `{%-` whitespace
+control drops the newline that ends each message (`<|user|>\nQ<|assistant|>\nA</s>`),
+so it is not byte-identical to open-instruct's `concat_messages`
+(`<|user|>\nQ\n<|assistant|>\nA</s>\n`). Training and evaluation use the same
+rendering, so the Llama runs are consistent. `chat_template: less_tulu` selects
+the exact open-instruct / LESS rendering (used by the GREATS settings).
 
 ## Loss convention (`loss_reduction`)
 

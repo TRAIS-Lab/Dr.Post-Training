@@ -26,6 +26,7 @@ task=""
 subject=""
 method=""
 n_test=-1
+lora_merge=""      # false -> keep LoRA adapters unmerged (eval.py --lora_merge)
 batch_size=1
 max_new_tokens=""     # empty -> per-task default in eval.py
 temperature=""        # empty -> eval.py default (0.7; 0 = greedy)
@@ -68,6 +69,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --method)
             method="$2"
+            shift 2
+            ;;
+        --lora_merge)
+            lora_merge="$2"
             shift 2
             ;;
         --n_test)
@@ -138,6 +143,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --subject NAME       MMLU subject or BBH task to evaluate on (default: all)"
             echo "  --method NAME        Filter by method (e.g., FullTraining-MeSO, LayerWiseSubset-Full)"
             echo "  --n_test N           Number of test examples (-1 for all)"
+            echo "  --lora_merge BOOL    false: keep LoRA adapters unmerged (small-scale adapters do not survive a bf16 merge)"
             echo "  --batch_size N       Batch size for generation (default: 1)"
             echo "  --max_new_tokens N   Max tokens to generate (default: per task; 128 legacy, 2048 IF/code, 4096 math)"
             echo "  --temperature T      Sampling temperature for benchmark tasks (default 0.7; 0 = greedy)"
@@ -186,6 +192,7 @@ cmd="$cmd --data_dir $data_dir"
 cmd="$cmd --n_test $n_test"
 cmd="$cmd --batch_size $batch_size"
 [[ -n "$max_new_tokens" ]] && cmd="$cmd --max_new_tokens $max_new_tokens"
+[[ -n "$lora_merge" ]] && cmd="$cmd --lora_merge $lora_merge"
 [[ -n "$temperature" ]] && cmd="$cmd --temperature $temperature"
 [[ -n "$top_p" ]] && cmd="$cmd --top_p $top_p"
 [[ -n "$top_k" ]] && cmd="$cmd --top_k $top_k"

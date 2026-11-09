@@ -3,7 +3,11 @@
 #
 # Yaml keys forwarded to train.py besides the shared ones: init_eot_from_eos (Qwen3 <|im_end|> row init),
 # loss_reduction (sample_mean | token_mean; the paper uses sample_mean), score_normalization (none | layer_meanabs |
-# layer_std, layer-normalized Global Subset control), selection_mode (topk | random). Run dirs land under
+# layer_std, layer-normalized Global Subset control), selection_mode (topk | random), lora_target_modules (comma-separated
+# module-name suffixes, e.g. q_proj,k_proj; default all-linear), add_bos (BOS id on every sequence), chat_template (less_tulu),
+# subset_sampler / subset_seed (how and with which fixed seed the pool subset is drawn), target_max_seq_length, torch_dtype /
+# bf16 (float32 weights; bf16: false turns bf16 autocast off), stop_at_step (end early, LR
+# schedule keeps the full horizon), warmup_steps (overrides warmup_ratio), save_at_steps (full checkpoints). Run dirs land under
 # --runs_root (default $SCRATCH_DIR/Dr.Post-Training/SFT/runs, the sample-mean tree the paper reads).
 # CLI overrides of yaml keys: --gradient_checkpointing, --subset_mode, --eval_steps (48 GB cards; evaluation cadence).
 # Never edit this file while jobs are running it (bash reads scripts incrementally): copy, edit, launch the copy.
@@ -177,6 +181,7 @@ reset_config() {
     cfg_lora_r="8"
     cfg_lora_alpha="16"
     cfg_lora_dropout="0.1"
+    cfg_lora_target_modules=""        # comma-separated suffixes; empty -> train.py default (all-linear)
 
     # Experiment
     cfg_model="meta-llama/Llama-3.2-1B"
@@ -211,6 +216,16 @@ reset_config() {
     cfg_gradient_checkpointing="false"
     cfg_val_seq_length_multiplier=""   # empty -> train.py default (1.2); 0 disables rejection
     cfg_eval_split=""                  # empty -> "test"; CLI --eval_split overrides
+    cfg_add_bos=""                     # true -> BOS id on every sequence (GREATS / LESS / torchtune encoding)
+    cfg_chat_template=""               # less_tulu -> exact LESS / open-instruct tulu rendering (SFT/data/chat_format.py)
+    cfg_subset_sampler=""              # torch | numpy (LESS / GREATS np.random.permutation)
+    cfg_subset_seed=""                 # pool-subset seed fixed across training seeds (default seed + 1)
+    cfg_target_max_seq_length=""       # truncation of D* / held-out rows (default max_seq_length)
+    cfg_torch_dtype=""                 # float32 -> fp32 weights (default: bfloat16 under bf16 training)
+    cfg_bf16=""                        # false -> no bf16 autocast (pure fp32 with torch_dtype float32)
+    cfg_stop_at_step=""                # end training at this step; the LR schedule keeps the full-run horizon
+    cfg_warmup_steps=""                # absolute warmup steps (overrides warmup_ratio when > 0)
+    cfg_save_at_steps=""               # comma-separated full-checkpoint steps (CLI --save_at_steps overrides)
 }
 
 parse_yaml() {
@@ -264,6 +279,7 @@ parse_yaml() {
             lora_r)                              cfg_lora_r="$val" ;;
             lora_alpha)                          cfg_lora_alpha="$val" ;;
             lora_dropout)                        cfg_lora_dropout="$val" ;;
+            lora_target_modules)                 cfg_lora_target_modules="$val" ;;
             model)                               cfg_model="$val" ;;
             seed)                                cfg_seed="$val" ;;
             batch_size)                          cfg_batch_size="$val" ;;
@@ -290,6 +306,16 @@ parse_yaml() {
             init_eot_from_eos)                   cfg_init_eot_from_eos="$val" ;;
             loss_reduction)                      cfg_loss_reduction="$val" ;;
             score_normalization)                 cfg_score_normalization="$val" ;;
+            add_bos)                             cfg_add_bos="$val" ;;
+            chat_template)                       cfg_chat_template="$val" ;;
+            subset_sampler)                      cfg_subset_sampler="$val" ;;
+            subset_seed)                         cfg_subset_seed="$val" ;;
+            target_max_seq_length)               cfg_target_max_seq_length="$val" ;;
+            torch_dtype)                         cfg_torch_dtype="$val" ;;
+            bf16)                                cfg_bf16="$val" ;;
+            stop_at_step)                        cfg_stop_at_step="$val" ;;
+            warmup_steps)                        cfg_warmup_steps="$val" ;;
+            save_at_steps)                       cfg_save_at_steps="$val" ;;
         esac
     done < "$file"
 }
@@ -411,14 +437,9 @@ run_method() {
     echo "Output: $output_dir"
     echo "=============================================="
 
-    # FSDP for large models
+    # No FSDP: LESS wrapped Llama-2-13B / Mistral-7B in FSDP for multi-GPU runs, but this launcher starts one process
+    # (--nproc_per_node 1), where full sharding only adds a wrapper around the model and its gradient hooks.
     local fsdp_args=""
-    case "$cfg_model" in
-        *Llama-2-13b*|*llama-2-13b*)
-            fsdp_args="--fsdp 'full_shard auto_wrap' --fsdp_config llama2_13b_finetune" ;;
-        *Mistral-7B*|*mistral-7b*)
-            fsdp_args="--fsdp 'full_shard auto_wrap' --fsdp_config mistral_7b_finetune" ;;
-    esac
 
     local DATA_SEED=$((cfg_seed + 1))
     # Derive port from SLURM_JOB_ID (or PID fallback) so different jobs landing
@@ -469,11 +490,22 @@ $fsdp_args \
     [[ -n "$cfg_selection_groups" ]] && cmd="$cmd --selection_groups '$cfg_selection_groups'"
     [[ -n "$cfg_train_dataset" ]] && cmd="$cmd --train_dataset_names $cfg_train_dataset"
     [[ -n "$cfg_val_batch_size" ]] && cmd="$cmd --val_batch_size_for_selection $cfg_val_batch_size"
-    [[ -n "$save_at_steps_override" ]] && cmd="$cmd --save_at_steps $save_at_steps_override"
+    if [[ -n "$save_at_steps_override" ]]; then cmd="$cmd --save_at_steps $save_at_steps_override"
+    elif [[ -n "$cfg_save_at_steps" ]]; then cmd="$cmd --save_at_steps $cfg_save_at_steps"; fi
+    [[ "$cfg_add_bos" == "true" ]] && cmd="$cmd --add_bos True"
+    [[ -n "$cfg_chat_template" ]] && cmd="$cmd --chat_template $cfg_chat_template"
+    [[ -n "$cfg_subset_sampler" ]] && cmd="$cmd --subset_sampler $cfg_subset_sampler"
+    [[ -n "$cfg_subset_seed" ]] && cmd="$cmd --subset_seed $cfg_subset_seed"
+    [[ -n "$cfg_target_max_seq_length" ]] && cmd="$cmd --target_max_seq_length $cfg_target_max_seq_length"
+    [[ -n "$cfg_torch_dtype" ]] && cmd="$cmd --torch_dtype $cfg_torch_dtype"
+    [[ "$cfg_bf16" == "false" ]] && cmd="$cmd --bf16 False"   # overrides FIXED_ARGS --bf16=True (last one wins)
+    [[ -n "$cfg_stop_at_step" ]] && cmd="$cmd --stop_at_step $cfg_stop_at_step"
+    [[ -n "$cfg_warmup_steps" ]] && cmd="$cmd --warmup_steps $cfg_warmup_steps"
 
     # LoRA
     if [[ "$use_lora" == "true" ]]; then
         cmd="$cmd --lora True --lora_r $cfg_lora_r --lora_alpha $cfg_lora_alpha --lora_dropout $cfg_lora_dropout"
+        [[ -n "$cfg_lora_target_modules" ]] && cmd="$cmd --lora_target_modules ${cfg_lora_target_modules//,/ }"
     else
         cmd="$cmd --lora False"
     fi

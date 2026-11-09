@@ -92,6 +92,20 @@ class ModelArguments:
         metadata={"help": "Whether to use Flash Attention 2"},
     )
 
+    # Fallback chat template for tokenizers without one (SFT/data/chat_format.py CHAT_TEMPLATES)
+    chat_template: Optional[str] = field(
+        default=None,
+        metadata={"help": "less_tulu: render messages exactly as LESS / open-instruct concat_messages (newline after every "
+                          "message), for tokenizers that ship no template. Default: the repo's tulu fallback."},
+    )
+
+    # BOS on every sequence (LESS / GREATS / torchtune tokenize with the tokenizer's default special tokens)
+    add_bos: bool = field(
+        default=False,
+        metadata={"help": "Prepend tokenizer.bos_token_id to every training row, target row and evaluation prompt (recorded in "
+                          "the run dir's encoding.json for SFT/eval/eval.py). Default off: the repo tokenizes without special tokens."},
+    )
+
     # Stop-token initialisation (Qwen3-Base's <|im_end|> row is near-untrained)
     init_eot_from_eos: bool = field(
         default=False,

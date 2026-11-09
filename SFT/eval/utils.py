@@ -7,6 +7,8 @@ import os
 from importlib import import_module
 from transformers import StoppingCriteria
 
+from SFT.data.chat_format import bos_ids
+
 
 class KeyWordsCriteria(StoppingCriteria):
     def __init__(self, stop_id_sequences):
@@ -70,7 +72,13 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
     generation_kwargs.pop("pad_token_id", None)
     for i in range(0, len(prompts), batch_size):
         batch_prompts = prompts[i:i+batch_size]
-        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
+        bos = bos_ids(tokenizer)   # add_bos runs (run-dir encoding.json, SFT/eval/eval.py): prepend the id, as in training
+        if bos and not add_special_tokens:
+            encoded = tokenizer(batch_prompts, add_special_tokens=False)
+            tokenized_prompts = tokenizer.pad({"input_ids": [bos + ids for ids in encoded["input_ids"]]},
+                                              padding="longest", return_tensors="pt")
+        else:
+            tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
         batch_input_ids = tokenized_prompts.input_ids
         attention_mask = tokenized_prompts.attention_mask
         if model.device.type == "cuda":

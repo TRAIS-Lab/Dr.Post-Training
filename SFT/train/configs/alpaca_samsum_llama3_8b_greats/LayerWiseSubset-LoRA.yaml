@@ -1,0 +1,11 @@
+# Layer-Wise Subset with the compressed 64x64 scoring backend of the question-answering protocol
+method: LayerWiseSubset
+finetuning: LoRA
+learning_rate: 2.00e-05
+scoring:
+  method: compress
+  compression: normal-64*64
+lora_r: 8
+lora_alpha: 0.1
+lora_dropout: 0.1
+lora_target_modules: q_proj,k_proj,v_proj,o_proj

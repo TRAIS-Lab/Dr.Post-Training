@@ -19,7 +19,8 @@ train=$(yval $cdir/defaults.yaml train_dataset); target=$(yval $cdir/defaults.ya
 model=$(basename "$(yval $cdir/defaults.yaml model)"); pct=$(yval $cdir/defaults.yaml percentage)
 bs=$(yval $cdir/defaults.yaml batch_size); nval=${N_VAL:-$(yval $cdir/defaults.yaml n_val)}   # N_VAL: target-set size sweep (SFT/tables/qa_nval_sweep.py)
 lr=$(yval $cdir/$method.yaml learning_rate); [ -z "$lr" ] && lr=$(yval $cdir/defaults.yaml learning_rate)
-d=$RUNS_ROOT/${train}_${target}-${model}-${method}-p${pct}-lr${lr}-b${bs}-v${nval}-s${seed}
+msuf=""; [ "$(yval $cdir/$method.yaml use_second_order)" = true ] && msuf=-2nd   # train.sh names second-order (GREATS greedy) arms <method>-2nd
+d=$RUNS_ROOT/${train}_${target}-${model}-${method}${msuf}-p${pct}-lr${lr}-b${bs}-v${nval}-s${seed}
 echo "[qa_matrix] $cfg / $method / seed $seed -> $d"
 if ls "$d"/*.safetensors >/dev/null 2>&1; then echo "[qa_matrix] model exists, skipping training"; else
   # Periodic evaluation (500 held-out rows) every `eval_steps` costs ~50 min per task and does not affect training; the matrix evaluates

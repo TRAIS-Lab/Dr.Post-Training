@@ -1,0 +1,13 @@
+# GREATS's greedy selection itself (first-order score x lr, train-train interaction x lr^2, ghost inner products); run dir
+# suffix -2nd. Not in the manifest: at these learning rates it selects what GlobalSubset-LoRA selects.
+method: GlobalSubset
+finetuning: LoRA
+learning_rate: 2.00e-05
+subset_mode: one_pass
+use_second_order: true
+scoring:
+  method: gip
+lora_r: 8
+lora_alpha: 0.1
+lora_dropout: 0.1
+lora_target_modules: q_proj,k_proj,v_proj,o_proj

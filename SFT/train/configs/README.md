@@ -45,6 +45,29 @@ scored post hoc (see `SFT/README.md`). Each holds `defaults.yaml` plus the seven
 | `val_seq_length_multiplier` | float | D* rejection threshold as a multiple of the average train length; `0` disables |
 | `eval_split` | validation, lr, test | Split used for the `eval_loss` curve (default `test`; CLI `--eval_split` overrides) |
 
+## GREATS settings (7–8B)
+
+`less_tydiqa_mistral7b_greats` (Mistral-7B, LESS → TyDiQA) and `alpaca_samsum_llama3_8b_greats` (Llama-3-8B, Alpaca → SAMSum)
+reproduce GREATS's largest-scale settings (`SFT/README.md`). Each holds `defaults.yaml` and the arms `FullTraining-LoRA`,
+`GlobalSubset-LoRA` (exact scores), `LayerWiseSubset-LoRA` (compressed 64×64), and `GlobalSubset-LoRA-greats` (GREATS's greedy
+selection, `use_second_order: true`; identical to `GlobalSubset-LoRA` at these learning rates, so not in the manifests). Their
+yaml files use these keys, all forwarded by `train.sh` and off by default:
+
+| Key | Values | Description |
+|---|---|---|
+| `lora_target_modules` | comma-separated suffixes, e.g. `q_proj,k_proj` | LoRA targets (default all-linear) |
+| `add_bos` | true, false | Prepend the BOS id to every training row, target row and evaluation prompt, recorded in the run dir's `encoding.json` |
+| `chat_template` | `less_tulu` | Exact open-instruct / LESS tulu rendering for tokenizers without a template (the default fallback drops inter-message newlines) |
+| `subset_sampler`, `subset_seed` | torch \| numpy, int | How the `percentage` subset of the pool is drawn, with a seed fixed across training seeds (LESS / GREATS: numpy, 42) |
+| `target_max_seq_length` | int | Truncation of D\* and held-out rows (default `max_seq_length`) |
+| `stop_at_step` | int | End training at this step; the LR schedule keeps the full-run horizon |
+| `warmup_steps` | int | Absolute warmup steps (overrides `warmup_ratio`) |
+| `save_at_steps` | comma-separated steps | Full checkpoints; `greats_task.sh` evaluates each one |
+| `torch_dtype`, `bf16` | float32, false | fp32 weights; `bf16: false` also turns bf16 autocast off (pure fp32) |
+
+Pools `less_official` (official LESS mixture, 270,679 rows) and `alpaca_tt`, and targets `tydiqa_less` and `samsum_tt`, are
+pre-rendered `{"prompt", "completion"}` rows (or tulu `messages` for `less_official`) written by `SFT/data/prepare_greats_data.py`.
+
 ## Gradient Compression
 
 Both `score_grad_compression` and `opt_grad_compression` use the same two-stage pipeline:

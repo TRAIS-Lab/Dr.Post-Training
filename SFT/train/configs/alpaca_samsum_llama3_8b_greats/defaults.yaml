@@ -1,0 +1,54 @@
+# GREATS's Alpaca -> SAMSum setting (Wang et al., NeurIPS 2024, Table 1 row 3 / App. B item 3; GREATS's torchtune recipe
+# torchtune/recipes/gc_lora_finetune_single_device.py with configs/llama3/8B_lora_single_device.yaml). Every value below is GREATS's:
+#   - Meta-Llama-3-8B; all of tatsu-lab/alpaca (52,002 rows, one epoch = 3,251 steps), rendered as torchtune does it: Alpaca
+#     instruct template inside Llama-3 header / <|eot_id|> tokens, the whole assistant message supervised, BOS
+#     (SFT/data/prepare_greats_data.py, pool alpaca_tt)
+#   - batch 16 candidates per step; curation keeps 50% (Sec. 5.1)
+#   - LoRA r 8, alpha 0.1 (scale 1/80), dropout 0.1 (hard-coded in the recipe's GCLoRALinear swap), on q/k/v/o projections
+#   - lr 2e-5, AdamW weight decay 0.01, cosine schedule with 100 warmup steps, 512 tokens, activation checkpointing,
+#     token-mean loss (torchtune CrossEntropyLoss)
+#   - D*: the first 16 rows of the SAMSum validation split in the "Summarize this dialogue:" template, untruncated
+#   - held-out curve: the first 432 rows of the SAMSum test split (GREATS reads 27 batches of 16), every 100 steps (GREATS: 50;
+#     the cadence only changes how often the curve is read, and one fp32 pass over 432 rows costs ~70 s)
+#   - a full checkpoint at step 1,000, where GREATS's SAMSum curves end (Fig. 9), is evaluated as well as the final model
+#   - fp32 weights and fp32 compute (no autocast, no TF32), SDPA attention: the recipe swaps in GCLoRALinear layers created in
+#     fp32 outside torchtune's dtype context and never casts them, so its LoRA path (x @ lora_A.T) only runs with fp32
+#     activations; the config GREATS ran is not in its repo (8B_lora_single_device.yaml's dtype: bf16 would raise there)
+# GREATS reports SAMSum perplexity only; ROUGE on the test split is this harness's downstream number (SFT/eval/tasks/greats.py).
+# tests/test_greats_encoding.py checks every pool and target row token by token against torchtune's tokenize_messages.
+# Not reproduced: torchtune's fixed sampler seed (each seed has its own batch order here).
+model: meta-llama/Meta-Llama-3-8B
+train_dataset: alpaca_tt
+target_task: samsum_tt
+percentage: 1.0
+
+seed: 42
+batch_size: 16
+gradient_accumulation_steps: 1
+optim: adamw_torch
+max_seq_length: 512
+lr_scheduler_type: cosine
+warmup_steps: 100
+warmup_ratio: 0.0
+weight_decay: 0.01
+num_train_epochs: 1
+save_at_steps: 1000
+loss_reduction: token_mean
+add_bos: true
+eval_steps: 100
+torch_dtype: float32
+bf16: false
+use_flash_attention: false
+gradient_checkpointing: true
+
+n_eval: 432
+target_max_seq_length: 4096
+val_seq_length_multiplier: 0
+
+selection_frac: 0.5
+selection_mode: topk
+n_val: 16
+val_batch_size: 1
+val_strategy: merged_batch
+scoring:
+  method: pip

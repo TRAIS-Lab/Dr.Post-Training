@@ -2,6 +2,7 @@ import contextlib
 from functools import partial
 from typing import List, Union
 
+import numpy as np
 import torch
 from datasets import load_dataset
 
@@ -64,6 +65,17 @@ def get_train_files_for_dataset(data_dir: str, dataset_name: str) -> List[str]:
             f"{data_dir}/train/dolly/dolly_data.jsonl",
             f"{data_dir}/train/oasst1/oasst1_data.jsonl",
         ],
+        # Official LESS pool (princeton-nlp/less_data, 270,679 rows), the one GREATS samples from
+        # (train/less_official/README.md); the `less` reconstruction above is ~1.96M rows, mostly CoT-Collection.
+        # GREATS's torchtune Llama-3 Alpaca pool (tatsu-lab/alpaca, 52,002 rows), pre-rendered prompt/completion rows
+        # (SFT/data/prepare_greats_data.py); Llama-3 tokenizers only.
+        "alpaca_tt": [f"{data_dir}/train/alpaca_tt/alpaca_tt_data.jsonl"],
+        "less_official": [
+            f"{data_dir}/train/less_official/flan_v2_data.jsonl",
+            f"{data_dir}/train/less_official/cot_data.jsonl",
+            f"{data_dir}/train/less_official/dolly_data.jsonl",
+            f"{data_dir}/train/less_official/oasst1_data.jsonl",
+        ],
     }
 
     if dataset_name not in dataset_mapping:
@@ -103,7 +115,7 @@ def _get_default_train_files(data_dir: str, task: str) -> List[str]:
 
 
 def get_training_dataset(data_dir: str, task: str, tokenizer, max_seq_length,
-                         sample_percentage=1.0, seed=0, train_files: List[str] = None,
+                         sample_percentage=1.0, seed=0, train_files: List[str] = None, subset_sampler: str = "torch",
                          train_dataset_names: List[str] = None):
     """
     Get training dataset with a specified seed.
@@ -133,13 +145,13 @@ def get_training_dataset(data_dir: str, task: str, tokenizer, max_seq_length,
             train_files = _get_default_train_files(data_dir, task)
 
     raw_datasets = load_raw_dataset(
-        train_files, sample_percentage=sample_percentage, seed=seed)
+        train_files, sample_percentage=sample_percentage, seed=seed, sampler=subset_sampler)
     lm_datasets = encode_data(
         raw_datasets, tokenizer, max_seq_length)
     return lm_datasets
 
 
-def load_raw_dataset(train_files: Union[List[str], str], sample_size=None, sample_percentage=1.0, seed=0):
+def load_raw_dataset(train_files: Union[List[str], str], sample_size=None, sample_percentage=1.0, seed=0, sampler="torch"):
     """ load raw dataset """
     if isinstance(train_files, str):
         train_files = [train_files]
@@ -153,8 +165,12 @@ def load_raw_dataset(train_files: Union[List[str], str], sample_size=None, sampl
     if sample_size == len(processed_datasets):
         return processed_datasets  # not shuffle
 
-    with temp_seed(seed):
-        index = torch.randperm(len(processed_datasets))[:sample_size].tolist()
+    if sampler == "numpy":
+        # LESS / GREATS (less/data_selection/get_training_dataset.py): np.random.permutation under np.random.seed(seed)
+        index = np.random.RandomState(seed).permutation(len(processed_datasets))[:sample_size].tolist()
+    else:
+        with temp_seed(seed):
+            index = torch.randperm(len(processed_datasets))[:sample_size].tolist()
 
     sampled_dataset = processed_datasets.select(index)
 
@@ -165,13 +181,15 @@ def encode_data(raw_datasets, tokenizer, max_seq_length, processing_num_workers=
     """Encode messages-format examples with the tokenizer's native chat template."""
     if "input_ids" in raw_datasets.features:
         return raw_datasets
-    if "messages" not in raw_datasets.column_names:
+    prompt_completion = {"prompt", "completion"} <= set(raw_datasets.column_names)
+    if "messages" not in raw_datasets.column_names and not prompt_completion:
         raise ValueError(
-            "Training data must have a 'messages' column. Got columns: "
+            "Training data must have a 'messages' column (or pre-rendered 'prompt' + 'completion'). Got columns: "
             f"{raw_datasets.column_names}"
         )
+    from SFT.data.chat_format import encode_prompt_completion
     encode_function = partial(
-        encode_with_messages_format,
+        encode_prompt_completion if prompt_completion else encode_with_messages_format,
         tokenizer=tokenizer,
         max_seq_length=max_seq_length,
     )

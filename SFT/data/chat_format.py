@@ -6,8 +6,10 @@ Two rendering regimes are supported through one interface:
   reaches the model is produced by ``tokenizer.apply_chat_template``.
 * **Tulu fallback** (Llama-3.2-1B-Base ships no template): the open-instruct
   plaintext markers used by the paper's runs. The fallback Jinja template
-  reproduces ``get_train_dataset.concat_messages`` byte-for-byte, so the
-  Llama experiments encode exactly as with the plain concatenation.
+  (``TULU_CHAT_TEMPLATE``) drops the newline that ends each message, so it is
+  not byte-identical to open-instruct's ``concat_messages``; training and
+  evaluation share it. ``LESS_TULU_CHAT_TEMPLATE`` (model arg
+  ``chat_template=less_tulu``) is the exact open-instruct / LESS rendering.
 
 Training encoding (``encode_messages_with_chat_template``) is the single encoder
 behind ``get_train_dataset.encode_with_messages_format``. It supervises assistant
@@ -44,7 +46,40 @@ TULU_CHAT_TEMPLATE = (
     "{%- if add_generation_prompt %}<|assistant|>\n{% endif %}"
 )
 
+# Opt-in exact open-instruct / LESS tulu rendering (model arg chat_template=less_tulu). TULU_CHAT_TEMPLATE above opens every
+# block with `{%-`, which also strips the literal newline that ends the previous message, so it renders
+# "<|user|>\nQ<|assistant|>\nA</s>" where LESS's concat_messages writes "<|user|>\nQ\n<|assistant|>\nA</s>\n". This variant
+# has no whitespace control and keeps those newlines (tests/test_greats_encoding.py checks it token by token against LESS).
+LESS_TULU_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}<|system|>\n{{ message['content'].strip() }}\n"
+    "{% elif message['role'] == 'user' %}<|user|>\n{{ message['content'].strip() }}\n"
+    "{% elif message['role'] == 'assistant' %}<|assistant|>\n{{ message['content'].strip() }}{{ eos_token }}\n"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|assistant|>\n{% endif %}"
+)
+CHAT_TEMPLATES = {"less_tulu": LESS_TULU_CHAT_TEMPLATE}
+
 _NATIVE_TEMPLATE_FLAG = "_drpt_native_chat_template"
+_ADD_BOS_FLAG = "_drpt_add_bos"
+# Written to a run dir when add_bos is on, so SFT/eval/eval.py encodes prompts the way the run was trained.
+ENCODING_FILE = "encoding.json"
+
+
+def set_add_bos(tokenizer: PreTrainedTokenizerBase, add_bos: bool) -> None:
+    """Opt-in BOS: every sequence this repo tokenizes (training rows, target rows, generation prompts) then starts
+    with ``tokenizer.bos_token_id``, as in the LESS / GREATS / torchtune encoders, which tokenize with the tokenizer's
+    default special tokens. The id is prepended rather than rendered as text: a literal ``<s>`` changes how the
+    Mistral tokenizer splits the text that follows it."""
+    setattr(tokenizer, _ADD_BOS_FLAG, bool(add_bos))
+
+
+def bos_ids(tokenizer: PreTrainedTokenizerBase) -> List[int]:
+    """``[bos_token_id]`` when add_bos is on for this tokenizer, else ``[]`` (the repo default)."""
+    if getattr(tokenizer, _ADD_BOS_FLAG, False) and tokenizer.bos_token_id is not None:
+        return [tokenizer.bos_token_id]
+    return []
 
 
 def has_native_chat_template(tokenizer: PreTrainedTokenizerBase) -> bool:
@@ -290,15 +325,16 @@ def encode_messages_with_chat_template(
     full_text = render_messages(tokenizer, messages)
     spans = _assistant_char_spans(tokenizer, messages, full_text)
 
+    bos = bos_ids(tokenizer)
     encoded = tokenizer(
         full_text,
         return_offsets_mapping=True,
         add_special_tokens=False,  # the template already emitted BOS/EOS-equivalents
-        max_length=max_seq_length,
+        max_length=max_seq_length - len(bos),
         truncation=True,
     )
-    input_ids = torch.tensor(encoded["input_ids"], dtype=torch.long)
-    offsets = encoded["offset_mapping"]
+    input_ids = torch.tensor(bos + encoded["input_ids"], dtype=torch.long)
+    offsets = [(0, 0)] * len(bos) + list(encoded["offset_mapping"])
     labels = torch.full_like(input_ids, -100)
     span_index = 0
     for position, (char_start, char_end) in enumerate(offsets):
@@ -315,4 +351,31 @@ def encode_messages_with_chat_template(
         "input_ids": input_ids,
         "labels": labels,
         "attention_mask": attention_mask,
+    }
+
+
+def encode_prompt_completion(
+    example: Mapping[str, Any],
+    tokenizer: PreTrainedTokenizerBase,
+    max_seq_length: int,
+) -> Dict[str, torch.Tensor]:
+    """Tokenize a pre-rendered ``{"prompt", "completion"}`` row verbatim (no chat template); supervise the completion.
+
+    Rows of this form reproduce an external codebase's exact strings (the torchtune Llama-3 Alpaca pool of GREATS,
+    SFT/data/prepare_greats_data.py). ``prompt + completion`` is tokenized jointly and the first
+    ``len(tokenize(prompt))`` tokens are masked, as in ``get_val_dataset.tokenize`` (the LESS convention); the optional
+    BOS id (``set_add_bos``) is prepended and masked.
+    """
+    bos = bos_ids(tokenizer)
+    prompt, completion = example["prompt"], example["completion"]
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    full_ids = tokenizer(prompt + completion, add_special_tokens=False, max_length=max_seq_length - len(bos),
+                         truncation=True)["input_ids"]
+    input_ids = torch.tensor(bos + full_ids, dtype=torch.long)
+    labels = input_ids.clone()
+    labels[:len(bos) + min(len(prompt_ids), len(full_ids))] = -100
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": torch.ones_like(input_ids),
     }

@@ -22,6 +22,7 @@ DEFAULT_SEQ_LENGTH_MULTIPLIER = 1.2
 # train.py and the eval tasks import them from this module.
 from SFT.data.chat_format import (  # noqa: E402
     TULU_CHAT_TEMPLATE as _DEFAULT_CHAT_TEMPLATE,
+    bos_ids,
     ensure_chat_template,
     render_generation_prompt,
     render_prompt_and_answer,
@@ -82,9 +83,10 @@ def tokenize(
         print(full_prompt)
         print("******** Example ends ********")
 
-    prompt_input_ids = tokenizer.encode(query, add_special_tokens=False)
-    full_tokens = tokenizer.encode(
-        full_prompt, max_length=max_length, truncation=True, add_special_tokens=False
+    bos = bos_ids(tokenizer)   # [] unless add_bos is on (SFT/data/chat_format.py set_add_bos)
+    prompt_input_ids = bos + tokenizer.encode(query, add_special_tokens=False)
+    full_tokens = bos + tokenizer.encode(
+        full_prompt, max_length=max_length - len(bos), truncation=True, add_special_tokens=False
     )
 
     prompt_len = min(len(prompt_input_ids), len(full_tokens))
@@ -399,6 +401,20 @@ def get_messages_dataset(
         if accepted_count >= k:
             break
 
+        if "prompt" in example and "completion" in example:
+            # Pre-rendered row (SFT/data/prepare_greats_data.py): the strings are used verbatim, no chat template.
+            prompt, answer = example["prompt"], example["completion"]
+            if max_seq_length_threshold is not None and \
+                    estimate_token_length(tokenizer, prompt, answer) > max_seq_length_threshold:
+                rejected_count += 1
+                continue
+            full_input_ids, labels, attention_mask = tokenize(
+                tokenizer, prompt, answer, max_length, print_ex=accepted_count == 0)
+            dataset["input_ids"].append(full_input_ids)
+            dataset["labels"].append(labels)
+            dataset["attention_mask"].append(attention_mask)
+            accepted_count += 1
+            continue
         messages = example.get("messages", [])
         system_content = None
         user_content = None

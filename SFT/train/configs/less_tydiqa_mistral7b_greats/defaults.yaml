@@ -1,0 +1,54 @@
+# GREATS's LESS -> TyDiQA setting (Wang et al., "GREATS: Online Selection of High-Quality Data for LLM Training in Every
+# Iteration", NeurIPS 2024, Table 1 row 2 / App. B item 2; github.com/Jiachen-T-Wang/GREATS, less/ code path). Every value below
+# is GREATS's, from the paper or the code that produced it:
+#   - Mistral-7B-v0.1; the official LESS pool (270,679 rows, SFT/data/prepare_greats_data.py), a 40% subset drawn as LESS does
+#     (np.random.permutation under sample_data_seed 42, the same subset for every training seed)
+#   - batch 4 candidates per step; curation keeps 50% (Sec. 5.1: Regular trains on all 4, selection methods on 2)
+#   - LoRA r 128, alpha 1 (scale 1/128), dropout 0, on q_proj + k_proj: GREATS swaps PEFT's LoRA layers for its own
+#     GCLoRALinear(in, out, r), whose alpha (1) and dropout (0) defaults are what trained (the paper states dropout 0.1)
+#   - lr 1e-5, AdamW, weight decay 0, linear schedule with 3% warmup over one epoch (108,271 rows -> 27,068 steps); training
+#     stops at step 3,000, where GREATS's TyDiQA curves and F1 end (Fig. 4), so the schedule is the 1-epoch one
+#   - token-mean loss (HF model loss), 512 tokens, BOS on every sequence, the exact LESS tulu rendering (less_tulu)
+#   - fp32 weights under bf16 autocast (GREATS loads the model with torch_dtype None and trains with HF bf16=True) and SDPA
+#     attention (the default of its transformers 4.36.2; flash-attention-2 cannot run the fp32 step-0 evaluation)
+#   - D*: LESS's TyDiQA dev file, 9 rows (one per language; GREATS asks for n_val 10 and gets the 9), never length-rejected
+#   - held-out curve: the first 110 of GREATS's 500 test rows (its test perplexity reads 11 batches of 10), every 64 steps
+#   - downstream: 1-shot macro F1 on the 500 test rows, LESS / open-instruct protocol (SFT/eval/tasks/greats.py)
+# tests/test_greats_encoding.py checks the training rows and target rows token by token against GREATS's encoding.
+# Not reproduced: the batch order (GREATS fixes data_seed 3 for all seeds and its HF/accelerate versions sample differently;
+# here each seed has its own order).
+model: mistralai/Mistral-7B-v0.1
+train_dataset: less_official
+target_task: tydiqa_less
+percentage: 0.4
+subset_sampler: numpy
+subset_seed: 42
+
+seed: 42
+batch_size: 4
+gradient_accumulation_steps: 1
+optim: adamw_torch
+max_seq_length: 512
+lr_scheduler_type: linear
+warmup_ratio: 0.03
+weight_decay: 0.0
+num_train_epochs: 1
+stop_at_step: 3000
+loss_reduction: token_mean
+add_bos: true
+chat_template: less_tulu
+eval_steps: 64
+torch_dtype: float32
+use_flash_attention: false
+gradient_checkpointing: false
+
+n_eval: 110
+val_seq_length_multiplier: 0
+
+selection_frac: 0.5
+selection_mode: topk
+n_val: 9
+val_batch_size: 1
+val_strategy: merged_batch
+scoring:
+  method: pip
